@@ -1,5 +1,6 @@
 export {
 	assertGoalId,
+	GOAL_CHECKPOINT_SCHEMA,
 	GOAL_CONTRACT_PROJECTION_SCHEMA,
 	GOAL_CONTRACT_SCHEMA,
 	GOAL_EVENT_SCHEMA,
@@ -8,6 +9,9 @@ export {
 	type GoalActor,
 	type GoalBudgets,
 	type GoalCapabilities,
+	type GoalCheckpoint,
+	type GoalCheckpointedEvent,
+	type GoalCheckpointedEventPayload,
 	type GoalContractProjection,
 	type GoalContractUpdatedEvent,
 	type GoalContractV1,
@@ -15,6 +19,7 @@ export {
 	type GoalEvent,
 	type GoalHead,
 	GoalValidationError,
+	validateGoalCheckpoint,
 	validateGoalContract,
 } from "./contract.ts";
 export {

@@ -19,7 +19,8 @@
 		"build": "tsgo -p tsconfig.build.json"
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-coding-agent": "0.80.10"
+		"@earendil-works/pi-coding-agent": "0.80.10",
+		"pi-xk-core": "0.0.0"
 	},
 	"devDependencies": {
 		"shx": "0.4.0"

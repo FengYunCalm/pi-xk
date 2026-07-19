@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+	type GoalCheckpoint,
 	type GoalContractV1,
 	GoalCorruptionError,
 	GoalHeadConflictError,
@@ -109,6 +110,45 @@ describe("GoalStore", () => {
 		await expect(store.createGoal({ ...contract, title: "Different payload" }, options)).rejects.toBeInstanceOf(
 			GoalIdempotencyConflictError,
 		);
+	});
+
+	it("appends an idempotent checkpoint without changing the current contract", async () => {
+		const { store, projectRoot } = await createStore();
+		const contract = createContract("goal_checkpoint");
+		const created = await store.createGoal(contract, {
+			eventId: "evt-create",
+			idempotencyKey: "create:goal_checkpoint",
+		});
+		const checkpoint: GoalCheckpoint = {
+			schema: "pi-xk.goal-checkpoint.v1",
+			sessionId: "session-checkpoint",
+			leafId: "leaf-tool-result",
+			turnIndex: 0,
+			toolResultCount: 1,
+			reason: "turn_end",
+			createdAt: "2026-07-19T00:00:01.000Z",
+		};
+
+		const first = await store.appendCheckpoint(contract.goalId, checkpoint, {
+			eventId: "evt-checkpoint",
+			idempotencyKey: "checkpoint:session-checkpoint:leaf-tool-result",
+			expectedHead: created.head,
+		});
+		const retry = await store.appendCheckpoint(contract.goalId, checkpoint, {
+			eventId: "evt-checkpoint-retry",
+			idempotencyKey: "checkpoint:session-checkpoint:leaf-tool-result",
+			expectedHead: created.head,
+		});
+		const replayed = await store.replayGoal(contract.goalId);
+		const projection = JSON.parse(
+			await readFile(join(projectRoot, ".pi-xk", "goals", contract.goalId, "contract.json"), "utf8"),
+		) as { sequence: number; baseHash: string; contract: GoalContractV1 };
+
+		expect(first.event.eventType).toBe("goal_checkpointed");
+		expect(retry).toEqual(first);
+		expect(replayed.events).toHaveLength(2);
+		expect(replayed.contract).toEqual(contract);
+		expect(projection).toMatchObject({ sequence: 2, baseHash: first.event.hash, contract });
 	});
 
 	it("serializes concurrent writes without duplicate sequences", async () => {

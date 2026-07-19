@@ -4,6 +4,8 @@ export const GOAL_EVENT_SCHEMA = "pi-xk.goal-event.v1";
 
 export const GOAL_CONTRACT_PROJECTION_SCHEMA = "pi-xk.goal-contract-projection.v1";
 
+export const GOAL_CHECKPOINT_SCHEMA = "pi-xk.goal-checkpoint.v1";
+
 export type GoalAcceptanceKind = "command" | "test" | "artifact" | "approval";
 
 export interface GoalAcceptance {
@@ -55,6 +57,20 @@ export interface GoalContractUpdatedEventPayload {
 	contract: GoalContractV1;
 }
 
+export interface GoalCheckpoint {
+	schema: typeof GOAL_CHECKPOINT_SCHEMA;
+	sessionId: string;
+	leafId: string;
+	turnIndex: number;
+	toolResultCount: number;
+	reason: "turn_end";
+	createdAt: string;
+}
+
+export interface GoalCheckpointedEventPayload {
+	checkpoint: GoalCheckpoint;
+}
+
 export interface GoalCreatedEvent {
 	schema: typeof GOAL_EVENT_SCHEMA;
 	eventId: string;
@@ -85,7 +101,22 @@ export interface GoalContractUpdatedEvent {
 	hash: string;
 }
 
-export type GoalEvent = GoalCreatedEvent | GoalContractUpdatedEvent;
+export interface GoalCheckpointedEvent {
+	schema: typeof GOAL_EVENT_SCHEMA;
+	eventId: string;
+	goalId: string;
+	sequence: number;
+	eventType: "goal_checkpointed";
+	actor: GoalActor;
+	timestamp: string;
+	prevHash: string;
+	payload: GoalCheckpointedEventPayload;
+	schemaVersion: 1;
+	idempotencyKey: string;
+	hash: string;
+}
+
+export type GoalEvent = GoalCreatedEvent | GoalContractUpdatedEvent | GoalCheckpointedEvent;
 
 export interface GoalContractProjection {
 	schema: typeof GOAL_CONTRACT_PROJECTION_SCHEMA;
@@ -234,5 +265,32 @@ export function validateGoalContract(value: unknown): GoalContractV1 {
 		ownerSessionId: requireNonEmptyString(value.ownerSessionId, "ownerSessionId"),
 		createdAt,
 		schemaVersion: 1,
+	};
+}
+
+export function validateGoalCheckpoint(value: unknown): GoalCheckpoint {
+	if (!isRecord(value)) {
+		throw new GoalValidationError("Goal checkpoint must be an object");
+	}
+	requireExactKeys(
+		value,
+		["schema", "sessionId", "leafId", "turnIndex", "toolResultCount", "reason", "createdAt"],
+		"Goal checkpoint",
+	);
+	if (value.schema !== GOAL_CHECKPOINT_SCHEMA || value.reason !== "turn_end") {
+		throw new GoalValidationError("Goal checkpoint schema or reason is unsupported");
+	}
+	const createdAt = requireNonEmptyString(value.createdAt, "checkpoint.createdAt");
+	if (Number.isNaN(Date.parse(createdAt))) {
+		throw new GoalValidationError("checkpoint.createdAt must be an ISO timestamp");
+	}
+	return {
+		schema: GOAL_CHECKPOINT_SCHEMA,
+		sessionId: requireNonEmptyString(value.sessionId, "checkpoint.sessionId"),
+		leafId: requireNonEmptyString(value.leafId, "checkpoint.leafId"),
+		turnIndex: requireNonNegativeInteger(value.turnIndex, "checkpoint.turnIndex"),
+		toolResultCount: requireNonNegativeInteger(value.toolResultCount, "checkpoint.toolResultCount"),
+		reason: "turn_end",
+		createdAt,
 	};
 }

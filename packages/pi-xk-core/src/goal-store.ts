@@ -6,6 +6,8 @@ import {
 	GOAL_CONTRACT_PROJECTION_SCHEMA,
 	GOAL_EVENT_SCHEMA,
 	type GoalActor,
+	type GoalCheckpoint,
+	type GoalCheckpointedEvent,
 	type GoalContractProjection,
 	type GoalContractUpdatedEvent,
 	type GoalContractV1,
@@ -13,6 +15,7 @@ import {
 	type GoalEvent,
 	type GoalHead,
 	GoalValidationError,
+	validateGoalCheckpoint,
 	validateGoalContract,
 } from "./contract.ts";
 import { stableJsonStringify } from "./stable-json.ts";
@@ -131,6 +134,8 @@ interface EventInput {
 	idempotencyKey: string;
 }
 
+type GoalContractEventType = "goal_created" | "goal_contract_updated";
+
 interface GoalEventHashInput {
 	schema: typeof GOAL_EVENT_SCHEMA;
 	eventId: string;
@@ -180,6 +185,20 @@ function calculateEventHash(event: GoalEventHashInput): string {
 	return `sha256:${createHash("sha256").update(eventHashInput(event)).digest("hex")}`;
 }
 
+function getContractFromPayload(payload: GoalEvent["payload"]): GoalContractV1 {
+	if (!("contract" in payload)) {
+		throw new GoalValidationError("Goal event requires a contract payload");
+	}
+	return payload.contract;
+}
+
+function getCheckpointFromPayload(payload: GoalEvent["payload"]): GoalCheckpoint {
+	if (!("checkpoint" in payload)) {
+		throw new GoalValidationError("Goal checkpoint event requires a checkpoint payload");
+	}
+	return payload.checkpoint;
+}
+
 function createEvent(input: EventInput): GoalEvent {
 	if (input.eventType === "goal_created") {
 		if (input.prevHash !== null) {
@@ -194,7 +213,7 @@ function createEvent(input: EventInput): GoalEvent {
 			actor: input.actor,
 			timestamp: input.timestamp,
 			prevHash: null,
-			payload: { contract: input.payload.contract },
+			payload: { contract: getContractFromPayload(input.payload) },
 			schemaVersion: 1,
 			idempotencyKey: input.idempotencyKey,
 		};
@@ -202,6 +221,22 @@ function createEvent(input: EventInput): GoalEvent {
 	}
 	if (input.prevHash === null) {
 		throw new GoalValidationError("Goal contract updates require a previous hash");
+	}
+	if (input.eventType === "goal_checkpointed") {
+		const eventWithoutHash: Omit<GoalCheckpointedEvent, "hash"> = {
+			schema: GOAL_EVENT_SCHEMA,
+			eventId: input.eventId,
+			goalId: input.goalId,
+			sequence: input.sequence,
+			eventType: "goal_checkpointed",
+			actor: input.actor,
+			timestamp: input.timestamp,
+			prevHash: input.prevHash,
+			payload: { checkpoint: getCheckpointFromPayload(input.payload) },
+			schemaVersion: 1,
+			idempotencyKey: input.idempotencyKey,
+		};
+		return { ...eventWithoutHash, hash: calculateEventHash(eventWithoutHash) };
 	}
 	const eventWithoutHash: Omit<GoalContractUpdatedEvent, "hash"> = {
 		schema: GOAL_EVENT_SCHEMA,
@@ -212,7 +247,7 @@ function createEvent(input: EventInput): GoalEvent {
 		actor: input.actor,
 		timestamp: input.timestamp,
 		prevHash: input.prevHash,
-		payload: { contract: input.payload.contract },
+		payload: { contract: getContractFromPayload(input.payload) },
 		schemaVersion: 1,
 		idempotencyKey: input.idempotencyKey,
 	};
@@ -335,6 +370,28 @@ function parseGoalEvent(value: unknown, lineNumber: number): GoalEvent {
 			hash: value.hash,
 		};
 		event = updatedEvent;
+	} else if (value.eventType === "goal_checkpointed") {
+		if (Object.keys(value.payload).length !== 1 || !("checkpoint" in value.payload)) {
+			throw new GoalCorruptionError(`Event ${lineNumber} has an invalid checkpoint payload`);
+		}
+		if (typeof value.prevHash !== "string") {
+			throw new GoalCorruptionError(`Event ${lineNumber} checkpoint event has no previous hash`);
+		}
+		const checkpointedEvent: GoalCheckpointedEvent = {
+			schema: GOAL_EVENT_SCHEMA,
+			eventId: value.eventId,
+			goalId: value.goalId,
+			sequence: value.sequence,
+			eventType: "goal_checkpointed",
+			actor: value.actor as GoalActor,
+			timestamp: value.timestamp,
+			prevHash: value.prevHash,
+			payload: { checkpoint: validateGoalCheckpoint(value.payload.checkpoint) },
+			schemaVersion: 1,
+			idempotencyKey: value.idempotencyKey,
+			hash: value.hash,
+		};
+		event = checkpointedEvent;
 	} else {
 		throw new GoalCorruptionError(`Event ${lineNumber} has an unsupported type`);
 	}
@@ -383,17 +440,19 @@ function replayEvents(goalId: string, raw: string): GoalReplay {
 		if (index === 0 && event.eventType !== "goal_created") {
 			throw new GoalCorruptionError("The first Goal event must be goal_created");
 		}
-		if (index > 0 && event.eventType !== "goal_contract_updated") {
+		if (index > 0 && event.eventType !== "goal_contract_updated" && event.eventType !== "goal_checkpointed") {
 			throw new GoalCorruptionError(`Event ${index + 1} is invalid after Goal creation`);
 		}
-		const nextContract = event.payload.contract;
-		if (nextContract.goalId !== goalId) {
-			throw new GoalCorruptionError(`Event ${index + 1} contract has a different Goal ID`);
+		if (event.eventType !== "goal_checkpointed") {
+			const nextContract = event.payload.contract;
+			if (nextContract.goalId !== goalId) {
+				throw new GoalCorruptionError(`Event ${index + 1} contract has a different Goal ID`);
+			}
+			if (contract && nextContract.createdAt !== contract.createdAt) {
+				throw new GoalCorruptionError(`Event ${index + 1} changes the Goal creation timestamp`);
+			}
+			contract = nextContract;
 		}
-		if (contract && nextContract.createdAt !== contract.createdAt) {
-			throw new GoalCorruptionError(`Event ${index + 1} changes the Goal creation timestamp`);
-		}
-		contract = nextContract;
 		previousHash = event.hash;
 	}
 	const lastEvent = events.at(-1);
@@ -565,7 +624,7 @@ export class GoalStore {
 
 	private buildEvent(
 		contract: GoalContractV1,
-		eventType: GoalEvent["eventType"],
+		eventType: GoalContractEventType,
 		options: GoalMutationOptions,
 		sequence: number,
 		prevHash: string | null,
@@ -584,6 +643,32 @@ export class GoalStore {
 			timestamp,
 			prevHash,
 			payload: { contract },
+			sequence,
+			idempotencyKey: options.idempotencyKey,
+		});
+	}
+
+	private buildCheckpointEvent(
+		goalId: string,
+		checkpoint: GoalCheckpoint,
+		options: GoalMutationOptions,
+		sequence: number,
+		prevHash: string,
+	): GoalEvent {
+		assertNonEmptyString(options.eventId, "eventId");
+		assertNonEmptyString(options.idempotencyKey, "idempotencyKey");
+		const actor = options.actor ?? "runtime";
+		assertActor(actor);
+		const timestamp = options.timestamp ?? checkpoint.createdAt;
+		assertIsoTimestamp(timestamp, "timestamp");
+		return createEvent({
+			eventId: options.eventId,
+			goalId,
+			eventType: "goal_checkpointed",
+			actor,
+			timestamp,
+			prevHash,
+			payload: { checkpoint },
 			sequence,
 			idempotencyKey: options.idempotencyKey,
 		});
@@ -664,6 +749,41 @@ export class GoalStore {
 			const nextReplay: GoalReplay = {
 				goalId: contract.goalId,
 				contract,
+				head: headForEvent(event),
+				events: [...replay.events, event],
+			};
+			await this.writeProjection(paths, nextReplay);
+			return { event, head: nextReplay.head };
+		});
+	}
+
+	async appendCheckpoint(
+		goalId: string,
+		checkpointInput: GoalCheckpoint,
+		options: GoalContractUpdateOptions,
+	): Promise<GoalWriteResult> {
+		assertGoalId(goalId);
+		const checkpoint = validateGoalCheckpoint(checkpointInput);
+		const paths = this.paths(goalId);
+		return await this.withGoalLock(paths, goalId, async () => {
+			const replay = await this.readReplay(paths, goalId);
+			if (replay.tailDiagnostic) throw new GoalRecoveryRequiredError(goalId);
+			const event = this.buildCheckpointEvent(
+				goalId,
+				checkpoint,
+				options,
+				replay.head.sequence + 1,
+				replay.head.hash,
+			);
+			const retry = this.ensureRetryMatches(replay, event);
+			if (retry) return retry;
+			if (options.expectedHead.sequence !== replay.head.sequence || options.expectedHead.hash !== replay.head.hash) {
+				throw new GoalHeadConflictError(options.expectedHead, replay.head);
+			}
+			await this.appendEvent(paths, event);
+			const nextReplay: GoalReplay = {
+				goalId,
+				contract: replay.contract,
 				head: headForEvent(event),
 				events: [...replay.events, event],
 			};
