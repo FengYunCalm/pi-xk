@@ -1,0 +1,27 @@
+{
+	"name": "pi-xk-extension",
+	"version": "0.0.0",
+	"private": true,
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		}
+	},
+	"files": [
+		"dist"
+	],
+	"scripts": {
+		"clean": "shx rm -rf dist",
+		"build": "tsgo -p tsconfig.build.json"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "0.80.10"
+	},
+	"devDependencies": {
+		"shx": "0.4.0"
+	}
+}
