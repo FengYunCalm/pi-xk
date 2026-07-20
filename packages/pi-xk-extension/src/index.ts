@@ -484,6 +484,8 @@ export interface PiXkGoalExtensionOptions {
 	createGoalId?: () => string;
 	/** Test and SDK injection point for lifecycle timestamps. */
 	now?: () => Date;
+	/** Test and SDK injection point for retry delays after provider failures. */
+	retryDelayMs?: (consecutiveFailureCount: number) => number;
 	/** Test and SDK injection point for the project-local GoalStore. */
 	createGoalStore?: (projectRoot: string) => GoalStore;
 	/** Optional non-fatal diagnostic receiver for Goal command and lifecycle errors. */
@@ -557,7 +559,11 @@ function notifyGoalError(ctx: ExtensionContext, options: PiXkGoalExtensionOption
 	} catch {
 		// Host diagnostics must not break Pi command or agent lifecycles.
 	}
-	ctx.ui.notify(`Pi-XK Goal: ${normalized.message}`, "error");
+	try {
+		ctx.ui.notify(`Pi-XK Goal: ${normalized.message}`, "error");
+	} catch {
+		// A delayed retry can outlive a replaced extension context; diagnostics must not leak an unhandled rejection.
+	}
 }
 
 function objectiveTitle(objective: string): string {
@@ -565,11 +571,21 @@ function objectiveTitle(objective: string): string {
 	return firstLine.length <= 120 ? firstLine : `${firstLine.slice(0, 117)}...`;
 }
 
+function goalRuntimePrompt(objectivePath: string): string {
+	return [
+		`An active Pi-XK Goal is bound to this session. Read ${objectivePath} and follow its contract.`,
+		"A normal assistant response does not end this Goal: Pi-XK continues active Goals into another run.",
+		"Before calling pi_xk_end_goal, update the Goal state and verify that the objective and declared acceptance evidence are complete.",
+		"If you need user input or an external change, update the Goal state and call pi_xk_pause_goal instead.",
+		"Otherwise record current evidence and continue with the next best action; do not end a Goal merely because you have described a plan or partial result.",
+	].join("\n");
+}
+
 function kickoffGoal(pi: ExtensionAPI, goalId: string): void {
 	pi.sendMessage(
 		{
 			customType: PI_XK_GOAL_KICKOFF_CUSTOM_TYPE,
-			content: "Continue the active Pi-XK Goal according to its contract.",
+			content: "Continue the active Pi-XK Goal according to its durable contract.",
 			display: false,
 			details: { goalId },
 		},
@@ -718,6 +734,32 @@ async function settleGoalRun(
 		{ eventType: "goal_run_settled", payload: { runId: replay.lifecycle.openRunId } },
 		lifecycleWrite(binding.goalId, "run_settled", "runtime", timestamp, replay.lifecycle.openRunId),
 	);
+}
+
+type GoalRunOutcome = "continue" | "error" | "aborted";
+
+function goalRunOutcome(event: AgentEndEvent): GoalRunOutcome {
+	for (let index = event.messages.length - 1; index >= 0; index--) {
+		const message = event.messages[index];
+		if (message?.role !== "assistant") continue;
+		if (message.stopReason === "error") return "error";
+		if (message.stopReason === "aborted") return "aborted";
+		return "continue";
+	}
+	return "aborted";
+}
+
+async function continueActiveGoal(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	storeFor: (projectRoot: string) => GoalStore,
+): Promise<void> {
+	if (!ctx.isIdle()) return;
+	const binding = findCurrentGoalBinding(ctx);
+	if (!binding) return;
+	const replay = await storeFor(ctx.cwd).replayGoal(binding.goalId);
+	if (replay.lifecycle.status !== "active" || replay.lifecycle.openRunId) return;
+	kickoffGoal(pi, binding.goalId);
 }
 
 async function settleGoalLifecycleIntent(
@@ -937,6 +979,30 @@ async function showGoalStatus(
 export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}): ExtensionFactory {
 	const storeFor = createGoalStoreResolver(options);
 	return (pi) => {
+		let consecutiveGoalFailures = 0;
+		let lastGoalRunOutcome: GoalRunOutcome = "aborted";
+		let retryTimer: ReturnType<typeof setTimeout> | undefined;
+
+		const clearRetryTimer = () => {
+			if (retryTimer === undefined) return;
+			clearTimeout(retryTimer);
+			retryTimer = undefined;
+		};
+
+		const retryDelay = (failureCount: number): number => {
+			const configured = options.retryDelayMs?.(failureCount);
+			if (configured !== undefined) return Math.max(0, configured);
+			return Math.min(1_000 * 2 ** Math.min(failureCount - 1, 6), 60_000);
+		};
+
+		const scheduleRetry = (ctx: ExtensionContext, delayMs: number) => {
+			clearRetryTimer();
+			retryTimer = setTimeout(() => {
+				retryTimer = undefined;
+				void continueActiveGoal(pi, ctx, storeFor).catch((error) => notifyGoalError(ctx, options, error));
+			}, delayMs);
+		};
+
 		createPiXkExtension({
 			resolveBindings: (ctx) => {
 				const binding = findCurrentGoalBinding(ctx);
@@ -962,7 +1028,7 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 			name: "pi_xk_pause_goal",
 			label: "Pause Goal",
 			description:
-				"Pause the active Pi-XK Goal after you have updated goal-state.md with the current evidence and next best action.",
+				"Pause the active Pi-XK Goal only after you have updated goal-state.md with current evidence and the next best action. Use this when user input or an external change is required.",
 			parameters: Type.Object({
 				reason: Type.String({ description: "Why this Goal should pause" }),
 				nextBestAction: Type.Optional(Type.String({ description: "The next action to record in goal-state.md" })),
@@ -984,7 +1050,8 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 		pi.registerTool({
 			name: "pi_xk_end_goal",
 			label: "End Goal",
-			description: "End the active Pi-XK Goal after you have updated goal-state.md with final evidence and outcome.",
+			description:
+				"End the active Pi-XK Goal only after you have updated goal-state.md and verified that its objective and declared acceptance evidence are complete. A normal response does not end the Goal.",
 			parameters: Type.Object({
 				outcome: Type.String({ description: "The final Goal outcome" }),
 				reason: Type.String({ description: "Why this Goal is ending" }),
@@ -1019,7 +1086,7 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 				const objectivePath = await getActiveGoalObjectivePath(ctx, storeFor);
 				if (!objectivePath) return;
 				return {
-					systemPrompt: `${event.systemPrompt}\n\n<pi-xk-goal>\nAn active Pi-XK Goal is bound to this session. Read ${objectivePath} and follow its contract.\n</pi-xk-goal>`,
+					systemPrompt: `${event.systemPrompt}\n\n<pi-xk-goal>\n${goalRuntimePrompt(objectivePath)}\n</pi-xk-goal>`,
 				};
 			} catch (error) {
 				notifyGoalError(ctx, options, error);
@@ -1028,40 +1095,53 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 		});
 		pi.on("context", async (event, ctx) => {
 			const kickoffIndex = findCurrentKickoffMessageIndex(event.messages);
-			if (kickoffIndex < 0) return;
+			let kickoffPrompt: string | undefined;
 			try {
-				const objectivePath = await getActiveGoalObjectivePath(ctx, storeFor);
-				if (!objectivePath) return;
-				return {
-					messages: event.messages.map((message, index) =>
-						index === kickoffIndex && message.role === "custom"
-							? {
-									...message,
-									content: `An active Pi-XK Goal is bound to this session. Read ${objectivePath} and follow its contract.`,
-								}
-							: message,
-					),
-				};
+				if (kickoffIndex >= 0) {
+					const objectivePath = await getActiveGoalObjectivePath(ctx, storeFor);
+					if (objectivePath) kickoffPrompt = goalRuntimePrompt(objectivePath);
+				}
 			} catch (error) {
 				notifyGoalError(ctx, options, error);
-				return;
 			}
+			const messages = event.messages.map((message, index) => {
+				if (message.role !== "custom" || message.customType !== PI_XK_GOAL_KICKOFF_CUSTOM_TYPE) {
+					return message;
+				}
+				return { ...message, content: index === kickoffIndex && kickoffPrompt ? kickoffPrompt : "" };
+			});
+			if (messages.some((message, index) => message !== event.messages[index])) return { messages };
 		});
 		pi.on("agent_start", async (_event, ctx) => {
 			try {
+				lastGoalRunOutcome = "aborted";
 				await startGoalRun(ctx, storeFor, options);
 			} catch (error) {
 				notifyGoalError(ctx, options, error);
 			}
 		});
+		pi.on("agent_end", (event, ctx) => {
+			if (!findCurrentGoalBinding(ctx)) return;
+			lastGoalRunOutcome = goalRunOutcome(event);
+		});
 		pi.on("agent_settled", async (_event, ctx) => {
 			try {
-				if (!(await settleGoalLifecycleIntent(pi, ctx, storeFor, options))) {
-					await settleGoalRun(ctx, storeFor, options);
+				if (await settleGoalLifecycleIntent(pi, ctx, storeFor, options)) return;
+				await settleGoalRun(ctx, storeFor, options);
+				if (lastGoalRunOutcome === "aborted") return;
+				if (lastGoalRunOutcome === "error") {
+					consecutiveGoalFailures += 1;
+					scheduleRetry(ctx, retryDelay(consecutiveGoalFailures));
+					return;
 				}
+				consecutiveGoalFailures = 0;
+				await continueActiveGoal(pi, ctx, storeFor);
 			} catch (error) {
 				notifyGoalError(ctx, options, error);
 			}
+		});
+		pi.on("session_shutdown", () => {
+			clearRetryTimer();
 		});
 		pi.on("input", async (event, ctx) => {
 			const capture = findCurrentGoalCapture(ctx);

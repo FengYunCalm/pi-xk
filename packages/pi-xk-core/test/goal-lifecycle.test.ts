@@ -234,6 +234,8 @@ describe("Goal lifecycle and files", () => {
 
 		expect(objective).toContain("goal-objective.md is read-only");
 		expect(objective).toContain("read goal-state.md before every new agent run");
+		expect(objective).toContain("A normal assistant response does not end this Goal");
+		expect(objective).toContain("pi_xk_end_goal");
 		expect(state).toContain("## done");
 		expect(state).toContain("## next_best_action");
 		expect(await store.inspectGoalFiles(contract.goalId)).toMatchObject({

@@ -1,6 +1,6 @@
 # Pi-XK 架构策划案
 
-> **状态**：In implementation（Phase 0 与 Phase 1.1–1.5 已完成；Policy、沙箱、隔离 worker 和其余 MVP 能力仍按路线图推进）
+> **状态**：In implementation（Phase 0 与 Phase 1.1–1.7 已完成；当前个人本机无限权限 profile 仍明确延后 Policy/沙箱，TaskSupervisor、通用 Context/memory 和其余 MVP 能力按路线图推进）
 >
 > **版本**：1.0.0
 >
@@ -772,10 +772,17 @@ pi_xk.artifact.*
 
 - Goal contract、事件追加、hash chain、idempotency、CAS/锁和重放；
 - Pi session 的 goal/task binding custom entry；
-- turn_end、tool-batch-end、compaction-before 的自动 checkpoint；
+- 工具结果已持久化后的 `turn_end` 与 `session_before_compact` 的自动 checkpoint；
 - artifact store、redaction 和可重建 read model。
 
-**2026-07-20 实现状态：** Phase 1.1–1.5 已完成 Goal contract/event log、Pi binding/ref、`turn_end`（工具结果已持久化后）与 `session_before_compact` 的 checkpoint evidence、项目作用域 artifact store、v1 读取 upcast 和可重建 `goal-read-model.json`。Phase 1.6 已验证 Pi 原生本地 package 安装、冷启动自动发现和用户级 `/goal` 命令注册；`pi-xk-extension` 提供安装/恢复说明和无网络 runtime preflight。artifact 默认只保存 runtime 生成的 provenance，不复制 Pi transcript、Goal state 或工具正文；Policy、context 注入、artifact retention/GC 与 memory 仍未实现。
+**2026-07-20 实现状态：** Phase 1.1–1.5 已完成 Goal contract/event log、Pi binding/ref、`turn_end`（工具结果已持久化后）与 `session_before_compact` 的 checkpoint evidence、项目作用域 artifact store、v1 读取 upcast 和可重建 `goal-read-model.json`。Phase 1.6 已验证 Pi 原生本地 package 安装、冷启动自动发现和用户级 `/goal` 命令注册；`pi-xk-extension` 提供安装/恢复说明和无网络 runtime preflight。Phase 1.7 已实现活跃 Goal 的连续 run：普通模型回复不会结束 Goal，只有模型 `pi_xk_end_goal` 或用户 `/goal end` 会写入 ended；不以 run 数量作为终止条件，provider 失败保持 Goal active 并按指数退避重试。Goal 专用的 objective-path 执行提示已通过 `before_agent_start` 与 kickoff context 注入；尚未实现的是通用 L0/L1/L2 Context controller。artifact 默认只保存 runtime 生成的 provenance，不复制 Pi transcript、Goal state 或工具正文；Policy、artifact retention/GC 与 memory 仍未实现。
+
+#### Phase 1.7：Goal 连续执行（已完成）
+
+- 每个 active Goal 在一次 agent run settled 后自动启动下一次隐藏 kickoff；模型的普通文本、计划或部分结果都不是终止信号。
+- 模型必须先更新 `goal-state.md` 并验证目标与验收证据，再调用 `pi_xk_end_goal`；需要用户输入或外部变化时调用 `pi_xk_pause_goal`。用户仍可用 `/goal pause` 或 `/goal end` 覆盖运行。
+- 不设置最大 run 数；Goal 的语义完成权由模型的显式 end 工具调用决定。provider error 不会伪造 ended，而是在当前 live session 内指数退避重试。
+- 自动续跑沿用既有 checkpoint、生命周期和 branch binding；它不是 TaskSupervisor、后台 child agent 或无人值守沙箱的替代品。
 
 必测故障：
 

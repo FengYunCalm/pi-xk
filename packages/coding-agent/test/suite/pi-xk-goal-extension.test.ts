@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
+import { type FauxResponseFactory, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import { GoalStore } from "../../../pi-xk-core/src/index.ts";
 import {
@@ -55,6 +55,14 @@ async function waitForAgent(harness: Harness): Promise<void> {
 	await harness.session.waitForIdle();
 }
 
+async function waitForProviderCalls(harness: Harness, minimumCalls: number): Promise<void> {
+	for (let attempt = 0; attempt < 100; attempt++) {
+		if (harness.faux.state.callCount >= minimumCalls) return;
+		await new Promise<void>((resolve) => setTimeout(resolve, 5));
+	}
+	throw new Error(`expected ${minimumCalls} provider calls, received ${harness.faux.state.callCount}`);
+}
+
 afterEach(() => {
 	while (harnesses.length > 0) {
 		harnesses.pop()?.cleanup();
@@ -62,11 +70,88 @@ afterEach(() => {
 });
 
 describe("Pi-XK Goal extension", () => {
+	it("keeps an active Goal running until the model explicitly ends it and exposes the termination contract", async () => {
+		const requestTexts: string[] = [];
+		const harness = await createHarness({
+			extensionFactories: [createPiXkGoalExtension({ createGoalId: () => "goal_continuous" })],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			(context) => {
+				requestTexts.push(context.messages.map((message) => getMessageText(message)).join("\n"));
+				return fauxAssistantMessage("The first concrete action is complete.");
+			},
+			(context) => {
+				requestTexts.push(context.messages.map((message) => getMessageText(message)).join("\n"));
+				return fauxAssistantMessage(
+					[
+						fauxToolCall("pi_xk_end_goal", {
+							outcome: "accepted",
+							reason: "the acceptance evidence is complete",
+							finalEvidence: "state and verification are current",
+						}),
+					],
+					{ stopReason: "toolUse" },
+				);
+			},
+		]);
+
+		await harness.session.bindExtensions({});
+		await harness.session.prompt("/goal Continue until the model has verified completion.");
+		await waitForAgent(harness);
+
+		expect(requestTexts).toHaveLength(2);
+		for (const requestText of requestTexts) {
+			expect(requestText).toContain("A normal assistant response does not end this Goal");
+			expect(requestText).toContain("pi_xk_end_goal");
+		}
+		const goalId = getCurrentGoalId(harness);
+		const objective = await readFile(join(harness.tempDir, ".pi-xk", "goals", goalId!, "goal-objective.md"), "utf8");
+		expect(objective).toContain("A normal assistant response does not end this Goal");
+		expect(objective).toContain("pi_xk_end_goal");
+		expect((await new GoalStore(harness.tempDir).replayGoal(goalId!)).lifecycle.status).toBe("ended");
+	});
+
+	it("backs off provider failures without ending the Goal before the model decides to end it", async () => {
+		const retryCounts: number[] = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				createPiXkGoalExtension({
+					createGoalId: () => "goal_retry",
+					retryDelayMs: (failureCount) => {
+						retryCounts.push(failureCount);
+						return 0;
+					},
+				}),
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "temporary provider failure" }),
+			fauxAssistantMessage(
+				[fauxToolCall("pi_xk_end_goal", { outcome: "accepted", reason: "recovered and verified" })],
+				{ stopReason: "toolUse" },
+			),
+		]);
+
+		await harness.session.bindExtensions({});
+		await harness.session.prompt("/goal Retry until the model confirms completion.");
+		await waitForAgent(harness);
+		await waitForProviderCalls(harness, 2);
+		await waitForAgent(harness);
+
+		const goalId = getCurrentGoalId(harness);
+		const replayed = await new GoalStore(harness.tempDir).replayGoal(goalId!);
+		expect(retryCounts).toEqual([1]);
+		expect(replayed.lifecycle.status).toBe("ended");
+		expect(replayed.events.filter((event) => event.eventType === "goal_run_started")).toHaveLength(2);
+	});
+
 	it("creates a Goal from /goal without sending the raw objective and injects only an objective L0", async () => {
 		const rawObjective = "Ship the release without leaking this objective.";
 		let providerSystemPrompt = "";
 		let providerText = "";
-		let activeTurnSystemPrompt = "";
+		let activeTurnText = "";
 		const harness = await createHarness({
 			extensionFactories: [
 				createPiXkGoalExtension({
@@ -82,8 +167,11 @@ describe("Pi-XK Goal extension", () => {
 				return fauxAssistantMessage("kickoff complete");
 			},
 			(context) => {
-				activeTurnSystemPrompt = context.systemPrompt ?? "";
-				return fauxAssistantMessage("active turn complete");
+				activeTurnText = context.messages.map((message) => getMessageText(message)).join("\n");
+				return fauxAssistantMessage(
+					[fauxToolCall("pi_xk_pause_goal", { reason: "verify the injected contract" })],
+					{ stopReason: "toolUse" },
+				);
 			},
 		]);
 
@@ -100,15 +188,14 @@ describe("Pi-XK Goal extension", () => {
 		expect(providerText.match(/goal-objective\.md/g)).toHaveLength(1);
 		expect(providerSystemPrompt).not.toContain("goal-state.md");
 		expect(providerSystemPrompt).not.toContain(rawObjective);
-		await harness.session.prompt("continue the active Goal");
-		await waitForAgent(harness);
-		expect(activeTurnSystemPrompt).toContain("goal-objective.md");
-		expect(activeTurnSystemPrompt).not.toContain("goal-state.md");
-		expect(activeTurnSystemPrompt.match(/goal-objective\.md/g)).toHaveLength(1);
+		expect(activeTurnText).toContain("goal-objective.md");
+		expect(activeTurnText).toContain("A normal assistant response does not end this Goal");
+		expect(activeTurnText).not.toContain("goal-state.md");
+		expect(activeTurnText.match(/goal-objective\.md/g)).toHaveLength(1);
 
 		const goalStore = new GoalStore(harness.tempDir);
 		const replayed = await goalStore.replayGoal(goalId!);
-		expect(replayed.lifecycle.status).toBe("active");
+		expect(replayed.lifecycle.status).toBe("paused");
 		expect(replayed.events.map((event) => event.eventType)).toContain("goal_run_started");
 		expect(replayed.events.map((event) => event.eventType)).toContain("goal_run_settled");
 		await expect(
@@ -124,8 +211,14 @@ describe("Pi-XK Goal extension", () => {
 		harnesses.push(harness);
 		harness.setResponses([
 			fauxAssistantMessage("ordinary after cancelled capture"),
-			fauxAssistantMessage("reserved objective kickoff"),
-			fauxAssistantMessage("replacement kickoff"),
+			fauxAssistantMessage(
+				[fauxToolCall("pi_xk_end_goal", { outcome: "reserved complete", reason: "reserved objective checked" })],
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage(
+				[fauxToolCall("pi_xk_end_goal", { outcome: "replacement complete", reason: "replacement checked" })],
+				{ stopReason: "toolUse" },
+			),
 		]);
 
 		await harness.session.bindExtensions({});
@@ -159,51 +252,61 @@ describe("Pi-XK Goal extension", () => {
 	it("captures a multiline objective, keeps pause sticky, and stops injection after end", async () => {
 		const goalIds = ["goal_capture", "goal_unused"];
 		const requestTexts: string[] = [];
+		let resumed = false;
+		let pauseRequested = false;
+		let endRequested = false;
 		const harness = await createHarness({
 			extensionFactories: [createPiXkGoalExtension({ createGoalId: () => goalIds.shift()! })],
 		});
 		harnesses.push(harness);
-		harness.setResponses([
-			(context) => {
-				requestTexts.push(context.messages.map((message) => getMessageText(message)).join("\n"));
-				return fauxAssistantMessage("captured kickoff");
-			},
-			(context) => {
-				requestTexts.push(context.messages.map((message) => getMessageText(message)).join("\n"));
-				return fauxAssistantMessage("paused normal turn");
-			},
-			(context) => {
-				requestTexts.push(context.messages.map((message) => getMessageText(message)).join("\n"));
-				return fauxAssistantMessage("resumed kickoff");
-			},
-			(context) => {
-				requestTexts.push(context.messages.map((message) => getMessageText(message)).join("\n"));
-				return fauxAssistantMessage("ended normal turn");
-			},
-		]);
+		const respond: FauxResponseFactory = (context) => {
+			const requestText = context.messages.map((message) => getMessageText(message)).join("\n");
+			requestTexts.push(requestText);
+			if (!pauseRequested) {
+				pauseRequested = true;
+				return fauxAssistantMessage(
+					[fauxToolCall("pi_xk_pause_goal", { reason: "inspect state", nextBestAction: "resume after review" })],
+					{ stopReason: "toolUse" },
+				);
+			}
+			if (resumed && !endRequested) {
+				endRequested = true;
+				return fauxAssistantMessage(
+					[fauxToolCall("pi_xk_end_goal", { outcome: "accepted", reason: "review complete" })],
+					{ stopReason: "toolUse" },
+				);
+			}
+			return fauxAssistantMessage("ordinary response");
+		};
+		harness.setResponses(Array.from({ length: 8 }, () => respond));
 
 		await harness.session.bindExtensions({});
 		await harness.session.prompt("/goal");
-		expect(harness.getPendingResponseCount()).toBe(4);
+		expect(harness.getPendingResponseCount()).toBe(8);
 		await harness.session.prompt("First line\nSecond line");
 		await waitForAgent(harness);
 		const goalId = getCurrentGoalId(harness);
 		expect(goalId).toBe("goal_capture");
+		expect((await new GoalStore(harness.tempDir).replayGoal(goalId!)).lifecycle.status).toBe("paused");
 
-		await harness.session.prompt("/goal pause inspect state");
 		await harness.session.prompt("ordinary paused prompt");
 		await waitForAgent(harness);
+		const pausedRequest = requestTexts.find((requestText) => requestText.includes("ordinary paused prompt"));
+		expect(pausedRequest).toBeDefined();
+		expect(pausedRequest).not.toContain("goal-objective.md");
+
+		resumed = true;
 		await harness.session.prompt("/goal start");
 		await waitForAgent(harness);
-		await harness.session.prompt("/goal end accepted");
+		expect((await new GoalStore(harness.tempDir).replayGoal(goalId!)).lifecycle.status).toBe("ended");
+
 		await harness.session.prompt("ordinary ended prompt");
 		await waitForAgent(harness);
 
-		expect(requestTexts).toHaveLength(4);
 		expect(requestTexts[0]).toContain("goal-objective.md");
-		expect(requestTexts[1]).not.toContain("goal-objective.md");
-		expect(requestTexts[2]).toContain("goal-objective.md");
-		expect(requestTexts[3]).not.toContain("goal-objective.md");
+		const endedRequest = requestTexts.find((requestText) => requestText.includes("ordinary ended prompt"));
+		expect(endedRequest).toBeDefined();
+		expect(endedRequest).not.toContain("goal-objective.md");
 		const replayed = await new GoalStore(harness.tempDir).replayGoal(goalId!);
 		expect(replayed.lifecycle.status).toBe("ended");
 	});

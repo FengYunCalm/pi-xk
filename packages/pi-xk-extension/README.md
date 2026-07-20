@@ -32,7 +32,7 @@ Pi's native `find` tool needs `fd`. On Ubuntu or Debian, install `fd-find`; Pi r
 /goal <objective>          Create and immediately start a Goal.
 /goal                      Start or cancel multi-line objective capture.
 /goal pause [reason]       Pause the active Goal and interrupt a busy run.
-/goal start                Resume a paused Goal or start an active idle run.
+/goal start                Resume a paused Goal; active Goals otherwise continue automatically.
 /goal status               Show Goal state, diagnostics, and timing.
 /goal end [reason]         End the active Goal after its final checkpoint.
 /goal -- <objective>       Create an objective beginning with a reserved subcommand.
@@ -41,6 +41,8 @@ Pi's native `find` tool needs `fd`. On Ubuntu or Debian, install `fd-find`; Pi r
 The initial objective is written to `goal-objective.md` and is not sent as a normal chat message. Each Goal also has a mutable `goal-state.md`. At the start of an active run, Pi-XK tells the model to read the objective; the objective itself requires the model to read and maintain state with Pi's native file tools.
 
 `pi_xk_pause_goal` and `pi_xk_end_goal` are model tools. The model must update `goal-state.md` before using them. User and model termination requests are committed only after the final observable checkpoint.
+
+While a Goal is active, Pi-XK starts another run after a settled run. A normal assistant response, plan, or partial result does not end the Goal. The model must call `pi_xk_end_goal` only after it has updated `goal-state.md` and verified the objective and declared acceptance evidence. If it needs user input or an external change, it must update state and call `pi_xk_pause_goal`. There is no run-count completion limit. Provider failures leave the Goal active and retry with exponential backoff rather than fabricating an ended state.
 
 ## Files And Recovery
 
