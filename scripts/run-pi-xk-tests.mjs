@@ -11,6 +11,8 @@ const testTempDir =
 		: inheritedTempDir;
 const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
 const commands = [
+	["--workspace", "pi-xk-core", "run", "build"],
+	["--workspace", "pi-xk-extension", "run", "build"],
 	[
 		"--workspace",
 		"pi-xk-core",
@@ -31,6 +33,7 @@ const commands = [
 		"test/suite/pi-xk-session-link.test.ts",
 		"test/suite/pi-xk-checkpoint-bridge.test.ts",
 		"test/suite/pi-xk-goal-extension.test.ts",
+		"test/suite/pi-xk-package-install.test.ts",
 	],
 ];
 

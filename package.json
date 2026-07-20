@@ -19,6 +19,7 @@
 		"check:shrinkwrap": "node scripts/generate-coding-agent-shrinkwrap.mjs --check",
 		"check:install-lock:coding-agent": "node scripts/generate-coding-agent-install-lock.mjs --check",
 		"check:ts-imports": "node scripts/check-ts-relative-imports.mjs",
+		"check:pi-xk-runtime": "node scripts/check-pi-xk-runtime.mjs",
 		"test:pi-xk": "node scripts/run-pi-xk-tests.mjs",
 		"generate:models": "npm --prefix packages/ai run generate-models && npm --prefix packages/ai run generate-image-models",
 		"generate:model-catalog": "npm --prefix packages/ai run generate-model-catalog",

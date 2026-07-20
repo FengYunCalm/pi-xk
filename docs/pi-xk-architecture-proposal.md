@@ -775,7 +775,7 @@ pi_xk.artifact.*
 - turn_end、tool-batch-end、compaction-before 的自动 checkpoint；
 - artifact store、redaction 和可重建 read model。
 
-**2026-07-20 实现状态：** Phase 1.1–1.5 已完成 Goal contract/event log、Pi binding/ref、`turn_end`（工具结果已持久化后）与 `session_before_compact` 的 checkpoint evidence、项目作用域 artifact store、v1 读取 upcast 和可重建 `goal-read-model.json`。artifact 默认只保存 runtime 生成的 provenance，不复制 Pi transcript、Goal state 或工具正文；Policy、context 注入、artifact retention/GC 与 memory 仍未实现。
+**2026-07-20 实现状态：** Phase 1.1–1.5 已完成 Goal contract/event log、Pi binding/ref、`turn_end`（工具结果已持久化后）与 `session_before_compact` 的 checkpoint evidence、项目作用域 artifact store、v1 读取 upcast 和可重建 `goal-read-model.json`。Phase 1.6 已验证 Pi 原生本地 package 安装、冷启动自动发现和用户级 `/goal` 命令注册；`pi-xk-extension` 提供安装/恢复说明和无网络 runtime preflight。artifact 默认只保存 runtime 生成的 provenance，不复制 Pi transcript、Goal state 或工具正文；Policy、context 注入、artifact retention/GC 与 memory 仍未实现。
 
 必测故障：
 
