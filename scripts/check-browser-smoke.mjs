@@ -1,10 +1,22 @@
-import { existsSync, writeFileSync } from "node:fs";
+import { accessSync, constants, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { build } from "esbuild";
 
-const outputPath = join(tmpdir(), "pi-browser-smoke.js");
-const errorLogPath = join(tmpdir(), "pi-browser-smoke-errors.log");
+function getWritableTempDir() {
+	const configuredTempDir = tmpdir();
+	try {
+		accessSync(configuredTempDir, constants.W_OK);
+		return configuredTempDir;
+	} catch {
+		if (process.platform !== "win32" && existsSync("/tmp")) return "/tmp";
+		return configuredTempDir;
+	}
+}
+
+const tempDir = getWritableTempDir();
+const outputPath = join(tempDir, "pi-browser-smoke.js");
+const errorLogPath = join(tempDir, "pi-browser-smoke-errors.log");
 const generatedCatalogDataDir = join(process.cwd(), "packages/ai/src/providers/data");
 
 // Fresh checkouts do not materialize provider JSON until npm run build.

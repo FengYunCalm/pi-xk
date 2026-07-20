@@ -1,6 +1,6 @@
 # Pi-XK 架构策划案
 
-> **状态**：Proposed
+> **状态**：In implementation（Phase 0 与 Phase 1.1–1.5 已完成；Policy、沙箱、隔离 worker 和其余 MVP 能力仍按路线图推进）
 >
 > **版本**：1.0.0
 >
@@ -774,6 +774,8 @@ pi_xk.artifact.*
 - Pi session 的 goal/task binding custom entry；
 - turn_end、tool-batch-end、compaction-before 的自动 checkpoint；
 - artifact store、redaction 和可重建 read model。
+
+**2026-07-20 实现状态：** Phase 1.1–1.5 已完成 Goal contract/event log、Pi binding/ref、`turn_end`（工具结果已持久化后）与 `session_before_compact` 的 checkpoint evidence、项目作用域 artifact store、v1 读取 upcast 和可重建 `goal-read-model.json`。artifact 默认只保存 runtime 生成的 provenance，不复制 Pi transcript、Goal state 或工具正文；Policy、context 注入、artifact retention/GC 与 memory 仍未实现。
 
 必测故障：
 

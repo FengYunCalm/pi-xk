@@ -1,23 +1,45 @@
 import { createHash, randomUUID } from "node:crypto";
 import { type FileHandle, mkdir, open, readFile, rename, rm, unlink } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
+import { ArtifactStore, type ArtifactWriteInput } from "./artifact-store.ts";
 import {
 	assertGoalId,
+	GOAL_CHECKPOINT_SCHEMA,
 	GOAL_CONTRACT_PROJECTION_SCHEMA,
 	GOAL_EVENT_SCHEMA,
 	type GoalActor,
+	type GoalArtifactMetadata,
 	type GoalCheckpoint,
 	type GoalCheckpointedEvent,
+	type GoalCheckpointV2,
 	type GoalContractProjection,
 	type GoalContractUpdatedEvent,
 	type GoalContractV1,
 	type GoalCreatedEvent,
 	type GoalEvent,
 	type GoalHead,
+	type GoalLifecycleEvent,
+	type GoalLifecycleEventInput,
+	type GoalLifecycleEventType,
+	type GoalLifecycleProjection,
+	type GoalReadModel,
+	type GoalRunProjection,
 	GoalValidationError,
 	validateGoalCheckpoint,
 	validateGoalContract,
+	validateGoalLifecycleEventInput,
 } from "./contract.ts";
+import {
+	createGoalFiles,
+	type GoalFilesDiagnostic,
+	inspectGoalFiles as inspectGoalFileArtifacts,
+} from "./goal-files.ts";
+import {
+	buildGoalReadModel,
+	GoalReadModelStaleError,
+	sameGoalReadModel,
+	validateGoalReadModel,
+} from "./goal-read-model.ts";
 import { stableJsonStringify } from "./stable-json.ts";
 
 const LOCK_RETRY_LIMIT = 100;
@@ -75,9 +97,30 @@ export class GoalCorruptionError extends GoalStoreError {
 }
 
 export class GoalLockedError extends GoalStoreError {
-	constructor(goalId: string) {
-		super(`Goal is locked by another writer: ${goalId}`);
+	constructor(goalId: string, operation = "writing") {
+		super(`Goal is locked while ${operation}: ${goalId}`);
 		this.name = "GoalLockedError";
+	}
+}
+
+export class GoalLockRecoveryError extends GoalStoreError {
+	constructor(goalId: string, message: string) {
+		super(`Goal write-lock recovery failed for ${goalId}: ${message}`);
+		this.name = "GoalLockRecoveryError";
+	}
+}
+
+export class GoalLockRecoveryConflictError extends GoalStoreError {
+	constructor(goalId: string) {
+		super(`Goal write-lock recovery conflicted with a different lock owner: ${goalId}`);
+		this.name = "GoalLockRecoveryConflictError";
+	}
+}
+
+export class GoalLifecycleTransitionError extends GoalStoreError {
+	constructor(message: string) {
+		super(`Goal lifecycle transition is invalid: ${message}`);
+		this.name = "GoalLifecycleTransitionError";
 	}
 }
 
@@ -85,13 +128,25 @@ interface GoalPaths {
 	goalDirectory: string;
 	eventsPath: string;
 	projectionPath: string;
+	readModelProjectionPath: string;
 	lockPath: string;
+	recoveryLockPath: string;
 }
 
 interface StoredLock {
 	pid: number;
 	nonce: string;
 	createdAt: string;
+}
+
+export type GoalLockOwnerState = "alive" | "missing" | "unknown";
+
+export interface GoalWriteLockDiagnostic {
+	pid?: number;
+	nonce?: string;
+	createdAt?: string;
+	ownerState: GoalLockOwnerState;
+	malformed: boolean;
 }
 
 export interface GoalTailDiagnostic {
@@ -103,7 +158,13 @@ export interface GoalReplay {
 	contract: GoalContractV1;
 	head: GoalHead;
 	events: GoalEvent[];
+	lifecycle: GoalLifecycleProjection;
 	tailDiagnostic?: GoalTailDiagnostic;
+}
+
+export interface GoalReplayOptions {
+	/** ISO timestamp used for open wall/active elapsed calculations. */
+	now?: string;
 }
 
 export interface GoalMutationOptions {
@@ -177,6 +238,23 @@ function assertActor(value: GoalActor): void {
 	}
 }
 
+function parseStoredLock(value: unknown): StoredLock | undefined {
+	if (!isRecord(value)) return undefined;
+	if (typeof value.pid !== "number" || !Number.isInteger(value.pid) || value.pid <= 0) return undefined;
+	if (typeof value.nonce !== "string" || value.nonce.trim().length === 0) return undefined;
+	if (typeof value.createdAt !== "string" || Number.isNaN(Date.parse(value.createdAt))) return undefined;
+	return { pid: value.pid, nonce: value.nonce, createdAt: value.createdAt };
+}
+
+function getLockOwnerState(pid: number): GoalLockOwnerState {
+	try {
+		process.kill(pid, 0);
+		return "alive";
+	} catch (error) {
+		return isErrno(error, "ESRCH") ? "missing" : "unknown";
+	}
+}
+
 function eventHashInput(event: GoalEventHashInput): string {
 	return stableJsonStringify(event);
 }
@@ -197,6 +275,48 @@ function getCheckpointFromPayload(payload: GoalEvent["payload"]): GoalCheckpoint
 		throw new GoalValidationError("Goal checkpoint event requires a checkpoint payload");
 	}
 	return payload.checkpoint;
+}
+
+function isGoalLifecycleEventType(eventType: GoalEvent["eventType"]): eventType is GoalLifecycleEventType {
+	return (
+		eventType === "goal_activated" ||
+		eventType === "goal_paused" ||
+		eventType === "goal_resumed" ||
+		eventType === "goal_ended" ||
+		eventType === "goal_run_started" ||
+		eventType === "goal_run_settled" ||
+		eventType === "goal_run_interrupted"
+	);
+}
+
+function getLifecycleEventInput(
+	eventType: GoalLifecycleEventType,
+	payload: GoalEvent["payload"],
+): GoalLifecycleEventInput {
+	return validateGoalLifecycleEventInput({ eventType, payload });
+}
+
+function createLifecycleEvent(
+	input: EventInput & { eventType: GoalLifecycleEventType; prevHash: string },
+): GoalLifecycleEvent {
+	const lifecycle = getLifecycleEventInput(input.eventType, input.payload);
+	const eventWithoutHash: GoalEventHashInput = {
+		schema: GOAL_EVENT_SCHEMA,
+		eventId: input.eventId,
+		goalId: input.goalId,
+		sequence: input.sequence,
+		eventType: lifecycle.eventType,
+		actor: input.actor,
+		timestamp: input.timestamp,
+		prevHash: input.prevHash,
+		payload: lifecycle.payload,
+		schemaVersion: 1 as const,
+		idempotencyKey: input.idempotencyKey,
+	};
+	return {
+		...eventWithoutHash,
+		hash: calculateEventHash(eventWithoutHash),
+	} as GoalLifecycleEvent;
 }
 
 function createEvent(input: EventInput): GoalEvent {
@@ -220,7 +340,10 @@ function createEvent(input: EventInput): GoalEvent {
 		return { ...eventWithoutHash, hash: calculateEventHash(eventWithoutHash) };
 	}
 	if (input.prevHash === null) {
-		throw new GoalValidationError("Goal contract updates require a previous hash");
+		throw new GoalValidationError("Goal events after creation require a previous hash");
+	}
+	if (isGoalLifecycleEventType(input.eventType)) {
+		return createLifecycleEvent({ ...input, eventType: input.eventType, prevHash: input.prevHash });
 	}
 	if (input.eventType === "goal_checkpointed") {
 		const eventWithoutHash: Omit<GoalCheckpointedEvent, "hash"> = {
@@ -392,6 +515,39 @@ function parseGoalEvent(value: unknown, lineNumber: number): GoalEvent {
 			hash: value.hash,
 		};
 		event = checkpointedEvent;
+	} else if (
+		value.eventType === "goal_activated" ||
+		value.eventType === "goal_paused" ||
+		value.eventType === "goal_resumed" ||
+		value.eventType === "goal_ended" ||
+		value.eventType === "goal_run_started" ||
+		value.eventType === "goal_run_settled" ||
+		value.eventType === "goal_run_interrupted"
+	) {
+		if (typeof value.prevHash !== "string") {
+			throw new GoalCorruptionError(`Event ${lineNumber} lifecycle event has no previous hash`);
+		}
+		let lifecycle: GoalLifecycleEventInput;
+		try {
+			lifecycle = validateGoalLifecycleEventInput({ eventType: value.eventType, payload: value.payload });
+		} catch {
+			throw new GoalCorruptionError(`Event ${lineNumber} has an invalid lifecycle payload`);
+		}
+		const lifecycleEvent = {
+			schema: GOAL_EVENT_SCHEMA,
+			eventId: value.eventId,
+			goalId: value.goalId,
+			sequence: value.sequence,
+			eventType: lifecycle.eventType,
+			actor: value.actor as GoalActor,
+			timestamp: value.timestamp,
+			prevHash: value.prevHash,
+			payload: lifecycle.payload,
+			schemaVersion: 1 as const,
+			idempotencyKey: value.idempotencyKey,
+			hash: value.hash,
+		} as GoalLifecycleEvent;
+		event = lifecycleEvent;
 	} else {
 		throw new GoalCorruptionError(`Event ${lineNumber} has an unsupported type`);
 	}
@@ -402,7 +558,135 @@ function parseGoalEvent(value: unknown, lineNumber: number): GoalEvent {
 	return event;
 }
 
-function replayEvents(goalId: string, raw: string): GoalReplay {
+function isGoalLifecycleEvent(event: GoalEvent): event is GoalLifecycleEvent {
+	return isGoalLifecycleEventType(event.eventType);
+}
+
+function projectGoalLifecycle(events: readonly GoalEvent[], now: string): GoalLifecycleProjection {
+	const nowMs = Date.parse(now);
+	if (Number.isNaN(nowMs)) {
+		throw new GoalValidationError("Goal replay now must be an ISO timestamp");
+	}
+	let status: GoalLifecycleProjection["status"] = "inactive";
+	let activatedAt: string | undefined;
+	let activatedAtMs: number | undefined;
+	let pausedAt: string | undefined;
+	let endedAt: string | undefined;
+	let endedAtMs: number | undefined;
+	let activeSinceMs: number | undefined;
+	let activeElapsed = 0;
+	let busyElapsed = 0;
+	let lastLifecycleTimestamp = Number.NEGATIVE_INFINITY;
+	const runs: GoalRunProjection[] = [];
+	const runIds = new Set<string>();
+	let openRun: { run: GoalRunProjection; startedAtMs: number } | undefined;
+
+	for (const event of events) {
+		if (!isGoalLifecycleEvent(event)) continue;
+		const timestampMs = Date.parse(event.timestamp);
+		if (timestampMs < lastLifecycleTimestamp) {
+			throw new GoalLifecycleTransitionError("lifecycle timestamps must be non-decreasing");
+		}
+		lastLifecycleTimestamp = timestampMs;
+
+		switch (event.eventType) {
+			case "goal_activated":
+				if (status !== "inactive") throw new GoalLifecycleTransitionError("activation requires an inactive Goal");
+				status = "active";
+				activatedAt = event.timestamp;
+				activatedAtMs = timestampMs;
+				activeSinceMs = timestampMs;
+				break;
+			case "goal_paused":
+				if (status !== "active" || openRun) {
+					throw new GoalLifecycleTransitionError("pause requires an active Goal with no running agent");
+				}
+				if (activeSinceMs === undefined) throw new GoalLifecycleTransitionError("active elapsed time is missing");
+				activeElapsed += timestampMs - activeSinceMs;
+				activeSinceMs = undefined;
+				pausedAt = event.timestamp;
+				status = "paused";
+				break;
+			case "goal_resumed":
+				if (status !== "paused") throw new GoalLifecycleTransitionError("resume requires a paused Goal");
+				status = "active";
+				pausedAt = undefined;
+				activeSinceMs = timestampMs;
+				break;
+			case "goal_ended":
+				if ((status !== "active" && status !== "paused") || openRun) {
+					throw new GoalLifecycleTransitionError("end requires an active or paused Goal with no running agent");
+				}
+				if (status === "active") {
+					if (activeSinceMs === undefined)
+						throw new GoalLifecycleTransitionError("active elapsed time is missing");
+					activeElapsed += timestampMs - activeSinceMs;
+					activeSinceMs = undefined;
+				}
+				status = "ended";
+				endedAt = event.timestamp;
+				endedAtMs = timestampMs;
+				break;
+			case "goal_run_started": {
+				if (status !== "active" || openRun) {
+					throw new GoalLifecycleTransitionError("run start requires an active Goal with no running agent");
+				}
+				if (runIds.has(event.payload.runId)) {
+					throw new GoalLifecycleTransitionError("run IDs must be unique within a Goal");
+				}
+				const run: GoalRunProjection = {
+					runId: event.payload.runId,
+					sessionId: event.payload.sessionId,
+					startedAt: event.timestamp,
+					status: "interrupted",
+				};
+				runs.push(run);
+				runIds.add(run.runId);
+				openRun = { run, startedAtMs: timestampMs };
+				break;
+			}
+			case "goal_run_settled":
+				if (status !== "active" || !openRun || openRun.run.runId !== event.payload.runId) {
+					throw new GoalLifecycleTransitionError("run settlement must match the active run");
+				}
+				openRun.run.status = "settled";
+				openRun.run.endedAt = event.timestamp;
+				busyElapsed += timestampMs - openRun.startedAtMs;
+				openRun = undefined;
+				break;
+			case "goal_run_interrupted":
+				if (status !== "active" || !openRun || openRun.run.runId !== event.payload.runId) {
+					throw new GoalLifecycleTransitionError("run interruption must match the active run");
+				}
+				openRun.run.status = "interrupted";
+				openRun.run.endedAt = event.timestamp;
+				if (!event.payload.recovered) {
+					busyElapsed += timestampMs - openRun.startedAtMs;
+				}
+				openRun = undefined;
+				break;
+		}
+	}
+
+	const effectiveNow = Math.max(nowMs, lastLifecycleTimestamp);
+	if (status === "active" && activeSinceMs !== undefined) {
+		activeElapsed += effectiveNow - activeSinceMs;
+	}
+	const wallEndMs = endedAtMs ?? effectiveNow;
+	return {
+		status,
+		...(activatedAt === undefined ? {} : { activatedAt }),
+		...(pausedAt === undefined ? {} : { pausedAt }),
+		...(endedAt === undefined ? {} : { endedAt }),
+		wallElapsed: activatedAtMs === undefined ? 0 : wallEndMs - activatedAtMs,
+		activeElapsed,
+		busyElapsed,
+		runs,
+		...(openRun ? { openRunId: openRun.run.runId } : {}),
+	};
+}
+
+function replayEvents(goalId: string, raw: string, now = new Date().toISOString()): GoalReplay {
 	const lastNewline = raw.lastIndexOf("\n");
 	const completeContent = lastNewline === -1 ? "" : raw.slice(0, lastNewline + 1);
 	const trailingContent = raw.slice(lastNewline + 1);
@@ -440,10 +724,15 @@ function replayEvents(goalId: string, raw: string): GoalReplay {
 		if (index === 0 && event.eventType !== "goal_created") {
 			throw new GoalCorruptionError("The first Goal event must be goal_created");
 		}
-		if (index > 0 && event.eventType !== "goal_contract_updated" && event.eventType !== "goal_checkpointed") {
+		if (
+			index > 0 &&
+			event.eventType !== "goal_contract_updated" &&
+			event.eventType !== "goal_checkpointed" &&
+			!isGoalLifecycleEventType(event.eventType)
+		) {
 			throw new GoalCorruptionError(`Event ${index + 1} is invalid after Goal creation`);
 		}
-		if (event.eventType !== "goal_checkpointed") {
+		if (event.eventType === "goal_created" || event.eventType === "goal_contract_updated") {
 			const nextContract = event.payload.contract;
 			if (nextContract.goalId !== goalId) {
 				throw new GoalCorruptionError(`Event ${index + 1} contract has a different Goal ID`);
@@ -459,11 +748,21 @@ function replayEvents(goalId: string, raw: string): GoalReplay {
 	if (!contract || !lastEvent) {
 		throw new GoalCorruptionError(`Goal replay failed: ${goalId}`);
 	}
+	let lifecycle: GoalLifecycleProjection;
+	try {
+		lifecycle = projectGoalLifecycle(events, now);
+	} catch (error) {
+		if (error instanceof GoalLifecycleTransitionError) {
+			throw new GoalCorruptionError(`Goal lifecycle is invalid: ${error.message}`);
+		}
+		throw error;
+	}
 	return {
 		goalId,
 		contract,
 		head: headForEvent(lastEvent),
 		events,
+		lifecycle,
 		...(trailingContent.length > 0 ? { tailDiagnostic: { discardedBytes: Buffer.byteLength(trailingContent) } } : {}),
 	};
 }
@@ -474,9 +773,12 @@ function wait(ms: number): Promise<void> {
 
 export class GoalStore {
 	private readonly goalsDirectory: string;
+	private readonly artifactStore: ArtifactStore;
 
 	constructor(projectRoot: string) {
-		this.goalsDirectory = join(resolve(projectRoot), ".pi-xk", "goals");
+		const resolvedProjectRoot = resolve(projectRoot);
+		this.goalsDirectory = join(resolvedProjectRoot, ".pi-xk", "goals");
+		this.artifactStore = new ArtifactStore(resolvedProjectRoot);
 	}
 
 	private paths(goalId: string): GoalPaths {
@@ -489,11 +791,13 @@ export class GoalStore {
 			goalDirectory,
 			eventsPath: join(goalDirectory, "events.jsonl"),
 			projectionPath: join(goalDirectory, "contract.json"),
+			readModelProjectionPath: join(goalDirectory, "goal-read-model.json"),
 			lockPath: join(goalDirectory, ".write.lock"),
+			recoveryLockPath: join(goalDirectory, ".write.recovery.lock"),
 		};
 	}
 
-	private async readReplay(paths: GoalPaths, goalId: string): Promise<GoalReplay> {
+	private async readReplay(paths: GoalPaths, goalId: string, options: GoalReplayOptions = {}): Promise<GoalReplay> {
 		let raw: string;
 		try {
 			raw = await readFile(paths.eventsPath, "utf8");
@@ -501,32 +805,58 @@ export class GoalStore {
 			if (isErrno(error, "ENOENT")) throw new GoalNotFoundError(goalId);
 			throw error;
 		}
-		return replayEvents(goalId, raw);
+		return replayEvents(goalId, raw, options.now);
 	}
 
-	private async recoverStaleLock(paths: GoalPaths): Promise<boolean> {
-		let stored: StoredLock;
+	private async readWriteLockDiagnostic(paths: GoalPaths): Promise<GoalWriteLockDiagnostic | undefined> {
+		let raw: string;
 		try {
-			stored = JSON.parse(await readFile(paths.lockPath, "utf8")) as StoredLock;
-		} catch {
-			return false;
-		}
-		if (!Number.isInteger(stored.pid) || stored.pid <= 0 || typeof stored.nonce !== "string") {
-			return false;
-		}
-		try {
-			process.kill(stored.pid, 0);
-			return false;
+			raw = await readFile(paths.lockPath, "utf8");
 		} catch (error) {
-			if (!isErrno(error, "ESRCH")) return false;
+			if (isErrno(error, "ENOENT")) return undefined;
+			throw error;
 		}
+		let stored: StoredLock | undefined;
 		try {
-			const stalePath = `${paths.lockPath}.stale-${randomUUID()}`;
-			await rename(paths.lockPath, stalePath);
-			await rm(stalePath, { force: true });
-			return true;
+			stored = parseStoredLock(JSON.parse(raw) as unknown);
 		} catch {
-			return false;
+			stored = undefined;
+		}
+		if (!stored) {
+			return { ownerState: "unknown", malformed: true };
+		}
+		return {
+			pid: stored.pid,
+			nonce: stored.nonce,
+			createdAt: stored.createdAt,
+			ownerState: getLockOwnerState(stored.pid),
+			malformed: false,
+		};
+	}
+
+	private async withRecoveryLock<TResult>(
+		paths: GoalPaths,
+		goalId: string,
+		action: () => Promise<TResult>,
+	): Promise<TResult> {
+		await mkdir(paths.goalDirectory, { recursive: true });
+		const recoveryLock: StoredLock = { pid: process.pid, nonce: randomUUID(), createdAt: new Date().toISOString() };
+		let handle: FileHandle | undefined;
+		let ownsRecoveryLock = false;
+		try {
+			try {
+				handle = await open(paths.recoveryLockPath, "wx", 0o600);
+				ownsRecoveryLock = true;
+			} catch (error) {
+				if (isErrno(error, "EEXIST")) throw new GoalLockedError(goalId, "recovering its write lock");
+				throw error;
+			}
+			await handle.writeFile(`${JSON.stringify(recoveryLock)}\n`, "utf8");
+			await handle.sync();
+			return await action();
+		} finally {
+			await handle?.close().catch(() => {});
+			if (ownsRecoveryLock) await unlink(paths.recoveryLockPath).catch(() => {});
 		}
 	}
 
@@ -543,7 +873,6 @@ export class GoalStore {
 				handle = await open(paths.lockPath, "wx", 0o600);
 			} catch (error) {
 				if (!isErrno(error, "EEXIST")) throw error;
-				if (await this.recoverStaleLock(paths)) continue;
 				await wait(LOCK_RETRY_DELAY_MS);
 				continue;
 			}
@@ -602,6 +931,36 @@ export class GoalStore {
 			await this.syncDirectory(paths.goalDirectory);
 		} finally {
 			await rm(temporaryPath, { force: true });
+		}
+	}
+
+	private async writeGoalReadModel(paths: GoalPaths, replay: GoalReplay): Promise<GoalReadModel> {
+		const readModel = await buildGoalReadModel(replay, this.artifactStore);
+		const temporaryPath = join(paths.goalDirectory, `.read-model-${randomUUID()}.tmp`);
+		try {
+			const handle = await open(temporaryPath, "wx", 0o600);
+			try {
+				await handle.writeFile(`${JSON.stringify(readModel, null, "\t")}\n`, "utf8");
+				await handle.sync();
+			} finally {
+				await handle.close();
+			}
+			await rename(temporaryPath, paths.readModelProjectionPath);
+			await this.syncDirectory(paths.goalDirectory);
+		} finally {
+			await rm(temporaryPath, { force: true });
+		}
+		return readModel;
+	}
+
+	private async writeDerivedProjections(paths: GoalPaths, replay: GoalReplay): Promise<void> {
+		await this.writeProjection(paths, replay);
+		await this.writeGoalReadModel(paths, replay);
+	}
+
+	private async assertCheckpointArtifacts(checkpoint: GoalCheckpointV2): Promise<void> {
+		for (const artifact of checkpoint.evidence.artifacts) {
+			await this.artifactStore.read(artifact.artifactId);
 		}
 	}
 
@@ -674,6 +1033,32 @@ export class GoalStore {
 		});
 	}
 
+	private buildLifecycleEvent(
+		goalId: string,
+		input: GoalLifecycleEventInput,
+		options: GoalMutationOptions,
+		sequence: number,
+		prevHash: string,
+	): GoalEvent {
+		assertNonEmptyString(options.eventId, "eventId");
+		assertNonEmptyString(options.idempotencyKey, "idempotencyKey");
+		const actor = options.actor ?? "runtime";
+		assertActor(actor);
+		const timestamp = options.timestamp ?? new Date().toISOString();
+		assertIsoTimestamp(timestamp, "timestamp");
+		return createEvent({
+			eventId: options.eventId,
+			goalId,
+			eventType: input.eventType,
+			actor,
+			timestamp,
+			prevHash,
+			payload: input.payload,
+			sequence,
+			idempotencyKey: options.idempotencyKey,
+		});
+	}
+
 	private ensureRetryMatches(replay: GoalReplay, event: GoalEvent): GoalWriteResult | undefined {
 		const existing = replay.events.find((candidate) => candidate.idempotencyKey === event.idempotencyKey);
 		if (!existing) return undefined;
@@ -700,14 +1085,16 @@ export class GoalStore {
 				if (retry) return retry;
 				throw new GoalAlreadyExistsError(contract.goalId);
 			}
+			await createGoalFiles(paths.goalDirectory, contract);
 			await this.appendEvent(paths, event);
 			const replay: GoalReplay = {
 				goalId: contract.goalId,
 				contract,
 				head: headForEvent(event),
 				events: [event],
+				lifecycle: projectGoalLifecycle([event], options.timestamp ?? new Date().toISOString()),
 			};
-			await this.writeProjection(paths, replay);
+			await this.writeDerivedProjections(paths, replay);
 			return { event, head: replay.head };
 		});
 	}
@@ -716,9 +1103,72 @@ export class GoalStore {
 		return await this.replayGoal(goalId);
 	}
 
-	async replayGoal(goalId: string): Promise<GoalReplay> {
+	async replayGoal(goalId: string, options: GoalReplayOptions = {}): Promise<GoalReplay> {
 		const paths = this.paths(goalId);
-		return await this.readReplay(paths, goalId);
+		return await this.readReplay(paths, goalId, options);
+	}
+
+	async putArtifact(input: ArtifactWriteInput): Promise<GoalArtifactMetadata> {
+		return await this.artifactStore.put(input);
+	}
+
+	async loadGoalReadModel(goalId: string): Promise<GoalReadModel> {
+		const paths = this.paths(goalId);
+		const replay = await this.readReplay(paths, goalId);
+		if (replay.tailDiagnostic) throw new GoalRecoveryRequiredError(goalId);
+		let stored: GoalReadModel;
+		try {
+			stored = validateGoalReadModel(JSON.parse(await readFile(paths.readModelProjectionPath, "utf8")) as unknown);
+		} catch {
+			throw new GoalReadModelStaleError(goalId);
+		}
+		if (
+			stored.goalId !== replay.goalId ||
+			stored.sequence !== replay.head.sequence ||
+			stored.baseHash !== replay.head.hash
+		) {
+			throw new GoalReadModelStaleError(goalId);
+		}
+		const rebuilt = await buildGoalReadModel(replay, this.artifactStore);
+		if (!sameGoalReadModel(stored, rebuilt)) {
+			throw new GoalReadModelStaleError(goalId);
+		}
+		return stored;
+	}
+
+	async rebuildGoalReadModel(goalId: string): Promise<GoalReadModel> {
+		const paths = this.paths(goalId);
+		return await this.withGoalLock(paths, goalId, async () => {
+			const replay = await this.readReplay(paths, goalId);
+			if (replay.tailDiagnostic) throw new GoalRecoveryRequiredError(goalId);
+			return await this.writeGoalReadModel(paths, replay);
+		});
+	}
+
+	async inspectWriteLock(goalId: string): Promise<GoalWriteLockDiagnostic | undefined> {
+		const paths = this.paths(goalId);
+		return await this.readWriteLockDiagnostic(paths);
+	}
+
+	async repairAbandonedWriteLock(goalId: string, expectedNonce: string): Promise<boolean> {
+		assertGoalId(goalId);
+		assertNonEmptyString(expectedNonce, "expectedNonce");
+		const paths = this.paths(goalId);
+		return await this.withRecoveryLock(paths, goalId, async () => {
+			const diagnostic = await this.readWriteLockDiagnostic(paths);
+			if (!diagnostic) return false;
+			if (diagnostic.malformed || !diagnostic.nonce) {
+				throw new GoalLockRecoveryError(goalId, "the lock metadata is malformed");
+			}
+			if (diagnostic.nonce !== expectedNonce) {
+				throw new GoalLockRecoveryConflictError(goalId);
+			}
+			if (diagnostic.ownerState !== "missing") {
+				throw new GoalLockRecoveryError(goalId, `the owner is ${diagnostic.ownerState}`);
+			}
+			await unlink(paths.lockPath);
+			return true;
+		});
 	}
 
 	async updateGoalContract(
@@ -751,19 +1201,24 @@ export class GoalStore {
 				contract,
 				head: headForEvent(event),
 				events: [...replay.events, event],
+				lifecycle: projectGoalLifecycle([...replay.events, event], options.timestamp ?? new Date().toISOString()),
 			};
-			await this.writeProjection(paths, nextReplay);
+			await this.writeDerivedProjections(paths, nextReplay);
 			return { event, head: nextReplay.head };
 		});
 	}
 
 	async appendCheckpoint(
 		goalId: string,
-		checkpointInput: GoalCheckpoint,
+		checkpointInput: GoalCheckpointV2,
 		options: GoalContractUpdateOptions,
 	): Promise<GoalWriteResult> {
 		assertGoalId(goalId);
-		const checkpoint = validateGoalCheckpoint(checkpointInput);
+		const validatedCheckpoint = validateGoalCheckpoint(checkpointInput);
+		if (validatedCheckpoint.schema !== GOAL_CHECKPOINT_SCHEMA) {
+			throw new GoalValidationError("Goal checkpoint writers must use checkpoint v2");
+		}
+		const checkpoint = validatedCheckpoint;
 		const paths = this.paths(goalId);
 		return await this.withGoalLock(paths, goalId, async () => {
 			const replay = await this.readReplay(paths, goalId);
@@ -780,16 +1235,61 @@ export class GoalStore {
 			if (options.expectedHead.sequence !== replay.head.sequence || options.expectedHead.hash !== replay.head.hash) {
 				throw new GoalHeadConflictError(options.expectedHead, replay.head);
 			}
+			await this.assertCheckpointArtifacts(checkpoint);
 			await this.appendEvent(paths, event);
 			const nextReplay: GoalReplay = {
 				goalId,
 				contract: replay.contract,
 				head: headForEvent(event),
 				events: [...replay.events, event],
+				lifecycle: projectGoalLifecycle([...replay.events, event], options.timestamp ?? new Date().toISOString()),
 			};
-			await this.writeProjection(paths, nextReplay);
+			await this.writeDerivedProjections(paths, nextReplay);
 			return { event, head: nextReplay.head };
 		});
+	}
+
+	async appendLifecycleEvent(
+		goalId: string,
+		input: GoalLifecycleEventInput,
+		options: GoalContractUpdateOptions,
+	): Promise<GoalWriteResult> {
+		assertGoalId(goalId);
+		const lifecycleInput = validateGoalLifecycleEventInput(input);
+		const paths = this.paths(goalId);
+		return await this.withGoalLock(paths, goalId, async () => {
+			const replay = await this.readReplay(paths, goalId);
+			if (replay.tailDiagnostic) throw new GoalRecoveryRequiredError(goalId);
+			const event = this.buildLifecycleEvent(
+				goalId,
+				lifecycleInput,
+				options,
+				replay.head.sequence + 1,
+				replay.head.hash,
+			);
+			const retry = this.ensureRetryMatches(replay, event);
+			if (retry) return retry;
+			if (options.expectedHead.sequence !== replay.head.sequence || options.expectedHead.hash !== replay.head.hash) {
+				throw new GoalHeadConflictError(options.expectedHead, replay.head);
+			}
+			const events = [...replay.events, event];
+			const lifecycle = projectGoalLifecycle(events, options.timestamp ?? new Date().toISOString());
+			await this.appendEvent(paths, event);
+			const nextReplay: GoalReplay = {
+				goalId,
+				contract: replay.contract,
+				head: headForEvent(event),
+				events,
+				lifecycle,
+			};
+			await this.writeDerivedProjections(paths, nextReplay);
+			return { event, head: nextReplay.head };
+		});
+	}
+
+	async inspectGoalFiles(goalId: string): Promise<GoalFilesDiagnostic> {
+		const replay = await this.replayGoal(goalId);
+		return await inspectGoalFileArtifacts(this.paths(goalId).goalDirectory, replay.contract);
 	}
 
 	async rebuildContractProjection(goalId: string): Promise<GoalReplay> {
@@ -811,7 +1311,7 @@ export class GoalStore {
 			const validContent = raw.slice(0, raw.lastIndexOf("\n") + 1);
 			await this.replaceEvents(paths, validContent);
 			const repaired = await this.readReplay(paths, goalId);
-			await this.writeProjection(paths, repaired);
+			await this.writeDerivedProjections(paths, repaired);
 			return repaired;
 		});
 	}

@@ -1,13 +1,15 @@
-import { appendFile, mkdir, readFile, rm } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-	type GoalCheckpoint,
+	ArtifactStore,
+	type GoalCheckpointV2,
 	type GoalContractV1,
 	GoalCorruptionError,
 	GoalHeadConflictError,
 	GoalIdempotencyConflictError,
+	GoalLockedError,
 	GoalRecoveryRequiredError,
 	GoalStore,
 	GoalValidationError,
@@ -119,14 +121,33 @@ describe("GoalStore", () => {
 			eventId: "evt-create",
 			idempotencyKey: "create:goal_checkpoint",
 		});
-		const checkpoint: GoalCheckpoint = {
-			schema: "pi-xk.goal-checkpoint.v1",
+		const artifact = await new ArtifactStore(projectRoot).put({
+			contentType: "application/json",
+			value: { sessionId: "session-checkpoint", leafId: "leaf-tool-result", toolResultCount: 1 },
+			producer: "pi-xk.checkpoint-evidence.v1",
+			sensitivity: "redacted",
+			sourceIds: ["session-checkpoint", "leaf-tool-result"],
+			createdAt: "2026-07-19T00:00:01.000Z",
+		});
+		const checkpoint: GoalCheckpointV2 = {
+			schema: "pi-xk.goal-checkpoint.v2",
 			sessionId: "session-checkpoint",
 			leafId: "leaf-tool-result",
 			turnIndex: 0,
 			toolResultCount: 1,
 			reason: "turn_end",
 			createdAt: "2026-07-19T00:00:01.000Z",
+			evidence: {
+				schema: "pi-xk.goal-checkpoint-evidence.v1",
+				sourceEntryIds: ["leaf-tool-result"],
+				artifacts: [
+					{
+						schema: "pi-xk.artifact-ref.v1",
+						artifactId: artifact.artifactId,
+						role: "checkpoint_evidence",
+					},
+				],
+			},
 		};
 
 		const first = await store.appendCheckpoint(contract.goalId, checkpoint, {
@@ -178,6 +199,48 @@ describe("GoalStore", () => {
 		expect([first, second].filter((result) => result.status === "rejected")).toHaveLength(1);
 		const replayed = await store.replayGoal(contract.goalId);
 		expect(replayed.events.map((event) => event.sequence)).toEqual([1, 2]);
+	});
+
+	it("fails closed on an abandoned write lock instead of silently reclaiming it", async () => {
+		const { store, projectRoot } = await createStore();
+		const contract = createContract("goal_abandoned_lock");
+		const created = await store.createGoal(contract, {
+			eventId: "evt-create",
+			idempotencyKey: "create:goal_abandoned_lock",
+		});
+		const lockPath = join(projectRoot, ".pi-xk", "goals", contract.goalId, ".write.lock");
+		await writeFile(
+			lockPath,
+			`${JSON.stringify({ pid: 999_999_999, nonce: "abandoned", createdAt: "2026-07-19T00:00:01.000Z" })}\n`,
+		);
+
+		await expect(
+			store.updateGoalContract(
+				{ ...contract, title: "Must not silently take the abandoned lock" },
+				{
+					eventId: "evt-update",
+					idempotencyKey: "update:goal_abandoned_lock:1",
+					expectedHead: created.head,
+				},
+			),
+		).rejects.toBeInstanceOf(GoalLockedError);
+
+		const replayed = await store.replayGoal(contract.goalId);
+		expect(replayed.events).toHaveLength(1);
+		const diagnostic = await store.inspectWriteLock(contract.goalId);
+		expect(diagnostic).toMatchObject({ nonce: "abandoned", ownerState: "missing", malformed: false });
+		await expect(store.repairAbandonedWriteLock(contract.goalId, "different-owner")).rejects.toThrow("conflicted");
+		await expect(store.repairAbandonedWriteLock(contract.goalId, "abandoned")).resolves.toBe(true);
+		await expect(
+			store.updateGoalContract(
+				{ ...contract, title: "Recovered after explicit abandoned-lock repair" },
+				{
+					eventId: "evt-update-after-repair",
+					idempotencyKey: "update:goal_abandoned_lock:2",
+					expectedHead: created.head,
+				},
+			),
+		).resolves.toMatchObject({ head: { sequence: 2 } });
 	});
 
 	it("rebuilds a missing projection after its write fails", async () => {

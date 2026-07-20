@@ -14,13 +14,24 @@
 	"files": [
 		"dist"
 	],
+	"pi": {
+		"extensions": [
+			"./dist/extension.js"
+		]
+	},
 	"scripts": {
 		"clean": "shx rm -rf dist",
-		"build": "tsgo -p tsconfig.build.json"
+		"build": "tsgo -p tsconfig.build.json && node scripts/bundle-core.mjs"
 	},
-	"peerDependencies": {
-		"@earendil-works/pi-coding-agent": "0.80.10",
+	"dependencies": {
 		"pi-xk-core": "0.0.0"
+	},
+	"bundledDependencies": [
+		"pi-xk-core"
+	],
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"typebox": "*"
 	},
 	"devDependencies": {
 		"shx": "0.4.0"

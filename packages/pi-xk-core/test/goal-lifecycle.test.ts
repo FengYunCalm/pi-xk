@@ -1,0 +1,248 @@
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+	type GoalContractV1,
+	GoalHeadConflictError,
+	type GoalLifecycleEventInput,
+	GoalLifecycleTransitionError,
+	GoalStore,
+} from "../src/index.ts";
+
+const tempDirs: string[] = [];
+
+function createContract(goalId: string): GoalContractV1 {
+	return {
+		schema: "pi-xk.goal.contract.v1",
+		goalId,
+		title: "Lifecycle test",
+		objective: "Exercise the Goal lifecycle projection.",
+		constraints: [],
+		acceptance: [],
+		capabilities: { filesystem: "unrestricted", network: "unrestricted", spawn: "unrestricted" },
+		budgets: { tokens: 0, costCents: 0, wallSeconds: 0 },
+		ownerSessionId: "session-lifecycle",
+		createdAt: "2026-07-20T00:00:00.000Z",
+		schemaVersion: 1,
+	};
+}
+
+async function createStore(): Promise<{ store: GoalStore; projectRoot: string }> {
+	const projectRoot = join(tmpdir(), `pi-xk-lifecycle-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+	await mkdir(projectRoot, { recursive: true });
+	tempDirs.push(projectRoot);
+	return { store: new GoalStore(projectRoot), projectRoot };
+}
+
+async function appendLifecycle(
+	store: GoalStore,
+	goalId: string,
+	input: GoalLifecycleEventInput,
+	timestamp: string,
+): Promise<void> {
+	const replay = await store.replayGoal(goalId);
+	await store.appendLifecycleEvent(goalId, input, {
+		eventId: `evt-${input.eventType}-${replay.head.sequence}`,
+		idempotencyKey: `lifecycle:${input.eventType}:${replay.head.sequence}`,
+		expectedHead: replay.head,
+		timestamp,
+	});
+}
+
+afterEach(async () => {
+	while (tempDirs.length > 0) {
+		const tempDir = tempDirs.pop();
+		if (tempDir) await rm(tempDir, { recursive: true, force: true });
+	}
+});
+
+describe("Goal lifecycle and files", () => {
+	it("projects active, paused, ended, and settled run timing from the event log", async () => {
+		const { store } = await createStore();
+		const contract = createContract("goal_lifecycle");
+		await store.createGoal(contract, {
+			eventId: "evt-create",
+			idempotencyKey: "create:goal_lifecycle",
+			timestamp: "2026-07-20T00:00:00.000Z",
+		});
+
+		await appendLifecycle(
+			store,
+			contract.goalId,
+			{ eventType: "goal_activated", payload: { sessionId: "session-lifecycle" } },
+			"2026-07-20T00:00:10.000Z",
+		);
+		await appendLifecycle(
+			store,
+			contract.goalId,
+			{ eventType: "goal_run_started", payload: { runId: "run-first", sessionId: "session-lifecycle" } },
+			"2026-07-20T00:00:20.000Z",
+		);
+		await appendLifecycle(
+			store,
+			contract.goalId,
+			{ eventType: "goal_run_settled", payload: { runId: "run-first" } },
+			"2026-07-20T00:00:30.000Z",
+		);
+		await appendLifecycle(
+			store,
+			contract.goalId,
+			{ eventType: "goal_paused", payload: { reason: "review" } },
+			"2026-07-20T00:00:40.000Z",
+		);
+		await appendLifecycle(
+			store,
+			contract.goalId,
+			{ eventType: "goal_resumed", payload: { reason: "continue" } },
+			"2026-07-20T00:01:00.000Z",
+		);
+		await appendLifecycle(
+			store,
+			contract.goalId,
+			{ eventType: "goal_run_started", payload: { runId: "run-second", sessionId: "session-lifecycle" } },
+			"2026-07-20T00:01:10.000Z",
+		);
+		await appendLifecycle(
+			store,
+			contract.goalId,
+			{ eventType: "goal_run_settled", payload: { runId: "run-second" } },
+			"2026-07-20T00:01:20.000Z",
+		);
+		await appendLifecycle(
+			store,
+			contract.goalId,
+			{ eventType: "goal_ended", payload: { outcome: "completed", reason: "accepted" } },
+			"2026-07-20T00:01:30.000Z",
+		);
+
+		const replayed = await store.replayGoal(contract.goalId, { now: "2026-07-20T00:02:00.000Z" });
+		expect(replayed.lifecycle).toMatchObject({
+			status: "ended",
+			wallElapsed: 80_000,
+			activeElapsed: 60_000,
+			busyElapsed: 20_000,
+		});
+		expect(replayed.lifecycle.runs).toEqual([
+			{
+				runId: "run-first",
+				sessionId: "session-lifecycle",
+				startedAt: "2026-07-20T00:00:20.000Z",
+				endedAt: "2026-07-20T00:00:30.000Z",
+				status: "settled",
+			},
+			{
+				runId: "run-second",
+				sessionId: "session-lifecycle",
+				startedAt: "2026-07-20T00:01:10.000Z",
+				endedAt: "2026-07-20T00:01:20.000Z",
+				status: "settled",
+			},
+		]);
+	});
+
+	it("rejects invalid lifecycle transitions and preserves idempotent event retries", async () => {
+		const { store } = await createStore();
+		const contract = createContract("goal_lifecycle_transition");
+		const created = await store.createGoal(contract, {
+			eventId: "evt-create",
+			idempotencyKey: "create:goal_lifecycle_transition",
+		});
+
+		await expect(
+			store.appendLifecycleEvent(
+				contract.goalId,
+				{ eventType: "goal_paused", payload: { reason: "invalid" } },
+				{
+					eventId: "evt-invalid-pause",
+					idempotencyKey: "lifecycle:invalid-pause",
+					expectedHead: created.head,
+				},
+			),
+		).rejects.toBeInstanceOf(GoalLifecycleTransitionError);
+
+		const activated = await store.appendLifecycleEvent(
+			contract.goalId,
+			{ eventType: "goal_activated", payload: { sessionId: "session-lifecycle" } },
+			{
+				eventId: "evt-activate",
+				idempotencyKey: "lifecycle:activate",
+				expectedHead: created.head,
+			},
+		);
+		const retry = await store.appendLifecycleEvent(
+			contract.goalId,
+			{ eventType: "goal_activated", payload: { sessionId: "session-lifecycle" } },
+			{
+				eventId: "evt-activate-retry",
+				idempotencyKey: "lifecycle:activate",
+				expectedHead: created.head,
+			},
+		);
+
+		expect(retry).toEqual(activated);
+		await expect(
+			store.appendLifecycleEvent(
+				contract.goalId,
+				{ eventType: "goal_paused", payload: { reason: "stale writer" } },
+				{
+					eventId: "evt-stale-pause",
+					idempotencyKey: "lifecycle:stale-pause",
+					expectedHead: created.head,
+				},
+			),
+		).rejects.toBeInstanceOf(GoalHeadConflictError);
+	});
+
+	it("marks a crashed open run as interrupted without inventing busy time", async () => {
+		const { store } = await createStore();
+		const contract = createContract("goal_crashed_run");
+		await store.createGoal(contract, { eventId: "evt-create", idempotencyKey: "create:goal_crashed_run" });
+		await appendLifecycle(
+			store,
+			contract.goalId,
+			{ eventType: "goal_activated", payload: { sessionId: "session-lifecycle" } },
+			"2026-07-20T00:00:00.000Z",
+		);
+		await appendLifecycle(
+			store,
+			contract.goalId,
+			{ eventType: "goal_run_started", payload: { runId: "run-crashed", sessionId: "session-lifecycle" } },
+			"2026-07-20T00:00:10.000Z",
+		);
+
+		const replayed = await store.replayGoal(contract.goalId, { now: "2026-07-20T00:00:30.000Z" });
+		expect(replayed.lifecycle.busyElapsed).toBe(0);
+		expect(replayed.lifecycle.runs).toEqual([
+			{
+				runId: "run-crashed",
+				sessionId: "session-lifecycle",
+				startedAt: "2026-07-20T00:00:10.000Z",
+				status: "interrupted",
+			},
+		]);
+	});
+
+	it("creates identity-protected objective and mutable state files without repairing damage", async () => {
+		const { store, projectRoot } = await createStore();
+		const contract = createContract("goal_files");
+		await store.createGoal(contract, { eventId: "evt-create", idempotencyKey: "create:goal_files" });
+		const goalDirectory = join(projectRoot, ".pi-xk", "goals", contract.goalId);
+		const objective = await readFile(join(goalDirectory, "goal-objective.md"), "utf8");
+		const statePath = join(goalDirectory, "goal-state.md");
+		const state = await readFile(statePath, "utf8");
+
+		expect(objective).toContain("goal-objective.md is read-only");
+		expect(objective).toContain("read goal-state.md before every new agent run");
+		expect(state).toContain("## done");
+		expect(state).toContain("## next_best_action");
+		expect(await store.inspectGoalFiles(contract.goalId)).toMatchObject({
+			objective: { status: "valid" },
+			state: { status: "valid" },
+		});
+
+		await writeFile(statePath, "<!-- pi-xk-goal-file: invalid -->\n");
+		expect(await store.inspectGoalFiles(contract.goalId)).toMatchObject({ state: { status: "corrupt" } });
+		expect(await readFile(statePath, "utf8")).toBe("<!-- pi-xk-goal-file: invalid -->\n");
+	});
+});

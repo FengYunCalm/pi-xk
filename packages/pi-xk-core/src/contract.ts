@@ -4,7 +4,19 @@ export const GOAL_EVENT_SCHEMA = "pi-xk.goal-event.v1";
 
 export const GOAL_CONTRACT_PROJECTION_SCHEMA = "pi-xk.goal-contract-projection.v1";
 
-export const GOAL_CHECKPOINT_SCHEMA = "pi-xk.goal-checkpoint.v1";
+export const GOAL_CHECKPOINT_V1_SCHEMA = "pi-xk.goal-checkpoint.v1";
+
+export const GOAL_CHECKPOINT_SCHEMA = "pi-xk.goal-checkpoint.v2";
+
+export const GOAL_CHECKPOINT_EVIDENCE_SCHEMA = "pi-xk.goal-checkpoint-evidence.v1";
+
+export const GOAL_FILE_SCHEMA = "pi-xk.goal-file.v1";
+
+export const GOAL_ARTIFACT_SCHEMA = "pi-xk.artifact.v1";
+
+export const GOAL_ARTIFACT_REF_SCHEMA = "pi-xk.artifact-ref.v1";
+
+export const GOAL_READ_MODEL_SCHEMA = "pi-xk.goal-read-model.v1";
 
 export type GoalAcceptanceKind = "command" | "test" | "artifact" | "approval";
 
@@ -49,6 +61,30 @@ export interface GoalHead {
 	hash: string;
 }
 
+export type GoalArtifactContentType = "application/json" | "text/plain";
+
+export type GoalArtifactSensitivity = "internal" | "redacted";
+
+export type GoalArtifactRole = "checkpoint_evidence" | "compaction_source";
+
+export interface GoalArtifactMetadata {
+	schema: typeof GOAL_ARTIFACT_SCHEMA;
+	artifactId: string;
+	contentType: GoalArtifactContentType;
+	bytes: number;
+	createdAt: string;
+	producer: string;
+	sensitivity: GoalArtifactSensitivity;
+	redactionVersion: string;
+	sourceIds: string[];
+}
+
+export interface GoalArtifactReference {
+	schema: typeof GOAL_ARTIFACT_REF_SCHEMA;
+	artifactId: string;
+	role: GoalArtifactRole;
+}
+
 export interface GoalCreatedEventPayload {
 	contract: GoalContractV1;
 }
@@ -57,8 +93,10 @@ export interface GoalContractUpdatedEventPayload {
 	contract: GoalContractV1;
 }
 
-export interface GoalCheckpoint {
-	schema: typeof GOAL_CHECKPOINT_SCHEMA;
+export type GoalCheckpointReason = "turn_end" | "session_before_compact";
+
+export interface GoalCheckpointV1 {
+	schema: typeof GOAL_CHECKPOINT_V1_SCHEMA;
 	sessionId: string;
 	leafId: string;
 	turnIndex: number;
@@ -67,9 +105,91 @@ export interface GoalCheckpoint {
 	createdAt: string;
 }
 
+export interface GoalCheckpointEvidence {
+	schema: typeof GOAL_CHECKPOINT_EVIDENCE_SCHEMA;
+	sourceEntryIds: string[];
+	artifacts: GoalArtifactReference[];
+}
+
+export interface GoalCheckpointV2 {
+	schema: typeof GOAL_CHECKPOINT_SCHEMA;
+	sessionId: string;
+	leafId: string;
+	turnIndex?: number;
+	toolResultCount?: number;
+	reason: GoalCheckpointReason;
+	createdAt: string;
+	evidence: GoalCheckpointEvidence;
+}
+
+/** Raw checkpoint payloads preserve their original on-disk schema for hash replay. */
+export type GoalCheckpoint = GoalCheckpointV1 | GoalCheckpointV2;
+
 export interface GoalCheckpointedEventPayload {
 	checkpoint: GoalCheckpoint;
 }
+
+export type GoalLifecycleEventType =
+	| "goal_activated"
+	| "goal_paused"
+	| "goal_resumed"
+	| "goal_ended"
+	| "goal_run_started"
+	| "goal_run_settled"
+	| "goal_run_interrupted";
+
+export interface GoalActivatedEventPayload {
+	sessionId: string;
+}
+
+export interface GoalPausedEventPayload {
+	reason?: string;
+	nextBestAction?: string;
+}
+
+export interface GoalResumedEventPayload {
+	reason?: string;
+}
+
+export interface GoalEndedEventPayload {
+	outcome: string;
+	reason?: string;
+	finalEvidence?: string;
+}
+
+export interface GoalRunStartedEventPayload {
+	runId: string;
+	sessionId: string;
+}
+
+export interface GoalRunSettledEventPayload {
+	runId: string;
+}
+
+export interface GoalRunInterruptedEventPayload {
+	runId: string;
+	reason?: string;
+	/** A newly loaded runtime closed a run it cannot time reliably. */
+	recovered?: boolean;
+}
+
+export type GoalLifecycleEventPayload =
+	| GoalActivatedEventPayload
+	| GoalPausedEventPayload
+	| GoalResumedEventPayload
+	| GoalEndedEventPayload
+	| GoalRunStartedEventPayload
+	| GoalRunSettledEventPayload
+	| GoalRunInterruptedEventPayload;
+
+export type GoalLifecycleEventInput =
+	| { eventType: "goal_activated"; payload: GoalActivatedEventPayload }
+	| { eventType: "goal_paused"; payload: GoalPausedEventPayload }
+	| { eventType: "goal_resumed"; payload: GoalResumedEventPayload }
+	| { eventType: "goal_ended"; payload: GoalEndedEventPayload }
+	| { eventType: "goal_run_started"; payload: GoalRunStartedEventPayload }
+	| { eventType: "goal_run_settled"; payload: GoalRunSettledEventPayload }
+	| { eventType: "goal_run_interrupted"; payload: GoalRunInterruptedEventPayload };
 
 export interface GoalCreatedEvent {
 	schema: typeof GOAL_EVENT_SCHEMA;
@@ -116,7 +236,59 @@ export interface GoalCheckpointedEvent {
 	hash: string;
 }
 
-export type GoalEvent = GoalCreatedEvent | GoalContractUpdatedEvent | GoalCheckpointedEvent;
+interface GoalLifecycleEventBase<TEventType extends GoalLifecycleEventType, TPayload> {
+	schema: typeof GOAL_EVENT_SCHEMA;
+	eventId: string;
+	goalId: string;
+	sequence: number;
+	eventType: TEventType;
+	actor: GoalActor;
+	timestamp: string;
+	prevHash: string;
+	payload: TPayload;
+	schemaVersion: 1;
+	idempotencyKey: string;
+	hash: string;
+}
+
+export type GoalLifecycleEvent =
+	| GoalLifecycleEventBase<"goal_activated", GoalActivatedEventPayload>
+	| GoalLifecycleEventBase<"goal_paused", GoalPausedEventPayload>
+	| GoalLifecycleEventBase<"goal_resumed", GoalResumedEventPayload>
+	| GoalLifecycleEventBase<"goal_ended", GoalEndedEventPayload>
+	| GoalLifecycleEventBase<"goal_run_started", GoalRunStartedEventPayload>
+	| GoalLifecycleEventBase<"goal_run_settled", GoalRunSettledEventPayload>
+	| GoalLifecycleEventBase<"goal_run_interrupted", GoalRunInterruptedEventPayload>;
+
+export type GoalEvent = GoalCreatedEvent | GoalContractUpdatedEvent | GoalCheckpointedEvent | GoalLifecycleEvent;
+
+export type GoalLifecycleStatus = "inactive" | "active" | "paused" | "ended";
+
+export type GoalRunStatus = "settled" | "interrupted";
+
+export interface GoalRunProjection {
+	runId: string;
+	sessionId: string;
+	startedAt: string;
+	endedAt?: string;
+	status: GoalRunStatus;
+}
+
+export interface GoalLifecycleProjection {
+	status: GoalLifecycleStatus;
+	activatedAt?: string;
+	pausedAt?: string;
+	endedAt?: string;
+	/** Milliseconds from activation until end or replay time, including pauses. */
+	wallElapsed: number;
+	/** Milliseconds while active, excluding paused intervals. */
+	activeElapsed: number;
+	/** Milliseconds for explicitly closed runs only. */
+	busyElapsed: number;
+	runs: GoalRunProjection[];
+	/** The log still has a run start without a corresponding terminal event. */
+	openRunId?: string;
+}
 
 export interface GoalContractProjection {
 	schema: typeof GOAL_CONTRACT_PROJECTION_SCHEMA;
@@ -124,6 +296,29 @@ export interface GoalContractProjection {
 	sequence: number;
 	baseHash: string;
 	contract: GoalContractV1;
+}
+
+export type GoalArtifactDiagnosticStatus = "valid" | "missing" | "corrupt";
+
+export interface GoalArtifactDiagnostic {
+	artifactId: string;
+	status: GoalArtifactDiagnosticStatus;
+}
+
+export interface GoalReadModelLatestCheckpoint {
+	eventId: string;
+	checkpoint: GoalCheckpointV2;
+}
+
+export interface GoalReadModel {
+	schema: typeof GOAL_READ_MODEL_SCHEMA;
+	goalId: string;
+	sequence: number;
+	baseHash: string;
+	lifecycle: GoalLifecycleProjection;
+	checkpointCount: number;
+	latestCheckpoint?: GoalReadModelLatestCheckpoint;
+	artifactDiagnostics: GoalArtifactDiagnostic[];
 }
 
 export class GoalValidationError extends Error {
@@ -156,6 +351,14 @@ function requireExactKeys(value: Record<string, unknown>, keys: readonly string[
 	const expected = [...keys].sort();
 	if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
 		throw new GoalValidationError(`${field} has unknown or missing fields`);
+	}
+}
+
+function requireAllowedKeys(value: Record<string, unknown>, keys: readonly string[], field: string): void {
+	for (const key of Object.keys(value)) {
+		if (!keys.includes(key)) {
+			throw new GoalValidationError(`${field} has unknown fields`);
+		}
 	}
 }
 
@@ -268,24 +471,82 @@ export function validateGoalContract(value: unknown): GoalContractV1 {
 	};
 }
 
-export function validateGoalCheckpoint(value: unknown): GoalCheckpoint {
-	if (!isRecord(value)) {
-		throw new GoalValidationError("Goal checkpoint must be an object");
+function requireArtifactId(value: unknown, field: string): string {
+	const artifactId = requireNonEmptyString(value, field);
+	if (!/^sha256:[a-f0-9]{64}$/.test(artifactId)) {
+		throw new GoalValidationError(`${field} must use the sha256:<lowercase-hex> format`);
 	}
+	return artifactId;
+}
+
+export function validateGoalArtifactReference(value: unknown): GoalArtifactReference {
+	if (!isRecord(value)) {
+		throw new GoalValidationError("Goal artifact reference must be an object");
+	}
+	requireExactKeys(value, ["schema", "artifactId", "role"], "Goal artifact reference");
+	if (value.schema !== GOAL_ARTIFACT_REF_SCHEMA) {
+		throw new GoalValidationError("Goal artifact reference schema is unsupported");
+	}
+	const role = requireNonEmptyString(value.role, "artifact reference role");
+	if (role !== "checkpoint_evidence" && role !== "compaction_source") {
+		throw new GoalValidationError("Goal artifact reference role is unsupported");
+	}
+	return {
+		schema: GOAL_ARTIFACT_REF_SCHEMA,
+		artifactId: requireArtifactId(value.artifactId, "artifact reference artifactId"),
+		role,
+	};
+}
+
+function validateGoalCheckpointEvidence(value: unknown, leafId: string): GoalCheckpointEvidence {
+	if (!isRecord(value)) {
+		throw new GoalValidationError("Goal checkpoint evidence must be an object");
+	}
+	requireExactKeys(value, ["schema", "sourceEntryIds", "artifacts"], "Goal checkpoint evidence");
+	if (value.schema !== GOAL_CHECKPOINT_EVIDENCE_SCHEMA) {
+		throw new GoalValidationError("Goal checkpoint evidence schema is unsupported");
+	}
+	if (!Array.isArray(value.sourceEntryIds) || value.sourceEntryIds.length === 0) {
+		throw new GoalValidationError("checkpoint evidence sourceEntryIds must be a non-empty string array");
+	}
+	const sourceEntryIds = value.sourceEntryIds.map((sourceEntryId, index) =>
+		requireNonEmptyString(sourceEntryId, `checkpoint evidence sourceEntryIds[${index}]`),
+	);
+	if (new Set(sourceEntryIds).size !== sourceEntryIds.length) {
+		throw new GoalValidationError("checkpoint evidence sourceEntryIds must be unique");
+	}
+	if (!sourceEntryIds.includes(leafId)) {
+		throw new GoalValidationError("checkpoint evidence must include its leafId as a source entry");
+	}
+	if (!Array.isArray(value.artifacts) || value.artifacts.length === 0) {
+		throw new GoalValidationError("checkpoint evidence artifacts must be a non-empty array");
+	}
+	const artifacts = value.artifacts.map(validateGoalArtifactReference);
+	const artifactIds = new Set<string>();
+	for (const artifact of artifacts) {
+		if (artifactIds.has(artifact.artifactId)) {
+			throw new GoalValidationError("checkpoint evidence artifact IDs must be unique");
+		}
+		artifactIds.add(artifact.artifactId);
+	}
+	return { schema: GOAL_CHECKPOINT_EVIDENCE_SCHEMA, sourceEntryIds, artifacts };
+}
+
+function validateGoalCheckpointV1(value: Record<string, unknown>): GoalCheckpointV1 {
 	requireExactKeys(
 		value,
 		["schema", "sessionId", "leafId", "turnIndex", "toolResultCount", "reason", "createdAt"],
-		"Goal checkpoint",
+		"Goal checkpoint v1",
 	);
-	if (value.schema !== GOAL_CHECKPOINT_SCHEMA || value.reason !== "turn_end") {
-		throw new GoalValidationError("Goal checkpoint schema or reason is unsupported");
+	if (value.reason !== "turn_end") {
+		throw new GoalValidationError("Goal checkpoint v1 reason is unsupported");
 	}
 	const createdAt = requireNonEmptyString(value.createdAt, "checkpoint.createdAt");
 	if (Number.isNaN(Date.parse(createdAt))) {
 		throw new GoalValidationError("checkpoint.createdAt must be an ISO timestamp");
 	}
 	return {
-		schema: GOAL_CHECKPOINT_SCHEMA,
+		schema: GOAL_CHECKPOINT_V1_SCHEMA,
 		sessionId: requireNonEmptyString(value.sessionId, "checkpoint.sessionId"),
 		leafId: requireNonEmptyString(value.leafId, "checkpoint.leafId"),
 		turnIndex: requireNonNegativeInteger(value.turnIndex, "checkpoint.turnIndex"),
@@ -293,4 +554,213 @@ export function validateGoalCheckpoint(value: unknown): GoalCheckpoint {
 		reason: "turn_end",
 		createdAt,
 	};
+}
+
+function validateGoalCheckpointV2(value: Record<string, unknown>): GoalCheckpointV2 {
+	const reason = requireNonEmptyString(value.reason, "checkpoint.reason");
+	if (reason !== "turn_end" && reason !== "session_before_compact") {
+		throw new GoalValidationError("Goal checkpoint v2 reason is unsupported");
+	}
+	if (reason === "turn_end") {
+		requireExactKeys(
+			value,
+			["schema", "sessionId", "leafId", "turnIndex", "toolResultCount", "reason", "createdAt", "evidence"],
+			"Goal checkpoint v2 turn_end",
+		);
+	} else {
+		requireExactKeys(
+			value,
+			["schema", "sessionId", "leafId", "reason", "createdAt", "evidence"],
+			"Goal checkpoint v2 session_before_compact",
+		);
+	}
+	const sessionId = requireNonEmptyString(value.sessionId, "checkpoint.sessionId");
+	const leafId = requireNonEmptyString(value.leafId, "checkpoint.leafId");
+	const createdAt = requireNonEmptyString(value.createdAt, "checkpoint.createdAt");
+	if (Number.isNaN(Date.parse(createdAt))) {
+		throw new GoalValidationError("checkpoint.createdAt must be an ISO timestamp");
+	}
+	const evidence = validateGoalCheckpointEvidence(value.evidence, leafId);
+	if (reason === "turn_end") {
+		return {
+			schema: GOAL_CHECKPOINT_SCHEMA,
+			sessionId,
+			leafId,
+			turnIndex: requireNonNegativeInteger(value.turnIndex, "checkpoint.turnIndex"),
+			toolResultCount: requireNonNegativeInteger(value.toolResultCount, "checkpoint.toolResultCount"),
+			reason,
+			createdAt,
+			evidence,
+		};
+	}
+	return {
+		schema: GOAL_CHECKPOINT_SCHEMA,
+		sessionId,
+		leafId,
+		reason,
+		createdAt,
+		evidence,
+	};
+}
+
+export function validateGoalCheckpoint(value: unknown): GoalCheckpoint {
+	if (!isRecord(value)) {
+		throw new GoalValidationError("Goal checkpoint must be an object");
+	}
+	if (value.schema === GOAL_CHECKPOINT_V1_SCHEMA) {
+		return validateGoalCheckpointV1(value);
+	}
+	if (value.schema === GOAL_CHECKPOINT_SCHEMA) {
+		return validateGoalCheckpointV2(value);
+	}
+	throw new GoalValidationError("Goal checkpoint schema is unsupported");
+}
+
+export function upcastGoalCheckpoint(checkpoint: GoalCheckpoint): GoalCheckpointV2 {
+	if (checkpoint.schema === GOAL_CHECKPOINT_SCHEMA) {
+		return {
+			...checkpoint,
+			evidence: {
+				...checkpoint.evidence,
+				sourceEntryIds: [...checkpoint.evidence.sourceEntryIds],
+				artifacts: checkpoint.evidence.artifacts.map((artifact) => ({ ...artifact })),
+			},
+		};
+	}
+	return {
+		schema: GOAL_CHECKPOINT_SCHEMA,
+		sessionId: checkpoint.sessionId,
+		leafId: checkpoint.leafId,
+		turnIndex: checkpoint.turnIndex,
+		toolResultCount: checkpoint.toolResultCount,
+		reason: "turn_end",
+		createdAt: checkpoint.createdAt,
+		evidence: {
+			schema: GOAL_CHECKPOINT_EVIDENCE_SCHEMA,
+			sourceEntryIds: [checkpoint.leafId],
+			artifacts: [],
+		},
+	};
+}
+
+function requireOptionalNonEmptyString(value: unknown, field: string): string | undefined {
+	if (value === undefined) return undefined;
+	return requireNonEmptyString(value, field);
+}
+
+function validateLifecyclePayloadRecord(
+	value: unknown,
+	keys: readonly string[],
+	field: string,
+): Record<string, unknown> {
+	if (!isRecord(value)) {
+		throw new GoalValidationError(`${field} must be an object`);
+	}
+	requireAllowedKeys(value, keys, field);
+	return value;
+}
+
+export function validateGoalLifecycleEventInput(value: unknown): GoalLifecycleEventInput {
+	if (!isRecord(value)) {
+		throw new GoalValidationError("Goal lifecycle event input has unknown or missing fields");
+	}
+	requireExactKeys(value, ["eventType", "payload"], "Goal lifecycle event input");
+	if (value.eventType === "goal_activated") {
+		const payload = validateLifecyclePayloadRecord(value.payload, ["sessionId"], "goal_activated payload");
+		return {
+			eventType: "goal_activated",
+			payload: { sessionId: requireNonEmptyString(payload.sessionId, "goal_activated.sessionId") },
+		};
+	}
+	if (value.eventType === "goal_paused") {
+		const payload = validateLifecyclePayloadRecord(
+			value.payload,
+			["reason", "nextBestAction"],
+			"goal_paused payload",
+		);
+		return {
+			eventType: "goal_paused",
+			payload: {
+				...(payload.reason === undefined
+					? {}
+					: { reason: requireOptionalNonEmptyString(payload.reason, "goal_paused.reason") }),
+				...(payload.nextBestAction === undefined
+					? {}
+					: {
+							nextBestAction: requireOptionalNonEmptyString(
+								payload.nextBestAction,
+								"goal_paused.nextBestAction",
+							),
+						}),
+			},
+		};
+	}
+	if (value.eventType === "goal_resumed") {
+		const payload = validateLifecyclePayloadRecord(value.payload, ["reason"], "goal_resumed payload");
+		return {
+			eventType: "goal_resumed",
+			payload: {
+				...(payload.reason === undefined
+					? {}
+					: { reason: requireOptionalNonEmptyString(payload.reason, "goal_resumed.reason") }),
+			},
+		};
+	}
+	if (value.eventType === "goal_ended") {
+		const payload = validateLifecyclePayloadRecord(
+			value.payload,
+			["outcome", "reason", "finalEvidence"],
+			"goal_ended payload",
+		);
+		return {
+			eventType: "goal_ended",
+			payload: {
+				outcome: requireNonEmptyString(payload.outcome, "goal_ended.outcome"),
+				...(payload.reason === undefined
+					? {}
+					: { reason: requireOptionalNonEmptyString(payload.reason, "goal_ended.reason") }),
+				...(payload.finalEvidence === undefined
+					? {}
+					: { finalEvidence: requireOptionalNonEmptyString(payload.finalEvidence, "goal_ended.finalEvidence") }),
+			},
+		};
+	}
+	if (value.eventType === "goal_run_started") {
+		const payload = validateLifecyclePayloadRecord(value.payload, ["runId", "sessionId"], "goal_run_started payload");
+		return {
+			eventType: "goal_run_started",
+			payload: {
+				runId: requireNonEmptyString(payload.runId, "goal_run_started.runId"),
+				sessionId: requireNonEmptyString(payload.sessionId, "goal_run_started.sessionId"),
+			},
+		};
+	}
+	if (value.eventType === "goal_run_settled") {
+		const payload = validateLifecyclePayloadRecord(value.payload, ["runId"], "goal_run_settled payload");
+		return {
+			eventType: "goal_run_settled",
+			payload: { runId: requireNonEmptyString(payload.runId, "goal_run_settled.runId") },
+		};
+	}
+	if (value.eventType === "goal_run_interrupted") {
+		const payload = validateLifecyclePayloadRecord(
+			value.payload,
+			["runId", "reason", "recovered"],
+			"goal_run_interrupted payload",
+		);
+		if (payload.recovered !== undefined && typeof payload.recovered !== "boolean") {
+			throw new GoalValidationError("goal_run_interrupted.recovered must be a boolean");
+		}
+		return {
+			eventType: "goal_run_interrupted",
+			payload: {
+				runId: requireNonEmptyString(payload.runId, "goal_run_interrupted.runId"),
+				...(payload.reason === undefined
+					? {}
+					: { reason: requireOptionalNonEmptyString(payload.reason, "goal_run_interrupted.reason") }),
+				...(payload.recovered === undefined ? {} : { recovered: payload.recovered }),
+			},
+		};
+	}
+	throw new GoalValidationError("Goal lifecycle event type is unsupported");
 }

@@ -5,8 +5,13 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+	createPiXkCheckpointRef,
+	createPiXkCompactionCheckpointIntent,
 	createPiXkExtension,
 	createPiXkGoalBinding,
+	createPiXkTurnCheckpointIntent,
+	isPiXkCheckpointIntent,
+	isPiXkCheckpointRef,
 	isPiXkSessionLink,
 	PI_XK_SESSION_LINK_CUSTOM_TYPE,
 	type PiXkLifecycleEvent,
@@ -31,7 +36,7 @@ describe("Pi-XK session link integration", () => {
 	});
 
 	it("validates goal bindings and writes each binding only once across reloads", async () => {
-		const binding = createPiXkGoalBinding("goal-123", 0);
+		const binding = createPiXkGoalBinding("goal_123", 0);
 		const harness = await createHarness({
 			extensionFactories: [createPiXkExtension({ bindings: [binding] })],
 		});
@@ -45,12 +50,39 @@ describe("Pi-XK session link integration", () => {
 		expect(links).toHaveLength(1);
 		expect(links[0]?.data).toEqual(binding);
 		expect(() => createPiXkGoalBinding("", 0)).toThrow("goalId");
-		expect(() => createPiXkGoalBinding("goal-123", -1)).toThrow("generation");
+		expect(() => createPiXkGoalBinding("goal_123", -1)).toThrow("generation");
+	});
+
+	it("rejects non-Goal IDs and custom entries with unknown fields", () => {
+		const binding = createPiXkGoalBinding("goal_schema", 1);
+		const checkpointRef = createPiXkCheckpointRef("goal_schema", "evt_checkpoint", 1);
+		const turnIntent = createPiXkTurnCheckpointIntent(
+			"goal_schema",
+			"session_schema",
+			"leaf_schema",
+			0,
+			0,
+			1,
+			"2026-07-19T00:00:00.000Z",
+		);
+		const compactionIntent = createPiXkCompactionCheckpointIntent(
+			"goal_schema",
+			"session_schema",
+			"leaf_schema",
+			1,
+			"2026-07-19T00:00:00.000Z",
+		);
+
+		expect(() => createPiXkGoalBinding("goal-schema", 1)).toThrow("goalId");
+		expect(isPiXkSessionLink({ ...binding, unexpected: "payload" })).toBe(false);
+		expect(isPiXkCheckpointRef({ ...checkpointRef, unexpected: "payload" })).toBe(false);
+		expect(isPiXkCheckpointIntent({ ...turnIntent, unexpected: "payload" })).toBe(false);
+		expect(isPiXkCheckpointIntent({ ...compactionIntent, unexpected: "payload" })).toBe(false);
 	});
 
 	it("keeps custom bindings in the tree and out of model context", async () => {
 		const harness = await createHarness({
-			extensionFactories: [createPiXkExtension({ bindings: [createPiXkGoalBinding("goal-tree", 2)] })],
+			extensionFactories: [createPiXkExtension({ bindings: [createPiXkGoalBinding("goal_tree", 2)] })],
 		});
 		harnesses.push(harness);
 
@@ -68,7 +100,7 @@ describe("Pi-XK session link integration", () => {
 		harnesses.push(harness);
 		const sessionDir = join(harness.tempDir, "sessions");
 		const source = SessionManager.create(harness.tempDir, sessionDir);
-		const binding = createPiXkGoalBinding("goal-persisted", 4);
+		const binding = createPiXkGoalBinding("goal_persisted", 4);
 		source.appendCustomEntry(PI_XK_SESSION_LINK_CUSTOM_TYPE, binding);
 		source.appendMessage(fauxAssistantMessage("persist custom entry"));
 		const sourcePath = source.getSessionFile();
