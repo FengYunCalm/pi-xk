@@ -79,11 +79,103 @@ function validateRunProjection(value: unknown, index: number): GoalRunProjection
 	};
 }
 
+function requireGoalActor(value: unknown, field: string): "user" | "runtime" | "model" | "child-task" | "system" {
+	if (value !== "user" && value !== "runtime" && value !== "model" && value !== "child-task" && value !== "system") {
+		throw new GoalValidationError(`${field} is invalid`);
+	}
+	return value;
+}
+
+function requireStringArray(value: unknown, field: string): string[] {
+	if (!Array.isArray(value)) {
+		throw new GoalValidationError(`${field} must be a string array`);
+	}
+	return value.map((item, index) => requireNonEmptyString(item, `${field}[${index}]`));
+}
+
+function validatePauseRecord(value: unknown): NonNullable<GoalLifecycleProjection["lastPause"]> {
+	if (!isRecord(value)) {
+		throw new GoalValidationError("Goal read model lifecycle lastPause must be an object");
+	}
+	requireExactKeys(
+		value,
+		["actor", "reason", "userRequest", "nextBestAction", "audit"],
+		"Goal read model lifecycle lastPause",
+	);
+	if (!isRecord(value.audit)) {
+		throw new GoalValidationError("Goal read model lifecycle lastPause.audit must be an object");
+	}
+	requireExactKeys(
+		value.audit,
+		["unmetRequiredAcceptanceIds", "currentEvidence", "incompleteConclusion"],
+		"Goal read model lifecycle lastPause.audit",
+	);
+	if (value.userRequest !== null && typeof value.userRequest !== "string") {
+		throw new GoalValidationError("Goal read model lifecycle lastPause.userRequest must be a string or null");
+	}
+	return {
+		actor: requireGoalActor(value.actor, "lifecycle.lastPause.actor"),
+		reason: requireNonEmptyString(value.reason, "lifecycle.lastPause.reason"),
+		userRequest:
+			value.userRequest === null
+				? null
+				: requireNonEmptyString(value.userRequest, "lifecycle.lastPause.userRequest"),
+		nextBestAction: requireNonEmptyString(value.nextBestAction, "lifecycle.lastPause.nextBestAction"),
+		audit: {
+			unmetRequiredAcceptanceIds: requireStringArray(
+				value.audit.unmetRequiredAcceptanceIds,
+				"lifecycle.lastPause.audit.unmetRequiredAcceptanceIds",
+			),
+			currentEvidence: requireNonEmptyString(
+				value.audit.currentEvidence,
+				"lifecycle.lastPause.audit.currentEvidence",
+			),
+			incompleteConclusion: requireNonEmptyString(
+				value.audit.incompleteConclusion,
+				"lifecycle.lastPause.audit.incompleteConclusion",
+			),
+		},
+	};
+}
+
+function validateResumeRecord(value: unknown): NonNullable<GoalLifecycleProjection["lastResume"]> {
+	if (!isRecord(value)) {
+		throw new GoalValidationError("Goal read model lifecycle lastResume must be an object");
+	}
+	requireExactKeys(value, ["actor", "reason", "resumeEvidence"], "Goal read model lifecycle lastResume");
+	return {
+		actor: requireGoalActor(value.actor, "lifecycle.lastResume.actor"),
+		reason: requireNonEmptyString(value.reason, "lifecycle.lastResume.reason"),
+		resumeEvidence: requireNonEmptyString(value.resumeEvidence, "lifecycle.lastResume.resumeEvidence"),
+	};
+}
+
+function validateEndRecord(value: unknown): NonNullable<GoalLifecycleProjection["end"]> {
+	if (!isRecord(value)) {
+		throw new GoalValidationError("Goal read model lifecycle end must be an object");
+	}
+	requireExactKeys(
+		value,
+		["actor", "outcome", "reason", "verifiedAcceptanceIds", "finalEvidence", "finalSummary"],
+		"Goal read model lifecycle end",
+	);
+	return {
+		actor: requireGoalActor(value.actor, "lifecycle.end.actor"),
+		outcome: requireNonEmptyString(value.outcome, "lifecycle.end.outcome"),
+		reason: requireNonEmptyString(value.reason, "lifecycle.end.reason"),
+		verifiedAcceptanceIds: requireStringArray(value.verifiedAcceptanceIds, "lifecycle.end.verifiedAcceptanceIds"),
+		finalEvidence: requireNonEmptyString(value.finalEvidence, "lifecycle.end.finalEvidence"),
+		finalSummary: requireNonEmptyString(value.finalSummary, "lifecycle.end.finalSummary"),
+	};
+}
+
 function validateLifecycleProjection(value: unknown): GoalLifecycleProjection {
 	if (!isRecord(value)) {
 		throw new GoalValidationError("Goal read model lifecycle must be an object");
 	}
-	const optionalKeys = ["activatedAt", "pausedAt", "endedAt", "openRunId"].filter((key) => key in value);
+	const optionalKeys = ["activatedAt", "pausedAt", "endedAt", "openRunId", "lastPause", "lastResume", "end"].filter(
+		(key) => key in value,
+	);
 	requireExactKeys(
 		value,
 		["status", "wallElapsed", "activeElapsed", "busyElapsed", "runs", ...optionalKeys],
@@ -114,6 +206,9 @@ function validateLifecycleProjection(value: unknown): GoalLifecycleProjection {
 		...(value.openRunId === undefined
 			? {}
 			: { openRunId: requireNonEmptyString(value.openRunId, "lifecycle.openRunId") }),
+		...(value.lastPause === undefined ? {} : { lastPause: validatePauseRecord(value.lastPause) }),
+		...(value.lastResume === undefined ? {} : { lastResume: validateResumeRecord(value.lastResume) }),
+		...(value.end === undefined ? {} : { end: validateEndRecord(value.end) }),
 	};
 }
 

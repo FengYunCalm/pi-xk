@@ -7,7 +7,7 @@ import {
 	ArtifactStore,
 	type GoalCheckpointV1,
 	type GoalCheckpointV2,
-	type GoalContractV1,
+	type GoalContractV2,
 	GoalReadModelStaleError,
 	GoalStore,
 	upcastGoalCheckpoint,
@@ -16,19 +16,32 @@ import { stableJsonStringify } from "../src/stable-json.ts";
 
 const tempDirs: string[] = [];
 
-function createContract(goalId: string): GoalContractV1 {
+function createContract(goalId: string): GoalContractV2 {
 	return {
-		schema: "pi-xk.goal.contract.v1",
+		schema: "pi-xk.goal.contract.v2",
 		goalId,
 		title: "Read model test",
 		objective: "Rebuild a read model from Goal facts.",
 		constraints: [],
-		acceptance: [],
+		acceptance: [
+			{
+				id: "A-1",
+				kind: "test",
+				description: "Rebuild the Goal read model.",
+				command: "npm run test:pi-xk",
+				required: true,
+			},
+		],
 		capabilities: { filesystem: "unrestricted", network: "unrestricted", spawn: "unrestricted" },
 		budgets: { tokens: 0, costCents: 0, wallSeconds: 0 },
 		ownerSessionId: "session-read-model",
 		createdAt: "2026-07-20T00:00:00.000Z",
-		schemaVersion: 1,
+		schemaVersion: 2,
+		nonGoals: [],
+		doneCondition: "All required acceptance has verified evidence.",
+		pauseCondition: "No in-scope action can proceed without new input or evidence.",
+		finalReport: "Report verified acceptance evidence.",
+		executionAuthorization: "In-scope edits are authorized.",
 	};
 }
 

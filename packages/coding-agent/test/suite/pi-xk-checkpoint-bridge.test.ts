@@ -6,7 +6,7 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
-import { ArtifactStore, type GoalCheckpointV2, type GoalContractV1, GoalStore } from "../../../pi-xk-core/src/index.ts";
+import { ArtifactStore, type GoalCheckpointV2, type GoalContractV2, GoalStore } from "../../../pi-xk-core/src/index.ts";
 import {
 	createPiXkExtension,
 	createPiXkGoalBinding,
@@ -22,19 +22,31 @@ import { createHarness, type Harness } from "./harness.ts";
 const projectRoots: string[] = [];
 const harnesses: Harness[] = [];
 
-function createContract(goalId: string): GoalContractV1 {
+function createContract(goalId: string): GoalContractV2 {
 	return {
-		schema: "pi-xk.goal.contract.v1",
+		schema: "pi-xk.goal.contract.v2",
 		goalId,
 		title: "Checkpoint bridge",
 		objective: "Persist Pi turn checkpoints.",
 		constraints: [],
-		acceptance: [],
+		acceptance: [
+			{
+				id: "A-1",
+				kind: "artifact",
+				description: "Persist Pi turn checkpoint evidence.",
+				required: true,
+			},
+		],
 		capabilities: { filesystem: "unrestricted", network: "unrestricted", spawn: "unrestricted" },
 		budgets: { tokens: 0, costCents: 0, wallSeconds: 0 },
 		ownerSessionId: "owner-session",
 		createdAt: "2026-07-19T00:00:00.000Z",
-		schemaVersion: 1,
+		schemaVersion: 2,
+		nonGoals: [],
+		doneCondition: "The required checkpoint evidence is persisted.",
+		pauseCondition: "No in-scope checkpoint action can continue without new evidence.",
+		finalReport: "Report the verified checkpoint evidence.",
+		executionAuthorization: "In-scope test and implementation edits are authorized.",
 	};
 }
 

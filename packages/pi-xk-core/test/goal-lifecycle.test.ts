@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-	type GoalContractV1,
+	type GoalContractV2,
 	GoalHeadConflictError,
 	type GoalLifecycleEventInput,
 	GoalLifecycleTransitionError,
@@ -12,19 +12,32 @@ import {
 
 const tempDirs: string[] = [];
 
-function createContract(goalId: string): GoalContractV1 {
+function createContract(goalId: string): GoalContractV2 {
 	return {
-		schema: "pi-xk.goal.contract.v1",
+		schema: "pi-xk.goal.contract.v2",
 		goalId,
 		title: "Lifecycle test",
 		objective: "Exercise the Goal lifecycle projection.",
 		constraints: [],
-		acceptance: [],
+		acceptance: [
+			{
+				id: "A-1",
+				kind: "test",
+				description: "Exercise the Goal lifecycle projection.",
+				command: "npm run test:pi-xk",
+				required: true,
+			},
+		],
 		capabilities: { filesystem: "unrestricted", network: "unrestricted", spawn: "unrestricted" },
 		budgets: { tokens: 0, costCents: 0, wallSeconds: 0 },
 		ownerSessionId: "session-lifecycle",
 		createdAt: "2026-07-20T00:00:00.000Z",
-		schemaVersion: 1,
+		schemaVersion: 2,
+		nonGoals: [],
+		doneCondition: "All required acceptance has verified evidence.",
+		pauseCondition: "No in-scope action can proceed without new input or evidence.",
+		finalReport: "Report verified acceptance evidence.",
+		executionAuthorization: "In-scope edits are authorized.",
 	};
 }
 
@@ -88,13 +101,25 @@ describe("Goal lifecycle and files", () => {
 		await appendLifecycle(
 			store,
 			contract.goalId,
-			{ eventType: "goal_paused", payload: { reason: "review" } },
+			{
+				eventType: "goal_paused",
+				payload: {
+					reason: "review",
+					userRequest: null,
+					nextBestAction: "Resume after review.",
+					audit: {
+						unmetRequiredAcceptanceIds: ["A-1"],
+						currentEvidence: "The lifecycle timing run is not complete.",
+						incompleteConclusion: "Acceptance A-1 remains open.",
+					},
+				},
+			},
 			"2026-07-20T00:00:40.000Z",
 		);
 		await appendLifecycle(
 			store,
 			contract.goalId,
-			{ eventType: "goal_resumed", payload: { reason: "continue" } },
+			{ eventType: "goal_resumed", payload: { reason: "continue", resumeEvidence: "Review completed." } },
 			"2026-07-20T00:01:00.000Z",
 		);
 		await appendLifecycle(
@@ -112,7 +137,16 @@ describe("Goal lifecycle and files", () => {
 		await appendLifecycle(
 			store,
 			contract.goalId,
-			{ eventType: "goal_ended", payload: { outcome: "completed", reason: "accepted" } },
+			{
+				eventType: "goal_ended",
+				payload: {
+					outcome: "completed",
+					reason: "accepted",
+					verifiedAcceptanceIds: ["A-1"],
+					finalEvidence: "Lifecycle timing assertions passed.",
+					finalSummary: "The lifecycle projection is complete.",
+				},
+			},
 			"2026-07-20T00:01:30.000Z",
 		);
 
@@ -152,7 +186,19 @@ describe("Goal lifecycle and files", () => {
 		await expect(
 			store.appendLifecycleEvent(
 				contract.goalId,
-				{ eventType: "goal_paused", payload: { reason: "invalid" } },
+				{
+					eventType: "goal_paused",
+					payload: {
+						reason: "invalid",
+						userRequest: null,
+						nextBestAction: "Do not pause an inactive Goal.",
+						audit: {
+							unmetRequiredAcceptanceIds: ["A-1"],
+							currentEvidence: "The Goal was never activated.",
+							incompleteConclusion: "Acceptance A-1 remains open.",
+						},
+					},
+				},
 				{
 					eventId: "evt-invalid-pause",
 					idempotencyKey: "lifecycle:invalid-pause",
@@ -184,7 +230,19 @@ describe("Goal lifecycle and files", () => {
 		await expect(
 			store.appendLifecycleEvent(
 				contract.goalId,
-				{ eventType: "goal_paused", payload: { reason: "stale writer" } },
+				{
+					eventType: "goal_paused",
+					payload: {
+						reason: "stale writer",
+						userRequest: null,
+						nextBestAction: "Retry from the current head.",
+						audit: {
+							unmetRequiredAcceptanceIds: ["A-1"],
+							currentEvidence: "The Goal remains active.",
+							incompleteConclusion: "Acceptance A-1 remains open.",
+						},
+					},
+				},
 				{
 					eventId: "evt-stale-pause",
 					idempotencyKey: "lifecycle:stale-pause",

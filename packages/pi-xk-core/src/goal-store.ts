@@ -12,9 +12,10 @@ import {
 	type GoalCheckpoint,
 	type GoalCheckpointedEvent,
 	type GoalCheckpointV2,
+	type GoalContract,
 	type GoalContractProjection,
 	type GoalContractUpdatedEvent,
-	type GoalContractV1,
+	type GoalContractV2,
 	type GoalCreatedEvent,
 	type GoalEvent,
 	type GoalHead,
@@ -25,8 +26,11 @@ import {
 	type GoalReadModel,
 	type GoalRunProjection,
 	GoalValidationError,
+	upcastGoalContract,
 	validateGoalCheckpoint,
 	validateGoalContract,
+	validateGoalContractV2,
+	validateGoalLifecycleEventForContract,
 	validateGoalLifecycleEventInput,
 } from "./contract.ts";
 import {
@@ -155,7 +159,10 @@ export interface GoalTailDiagnostic {
 
 export interface GoalReplay {
 	goalId: string;
-	contract: GoalContractV1;
+	/** The current contract projected into the v2 in-memory representation. */
+	contract: GoalContractV2;
+	/** The exact latest on-disk contract payload used to validate the event hash chain. */
+	sourceContract: GoalContract;
 	head: GoalHead;
 	events: GoalEvent[];
 	lifecycle: GoalLifecycleProjection;
@@ -263,7 +270,7 @@ function calculateEventHash(event: GoalEventHashInput): string {
 	return `sha256:${createHash("sha256").update(eventHashInput(event)).digest("hex")}`;
 }
 
-function getContractFromPayload(payload: GoalEvent["payload"]): GoalContractV1 {
+function getContractFromPayload(payload: GoalEvent["payload"]): GoalContract {
 	if (!("contract" in payload)) {
 		throw new GoalValidationError("Goal event requires a contract payload");
 	}
@@ -580,6 +587,9 @@ function projectGoalLifecycle(events: readonly GoalEvent[], now: string): GoalLi
 	const runs: GoalRunProjection[] = [];
 	const runIds = new Set<string>();
 	let openRun: { run: GoalRunProjection; startedAtMs: number } | undefined;
+	let lastPause: GoalLifecycleProjection["lastPause"];
+	let lastResume: GoalLifecycleProjection["lastResume"];
+	let end: GoalLifecycleProjection["end"];
 
 	for (const event of events) {
 		if (!isGoalLifecycleEvent(event)) continue;
@@ -606,12 +616,34 @@ function projectGoalLifecycle(events: readonly GoalEvent[], now: string): GoalLi
 				activeSinceMs = undefined;
 				pausedAt = event.timestamp;
 				status = "paused";
+				lastPause = {
+					actor: event.actor,
+					reason: event.payload.reason ?? "",
+					userRequest: event.payload.userRequest ?? null,
+					nextBestAction: event.payload.nextBestAction ?? "",
+					audit: event.payload.audit
+						? {
+								unmetRequiredAcceptanceIds: [...event.payload.audit.unmetRequiredAcceptanceIds],
+								currentEvidence: event.payload.audit.currentEvidence,
+								incompleteConclusion: event.payload.audit.incompleteConclusion,
+							}
+						: {
+								unmetRequiredAcceptanceIds: [],
+								currentEvidence: "Legacy pause event did not record current evidence.",
+								incompleteConclusion: "Legacy pause event did not record an audit.",
+							},
+				};
 				break;
 			case "goal_resumed":
 				if (status !== "paused") throw new GoalLifecycleTransitionError("resume requires a paused Goal");
 				status = "active";
 				pausedAt = undefined;
 				activeSinceMs = timestampMs;
+				lastResume = {
+					actor: event.actor,
+					reason: event.payload.reason ?? "Legacy resume event did not record a reason.",
+					resumeEvidence: event.payload.resumeEvidence ?? "Legacy resume event did not record resume evidence.",
+				};
 				break;
 			case "goal_ended":
 				if ((status !== "active" && status !== "paused") || openRun) {
@@ -626,6 +658,14 @@ function projectGoalLifecycle(events: readonly GoalEvent[], now: string): GoalLi
 				status = "ended";
 				endedAt = event.timestamp;
 				endedAtMs = timestampMs;
+				end = {
+					actor: event.actor,
+					outcome: event.payload.outcome,
+					reason: event.payload.reason ?? "Legacy end event did not record a reason.",
+					verifiedAcceptanceIds: [...(event.payload.verifiedAcceptanceIds ?? [])],
+					finalEvidence: event.payload.finalEvidence ?? "Legacy end event did not record final evidence.",
+					finalSummary: event.payload.finalSummary ?? "Legacy end event did not record a final summary.",
+				};
 				break;
 			case "goal_run_started": {
 				if (status !== "active" || openRun) {
@@ -683,6 +723,9 @@ function projectGoalLifecycle(events: readonly GoalEvent[], now: string): GoalLi
 		busyElapsed,
 		runs,
 		...(openRun ? { openRunId: openRun.run.runId } : {}),
+		...(lastPause === undefined ? {} : { lastPause }),
+		...(lastResume === undefined ? {} : { lastResume }),
+		...(end === undefined ? {} : { end }),
 	};
 }
 
@@ -705,7 +748,7 @@ function replayEvents(goalId: string, raw: string, now = new Date().toISOString(
 			throw new GoalCorruptionError(`Event ${index + 1} is not valid JSON`);
 		}
 	});
-	let contract: GoalContractV1 | undefined;
+	let sourceContract: GoalContract | undefined;
 	let previousHash: string | null = null;
 	const eventIds = new Set<string>();
 	const idempotencyKeys = new Set<string>();
@@ -737,15 +780,32 @@ function replayEvents(goalId: string, raw: string, now = new Date().toISOString(
 			if (nextContract.goalId !== goalId) {
 				throw new GoalCorruptionError(`Event ${index + 1} contract has a different Goal ID`);
 			}
-			if (contract && nextContract.createdAt !== contract.createdAt) {
+			if (sourceContract && nextContract.createdAt !== sourceContract.createdAt) {
 				throw new GoalCorruptionError(`Event ${index + 1} changes the Goal creation timestamp`);
 			}
-			contract = nextContract;
+			sourceContract = nextContract;
+		}
+		if (isGoalLifecycleEvent(event)) {
+			if (!sourceContract) {
+				throw new GoalCorruptionError(`Event ${index + 1} has no preceding Goal contract`);
+			}
+			try {
+				validateGoalLifecycleEventForContract(
+					{ eventType: event.eventType, payload: event.payload },
+					sourceContract,
+					event.actor,
+				);
+			} catch (error) {
+				if (error instanceof GoalValidationError) {
+					throw new GoalCorruptionError(`Event ${index + 1} violates its Goal contract`);
+				}
+				throw error;
+			}
 		}
 		previousHash = event.hash;
 	}
 	const lastEvent = events.at(-1);
-	if (!contract || !lastEvent) {
+	if (!sourceContract || !lastEvent) {
 		throw new GoalCorruptionError(`Goal replay failed: ${goalId}`);
 	}
 	let lifecycle: GoalLifecycleProjection;
@@ -759,7 +819,8 @@ function replayEvents(goalId: string, raw: string, now = new Date().toISOString(
 	}
 	return {
 		goalId,
-		contract,
+		contract: upcastGoalContract(sourceContract),
+		sourceContract,
 		head: headForEvent(lastEvent),
 		events,
 		lifecycle,
@@ -982,7 +1043,7 @@ export class GoalStore {
 	}
 
 	private buildEvent(
-		contract: GoalContractV1,
+		contract: GoalContractV2,
 		eventType: GoalContractEventType,
 		options: GoalMutationOptions,
 		sequence: number,
@@ -1068,8 +1129,8 @@ export class GoalStore {
 		return { event: existing, head: headForEvent(existing) };
 	}
 
-	async createGoal(contractInput: GoalContractV1, options: GoalMutationOptions): Promise<GoalWriteResult> {
-		const contract = validateGoalContract(contractInput);
+	async createGoal(contractInput: GoalContractV2, options: GoalMutationOptions): Promise<GoalWriteResult> {
+		const contract = validateGoalContractV2(contractInput);
 		const paths = this.paths(contract.goalId);
 		return await this.withGoalLock(paths, contract.goalId, async () => {
 			let existing: GoalReplay | undefined;
@@ -1090,6 +1151,7 @@ export class GoalStore {
 			const replay: GoalReplay = {
 				goalId: contract.goalId,
 				contract,
+				sourceContract: contract,
 				head: headForEvent(event),
 				events: [event],
 				lifecycle: projectGoalLifecycle([event], options.timestamp ?? new Date().toISOString()),
@@ -1172,10 +1234,10 @@ export class GoalStore {
 	}
 
 	async updateGoalContract(
-		contractInput: GoalContractV1,
+		contractInput: GoalContractV2,
 		options: GoalContractUpdateOptions,
 	): Promise<GoalWriteResult> {
-		const contract = validateGoalContract(contractInput);
+		const contract = validateGoalContractV2(contractInput);
 		const paths = this.paths(contract.goalId);
 		return await this.withGoalLock(paths, contract.goalId, async () => {
 			const replay = await this.readReplay(paths, contract.goalId);
@@ -1199,6 +1261,7 @@ export class GoalStore {
 			const nextReplay: GoalReplay = {
 				goalId: contract.goalId,
 				contract,
+				sourceContract: contract,
 				head: headForEvent(event),
 				events: [...replay.events, event],
 				lifecycle: projectGoalLifecycle([...replay.events, event], options.timestamp ?? new Date().toISOString()),
@@ -1240,6 +1303,7 @@ export class GoalStore {
 			const nextReplay: GoalReplay = {
 				goalId,
 				contract: replay.contract,
+				sourceContract: replay.sourceContract,
 				head: headForEvent(event),
 				events: [...replay.events, event],
 				lifecycle: projectGoalLifecycle([...replay.events, event], options.timestamp ?? new Date().toISOString()),
@@ -1260,9 +1324,14 @@ export class GoalStore {
 		return await this.withGoalLock(paths, goalId, async () => {
 			const replay = await this.readReplay(paths, goalId);
 			if (replay.tailDiagnostic) throw new GoalRecoveryRequiredError(goalId);
+			const contractLifecycleInput = validateGoalLifecycleEventForContract(
+				lifecycleInput,
+				replay.sourceContract,
+				options.actor ?? "runtime",
+			);
 			const event = this.buildLifecycleEvent(
 				goalId,
-				lifecycleInput,
+				contractLifecycleInput,
 				options,
 				replay.head.sequence + 1,
 				replay.head.hash,
@@ -1278,6 +1347,7 @@ export class GoalStore {
 			const nextReplay: GoalReplay = {
 				goalId,
 				contract: replay.contract,
+				sourceContract: replay.sourceContract,
 				head: headForEvent(event),
 				events,
 				lifecycle,

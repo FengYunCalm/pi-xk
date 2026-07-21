@@ -20,6 +20,7 @@ const commands = [
 		"test",
 		"--",
 		"test/goal-store.test.ts",
+		"test/goal-contract-v2.test.ts",
 		"test/goal-lifecycle.test.ts",
 		"test/artifact-store.test.ts",
 		"test/goal-read-model.test.ts",

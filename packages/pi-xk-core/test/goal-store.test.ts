@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
 	ArtifactStore,
 	type GoalCheckpointV2,
-	type GoalContractV1,
+	type GoalContractV2,
 	GoalCorruptionError,
 	GoalHeadConflictError,
 	GoalIdempotencyConflictError,
@@ -17,9 +17,9 @@ import {
 
 const tempDirs: string[] = [];
 
-function createContract(goalId: string, title = "Implement Goal Store"): GoalContractV1 {
+function createContract(goalId: string, title = "Implement Goal Store"): GoalContractV2 {
 	return {
-		schema: "pi-xk.goal.contract.v1",
+		schema: "pi-xk.goal.contract.v2",
 		goalId,
 		title,
 		objective: "Persist and replay a Goal contract.",
@@ -37,7 +37,12 @@ function createContract(goalId: string, title = "Implement Goal Store"): GoalCon
 		budgets: { tokens: 100_000, costCents: 0, wallSeconds: 0 },
 		ownerSessionId: "session-123",
 		createdAt: "2026-07-19T00:00:00.000Z",
-		schemaVersion: 1,
+		schemaVersion: 2,
+		nonGoals: [],
+		doneCondition: "All required acceptance has verified evidence.",
+		pauseCondition: "No in-scope action can proceed without new input or evidence.",
+		finalReport: "Report verified acceptance evidence.",
+		executionAuthorization: "In-scope edits are authorized.",
 	};
 }
 
@@ -67,7 +72,7 @@ describe("GoalStore", () => {
 		const replayed = await store.replayGoal(contract.goalId);
 		const projection = JSON.parse(
 			await readFile(join(projectRoot, ".pi-xk", "goals", contract.goalId, "contract.json"), "utf8"),
-		) as { sequence: number; hash: string; contract: GoalContractV1 };
+		) as { sequence: number; hash: string; contract: GoalContractV2 };
 
 		expect(created.head).toEqual({ sequence: 1, hash: created.event.hash });
 		expect(replayed.events).toHaveLength(1);
@@ -163,7 +168,7 @@ describe("GoalStore", () => {
 		const replayed = await store.replayGoal(contract.goalId);
 		const projection = JSON.parse(
 			await readFile(join(projectRoot, ".pi-xk", "goals", contract.goalId, "contract.json"), "utf8"),
-		) as { sequence: number; baseHash: string; contract: GoalContractV1 };
+		) as { sequence: number; baseHash: string; contract: GoalContractV2 };
 
 		expect(first.event.eventType).toBe("goal_checkpointed");
 		expect(retry).toEqual(first);

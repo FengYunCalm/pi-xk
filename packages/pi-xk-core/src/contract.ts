@@ -1,4 +1,9 @@
-export const GOAL_CONTRACT_SCHEMA = "pi-xk.goal.contract.v1";
+export const GOAL_CONTRACT_V1_SCHEMA = "pi-xk.goal.contract.v1";
+
+export const GOAL_CONTRACT_V2_SCHEMA = "pi-xk.goal.contract.v2";
+
+/** @deprecated Use GOAL_CONTRACT_V1_SCHEMA or GOAL_CONTRACT_V2_SCHEMA explicitly. */
+export const GOAL_CONTRACT_SCHEMA = GOAL_CONTRACT_V1_SCHEMA;
 
 export const GOAL_EVENT_SCHEMA = "pi-xk.goal-event.v1";
 
@@ -41,7 +46,7 @@ export interface GoalBudgets {
 }
 
 export interface GoalContractV1 {
-	schema: typeof GOAL_CONTRACT_SCHEMA;
+	schema: typeof GOAL_CONTRACT_V1_SCHEMA;
 	goalId: string;
 	title: string;
 	objective: string;
@@ -53,6 +58,28 @@ export interface GoalContractV1 {
 	createdAt: string;
 	schemaVersion: 1;
 }
+
+export interface GoalContractV2 {
+	schema: typeof GOAL_CONTRACT_V2_SCHEMA;
+	goalId: string;
+	title: string;
+	objective: string;
+	constraints: string[];
+	acceptance: GoalAcceptance[];
+	capabilities: GoalCapabilities;
+	budgets: GoalBudgets;
+	ownerSessionId: string;
+	createdAt: string;
+	schemaVersion: 2;
+	nonGoals: string[];
+	doneCondition: string;
+	pauseCondition: string;
+	finalReport: string;
+	executionAuthorization: string;
+}
+
+/** Raw on-disk contract payloads preserve their original version for hash replay. */
+export type GoalContract = GoalContractV1 | GoalContractV2;
 
 export type GoalActor = "user" | "runtime" | "model" | "child-task" | "system";
 
@@ -86,11 +113,11 @@ export interface GoalArtifactReference {
 }
 
 export interface GoalCreatedEventPayload {
-	contract: GoalContractV1;
+	contract: GoalContract;
 }
 
 export interface GoalContractUpdatedEventPayload {
-	contract: GoalContractV1;
+	contract: GoalContract;
 }
 
 export type GoalCheckpointReason = "turn_end" | "session_before_compact";
@@ -138,23 +165,57 @@ export type GoalLifecycleEventType =
 	| "goal_run_settled"
 	| "goal_run_interrupted";
 
+export interface GoalPauseAudit {
+	unmetRequiredAcceptanceIds: string[];
+	currentEvidence: string;
+	incompleteConclusion: string;
+}
+
+export interface GoalPauseRecord {
+	actor: GoalActor;
+	reason: string;
+	userRequest: string | null;
+	nextBestAction: string;
+	audit: GoalPauseAudit;
+}
+
+export interface GoalResumeRecord {
+	actor: GoalActor;
+	reason: string;
+	resumeEvidence: string;
+}
+
+export interface GoalEndRecord {
+	actor: GoalActor;
+	outcome: string;
+	reason: string;
+	verifiedAcceptanceIds: string[];
+	finalEvidence: string;
+	finalSummary: string;
+}
+
 export interface GoalActivatedEventPayload {
 	sessionId: string;
 }
 
 export interface GoalPausedEventPayload {
 	reason?: string;
+	userRequest?: string | null;
 	nextBestAction?: string;
+	audit?: GoalPauseAudit;
 }
 
 export interface GoalResumedEventPayload {
 	reason?: string;
+	resumeEvidence?: string;
 }
 
 export interface GoalEndedEventPayload {
 	outcome: string;
 	reason?: string;
 	finalEvidence?: string;
+	verifiedAcceptanceIds?: string[];
+	finalSummary?: string;
 }
 
 export interface GoalRunStartedEventPayload {
@@ -288,6 +349,12 @@ export interface GoalLifecycleProjection {
 	runs: GoalRunProjection[];
 	/** The log still has a run start without a corresponding terminal event. */
 	openRunId?: string;
+	/** The most recent pause request, including compatibility defaults for legacy events. */
+	lastPause?: GoalPauseRecord;
+	/** The most recent resume request, including compatibility defaults for legacy events. */
+	lastResume?: GoalResumeRecord;
+	/** The terminal result, including compatibility defaults for legacy events. */
+	end?: GoalEndRecord;
 }
 
 export interface GoalContractProjection {
@@ -295,7 +362,7 @@ export interface GoalContractProjection {
 	goalId: string;
 	sequence: number;
 	baseHash: string;
-	contract: GoalContractV1;
+	contract: GoalContractV2;
 }
 
 export type GoalArtifactDiagnosticStatus = "valid" | "missing" | "corrupt";
@@ -396,7 +463,7 @@ export function assertGoalId(goalId: string): void {
 	}
 }
 
-export function validateGoalContract(value: unknown): GoalContractV1 {
+export function validateGoalContractV1(value: unknown): GoalContractV1 {
 	if (!isRecord(value)) {
 		throw new GoalValidationError("Goal contract must be an object");
 	}
@@ -417,7 +484,7 @@ export function validateGoalContract(value: unknown): GoalContractV1 {
 		],
 		"Goal contract",
 	);
-	if (value.schema !== GOAL_CONTRACT_SCHEMA || value.schemaVersion !== 1) {
+	if (value.schema !== GOAL_CONTRACT_V1_SCHEMA || value.schemaVersion !== 1) {
 		throw new GoalValidationError("Goal contract schema is unsupported");
 	}
 	const goalId = requireNonEmptyString(value.goalId, "goalId");
@@ -449,7 +516,7 @@ export function validateGoalContract(value: unknown): GoalContractV1 {
 		throw new GoalValidationError("createdAt must be an ISO timestamp");
 	}
 	return {
-		schema: GOAL_CONTRACT_SCHEMA,
+		schema: GOAL_CONTRACT_V1_SCHEMA,
 		goalId,
 		title: requireNonEmptyString(value.title, "title"),
 		objective: requireNonEmptyString(value.objective, "objective"),
@@ -468,6 +535,132 @@ export function validateGoalContract(value: unknown): GoalContractV1 {
 		ownerSessionId: requireNonEmptyString(value.ownerSessionId, "ownerSessionId"),
 		createdAt,
 		schemaVersion: 1,
+	};
+}
+
+export function validateGoalContractV2(value: unknown): GoalContractV2 {
+	if (!isRecord(value)) {
+		throw new GoalValidationError("Goal contract must be an object");
+	}
+	requireExactKeys(
+		value,
+		[
+			"schema",
+			"goalId",
+			"title",
+			"objective",
+			"constraints",
+			"acceptance",
+			"capabilities",
+			"budgets",
+			"ownerSessionId",
+			"createdAt",
+			"schemaVersion",
+			"nonGoals",
+			"doneCondition",
+			"pauseCondition",
+			"finalReport",
+			"executionAuthorization",
+		],
+		"Goal contract",
+	);
+	if (value.schema !== GOAL_CONTRACT_V2_SCHEMA || value.schemaVersion !== 2) {
+		throw new GoalValidationError("Goal contract schema is unsupported");
+	}
+	const goalId = requireNonEmptyString(value.goalId, "goalId");
+	assertGoalId(goalId);
+	if (!Array.isArray(value.constraints) || value.constraints.some((constraint) => typeof constraint !== "string")) {
+		throw new GoalValidationError("constraints must be a string array");
+	}
+	if (!Array.isArray(value.nonGoals) || value.nonGoals.some((nonGoal) => typeof nonGoal !== "string")) {
+		throw new GoalValidationError("nonGoals must be a string array");
+	}
+	if (!Array.isArray(value.acceptance)) {
+		throw new GoalValidationError("acceptance must be an array");
+	}
+	const acceptance = value.acceptance.map(validateGoalAcceptance);
+	const acceptanceIds = new Set<string>();
+	for (const item of acceptance) {
+		if (acceptanceIds.has(item.id)) {
+			throw new GoalValidationError("acceptance IDs must be unique");
+		}
+		acceptanceIds.add(item.id);
+	}
+	if (!acceptance.some((item) => item.required)) {
+		throw new GoalValidationError("Goal contract v2 requires at least one required acceptance");
+	}
+	if (!isRecord(value.capabilities)) {
+		throw new GoalValidationError("capabilities must be an object");
+	}
+	requireExactKeys(value.capabilities, ["filesystem", "network", "spawn"], "capabilities");
+	if (!isRecord(value.budgets)) {
+		throw new GoalValidationError("budgets must be an object");
+	}
+	requireExactKeys(value.budgets, ["tokens", "costCents", "wallSeconds"], "budgets");
+	const createdAt = requireNonEmptyString(value.createdAt, "createdAt");
+	if (Number.isNaN(Date.parse(createdAt))) {
+		throw new GoalValidationError("createdAt must be an ISO timestamp");
+	}
+	return {
+		schema: GOAL_CONTRACT_V2_SCHEMA,
+		goalId,
+		title: requireNonEmptyString(value.title, "title"),
+		objective: requireNonEmptyString(value.objective, "objective"),
+		constraints: [...value.constraints],
+		acceptance,
+		capabilities: {
+			filesystem: requireNonEmptyString(value.capabilities.filesystem, "capabilities.filesystem"),
+			network: requireNonEmptyString(value.capabilities.network, "capabilities.network"),
+			spawn: requireNonEmptyString(value.capabilities.spawn, "capabilities.spawn"),
+		},
+		budgets: {
+			tokens: requireNonNegativeInteger(value.budgets.tokens, "budgets.tokens"),
+			costCents: requireNonNegativeInteger(value.budgets.costCents, "budgets.costCents"),
+			wallSeconds: requireNonNegativeInteger(value.budgets.wallSeconds, "budgets.wallSeconds"),
+		},
+		ownerSessionId: requireNonEmptyString(value.ownerSessionId, "ownerSessionId"),
+		createdAt,
+		schemaVersion: 2,
+		nonGoals: [...value.nonGoals],
+		doneCondition: requireNonEmptyString(value.doneCondition, "doneCondition"),
+		pauseCondition: requireNonEmptyString(value.pauseCondition, "pauseCondition"),
+		finalReport: requireNonEmptyString(value.finalReport, "finalReport"),
+		executionAuthorization: requireNonEmptyString(value.executionAuthorization, "executionAuthorization"),
+	};
+}
+
+export function validateGoalContract(value: unknown): GoalContract {
+	if (!isRecord(value)) {
+		throw new GoalValidationError("Goal contract must be an object");
+	}
+	if (value.schema === GOAL_CONTRACT_V1_SCHEMA) return validateGoalContractV1(value);
+	if (value.schema === GOAL_CONTRACT_V2_SCHEMA) return validateGoalContractV2(value);
+	throw new GoalValidationError("Goal contract schema is unsupported");
+}
+
+/** Converts a validated raw contract into the current in-memory representation without changing its source payload. */
+export function upcastGoalContract(contract: GoalContract): GoalContractV2 {
+	if (contract.schema === GOAL_CONTRACT_V2_SCHEMA) {
+		return validateGoalContractV2(contract);
+	}
+	const legacy = validateGoalContractV1(contract);
+	return {
+		schema: GOAL_CONTRACT_V2_SCHEMA,
+		goalId: legacy.goalId,
+		title: legacy.title,
+		objective: legacy.objective,
+		constraints: [...legacy.constraints],
+		acceptance: legacy.acceptance.map((item) => ({ ...item })),
+		capabilities: { ...legacy.capabilities },
+		budgets: { ...legacy.budgets },
+		ownerSessionId: legacy.ownerSessionId,
+		createdAt: legacy.createdAt,
+		schemaVersion: 2,
+		nonGoals: [],
+		doneCondition: "All required acceptance criteria have verified evidence.",
+		pauseCondition: "No in-scope action can continue without new input, external change, or evidence.",
+		finalReport: "Report verified acceptance evidence, unresolved limits, and the next action.",
+		executionAuthorization: "No execution authorization was recorded in this legacy Goal contract.",
 	};
 }
 
@@ -648,6 +841,38 @@ function requireOptionalNonEmptyString(value: unknown, field: string): string | 
 	return requireNonEmptyString(value, field);
 }
 
+function requireOptionalNullableNonEmptyString(value: unknown, field: string): string | null | undefined {
+	if (value === undefined) return undefined;
+	if (value === null) return null;
+	return requireNonEmptyString(value, field);
+}
+
+function requireStringArray(value: unknown, field: string): string[] {
+	if (!Array.isArray(value)) {
+		throw new GoalValidationError(`${field} must be a string array`);
+	}
+	return value.map((item, index) => requireNonEmptyString(item, `${field}[${index}]`));
+}
+
+function validateGoalPauseAudit(value: unknown): GoalPauseAudit {
+	if (!isRecord(value)) {
+		throw new GoalValidationError("goal_paused.audit must be an object");
+	}
+	requireExactKeys(
+		value,
+		["unmetRequiredAcceptanceIds", "currentEvidence", "incompleteConclusion"],
+		"goal_paused.audit",
+	);
+	return {
+		unmetRequiredAcceptanceIds: requireStringArray(
+			value.unmetRequiredAcceptanceIds,
+			"goal_paused.audit.unmetRequiredAcceptanceIds",
+		),
+		currentEvidence: requireNonEmptyString(value.currentEvidence, "goal_paused.audit.currentEvidence"),
+		incompleteConclusion: requireNonEmptyString(value.incompleteConclusion, "goal_paused.audit.incompleteConclusion"),
+	};
+}
+
 function validateLifecyclePayloadRecord(
 	value: unknown,
 	keys: readonly string[],
@@ -675,7 +900,7 @@ export function validateGoalLifecycleEventInput(value: unknown): GoalLifecycleEv
 	if (value.eventType === "goal_paused") {
 		const payload = validateLifecyclePayloadRecord(
 			value.payload,
-			["reason", "nextBestAction"],
+			["reason", "userRequest", "nextBestAction", "audit"],
 			"goal_paused payload",
 		);
 		return {
@@ -684,6 +909,11 @@ export function validateGoalLifecycleEventInput(value: unknown): GoalLifecycleEv
 				...(payload.reason === undefined
 					? {}
 					: { reason: requireOptionalNonEmptyString(payload.reason, "goal_paused.reason") }),
+				...(payload.userRequest === undefined
+					? {}
+					: {
+							userRequest: requireOptionalNullableNonEmptyString(payload.userRequest, "goal_paused.userRequest"),
+						}),
 				...(payload.nextBestAction === undefined
 					? {}
 					: {
@@ -692,24 +922,37 @@ export function validateGoalLifecycleEventInput(value: unknown): GoalLifecycleEv
 								"goal_paused.nextBestAction",
 							),
 						}),
+				...(payload.audit === undefined ? {} : { audit: validateGoalPauseAudit(payload.audit) }),
 			},
 		};
 	}
 	if (value.eventType === "goal_resumed") {
-		const payload = validateLifecyclePayloadRecord(value.payload, ["reason"], "goal_resumed payload");
+		const payload = validateLifecyclePayloadRecord(
+			value.payload,
+			["reason", "resumeEvidence"],
+			"goal_resumed payload",
+		);
 		return {
 			eventType: "goal_resumed",
 			payload: {
 				...(payload.reason === undefined
 					? {}
 					: { reason: requireOptionalNonEmptyString(payload.reason, "goal_resumed.reason") }),
+				...(payload.resumeEvidence === undefined
+					? {}
+					: {
+							resumeEvidence: requireOptionalNonEmptyString(
+								payload.resumeEvidence,
+								"goal_resumed.resumeEvidence",
+							),
+						}),
 			},
 		};
 	}
 	if (value.eventType === "goal_ended") {
 		const payload = validateLifecyclePayloadRecord(
 			value.payload,
-			["outcome", "reason", "finalEvidence"],
+			["outcome", "reason", "finalEvidence", "verifiedAcceptanceIds", "finalSummary"],
 			"goal_ended payload",
 		);
 		return {
@@ -722,6 +965,17 @@ export function validateGoalLifecycleEventInput(value: unknown): GoalLifecycleEv
 				...(payload.finalEvidence === undefined
 					? {}
 					: { finalEvidence: requireOptionalNonEmptyString(payload.finalEvidence, "goal_ended.finalEvidence") }),
+				...(payload.verifiedAcceptanceIds === undefined
+					? {}
+					: {
+							verifiedAcceptanceIds: requireStringArray(
+								payload.verifiedAcceptanceIds,
+								"goal_ended.verifiedAcceptanceIds",
+							),
+						}),
+				...(payload.finalSummary === undefined
+					? {}
+					: { finalSummary: requireOptionalNonEmptyString(payload.finalSummary, "goal_ended.finalSummary") }),
 			},
 		};
 	}
@@ -763,4 +1017,91 @@ export function validateGoalLifecycleEventInput(value: unknown): GoalLifecycleEv
 		};
 	}
 	throw new GoalValidationError("Goal lifecycle event type is unsupported");
+}
+
+function assertV2AcceptanceIds(
+	acceptanceIds: readonly string[],
+	contract: GoalContractV2,
+	field: string,
+	requiredOnly: boolean,
+): void {
+	if (new Set(acceptanceIds).size !== acceptanceIds.length) {
+		throw new GoalValidationError(`${field} must not contain duplicate acceptance IDs`);
+	}
+	const eligible = new Set(
+		contract.acceptance
+			.filter((acceptance) => !requiredOnly || acceptance.required)
+			.map((acceptance) => acceptance.id),
+	);
+	for (const acceptanceId of acceptanceIds) {
+		if (!eligible.has(acceptanceId)) {
+			throw new GoalValidationError(`${field} contains an unknown or ineligible acceptance ID: ${acceptanceId}`);
+		}
+	}
+}
+
+/**
+ * Validates new lifecycle writes against a v2 contract. Legacy raw lifecycle payloads remain readable
+ * through validateGoalLifecycleEventInput so their original event hashes can still replay.
+ */
+export function validateGoalLifecycleEventForContract(
+	value: unknown,
+	contract: GoalContract,
+	actor?: GoalActor,
+): GoalLifecycleEventInput {
+	const input = validateGoalLifecycleEventInput(value);
+	if (contract.schema !== GOAL_CONTRACT_V2_SCHEMA) return input;
+	if (input.eventType === "goal_paused") {
+		const { reason, userRequest, nextBestAction, audit } = input.payload;
+		if (reason === undefined || userRequest === undefined || nextBestAction === undefined || audit === undefined) {
+			throw new GoalValidationError(
+				"Goal contract v2 pauses require reason, userRequest, nextBestAction, and audit",
+			);
+		}
+		if (audit.unmetRequiredAcceptanceIds.length === 0) {
+			throw new GoalValidationError("Goal contract v2 pause audit requires an unmet required acceptance ID");
+		}
+		assertV2AcceptanceIds(
+			audit.unmetRequiredAcceptanceIds,
+			contract,
+			"goal_paused.audit.unmetRequiredAcceptanceIds",
+			true,
+		);
+		return input;
+	}
+	if (input.eventType === "goal_resumed") {
+		if (input.payload.reason === undefined || input.payload.resumeEvidence === undefined) {
+			throw new GoalValidationError("Goal contract v2 resumes require reason and resumeEvidence");
+		}
+		return input;
+	}
+	if (input.eventType === "goal_ended") {
+		const { reason, verifiedAcceptanceIds, finalEvidence, finalSummary } = input.payload;
+		if (actor === "user" && input.payload.outcome === "ended_by_user") {
+			if (reason === undefined) {
+				throw new GoalValidationError("User Goal termination requires a reason");
+			}
+			return input;
+		}
+		if (
+			reason === undefined ||
+			verifiedAcceptanceIds === undefined ||
+			finalEvidence === undefined ||
+			finalSummary === undefined
+		) {
+			throw new GoalValidationError(
+				"Goal contract v2 endings require reason, verifiedAcceptanceIds, finalEvidence, and finalSummary",
+			);
+		}
+		assertV2AcceptanceIds(verifiedAcceptanceIds, contract, "goal_ended.verifiedAcceptanceIds", false);
+		for (const requiredAcceptance of contract.acceptance.filter((acceptance) => acceptance.required)) {
+			if (!verifiedAcceptanceIds.includes(requiredAcceptance.id)) {
+				throw new GoalValidationError(
+					`Goal contract v2 ending is missing required acceptance ID: ${requiredAcceptance.id}`,
+				);
+			}
+		}
+		return input;
+	}
+	return input;
 }
