@@ -13,10 +13,11 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import {
 	type GoalCheckpointV2,
-	type GoalContractV1,
+	type GoalContractV2,
 	GoalHeadConflictError,
 	type GoalLifecycleEventInput,
 	GoalStore,
+	validateGoalLifecycleEventForContract,
 } from "pi-xk-core";
 import { Type } from "typebox";
 import {
@@ -25,17 +26,24 @@ import {
 	createPiXkCompactionCheckpointIntent,
 	createPiXkGoalBinding,
 	createPiXkGoalCapture,
+	createPiXkGoalDraft,
 	createPiXkGoalLifecycleIntent,
 	createPiXkTurnCheckpointIntent,
 	isPiXkCheckpointIntent,
 	isPiXkCheckpointRef,
 	isPiXkGoalCapture,
+	isPiXkGoalDraft,
 	isPiXkGoalLifecycleIntent,
 	isPiXkSessionLink,
+	normalizePiXkGoalLifecycleIntent,
 	type PiXkCheckpointIntent,
 	type PiXkGoalCapture,
+	type PiXkGoalDraft,
+	type PiXkGoalDraftProposal,
 	type PiXkGoalLifecycleIntent,
+	type PiXkGoalPauseAudit,
 	type PiXkSessionLink,
+	type PiXkStoredGoalLifecycleIntent,
 } from "./session-link.ts";
 
 export {
@@ -44,16 +52,20 @@ export {
 	createPiXkCompactionCheckpointIntent,
 	createPiXkGoalBinding,
 	createPiXkGoalCapture,
+	createPiXkGoalDraft,
 	createPiXkGoalLifecycleIntent,
 	createPiXkTurnCheckpointIntent,
 	isPiXkCheckpointIntent,
 	isPiXkCheckpointRef,
 	isPiXkGoalCapture,
+	isPiXkGoalDraft,
 	isPiXkGoalLifecycleIntent,
 	isPiXkSessionLink,
+	normalizePiXkGoalLifecycleIntent,
 	PI_XK_CHECKPOINT_INTENT_KIND,
 	PI_XK_CHECKPOINT_REF_KIND,
 	PI_XK_GOAL_CAPTURE_KIND,
+	PI_XK_GOAL_DRAFT_KIND,
 	PI_XK_GOAL_LIFECYCLE_INTENT_KIND,
 	PI_XK_SESSION_LINK_KIND,
 	PI_XK_SESSION_LINK_SCHEMA,
@@ -62,10 +74,17 @@ export {
 	type PiXkCompactionCheckpointIntent,
 	type PiXkGoalCapture,
 	type PiXkGoalCaptureState,
+	type PiXkGoalDraft,
+	type PiXkGoalDraftAcceptance,
+	type PiXkGoalDraftAcceptanceKind,
+	type PiXkGoalDraftProposal,
+	type PiXkGoalDraftState,
 	type PiXkGoalLifecycleIntent,
 	type PiXkGoalLifecycleIntentAction,
 	type PiXkGoalLifecycleIntentState,
+	type PiXkGoalPauseAudit,
 	type PiXkSessionLink,
+	type PiXkStoredGoalLifecycleIntent,
 	type PiXkTurnCheckpointIntent,
 } from "./session-link.ts";
 
@@ -472,6 +491,14 @@ export function createPiXkExtension(options: PiXkExtensionOptions = {}): Extensi
 
 const PI_XK_GOAL_KICKOFF_CUSTOM_TYPE = "pi-xk.goal-kickoff.v1";
 
+const PI_XK_GOAL_DRAFT_KICKOFF_CUSTOM_TYPE = "pi-xk.goal-draft-kickoff.v1";
+
+const PI_XK_GOAL_DRAFT_REVIEW_CUSTOM_TYPE = "pi-xk.goal-draft-review.v1";
+
+const GOAL_DRAFT_CONFIRM_OPTION = "确认，启动 Goal";
+
+const GOAL_DRAFT_REVISE_OPTION = "修改草案";
+
 interface GoalLifecycleWrite {
 	eventId: string;
 	idempotencyKey: string;
@@ -530,6 +557,23 @@ function findCurrentGoalCapture(ctx: ExtensionContext): PiXkGoalCapture | undefi
 	return undefined;
 }
 
+function findCurrentGoalDraft(ctx: ExtensionContext): PiXkGoalDraft | undefined {
+	for (const entry of [...ctx.sessionManager.getBranch()].reverse()) {
+		if (
+			entry.type === "custom" &&
+			entry.customType === PI_XK_SESSION_LINK_CUSTOM_TYPE &&
+			isPiXkGoalDraft(entry.data)
+		) {
+			return entry.data;
+		}
+	}
+	return undefined;
+}
+
+function isOutstandingGoalDraft(draft: PiXkGoalDraft | undefined): boolean {
+	return draft?.state === "requested" || draft?.state === "proposed" || draft?.state === "confirming";
+}
+
 function findPendingGoalLifecycleIntent(
 	ctx: ExtensionContext,
 	binding: PiXkSessionLink,
@@ -539,15 +583,15 @@ function findPendingGoalLifecycleIntent(
 		if (
 			entry.type !== "custom" ||
 			entry.customType !== PI_XK_SESSION_LINK_CUSTOM_TYPE ||
-			!isPiXkGoalLifecycleIntent(entry.data) ||
-			entry.data.goalId !== binding.goalId ||
-			entry.data.generation !== binding.generation
+			!isPiXkGoalLifecycleIntent(entry.data)
 		) {
 			continue;
 		}
-		if (settledIntentIds.has(entry.data.intentId)) continue;
-		settledIntentIds.add(entry.data.intentId);
-		if (entry.data.state === "requested") return entry.data;
+		const intent = normalizePiXkGoalLifecycleIntent(entry.data as PiXkStoredGoalLifecycleIntent);
+		if (intent.goalId !== binding.goalId || intent.generation !== binding.generation) continue;
+		if (settledIntentIds.has(intent.intentId)) continue;
+		settledIntentIds.add(intent.intentId);
+		if (intent.state === "requested") return intent;
 	}
 	return undefined;
 }
@@ -566,18 +610,35 @@ function notifyGoalError(ctx: ExtensionContext, options: PiXkGoalExtensionOption
 	}
 }
 
-function objectiveTitle(objective: string): string {
-	const firstLine = objective.split(/\r?\n/, 1)[0]?.trim() ?? "";
-	return firstLine.length <= 120 ? firstLine : `${firstLine.slice(0, 117)}...`;
+function goalRuntimePrompt(objectivePath: string, statePath: string): string {
+	return [
+		`An active Pi-XK Goal is bound to this session. Read ${objectivePath} and ${statePath} before substantive work.`,
+		"Audit every required acceptance against verification evidence before deciding whether to continue, pause, or end.",
+		"Treat goal-state.md as the authoritative execution state. Do not repeat work already recorded as done or retry a rejected path unless code, inputs, evidence, or assumptions changed. Update done, open, rejected paths, evidence, next action, assumptions, and blockers whenever they materially change.",
+		"A normal assistant response does not end this Goal: Pi-XK continues active Goals into another run.",
+		"Continue whenever an in-scope action can still advance an unmet required acceptance. Ordinary text, partial results, token use, run count, or a written plan are never pause or end reasons.",
+		"Before calling pi_xk_pause_goal, update the state and record unmet required acceptance IDs, current evidence, an incomplete conclusion, blockers, any user request, and the next best action.",
+		"Call pi_xk_end_goal only after all required acceptance criteria have verification evidence; update the state with verified IDs, final evidence, and a final summary first.",
+	].join("\n");
 }
 
-function goalRuntimePrompt(objectivePath: string): string {
+function goalDraftRuntimePrompt(draft: PiXkGoalDraft): string {
 	return [
-		`An active Pi-XK Goal is bound to this session. Read ${objectivePath} and follow its contract.`,
-		"A normal assistant response does not end this Goal: Pi-XK continues active Goals into another run.",
-		"Before calling pi_xk_end_goal, update the Goal state and verify that the objective and declared acceptance evidence are complete.",
-		"If you need user input or an external change, update the Goal state and call pi_xk_pause_goal instead.",
-		"Otherwise record current evidence and continue with the next best action; do not end a Goal merely because you have described a plan or partial result.",
+		"A Pi-XK Goal draft is pending user confirmation. Draft the contract only; do not perform Goal work, create a Goal, write files, or call pi_xk_start_goal, pi_xk_pause_goal, or pi_xk_end_goal.",
+		"Turn the requested objective into one durable, concise contract. Keep stable outcome, verification, constraints, authorization, and stopping rules separate from changing execution state. Do not put changing progress, completed work, failed attempts, current blockers, or the next action into the contract.",
+		"Define at least one required acceptance with an observable verification path. State constraints, non-goals, a done condition requiring verified evidence for every required acceptance, a pause condition that applies only when no meaningful in-scope action can proceed without new input or external change, and final report expectations.",
+		"Execution authorization must preserve any explicit user authorization. Unless the request says otherwise, authorize direct in-scope code, test, script, and formal-document edits, but require separate user approval for destructive operations, scope expansion, commit/push, deployment, or other external-state changes.",
+		"Use pi_xk_submit_goal_draft exactly once after reasoning. It is the only Goal-related tool available for this draft kickoff.",
+		`Requested objective:\n${draft.objective}`,
+		...(draft.revisionFeedback === null ? [] : [`Revision feedback:\n${draft.revisionFeedback}`]),
+	].join("\n\n");
+}
+
+function pausedGoalRecoveryPrompt(objectivePath: string, statePath: string): string {
+	return [
+		`A paused Pi-XK Goal is bound to this session. Read ${objectivePath} and ${statePath}, including the latest pause audit, before deciding whether the new user input changes the blocker.`,
+		"Do not perform Goal work while this Goal remains paused.",
+		"Call pi_xk_start_goal only when this input, an external change, or new evidence actually removes the recorded blocker. If you call start, stop this ordinary turn immediately; Pi-XK will begin a new active Goal kickoff.",
 	].join("\n");
 }
 
@@ -588,6 +649,18 @@ function kickoffGoal(pi: ExtensionAPI, goalId: string): void {
 			content: "Continue the active Pi-XK Goal according to its durable contract.",
 			display: false,
 			details: { goalId },
+		},
+		{ triggerTurn: true },
+	);
+}
+
+function kickoffGoalDraft(pi: ExtensionAPI, draftId: string): void {
+	pi.sendMessage(
+		{
+			customType: PI_XK_GOAL_DRAFT_KICKOFF_CUSTOM_TYPE,
+			content: "Prepare the requested Pi-XK Goal draft.",
+			display: false,
+			details: { draftId },
 		},
 		{ triggerTurn: true },
 	);
@@ -640,22 +713,27 @@ function formatDuration(milliseconds: number): string {
 
 function createGoalContract(
 	goalId: string,
-	objective: string,
+	proposal: PiXkGoalDraftProposal,
 	ownerSessionId: string,
 	createdAt: string,
-): GoalContractV1 {
+): GoalContractV2 {
 	return {
-		schema: "pi-xk.goal.contract.v1",
+		schema: "pi-xk.goal.contract.v2",
 		goalId,
-		title: objectiveTitle(objective),
-		objective,
-		constraints: [],
-		acceptance: [],
+		title: proposal.title,
+		objective: proposal.objective,
+		constraints: [...proposal.constraints],
+		acceptance: proposal.acceptance.map((acceptance) => ({ ...acceptance })),
 		capabilities: { filesystem: "unrestricted", network: "unrestricted", spawn: "unrestricted" },
 		budgets: { tokens: 0, costCents: 0, wallSeconds: 0 },
 		ownerSessionId,
 		createdAt,
-		schemaVersion: 1,
+		schemaVersion: 2,
+		nonGoals: [...proposal.nonGoals],
+		doneCondition: proposal.doneCondition,
+		pauseCondition: proposal.pauseCondition,
+		finalReport: proposal.finalReport,
+		executionAuthorization: proposal.executionAuthorization,
 	};
 }
 
@@ -675,6 +753,7 @@ async function recoverOpenGoalRun(
 	storeFor: (projectRoot: string) => GoalStore,
 	options: PiXkGoalExtensionOptions,
 ): Promise<void> {
+	if (isOutstandingGoalDraft(findCurrentGoalDraft(ctx))) return;
 	const binding = findCurrentGoalBinding(ctx);
 	if (!binding) return;
 	const store = storeFor(ctx.cwd);
@@ -697,6 +776,7 @@ async function startGoalRun(
 	storeFor: (projectRoot: string) => GoalStore,
 	options: PiXkGoalExtensionOptions,
 ): Promise<void> {
+	if (isOutstandingGoalDraft(findCurrentGoalDraft(ctx))) return;
 	const binding = findCurrentGoalBinding(ctx);
 	if (!binding) return;
 	const store = storeFor(ctx.cwd);
@@ -722,6 +802,7 @@ async function settleGoalRun(
 	storeFor: (projectRoot: string) => GoalStore,
 	options: PiXkGoalExtensionOptions,
 ): Promise<void> {
+	if (isOutstandingGoalDraft(findCurrentGoalDraft(ctx))) return;
 	const binding = findCurrentGoalBinding(ctx);
 	if (!binding) return;
 	const store = storeFor(ctx.cwd);
@@ -755,11 +836,67 @@ async function continueActiveGoal(
 	storeFor: (projectRoot: string) => GoalStore,
 ): Promise<void> {
 	if (!ctx.isIdle()) return;
+	if (isOutstandingGoalDraft(findCurrentGoalDraft(ctx))) return;
 	const binding = findCurrentGoalBinding(ctx);
 	if (!binding) return;
 	const replay = await storeFor(ctx.cwd).replayGoal(binding.goalId);
 	if (replay.lifecycle.status !== "active" || replay.lifecycle.openRunId) return;
 	kickoffGoal(pi, binding.goalId);
+}
+
+interface GoalLifecycleActionValues {
+	resumeEvidence?: string;
+	userRequest?: string | null;
+	nextBestAction?: string;
+	audit?: PiXkGoalPauseAudit;
+	outcome?: string;
+	verifiedAcceptanceIds?: string[];
+	finalEvidence?: string;
+	finalSummary?: string;
+}
+
+function requiredAcceptanceIds(contract: GoalContractV2): string[] {
+	return contract.acceptance.filter((acceptance) => acceptance.required).map((acceptance) => acceptance.id);
+}
+
+function defaultUserPauseAudit(contract: GoalContractV2): PiXkGoalPauseAudit {
+	return {
+		unmetRequiredAcceptanceIds: requiredAcceptanceIds(contract),
+		currentEvidence: "The user paused the Goal before all required acceptance evidence was recorded.",
+		incompleteConclusion: "The Goal remains incomplete until the required acceptance evidence is verified.",
+	};
+}
+
+function lifecycleInputForIntent(intent: PiXkGoalLifecycleIntent): GoalLifecycleEventInput {
+	if (intent.action === "start") {
+		return {
+			eventType: "goal_resumed",
+			payload: { reason: intent.reason, resumeEvidence: intent.resumeEvidence },
+		};
+	}
+	if (intent.action === "pause") {
+		return {
+			eventType: "goal_paused",
+			payload: {
+				reason: intent.reason,
+				userRequest: intent.userRequest,
+				nextBestAction: intent.nextBestAction,
+				audit: intent.audit,
+			},
+		};
+	}
+	return {
+		eventType: "goal_ended",
+		payload: {
+			outcome: intent.outcome,
+			...(intent.reason.length > 0 ? { reason: intent.reason } : {}),
+			...(intent.verifiedAcceptanceIds.length > 0
+				? { verifiedAcceptanceIds: [...intent.verifiedAcceptanceIds] }
+				: {}),
+			...(intent.finalEvidence.length > 0 ? { finalEvidence: intent.finalEvidence } : {}),
+			...(intent.finalSummary.length > 0 ? { finalSummary: intent.finalSummary } : {}),
+		},
+	};
 }
 
 async function settleGoalLifecycleIntent(
@@ -775,6 +912,23 @@ async function settleGoalLifecycleIntent(
 	const store = storeFor(ctx.cwd);
 	let replay = await store.replayGoal(binding.goalId);
 	const timestamp = goalNow(options);
+	if (intent.action === "start") {
+		if (replay.lifecycle.status !== "paused") {
+			throw new Error("only a paused Goal can be started");
+		}
+		await appendGoalLifecycle(
+			store,
+			binding.goalId,
+			lifecycleInputForIntent(intent),
+			lifecycleWrite(binding.goalId, "resumed", intent.actor, timestamp, intent.intentId),
+		);
+		pi.appendEntry(
+			PI_XK_SESSION_LINK_CUSTOM_TYPE,
+			createPiXkGoalLifecycleIntent({ ...intent, state: "committed", createdAt: timestamp }),
+		);
+		kickoffGoal(pi, binding.goalId);
+		return true;
+	}
 	if (intent.runId.length > 0 && replay.lifecycle.openRunId) {
 		if (intent.runId !== replay.lifecycle.openRunId) {
 			throw new Error(`lifecycle intent ${intent.intentId} does not match the active Goal run`);
@@ -787,34 +941,24 @@ async function settleGoalLifecycleIntent(
 		);
 		replay = await store.replayGoal(binding.goalId);
 	}
-	if (intent.action === "pause" && replay.lifecycle.status === "active") {
+	if (intent.action === "pause") {
+		if (replay.lifecycle.status !== "active") {
+			throw new Error("only an active Goal can be paused");
+		}
 		await appendGoalLifecycle(
 			store,
 			binding.goalId,
-			{
-				eventType: "goal_paused",
-				payload: {
-					reason: intent.reason,
-					...(intent.nextBestAction.length > 0 ? { nextBestAction: intent.nextBestAction } : {}),
-				},
-			},
+			lifecycleInputForIntent(intent),
 			lifecycleWrite(binding.goalId, "paused", intent.actor, timestamp, intent.intentId),
 		);
-	} else if (
-		intent.action === "end" &&
-		(replay.lifecycle.status === "active" || replay.lifecycle.status === "paused")
-	) {
+	} else if (intent.action === "end") {
+		if (replay.lifecycle.status !== "active" && replay.lifecycle.status !== "paused") {
+			throw new Error("only an active or paused Goal can be ended");
+		}
 		await appendGoalLifecycle(
 			store,
 			binding.goalId,
-			{
-				eventType: "goal_ended",
-				payload: {
-					outcome: intent.outcome,
-					...(intent.reason.length > 0 ? { reason: intent.reason } : {}),
-					...(intent.finalEvidence.length > 0 ? { finalEvidence: intent.finalEvidence } : {}),
-				},
-			},
+			lifecycleInputForIntent(intent),
 			lifecycleWrite(binding.goalId, "ended", intent.actor, timestamp, intent.intentId),
 		);
 	}
@@ -833,7 +977,7 @@ async function requestGoalLifecycleAction(
 	action: PiXkGoalLifecycleIntent["action"],
 	actor: PiXkGoalLifecycleIntent["actor"],
 	reason: string,
-	values: { nextBestAction?: string; outcome?: string; finalEvidence?: string } = {},
+	values: GoalLifecycleActionValues = {},
 ): Promise<void> {
 	const binding = findCurrentGoalBinding(ctx);
 	if (!binding) throw new Error("no Goal is bound to the current session branch");
@@ -842,68 +986,322 @@ async function requestGoalLifecycleAction(
 	if (action === "pause" && replay.lifecycle.status !== "active") {
 		throw new Error("only an active Goal can be paused");
 	}
+	if (action === "start" && replay.lifecycle.status !== "paused") {
+		throw new Error("only a paused Goal can be started");
+	}
 	if (action === "end" && replay.lifecycle.status !== "active" && replay.lifecycle.status !== "paused") {
 		throw new Error("only an active or paused Goal can be ended");
 	}
 	const timestamp = goalNow(options);
 	const intentId = `intent_${randomUUID().replaceAll("-", "")}`;
-	pi.appendEntry(
-		PI_XK_SESSION_LINK_CUSTOM_TYPE,
-		createPiXkGoalLifecycleIntent({
-			intentId,
-			goalId: binding.goalId,
-			generation: binding.generation,
-			actor,
-			action,
-			state: "requested",
-			runId: ctx.isIdle() ? "" : (replay.lifecycle.openRunId ?? ""),
-			reason,
-			nextBestAction: values.nextBestAction ?? "",
-			outcome: values.outcome ?? "ended",
-			finalEvidence: values.finalEvidence ?? "",
+	const intent = createPiXkGoalLifecycleIntent({
+		intentId,
+		goalId: binding.goalId,
+		generation: binding.generation,
+		actor,
+		action,
+		state: "requested",
+		runId: action === "start" ? "" : (replay.lifecycle.openRunId ?? ""),
+		reason,
+		resumeEvidence: values.resumeEvidence ?? "",
+		userRequest: values.userRequest ?? (actor === "user" && action === "pause" ? reason : null),
+		nextBestAction:
+			values.nextBestAction ??
+			(actor === "user" && action === "pause" ? "Wait for a user command or new evidence." : ""),
+		audit:
+			values.audit ??
+			(actor === "user" && action === "pause"
+				? defaultUserPauseAudit(replay.contract)
+				: { unmetRequiredAcceptanceIds: [], currentEvidence: "", incompleteConclusion: "" }),
+		outcome: values.outcome ?? (actor === "user" && action === "end" ? "ended_by_user" : "ended"),
+		verifiedAcceptanceIds: values.verifiedAcceptanceIds ?? [],
+		finalEvidence: values.finalEvidence ?? "",
+		finalSummary:
+			values.finalSummary ?? (actor === "user" && action === "end" ? "Goal ended by explicit user request." : ""),
+		createdAt: timestamp,
+	});
+	validateGoalLifecycleEventForContract(lifecycleInputForIntent(intent), replay.sourceContract, actor);
+	pi.appendEntry(PI_XK_SESSION_LINK_CUSTOM_TYPE, intent);
+	if (actor === "user") {
+		if (ctx.isIdle()) {
+			await settleGoalLifecycleIntent(pi, ctx, storeFor, options);
+		} else {
+			ctx.abort();
+		}
+	}
+}
+
+function renderGoalDraftMarkdown(draft: PiXkGoalDraft): string {
+	if (draft.proposal === null) {
+		return ["# Goal Draft", "", "## Requested objective", draft.objective || "Awaiting the next user input."].join(
+			"\n",
+		);
+	}
+	const proposal = draft.proposal;
+	return [
+		"# Goal Draft",
+		"",
+		`## ${proposal.title}`,
+		"",
+		"## Objective",
+		proposal.objective,
+		"",
+		"## Constraints",
+		...(proposal.constraints.length > 0
+			? proposal.constraints.map((constraint) => `- ${constraint}`)
+			: ["- None declared."]),
+		"",
+		"## Non-goals",
+		...(proposal.nonGoals.length > 0 ? proposal.nonGoals.map((nonGoal) => `- ${nonGoal}`) : ["- None declared."]),
+		"",
+		"## Acceptance",
+		...proposal.acceptance.map((acceptance) => {
+			const command = acceptance.command === undefined ? "" : ` Verify: ${acceptance.command}`;
+			const description = acceptance.description.endsWith(".")
+				? acceptance.description
+				: `${acceptance.description}.`;
+			return `- ${acceptance.id} (${acceptance.required ? "required" : "optional"}): ${description}${command}`;
+		}),
+		"",
+		"## Done condition",
+		proposal.doneCondition,
+		"",
+		"## Pause condition",
+		proposal.pauseCondition,
+		"",
+		"## Final report",
+		proposal.finalReport,
+		"",
+		"## Execution authorization",
+		proposal.executionAuthorization,
+	].join("\n");
+}
+
+function appendGoalDraft(pi: ExtensionAPI, draft: PiXkGoalDraft): void {
+	pi.appendEntry(PI_XK_SESSION_LINK_CUSTOM_TYPE, draft);
+}
+
+function requestGoalDraft(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext | ExtensionContext,
+	options: PiXkGoalExtensionOptions,
+	objectiveInput: string,
+	captureId?: string,
+): void {
+	if (!ctx.isIdle()) throw new Error("the agent is still busy");
+	const objective = objectiveInput.trim();
+	if (objective.length === 0) throw new Error("a Goal objective is required");
+	if (isOutstandingGoalDraft(findCurrentGoalDraft(ctx))) {
+		throw new Error("a Goal draft is already awaiting review");
+	}
+	const timestamp = goalNow(options);
+	const draft = createPiXkGoalDraft({
+		draftId: `draft_${randomUUID().replaceAll("-", "")}`,
+		state: "requested",
+		objective,
+		revisionFeedback: null,
+		proposal: null,
+		goalId: null,
+		createdAt: timestamp,
+	});
+	appendGoalDraft(pi, draft);
+	if (captureId) {
+		pi.appendEntry(PI_XK_SESSION_LINK_CUSTOM_TYPE, createPiXkGoalCapture(captureId, "consumed", timestamp));
+	}
+	kickoffGoalDraft(pi, draft.draftId);
+}
+
+function submitGoalDraft(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	options: PiXkGoalExtensionOptions,
+	proposal: PiXkGoalDraftProposal,
+): void {
+	const draft = findCurrentGoalDraft(ctx);
+	if (!draft || draft.state !== "requested" || draft.objective.length === 0) {
+		throw new Error("no requested Goal draft is awaiting model submission");
+	}
+	appendGoalDraft(
+		pi,
+		createPiXkGoalDraft({
+			draftId: draft.draftId,
+			state: "proposed",
+			objective: proposal.objective,
+			revisionFeedback: null,
+			proposal,
+			goalId: null,
+			createdAt: goalNow(options),
+		}),
+	);
+}
+
+function reviseGoalDraft(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext | ExtensionContext,
+	options: PiXkGoalExtensionOptions,
+	feedbackInput: string,
+): void {
+	if (!ctx.isIdle()) throw new Error("the agent is still busy");
+	const feedback = feedbackInput.trim();
+	if (feedback.length === 0) throw new Error("Goal draft revision feedback is required");
+	const draft = findCurrentGoalDraft(ctx);
+	if (!draft || draft.state !== "proposed" || draft.proposal === null) {
+		throw new Error("a proposed Goal draft is required before revision");
+	}
+	const timestamp = goalNow(options);
+	appendGoalDraft(
+		pi,
+		createPiXkGoalDraft({
+			draftId: draft.draftId,
+			state: "superseded",
+			objective: draft.objective,
+			revisionFeedback: feedback,
+			proposal: draft.proposal,
+			goalId: null,
 			createdAt: timestamp,
 		}),
 	);
-	if (ctx.isIdle()) {
-		await settleGoalLifecycleIntent(pi, ctx, storeFor, options);
-		return;
-	}
-	ctx.abort();
+	const revised = createPiXkGoalDraft({
+		draftId: draft.draftId,
+		state: "requested",
+		objective: draft.proposal.objective,
+		revisionFeedback: feedback,
+		proposal: null,
+		goalId: null,
+		createdAt: timestamp,
+	});
+	appendGoalDraft(pi, revised);
+	kickoffGoalDraft(pi, revised.draftId);
 }
 
-async function createGoalFromObjective(
+function cancelGoalDraft(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext | ExtensionContext,
+	options: PiXkGoalExtensionOptions,
+): void {
+	const draft = findCurrentGoalDraft(ctx);
+	if (!draft || draft.state === "confirmed" || draft.state === "cancelled") {
+		throw new Error("no cancellable Goal draft is pending");
+	}
+	if (draft.state === "confirming") {
+		throw new Error("Goal draft confirmation is already in progress");
+	}
+	appendGoalDraft(
+		pi,
+		createPiXkGoalDraft({
+			draftId: draft.draftId,
+			state: "cancelled",
+			objective: draft.objective,
+			revisionFeedback: draft.revisionFeedback,
+			proposal: draft.proposal,
+			goalId: null,
+			createdAt: goalNow(options),
+		}),
+	);
+	if (!ctx.isIdle()) ctx.abort();
+}
+
+async function confirmGoalDraft(
 	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext | ExtensionContext,
 	storeFor: (projectRoot: string) => GoalStore,
 	options: PiXkGoalExtensionOptions,
-	objectiveInput: string,
-	captureId?: string,
 ): Promise<void> {
-	const objective = objectiveInput.trim();
-	if (objective.length === 0) throw new Error("a Goal objective is required");
-	const goalId = newGoalId(options);
-	const timestamp = goalNow(options);
+	if (!ctx.isIdle()) throw new Error("the agent is still busy");
+	const current = findCurrentGoalDraft(ctx);
+	if (!current) throw new Error("no Goal draft is pending confirmation");
+	if (current.state === "confirmed") return;
+	let confirming: PiXkGoalDraft;
+	if (current.state === "proposed" && current.proposal !== null) {
+		confirming = createPiXkGoalDraft({
+			draftId: current.draftId,
+			state: "confirming",
+			objective: current.objective,
+			revisionFeedback: null,
+			proposal: current.proposal,
+			goalId: newGoalId(options),
+			createdAt: goalNow(options),
+		});
+		appendGoalDraft(pi, confirming);
+	} else if (current.state === "confirming" && current.proposal !== null && current.goalId !== null) {
+		confirming = current;
+	} else {
+		throw new Error("a proposed Goal draft is required before confirmation");
+	}
+
+	const goalId = confirming.goalId;
+	const proposal = confirming.proposal;
+	if (goalId === null || proposal === null) throw new Error("Goal draft confirmation state is invalid");
+	const contract = createGoalContract(goalId, proposal, ctx.sessionManager.getSessionId(), confirming.createdAt);
 	const store = storeFor(ctx.cwd);
-	const contract = createGoalContract(goalId, objective, ctx.sessionManager.getSessionId(), timestamp);
 	await store.createGoal(contract, {
 		eventId: `evt_goal_created_${goalId}`,
 		idempotencyKey: `goal-created:${goalId}`,
 		actor: "user",
-		timestamp,
+		timestamp: confirming.createdAt,
 	});
 	await appendGoalLifecycle(
 		store,
 		goalId,
 		{ eventType: "goal_activated", payload: { sessionId: ctx.sessionManager.getSessionId() } },
-		lifecycleWrite(goalId, "activated", "user", timestamp),
+		lifecycleWrite(goalId, "activated", "user", confirming.createdAt, confirming.draftId),
 	);
 	const previous = findCurrentGoalBinding(ctx);
-	const binding = createPiXkGoalBinding(goalId, previous ? previous.generation + 1 : 0);
-	pi.appendEntry(PI_XK_SESSION_LINK_CUSTOM_TYPE, binding);
-	if (captureId) {
-		pi.appendEntry(PI_XK_SESSION_LINK_CUSTOM_TYPE, createPiXkGoalCapture(captureId, "consumed", timestamp));
+	if (!previous || previous.goalId !== goalId) {
+		const binding = createPiXkGoalBinding(goalId, previous ? previous.generation + 1 : 0);
+		pi.appendEntry(PI_XK_SESSION_LINK_CUSTOM_TYPE, binding);
 	}
+	appendGoalDraft(
+		pi,
+		createPiXkGoalDraft({
+			draftId: confirming.draftId,
+			state: "confirmed",
+			objective: confirming.objective,
+			revisionFeedback: null,
+			proposal: confirming.proposal,
+			goalId,
+			createdAt: goalNow(options),
+		}),
+	);
 	kickoffGoal(pi, goalId);
+}
+
+function showGoalDraftReview(pi: ExtensionAPI, ctx: ExtensionContext): void {
+	const draft = findCurrentGoalDraft(ctx);
+	if (!draft || draft.state !== "proposed" || draft.proposal === null) {
+		throw new Error("no proposed Goal draft is available for review");
+	}
+	pi.sendMessage(
+		{
+			customType: PI_XK_GOAL_DRAFT_REVIEW_CUSTOM_TYPE,
+			content: renderGoalDraftMarkdown(draft),
+			display: true,
+			details: { draftId: draft.draftId },
+		},
+		{ triggerTurn: false },
+	);
+}
+
+async function reviewGoalDraftWithUi(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	storeFor: (projectRoot: string) => GoalStore,
+	options: PiXkGoalExtensionOptions,
+): Promise<void> {
+	const draft = findCurrentGoalDraft(ctx);
+	if (!ctx.hasUI || !draft || draft.state !== "proposed" || draft.proposal === null) return;
+	const choice = await ctx.ui.select(renderGoalDraftMarkdown(draft), [
+		GOAL_DRAFT_CONFIRM_OPTION,
+		GOAL_DRAFT_REVISE_OPTION,
+	]);
+	if (choice === GOAL_DRAFT_CONFIRM_OPTION) {
+		await confirmGoalDraft(pi, ctx, storeFor, options);
+		return;
+	}
+	if (choice !== GOAL_DRAFT_REVISE_OPTION) return;
+	const feedback = await ctx.ui.input("修改 Goal 草案", "");
+	if (!feedback?.trim()) return;
+	reviseGoalDraft(pi, ctx, options, feedback);
 }
 
 async function startCurrentGoal(
@@ -912,47 +1310,43 @@ async function startCurrentGoal(
 	storeFor: (projectRoot: string) => GoalStore,
 	options: PiXkGoalExtensionOptions,
 ): Promise<void> {
-	const binding = findCurrentGoalBinding(ctx);
-	if (!binding) throw new Error("no Goal is bound to the current session branch");
 	if (!ctx.isIdle()) throw new Error("the agent is still busy");
-	const store = storeFor(ctx.cwd);
-	const replay = await store.replayGoal(binding.goalId);
-	if (replay.lifecycle.status === "paused") {
-		const timestamp = goalNow(options);
-		await appendGoalLifecycle(
-			store,
-			binding.goalId,
-			{ eventType: "goal_resumed", payload: { reason: "started by user" } },
-			lifecycleWrite(binding.goalId, "resumed", "user", timestamp),
-		);
-	} else if (replay.lifecycle.status !== "active") {
-		throw new Error("only an active or paused Goal can be started");
-	}
-	kickoffGoal(pi, binding.goalId);
+	await requestGoalLifecycleAction(pi, ctx, storeFor, options, "start", "user", "started by user", {
+		resumeEvidence: "The user explicitly requested Goal recovery.",
+	});
 }
 
-async function getActiveGoalObjectivePath(
+interface GoalFilePaths {
+	status: "active" | "paused";
+	objectivePath: string;
+	statePath: string;
+}
+
+async function getCurrentGoalFilePaths(
 	ctx: ExtensionContext,
 	storeFor: (projectRoot: string) => GoalStore,
-): Promise<string | undefined> {
+): Promise<GoalFilePaths | undefined> {
 	const binding = findCurrentGoalBinding(ctx);
 	if (!binding) return undefined;
 	const store = storeFor(ctx.cwd);
 	const replay = await store.replayGoal(binding.goalId);
-	if (replay.lifecycle.status !== "active") return undefined;
+	if (replay.lifecycle.status !== "active" && replay.lifecycle.status !== "paused") return undefined;
 	const files = await store.inspectGoalFiles(binding.goalId);
 	if (files.objective.status !== "valid" || files.state.status !== "valid") {
 		throw new Error(`Goal files require repair: objective ${files.objective.status}, state ${files.state.status}`);
 	}
-	return files.objective.path;
+	return { status: replay.lifecycle.status, objectivePath: files.objective.path, statePath: files.state.path };
 }
 
-function findCurrentKickoffMessageIndex(messages: readonly { role: string; customType?: string }[]): number {
+function findCurrentKickoffMessageIndex(
+	messages: readonly { role: string; customType?: string }[],
+	kickoffCustomType: string,
+): number {
 	for (let index = messages.length - 1; index >= 0; index--) {
 		const message = messages[index];
 		if (message.role === "user") return -1;
 		if (message.role === "custom") {
-			return message.customType === PI_XK_GOAL_KICKOFF_CUSTOM_TYPE ? index : -1;
+			return message.customType === kickoffCustomType ? index : -1;
 		}
 	}
 	return -1;
@@ -981,6 +1375,7 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 	return (pi) => {
 		let consecutiveGoalFailures = 0;
 		let lastGoalRunOutcome: GoalRunOutcome = "aborted";
+		let currentRunKind: "draft" | "goal" | "other" = "other";
 		let retryTimer: ReturnType<typeof setTimeout> | undefined;
 
 		const clearRetryTimer = () => {
@@ -1010,6 +1405,7 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 			},
 			resolveGoalStore: (ctx) => storeFor(ctx.cwd),
 			shouldPersistBinding: async (binding, ctx) => {
+				if (isOutstandingGoalDraft(findCurrentGoalDraft(ctx))) return false;
 				const current = findCurrentGoalBinding(ctx);
 				if (!current || !isSameBinding(current, binding)) return false;
 				const replay = await storeFor(ctx.cwd).replayGoal(binding.goalId);
@@ -1025,20 +1421,147 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 		})(pi);
 
 		pi.registerTool({
+			name: "pi_xk_submit_goal_draft",
+			label: "Submit Goal Draft",
+			description:
+				"Submit a proposed Pi-XK Goal contract for user review. Use only during a Goal draft kickoff; this does not create or start a Goal.",
+			executionMode: "sequential",
+			parameters: Type.Object({
+				title: Type.String({ description: "Concise Goal title" }),
+				objective: Type.String({ description: "Stable, observable Goal objective" }),
+				constraints: Type.Array(Type.String()),
+				acceptance: Type.Array(
+					Type.Union([
+						Type.Object({
+							id: Type.String(),
+							kind: Type.Literal("command"),
+							description: Type.String(),
+							required: Type.Boolean(),
+							command: Type.String(),
+						}),
+						Type.Object({
+							id: Type.String(),
+							kind: Type.Literal("test"),
+							description: Type.String(),
+							required: Type.Boolean(),
+							command: Type.String(),
+						}),
+						Type.Object({
+							id: Type.String(),
+							kind: Type.Literal("artifact"),
+							description: Type.String(),
+							required: Type.Boolean(),
+						}),
+						Type.Object({
+							id: Type.String(),
+							kind: Type.Literal("approval"),
+							description: Type.String(),
+							required: Type.Boolean(),
+						}),
+					]),
+				),
+				nonGoals: Type.Array(Type.String()),
+				doneCondition: Type.String(),
+				pauseCondition: Type.String(),
+				finalReport: Type.String(),
+				executionAuthorization: Type.String(),
+			}),
+			execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+				try {
+					submitGoalDraft(pi, ctx, options, params);
+					return {
+						content: [{ type: "text", text: "Goal draft submitted for user review." }],
+						details: {},
+						terminate: true,
+					};
+				} catch (error) {
+					return {
+						content: [{ type: "text", text: `Goal draft submission failed: ${normalizeError(error).message}` }],
+						details: {},
+					};
+				}
+			},
+		});
+
+		pi.on("tool_call", (event, ctx) => {
+			if (currentRunKind === "draft") {
+				if (event.toolName === "pi_xk_submit_goal_draft") return;
+				return {
+					block: true,
+					reason: "A Goal draft kickoff only permits pi_xk_submit_goal_draft.",
+				};
+			}
+			if (event.toolName === "pi_xk_submit_goal_draft") {
+				return {
+					block: true,
+					reason: "pi_xk_submit_goal_draft is only available during a Goal draft kickoff.",
+				};
+			}
+			if (
+				isOutstandingGoalDraft(findCurrentGoalDraft(ctx)) &&
+				(event.toolName === "pi_xk_start_goal" ||
+					event.toolName === "pi_xk_pause_goal" ||
+					event.toolName === "pi_xk_end_goal")
+			) {
+				return {
+					block: true,
+					reason: "Pi-XK Goal lifecycle tools are unavailable while a Goal draft is awaiting review.",
+				};
+			}
+		});
+
+		pi.registerTool({
+			name: "pi_xk_start_goal",
+			label: "Start Goal",
+			description:
+				"Resume a paused Pi-XK Goal only when new user input, an external change, or new evidence removes its recorded blocker. Do not perform Goal work before calling this tool.",
+			executionMode: "sequential",
+			parameters: Type.Object({
+				reason: Type.String({ description: "Why the recorded blocker is now removed" }),
+				resumeEvidence: Type.String({
+					description: "New input, external change, or evidence that justifies resuming",
+				}),
+			}),
+			execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+				try {
+					await requestGoalLifecycleAction(pi, ctx, storeFor, options, "start", "model", params.reason, {
+						resumeEvidence: params.resumeEvidence,
+					});
+					return { content: [{ type: "text", text: "Goal start requested." }], details: {}, terminate: true };
+				} catch (error) {
+					return {
+						content: [{ type: "text", text: `Goal start failed: ${normalizeError(error).message}` }],
+						details: {},
+					};
+				}
+			},
+		});
+		pi.registerTool({
 			name: "pi_xk_pause_goal",
 			label: "Pause Goal",
 			description:
-				"Pause the active Pi-XK Goal only after you have updated goal-state.md with current evidence and the next best action. Use this when user input or an external change is required.",
+				"Pause an active Pi-XK Goal only after auditing incomplete required acceptance criteria in goal-state.md. The audit must name unmet IDs, current evidence, and the incomplete conclusion.",
+			executionMode: "sequential",
 			parameters: Type.Object({
-				reason: Type.String({ description: "Why this Goal should pause" }),
-				nextBestAction: Type.Optional(Type.String({ description: "The next action to record in goal-state.md" })),
+				reason: Type.String({ description: "Why this Goal must pause" }),
+				userRequest: Type.Union([Type.String(), Type.Null()], {
+					description: "The user response needed next, or null when waiting only on an external change",
+				}),
+				nextBestAction: Type.String({ description: "The next action after the blocker is removed" }),
+				audit: Type.Object({
+					unmetRequiredAcceptanceIds: Type.Array(Type.String()),
+					currentEvidence: Type.String(),
+					incompleteConclusion: Type.String(),
+				}),
 			}),
 			execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
 				try {
 					await requestGoalLifecycleAction(pi, ctx, storeFor, options, "pause", "model", params.reason, {
+						userRequest: params.userRequest === "" ? null : params.userRequest,
 						nextBestAction: params.nextBestAction,
+						audit: params.audit,
 					});
-					return { content: [{ type: "text", text: "Goal pause requested." }], details: {} };
+					return { content: [{ type: "text", text: "Goal pause requested." }], details: {}, terminate: true };
 				} catch (error) {
 					return {
 						content: [{ type: "text", text: `Goal pause failed: ${normalizeError(error).message}` }],
@@ -1051,19 +1574,26 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 			name: "pi_xk_end_goal",
 			label: "End Goal",
 			description:
-				"End the active Pi-XK Goal only after you have updated goal-state.md and verified that its objective and declared acceptance evidence are complete. A normal response does not end the Goal.",
+				"End an active Pi-XK Goal only after every required acceptance has verification evidence and goal-state.md records the final summary. A normal response does not end the Goal.",
+			executionMode: "sequential",
 			parameters: Type.Object({
 				outcome: Type.String({ description: "The final Goal outcome" }),
 				reason: Type.String({ description: "Why this Goal is ending" }),
-				finalEvidence: Type.Optional(Type.String({ description: "Final evidence recorded in goal-state.md" })),
+				verifiedAcceptanceIds: Type.Array(Type.String(), {
+					description: "Acceptance IDs with verified evidence; every required ID must be present",
+				}),
+				finalEvidence: Type.String({ description: "Final verification evidence recorded in goal-state.md" }),
+				finalSummary: Type.String({ description: "Concise final summary recorded in goal-state.md" }),
 			}),
 			execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
 				try {
 					await requestGoalLifecycleAction(pi, ctx, storeFor, options, "end", "model", params.reason, {
 						outcome: params.outcome,
+						verifiedAcceptanceIds: params.verifiedAcceptanceIds,
 						finalEvidence: params.finalEvidence,
+						finalSummary: params.finalSummary,
 					});
-					return { content: [{ type: "text", text: "Goal end requested." }], details: {} };
+					return { content: [{ type: "text", text: "Goal end requested." }], details: {}, terminate: true };
 				} catch (error) {
 					return {
 						content: [{ type: "text", text: `Goal end failed: ${normalizeError(error).message}` }],
@@ -1081,12 +1611,19 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 			}
 		});
 		pi.on("before_agent_start", async (event, ctx) => {
-			if (event.systemPrompt.includes("<pi-xk-goal>")) return;
+			if (event.systemPrompt.includes("<pi-xk-goal>") || event.systemPrompt.includes("<pi-xk-goal-recovery>")) {
+				return;
+			}
 			try {
-				const objectivePath = await getActiveGoalObjectivePath(ctx, storeFor);
-				if (!objectivePath) return;
+				if (isOutstandingGoalDraft(findCurrentGoalDraft(ctx))) return;
+				const files = await getCurrentGoalFilePaths(ctx, storeFor);
+				if (!files) return;
+				const prompt =
+					files.status === "active"
+						? `<pi-xk-goal>\n${goalRuntimePrompt(files.objectivePath, files.statePath)}\n</pi-xk-goal>`
+						: `<pi-xk-goal-recovery>\n${pausedGoalRecoveryPrompt(files.objectivePath, files.statePath)}\n</pi-xk-goal-recovery>`;
 				return {
-					systemPrompt: `${event.systemPrompt}\n\n<pi-xk-goal>\n${goalRuntimePrompt(objectivePath)}\n</pi-xk-goal>`,
+					systemPrompt: `${event.systemPrompt}\n\n${prompt}`,
 				};
 			} catch (error) {
 				notifyGoalError(ctx, options, error);
@@ -1094,21 +1631,42 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 			}
 		});
 		pi.on("context", async (event, ctx) => {
-			const kickoffIndex = findCurrentKickoffMessageIndex(event.messages);
-			let kickoffPrompt: string | undefined;
+			const draftKickoffIndex = findCurrentKickoffMessageIndex(event.messages, PI_XK_GOAL_DRAFT_KICKOFF_CUSTOM_TYPE);
+			const goalKickoffIndex = findCurrentKickoffMessageIndex(event.messages, PI_XK_GOAL_KICKOFF_CUSTOM_TYPE);
+			let draftKickoffPrompt: string | undefined;
+			let goalKickoffPrompt: string | undefined;
 			try {
-				if (kickoffIndex >= 0) {
-					const objectivePath = await getActiveGoalObjectivePath(ctx, storeFor);
-					if (objectivePath) kickoffPrompt = goalRuntimePrompt(objectivePath);
+				if (draftKickoffIndex >= 0) {
+					const draft = findCurrentGoalDraft(ctx);
+					if (draft?.state === "requested") draftKickoffPrompt = goalDraftRuntimePrompt(draft);
+				} else if (goalKickoffIndex >= 0 && !isOutstandingGoalDraft(findCurrentGoalDraft(ctx))) {
+					const files = await getCurrentGoalFilePaths(ctx, storeFor);
+					if (files?.status === "active") {
+						goalKickoffPrompt = goalRuntimePrompt(files.objectivePath, files.statePath);
+					}
 				}
 			} catch (error) {
 				notifyGoalError(ctx, options, error);
 			}
+			currentRunKind = draftKickoffIndex >= 0 ? "draft" : goalKickoffIndex >= 0 ? "goal" : "other";
 			const messages = event.messages.map((message, index) => {
-				if (message.role !== "custom" || message.customType !== PI_XK_GOAL_KICKOFF_CUSTOM_TYPE) {
-					return message;
+				if (message.role !== "custom") return message;
+				if (message.customType === PI_XK_GOAL_DRAFT_REVIEW_CUSTOM_TYPE) {
+					return { ...message, content: "" };
 				}
-				return { ...message, content: index === kickoffIndex && kickoffPrompt ? kickoffPrompt : "" };
+				if (message.customType === PI_XK_GOAL_DRAFT_KICKOFF_CUSTOM_TYPE) {
+					return {
+						...message,
+						content: index === draftKickoffIndex && draftKickoffPrompt ? draftKickoffPrompt : "",
+					};
+				}
+				if (message.customType === PI_XK_GOAL_KICKOFF_CUSTOM_TYPE) {
+					return {
+						...message,
+						content: index === goalKickoffIndex && goalKickoffPrompt ? goalKickoffPrompt : "",
+					};
+				}
+				return message;
 			});
 			if (messages.some((message, index) => message !== event.messages[index])) return { messages };
 		});
@@ -1121,11 +1679,20 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 			}
 		});
 		pi.on("agent_end", (event, ctx) => {
-			if (!findCurrentGoalBinding(ctx)) return;
+			if (isOutstandingGoalDraft(findCurrentGoalDraft(ctx)) || !findCurrentGoalBinding(ctx)) return;
 			lastGoalRunOutcome = goalRunOutcome(event);
 		});
 		pi.on("agent_settled", async (_event, ctx) => {
 			try {
+				const settledRunKind = currentRunKind;
+				currentRunKind = "other";
+				const draft = findCurrentGoalDraft(ctx);
+				if (isOutstandingGoalDraft(draft)) {
+					if (settledRunKind === "draft" && draft?.state === "proposed") {
+						await reviewGoalDraftWithUi(pi, ctx, storeFor, options);
+					}
+					return;
+				}
 				if (await settleGoalLifecycleIntent(pi, ctx, storeFor, options)) return;
 				await settleGoalRun(ctx, storeFor, options);
 				if (lastGoalRunOutcome === "aborted") return;
@@ -1147,7 +1714,7 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 			const capture = findCurrentGoalCapture(ctx);
 			if (!capture || capture.state !== "open") return { action: "continue" };
 			try {
-				await createGoalFromObjective(pi, ctx, storeFor, options, event.text, capture.captureId);
+				requestGoalDraft(pi, ctx, options, event.text, capture.captureId);
 			} catch (error) {
 				notifyGoalError(ctx, options, error);
 			}
@@ -1159,6 +1726,9 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 				const trimmed = args.trim();
 				try {
 					if (trimmed.length === 0) {
+						if (isOutstandingGoalDraft(findCurrentGoalDraft(ctx))) {
+							throw new Error("a Goal draft is already awaiting review");
+						}
 						const capture = findCurrentGoalCapture(ctx);
 						const timestamp = goalNow(options);
 						if (capture?.state === "open") {
@@ -1180,6 +1750,22 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 						await showGoalStatus(ctx, storeFor);
 						return;
 					}
+					if (trimmed === "review") {
+						showGoalDraftReview(pi, ctx);
+						return;
+					}
+					if (trimmed === "confirm") {
+						await confirmGoalDraft(pi, ctx, storeFor, options);
+						return;
+					}
+					if (trimmed === "cancel") {
+						cancelGoalDraft(pi, ctx, options);
+						return;
+					}
+					if (trimmed === "revise" || trimmed.startsWith("revise ")) {
+						reviseGoalDraft(pi, ctx, options, trimmed.slice("revise".length));
+						return;
+					}
 					if (trimmed === "start") {
 						await startCurrentGoal(pi, ctx, storeFor, options);
 						return;
@@ -1197,7 +1783,7 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 						return;
 					}
 					const objective = trimmed.startsWith("--") ? trimmed.slice(2).trimStart() : args;
-					await createGoalFromObjective(pi, ctx, storeFor, options, objective);
+					requestGoalDraft(pi, ctx, options, objective);
 				} catch (error) {
 					notifyGoalError(ctx, options, error);
 				}

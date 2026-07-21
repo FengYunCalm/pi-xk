@@ -1,6 +1,6 @@
 # ADR-0003：Goal 草案确认与全生命周期控制 v2
 
-> **状态**：Accepted for Phase 1.8
+> **状态**：Accepted and implemented for Phase 1.8
 >
 > **日期**：2026-07-21
 >

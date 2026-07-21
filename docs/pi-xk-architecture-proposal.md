@@ -1,6 +1,6 @@
 # Pi-XK 架构策划案
 
-> **状态**：In implementation（Phase 0 与 Phase 1.1–1.7 已完成；Phase 1.8 正在实现 Goal 草案确认与全生命周期控制；当前个人本机无限权限 profile 仍明确延后 Policy/沙箱，TaskSupervisor、通用 Context/memory 和其余 MVP 能力按路线图推进）
+> **状态**：In implementation（Phase 0 与 Phase 1.1–1.8 已完成；当前个人本机无限权限 profile 仍明确延后 Policy/沙箱，TaskSupervisor、通用 Context/memory 和其余 MVP 能力按路线图推进）
 >
 > **版本**：1.0.0
 >
@@ -783,7 +783,7 @@ pi_xk.artifact.*
 - 工具结果已持久化后的 `turn_end` 与 `session_before_compact` 的自动 checkpoint；
 - artifact store、redaction 和可重建 read model。
 
-**2026-07-21 实现状态：** Phase 1.1–1.5 已完成 Goal contract/event log、Pi binding/ref、`turn_end`（工具结果已持久化后）与 `session_before_compact` 的 checkpoint evidence、项目作用域 artifact store、v1 读取 upcast 和可重建 `goal-read-model.json`。Phase 1.6 已验证 Pi 原生本地 package 安装、冷启动自动发现和用户级 `/goal` 命令注册；`pi-xk-extension` 提供安装/恢复说明和无网络 runtime preflight。Phase 1.7 已实现活跃 Goal 的连续 run：普通模型回复不会结束 Goal，只有模型 `pi_xk_end_goal` 或用户 `/goal end` 会写入 ended；不以 run 数量作为终止条件，provider 失败保持 Goal active 并按指数退避重试。Phase 1.8 正在把未确认 Goal 改为 session 内草案，将合同升级为可兼容读取的 v2，并为模型 pause/resume/end 增加基于 required acceptance 的 host 校验。Goal 专用的 objective-path 执行提示已通过 `before_agent_start` 与 kickoff context 注入；尚未实现的是通用 L0/L1/L2 Context controller。artifact 默认只保存 runtime 生成的 provenance，不复制 Pi transcript、Goal state 或工具正文；Policy、artifact retention/GC 与 memory 仍未实现。
+**2026-07-21 实现状态：** Phase 1.1–1.5 已完成 Goal contract/event log、Pi binding/ref、`turn_end`（工具结果已持久化后）与 `session_before_compact` 的 checkpoint evidence、项目作用域 artifact store、v1 读取 upcast 和可重建 `goal-read-model.json`。Phase 1.6 已验证 Pi 原生本地 package 安装、冷启动自动发现和用户级 `/goal` 命令注册；`pi-xk-extension` 提供安装/恢复说明和无网络 runtime preflight。Phase 1.7 已实现活跃 Goal 的连续 run：普通模型回复不会结束 Goal，只有模型 `pi_xk_end_goal` 或用户 `/goal end` 会写入 ended；不以 run 数量作为终止条件，provider 失败保持 Goal active 并按指数退避重试。Phase 1.8 已实现 session 内 Goal 草案、Pi 原生确认/修订循环、无 UI 审阅命令、确认前零 Goal 落盘、`GoalContractV2` 与 v1 原始 hash/replay 兼容，以及模型 start/pause/end 的状态、审计、acceptance 和最终 checkpoint 校验。Goal 专用的 objective/state-path 执行与恢复提示已通过 `before_agent_start` 与 kickoff context 注入；尚未实现的是通用 L0/L1/L2 Context controller。artifact 默认只保存 runtime 生成的 provenance，不复制 Pi transcript、Goal state 或工具正文；Policy、artifact retention/GC 与 memory 仍未实现。
 
 #### Phase 1.7：Goal 连续执行（已完成）
 
@@ -792,11 +792,11 @@ pi_xk.artifact.*
 - 不设置最大 run 数；Goal 的语义完成权由模型的显式 end 工具调用决定。provider error 不会伪造 ended，而是在当前 live session 内指数退避重试。
 - 自动续跑沿用既有 checkpoint、生命周期和 branch binding；它不是 TaskSupervisor、后台 child agent 或无人值守沙箱的替代品。
 
-#### Phase 1.8：Goal 草案与模型全生命周期控制（实施中）
+#### Phase 1.8：Goal 草案与模型全生命周期控制（已完成）
 
-- 新 Goal 在用户确认前只存在于 Pi session draft entry；原生 UI 和无 UI 命令都必须提供确认、修订和取消。
+- 新 Goal 在用户确认前只存在于 Pi session draft entry；原生 UI 和无 UI 命令均提供确认、修订和取消，确认前不创建 Goal 目录或事件。
 - 新 writer 使用 `GoalContractV2`，历史 v1 hash 链只读并在 replay 时上转换；v2 合同要求非目标、完成/暂停条件、最终报告和执行授权。
-- 模型的 start/pause/end 工具必须经过 host 状态和 acceptance 校验；pause/end 仅在最终 checkpoint 后提交，普通模型回复仍会自动续跑。
+- 模型的 start/pause/end 工具经过 host 状态和 acceptance 校验；pause/end 仅在最终 checkpoint 后提交，普通模型回复仍会自动续跑。
 - 每个逻辑段只提交本段文件；检查通过后推送。网络不可用时保留顺序本地提交，恢复网络后重新核验 fast-forward 再推送。
 
 必测故障：

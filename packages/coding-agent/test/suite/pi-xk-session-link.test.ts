@@ -9,6 +9,7 @@ import {
 	createPiXkCompactionCheckpointIntent,
 	createPiXkExtension,
 	createPiXkGoalBinding,
+	createPiXkGoalDraft,
 	createPiXkTurnCheckpointIntent,
 	isPiXkCheckpointIntent,
 	isPiXkCheckpointRef,
@@ -78,6 +79,62 @@ describe("Pi-XK session link integration", () => {
 		expect(isPiXkCheckpointRef({ ...checkpointRef, unexpected: "payload" })).toBe(false);
 		expect(isPiXkCheckpointIntent({ ...turnIntent, unexpected: "payload" })).toBe(false);
 		expect(isPiXkCheckpointIntent({ ...compactionIntent, unexpected: "payload" })).toBe(false);
+	});
+
+	it("keeps draft acceptance shapes aligned with GoalContractV2", () => {
+		const proposal = {
+			title: "Draft acceptance validation",
+			objective: "Reject draft acceptance that cannot become a v2 contract.",
+			constraints: [],
+			acceptance: [
+				{
+					id: "A-1",
+					kind: "test" as const,
+					description: "Run the declared test.",
+					required: true,
+					command: "npm run test:pi-xk",
+				},
+			],
+			nonGoals: [],
+			doneCondition: "Acceptance A-1 is verified.",
+			pauseCondition: "New evidence is required.",
+			finalReport: "Report acceptance evidence.",
+			executionAuthorization: "In-scope test edits are authorized.",
+		};
+		const draft = {
+			draftId: "draft_acceptance",
+			state: "proposed" as const,
+			objective: proposal.objective,
+			revisionFeedback: null,
+			proposal,
+			goalId: null,
+			createdAt: "2026-07-21T00:00:00.000Z",
+		};
+
+		expect(createPiXkGoalDraft(draft).proposal).toEqual(proposal);
+		expect(() =>
+			createPiXkGoalDraft({
+				...draft,
+				proposal: { ...proposal, acceptance: [{ ...proposal.acceptance[0], command: undefined }] },
+			}),
+		).toThrow("Goal draft is invalid");
+		expect(() =>
+			createPiXkGoalDraft({
+				...draft,
+				proposal: {
+					...proposal,
+					acceptance: [
+						{
+							id: "A-1",
+							kind: "artifact",
+							description: "Inspect the artifact.",
+							required: true,
+							command: "invalid artifact command",
+						},
+					],
+				},
+			}),
+		).toThrow("Goal draft is invalid");
 	});
 
 	it("keeps custom bindings in the tree and out of model context", async () => {
