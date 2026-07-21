@@ -1,6 +1,6 @@
 # Pi-XK 架构策划案
 
-> **状态**：In implementation（Phase 0 与 Phase 1.1–1.7 已完成；当前个人本机无限权限 profile 仍明确延后 Policy/沙箱，TaskSupervisor、通用 Context/memory 和其余 MVP 能力按路线图推进）
+> **状态**：In implementation（Phase 0 与 Phase 1.1–1.7 已完成；Phase 1.8 正在实现 Goal 草案确认与全生命周期控制；当前个人本机无限权限 profile 仍明确延后 Policy/沙箱，TaskSupervisor、通用 Context/memory 和其余 MVP 能力按路线图推进）
 >
 > **版本**：1.0.0
 >
@@ -312,6 +312,8 @@ contract.json 是由事件日志生成的、可校验且便于人审的当前合
 
 创建 Goal 时，goal_created 事件保存完整规范化合同；后续变更追加 goal_contract_updated 事件。contract.json 只保存当前有效合同的可重建投影，并保留 baseHash 和事件序列号；发生不一致时以事件日志为准并重新生成。验收条件必须能指向命令、测试、artifact 或人工审批，不能只有“模型认为完成”。其中 command 只是声明，真正执行时仍要重新经过 CapabilityPolicy。
 
+Phase 1.8 开始为新 Goal 写入 `GoalContractV2`：除上述稳定目标与约束外，还要求 `nonGoals`、`doneCondition`、`pauseCondition`、`finalReport` 和 `executionAuthorization`，并要求至少一个 required acceptance。v1 事件与其原始 payload/hash 永远保持不变；读取侧先验证原始版本，再用纯 upcaster 生成统一内存合同。禁止为了升级而重写 JSONL 或把草案当作已确认合同。
+
 ### 6.3 事件协议
 
 每个事件至少包含：
@@ -384,6 +386,12 @@ checkpoint payload 包含：目标进度、验收条件状态、已验证事实�
 ~~~
 
 未完成操作的策略必须按类型定义：未出现最终 compaction entry 就重跑；已出现最终 entry 就只补 finish marker；child 进程不存在但状态为 running 就标记 orphaned 并等待用户重试或恢复。恢复本身产生审计事件。
+
+### 7.4 Goal 草案与生命周期决策
+
+新 Goal 先以 Pi session `goal_draft` custom entry 存在，状态为 `requested`、`proposed`、`superseded`、`confirming`、`confirmed` 或 `cancelled`。草案确认前不得创建 `.pi-xk/goals/<goalId>`、Goal JSONL、合同投影或 `goal-objective.md`/`goal-state.md`。Pi 原生 `ctx.ui.select` 与 `ctx.ui.input` 提供确认和修订；无 UI 环境使用等价 `/goal` 子命令。
+
+草案模型只能提交草案。已确认 Goal 的模型可提出 start、pause 和 end，但 host 按合同与当前状态校验工具参数。pause 必须声明未达 required acceptance、证据与阻塞；end 必须覆盖新的 v2 Goal 的所有 required acceptance。每个工具先写 session intent，最终 checkpoint 后才提交 Goal 生命周期事件。paused Goal 只有在新输入、外部变化或新证据解除阻塞后才可恢复；end 后不得重启。
 
 ## 8. Context、Compaction 与长期记忆
 
@@ -775,7 +783,7 @@ pi_xk.artifact.*
 - 工具结果已持久化后的 `turn_end` 与 `session_before_compact` 的自动 checkpoint；
 - artifact store、redaction 和可重建 read model。
 
-**2026-07-20 实现状态：** Phase 1.1–1.5 已完成 Goal contract/event log、Pi binding/ref、`turn_end`（工具结果已持久化后）与 `session_before_compact` 的 checkpoint evidence、项目作用域 artifact store、v1 读取 upcast 和可重建 `goal-read-model.json`。Phase 1.6 已验证 Pi 原生本地 package 安装、冷启动自动发现和用户级 `/goal` 命令注册；`pi-xk-extension` 提供安装/恢复说明和无网络 runtime preflight。Phase 1.7 已实现活跃 Goal 的连续 run：普通模型回复不会结束 Goal，只有模型 `pi_xk_end_goal` 或用户 `/goal end` 会写入 ended；不以 run 数量作为终止条件，provider 失败保持 Goal active 并按指数退避重试。Goal 专用的 objective-path 执行提示已通过 `before_agent_start` 与 kickoff context 注入；尚未实现的是通用 L0/L1/L2 Context controller。artifact 默认只保存 runtime 生成的 provenance，不复制 Pi transcript、Goal state 或工具正文；Policy、artifact retention/GC 与 memory 仍未实现。
+**2026-07-21 实现状态：** Phase 1.1–1.5 已完成 Goal contract/event log、Pi binding/ref、`turn_end`（工具结果已持久化后）与 `session_before_compact` 的 checkpoint evidence、项目作用域 artifact store、v1 读取 upcast 和可重建 `goal-read-model.json`。Phase 1.6 已验证 Pi 原生本地 package 安装、冷启动自动发现和用户级 `/goal` 命令注册；`pi-xk-extension` 提供安装/恢复说明和无网络 runtime preflight。Phase 1.7 已实现活跃 Goal 的连续 run：普通模型回复不会结束 Goal，只有模型 `pi_xk_end_goal` 或用户 `/goal end` 会写入 ended；不以 run 数量作为终止条件，provider 失败保持 Goal active 并按指数退避重试。Phase 1.8 正在把未确认 Goal 改为 session 内草案，将合同升级为可兼容读取的 v2，并为模型 pause/resume/end 增加基于 required acceptance 的 host 校验。Goal 专用的 objective-path 执行提示已通过 `before_agent_start` 与 kickoff context 注入；尚未实现的是通用 L0/L1/L2 Context controller。artifact 默认只保存 runtime 生成的 provenance，不复制 Pi transcript、Goal state 或工具正文；Policy、artifact retention/GC 与 memory 仍未实现。
 
 #### Phase 1.7：Goal 连续执行（已完成）
 
@@ -783,6 +791,13 @@ pi_xk.artifact.*
 - 模型必须先更新 `goal-state.md` 并验证目标与验收证据，再调用 `pi_xk_end_goal`；需要用户输入或外部变化时调用 `pi_xk_pause_goal`。用户仍可用 `/goal pause` 或 `/goal end` 覆盖运行。
 - 不设置最大 run 数；Goal 的语义完成权由模型的显式 end 工具调用决定。provider error 不会伪造 ended，而是在当前 live session 内指数退避重试。
 - 自动续跑沿用既有 checkpoint、生命周期和 branch binding；它不是 TaskSupervisor、后台 child agent 或无人值守沙箱的替代品。
+
+#### Phase 1.8：Goal 草案与模型全生命周期控制（实施中）
+
+- 新 Goal 在用户确认前只存在于 Pi session draft entry；原生 UI 和无 UI 命令都必须提供确认、修订和取消。
+- 新 writer 使用 `GoalContractV2`，历史 v1 hash 链只读并在 replay 时上转换；v2 合同要求非目标、完成/暂停条件、最终报告和执行授权。
+- 模型的 start/pause/end 工具必须经过 host 状态和 acceptance 校验；pause/end 仅在最终 checkpoint 后提交，普通模型回复仍会自动续跑。
+- 每个逻辑段只提交本段文件；检查通过后推送。网络不可用时保留顺序本地提交，恢复网络后重新核验 fast-forward 再推送。
 
 必测故障：
 
