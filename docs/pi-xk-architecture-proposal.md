@@ -1,6 +1,6 @@
 # Pi-XK 架构策划案
 
-> **状态**：In implementation（Phase 0 与 Phase 1.1–1.8 已完成；当前个人本机无限权限 profile 仍明确延后 Policy/沙箱，TaskSupervisor、通用 Context/memory 和其余 MVP 能力按路线图推进）
+> **状态**：In implementation（Phase 0 与 Phase 1.1–1.8 已完成，Goal CLI 计时与草案 custom UI 已作为扩展层跟进；当前个人本机无限权限 profile 仍明确延后 Policy/沙箱，TaskSupervisor、通用 Context/memory 和其余 MVP 能力按路线图推进）
 >
 > **版本**：1.0.0
 >
@@ -714,6 +714,9 @@ Claude Code 的具体源码可能继续变化，本次快照中部分 reactive/s
 | pi-hermes-memory | MIT / 0.8.1 | FTS5 session search、failure/correction memory、secret scan | 参考搜索和失败记忆 | 不让搜索索引取代 Pi session |
 | pi-lcm | MIT / 0.1.3 | SQLite 保留消息、DAG 分层摘要 | 研究无损压缩思路 | 与 Pi 原生 compaction/session 真相可能竞争 |
 | oh-my-pi | MIT | LSP、DAP、browser、collab、memory、native worker 等大型集成 | 只做架构和测试研究，不整体合并 | fork 面过大，升级和许可证 notices 复杂 |
+| @juicesharp/rpiv-ask-user-question | MIT / 1.20.0 | 多问题 tab、预览、滚动、复核和自由输入 UX | 只借鉴 Goal 草案 custom UI，不直接依赖 | 引入 rpiv-config/i18n 和大于当前需求的状态面 |
+| pi-tool-display | MIT / 0.5.0 | 响应式 overlay、分栏 inspector、窄终端降级 | modal 设计参考 | 工具渲染和配置系统不属于 Goal UI 范围 |
+| pi-nano-context | MIT / 0.1.1 | 紧凑 widget、footer status 组合方式 | `setStatus` 设计参考 | 发布包仍声明旧 Pi peer 名；自定义 footer 可能与其他 UI 竞争 |
 | pi-adaptative | MIT | autonomy、reflection、memory、research、proposal/reload 思路 | 借鉴 proposal/approval/generation | 自动化面广，不作为 Pi-XK 核心依赖 |
 | pi-fast-subagent / subagent-isolation | 需逐版本核验 | worker pool、后台 job、隔离工作区思路 | 仅做 benchmark 和 adapter 评估 | 不默认引入另一套任务事实源 |
 | @mjasnikovs/pi-task | AGPL-3.0-only | Goal/task 交互想法 | 不进入 MIT 基线 | 需单独许可证和分发决策 |
@@ -783,7 +786,7 @@ pi_xk.artifact.*
 - 工具结果已持久化后的 `turn_end` 与 `session_before_compact` 的自动 checkpoint；
 - artifact store、redaction 和可重建 read model。
 
-**2026-07-21 实现状态：** Phase 1.1–1.5 已完成 Goal contract/event log、Pi binding/ref、`turn_end`（工具结果已持久化后）与 `session_before_compact` 的 checkpoint evidence、项目作用域 artifact store、v1 读取 upcast 和可重建 `goal-read-model.json`。Phase 1.6 已验证 Pi 原生本地 package 安装、冷启动自动发现和用户级 `/goal` 命令注册；`pi-xk-extension` 提供安装/恢复说明和无网络 runtime preflight。Phase 1.7 已实现活跃 Goal 的连续 run：普通模型回复不会结束 Goal，只有模型 `pi_xk_end_goal` 或用户 `/goal end` 会写入 ended；不以 run 数量作为终止条件，provider 失败保持 Goal active 并按指数退避重试。Phase 1.8 已实现 session 内 Goal 草案、Pi 原生确认/修订循环、无 UI 审阅命令、确认前零 Goal 落盘、`GoalContractV2` 与 v1 原始 hash/replay 兼容，以及模型 start/pause/end 的状态、审计、acceptance 和最终 checkpoint 校验。Goal 专用的 objective/state-path 执行与恢复提示已通过 `before_agent_start` 与 kickoff context 注入；尚未实现的是通用 L0/L1/L2 Context controller。artifact 默认只保存 runtime 生成的 provenance，不复制 Pi transcript、Goal state 或工具正文；Policy、artifact retention/GC 与 memory 仍未实现。
+**2026-07-21 实现状态：** Phase 1.1–1.5 已完成 Goal contract/event log、Pi binding/ref、`turn_end`（工具结果已持久化后）与 `session_before_compact` 的 checkpoint evidence、项目作用域 artifact store、v1 读取 upcast 和可重建 `goal-read-model.json`。Phase 1.6 已验证 Pi 原生本地 package 安装、冷启动自动发现和用户级 `/goal` 命令注册；`pi-xk-extension` 提供安装/恢复说明和无网络 runtime preflight。Phase 1.7 已实现活跃 Goal 的连续 run：普通模型回复不会结束 Goal，只有模型 `pi_xk_end_goal` 或用户 `/goal end` 会写入 ended；不以 run 数量作为终止条件，provider 失败保持 Goal active 并按指数退避重试。Phase 1.8 已实现 session 内 Goal 草案、Pi 原生确认/修订循环、无 UI 审阅命令、确认前零 Goal 落盘、`GoalContractV2` 与 v1 原始 hash/replay 兼容，以及模型 start/pause/end 的状态、审计、acceptance 和最终 checkpoint 校验。后续 CLI UI 跟进通过 `ctx.ui.setStatus` 显示逐秒 active 时间，并用 `ctx.ui.custom` 提供可滚动的草案确认/修订对话框；实现仍完全位于扩展层。Goal 专用的 objective/state-path 执行与恢复提示已通过 `before_agent_start` 与 kickoff context 注入；尚未实现的是通用 L0/L1/L2 Context controller。artifact 默认只保存 runtime 生成的 provenance，不复制 Pi transcript、Goal state 或工具正文；Policy、artifact retention/GC 与 memory 仍未实现。
 
 #### Phase 1.7：Goal 连续执行（已完成）
 
@@ -799,6 +802,7 @@ pi_xk.artifact.*
 - 模型的 start/pause/end 工具经过 host 状态和 acceptance 校验；pause/end 仅在最终 checkpoint 后提交，普通模型回复仍会自动续跑。
 - 最终 checkpoint 必须已成为可重放的 Goal event；失败时 lifecycle intent 保持 pending。状态不再兼容的旧 intent 标记 rejected，不会在未来重复生效。
 - 当前 branch 的 Goal 未 ended 时拒绝新草案；`goal-objective.md` 按完整合同正文校验并在合同投影重建时同步刷新。
+- TUI footer 以 `setStatus` 显示 active 时间且不替换原生 footer；草案使用可滚动 custom dialog 和多行 revision editor，无 TUI 时继续使用命令降级。
 - 每个逻辑段只提交本段文件；检查通过后推送。网络不可用时保留顺序本地提交，恢复网络后重新核验 fast-forward 再推送。
 
 必测故障：
@@ -946,6 +950,9 @@ MVP 只包含：Pi 原生 session、Goal contract/event log、自动 checkpoint�
 - [pi-hermes-memory](https://github.com/chandra447/pi-hermes-memory)
 - [pi-lcm](https://github.com/codexstar69/pi-lcm)
 - [oh-my-pi](https://github.com/can1357/oh-my-pi)
+- [rpiv-ask-user-question](https://www.npmjs.com/package/@juicesharp/rpiv-ask-user-question)
+- [pi-tool-display](https://github.com/MasuRii/pi-tool-display)
+- [pi-nano-context](https://github.com/daynin/nano-context)
 - [pi-adaptative](https://github.com/Caupulican/pi-adaptative)
 
 外部研究快照存放在本机临时目录 /tmp/pi-xk-research，没有把第三方源码复制进 Pi-XK 仓库。版本、许可证和维护状态以采用前重新审计为准。

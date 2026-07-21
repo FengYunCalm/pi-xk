@@ -18,7 +18,7 @@ Phase 1.7 已经让 active Goal 在普通模型回复后继续运行，但新 Go
 
 ### 1. 使用 Pi 原生交互完成草案确认
 
-交互环境使用 `ctx.ui.select` 和 `ctx.ui.input`。`/goal` 捕获下一条普通输入，`/goal <objective>` 作为快捷入口。模型只可提交或修订草案，随后由用户选择“确认，启动 Goal”或“修改草案”；修改必须显式输入反馈后重新起草。
+TUI 环境使用 Pi 原生 `ctx.ui.custom` 显示全宽草案对话框。`/goal` 捕获下一条普通输入，`/goal <objective>` 作为快捷入口。模型只可提交或修订草案；对话框固定提供“确认，启动 Goal”和“修改草案”两个动作，Page Up/Page Down 滚动合同，Escape 关闭但不取消草案。修改动作打开空白的 Pi 原生多行 editor，用户提交反馈后模型重新起草。
 
 非交互环境保留等价命令：`/goal review`、`/goal confirm`、`/goal revise <text>` 和 `/goal cancel`。确认前不创建 Goal ID、目录、事件日志、合同投影或两份 Goal Markdown 文件。
 
@@ -66,7 +66,13 @@ paused Goal 收到普通用户输入时，只获得轻量恢复提示：先读�
 
 提示词只约束模型决策，不能替代 host 校验。模型不能借提示词获得额外文件、网络、部署或 Git 权限；`executionAuthorization` 只说明用户已授权的 Goal 范围内代码、测试、脚本和正式文档修改。
 
-### 6. 分段交付与 Git
+### 6. CLI 状态与交互边界
+
+TUI footer 通过 `ctx.ui.setStatus` 显示当前 Goal 状态和 `activeElapsed`。active 时每秒只刷新显示；paused、ended 或 session shutdown 时停止计时器。刷新不追加 Goal event、不写 session entry，也不替换 Pi 原生 footer。`/goal status` 展示包括暂停的 `wallElapsed`、排除暂停的 `activeElapsed` 和已关闭 run 的 `busyElapsed`。
+
+草案对话框、滚动和多行修订全部由 `pi-xk-extension` 使用 Pi 公开 UI API 实现。第三方问答、工具展示和 context bar 仅作为 UX 证据，不进入运行时依赖，也不修改 `packages/coding-agent/src` 或 `packages/tui`。
+
+### 7. 分段交付与 Git
 
 实现按 ADR、Core V2、模型工具与提示词、草案 UI/命令/文档四段进行。每段完成后运行定向测试、`npm run test:pi-xk`、`npm run check` 与 `git diff --check`，只暂存该段文件并创建 Conventional Commit。
 
@@ -78,6 +84,7 @@ paused Goal 收到普通用户输入时，只获得轻量恢复提示：先读�
 - 草案不会污染项目 `.pi-xk` 目录，但 session 恢复需要能重建其待确认状态。
 - v1 数据保持可重放，v2 的更强验证只用于新 writer，避免历史 hash 链被破坏。
 - 自动续跑不再依赖 run 上限；是否暂停或结束由验收证据和 host 校验共同决定。
+- CLI 计时和草案交互是可删除的扩展投影；不会成为 Goal 或 Pi session 的新事实源。
 - 本阶段不实现通用 Context/memory、TaskSupervisor、Policy/沙箱、外部问答依赖或未确认 Goal 的自动执行。
 
 ## 验证门
@@ -86,3 +93,4 @@ paused Goal 收到普通用户输入时，只获得轻量恢复提示：先读�
 2. 草案创建、修订、取消在确认前不产生 `.pi-xk/goals/<goalId>`；确认可幂等恢复。
 3. faux provider 覆盖模型恢复用户或模型暂停、pause audit、end acceptance、非法 start 和 checkpoint 后提交顺序。
 4. active Goal 在普通回复后继续；pause/end 后不续跑；ended Goal 拒绝 start。
+5. TUI footer 的 active 时间逐秒更新并在 pause/end 后冻结；草案 custom UI 覆盖滚动、确认、修订、取消和无 UI 降级。

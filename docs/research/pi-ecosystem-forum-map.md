@@ -2,7 +2,7 @@
 
 > **状态**：研究快照
 >
-> **日期**：2026-07-19
+> **日期**：2026-07-21（在 2026-07-19 快照上增量核验 CLI UI 候选）
 >
 > **用途**：Pi-XK 选型前的首要参考；不是允许直接安装依赖的清单。
 >
@@ -29,7 +29,9 @@ Pi-XK 的策略是：核心保持 Pi 原生 session + 自己的 Goal event log�
 
 本轮研究范围只覆盖已提供的四份论坛副本。研究时 Linux.do 的 HTTPS 连接不可达；仓库信息改由 GitHub API、GitHub README 和 npm 元数据交叉核验。
 
-外部版本、许可证、活跃度均为 2026-07-19 快照。实际引入前必须再次核验源码、许可证、peer dependency、安装脚本和 lockfile。
+2026-07-21 根据新增候选清单复核了全部 6 项：`pi-observational-memory`、`pi-ace-tool`、`pi-nano-context`、`pi-tool-display`、`@juicesharp/rpiv-ask-user-question` 和 `oh-my-pi`。其中后三项 CLI UI 候选补充核验了 npm 元数据与发布包源码，其余项目沿用并复核原快照结论。
+
+主体项目的外部版本、许可证和活跃度为 2026-07-19 快照，新增 CLI UI 候选为 2026-07-21 增量快照。实际引入前必须再次核验源码、许可证、peer dependency、安装脚本和 lockfile。
 
 ## 论坛实践的可迁移结论
 
@@ -75,6 +77,9 @@ Pi-XK 的策略是：核心保持 Pi 原生 session + 自己的 Goal event log�
 | [Magic Context](https://github.com/cortexkit/magic-context) | 分层上下文、cache-stable context、SQLite 工作流 | 体量和状态面较大，不适合作为 Pi-XK 地基 |
 | [oh-my-pi](https://github.com/can1357/oh-my-pi) | LSP、browser、subagent、hash anchored edit、丰富工具 | 大型 fork；直接合并会失去上游同步能力 |
 | [pi-adaptative](https://github.com/Caupulican/pi-adaptative) | source-backed self-modification、profile、reload | 研究 proposal/reload 边界；不接入其自动演化实现 |
+| [rpiv-ask-user-question](https://www.npmjs.com/package/@juicesharp/rpiv-ask-user-question) | 1.20.0；多问题、预览、滚动、复核和自由输入的原生 TUI | 只借鉴固定 chrome、溢出滚动和复核 UX；不引入 rpiv-config/i18n 依赖 |
+| [pi-tool-display](https://github.com/MasuRii/pi-tool-display) | MIT，0.5.0；响应式 overlay、分栏 inspector 和紧凑工具呈现 | 借鉴响应式 modal；Goal UI 不接管其工具渲染或配置系统 |
+| [pi-nano-context](https://github.com/daynin/nano-context) | MIT，0.1.1；编辑器下方紧凑 context bar 和自定义 footer | 证明 `setWidget/setStatus` 可组合模式；不替换 Pi-XK footer，采用前需处理旧 peer 包名 |
 
 ## C 类：个人工作台或外围 adapter
 
@@ -106,6 +111,7 @@ Pi-XK 的策略是：核心保持 Pi 原生 session + 自己的 Goal event log�
 4. pi-observational-memory 的开发分支可能含未发布行为；优先固定 npm 发布版本。
 5. Telegram bridge、MCP 和搜索工具会引入 token、网络、后台进程或外部服务；它们属于 adapter，不能成为 Goal/Task 事实源。
 6. 所有安装前检查 package name、repository、license、依赖、lifecycle script、固定版本和实际入口。帖子中的个人体验不是供应链审计。
+7. `rpiv-ask-user-question` 功能完整但超出 Goal 草案的两动作需求；Pi-XK 使用 Pi 原生 custom UI，不复制其状态机，也不增加其配置和 i18n 依赖。
 
 ## Pi-XK 的采用顺序
 

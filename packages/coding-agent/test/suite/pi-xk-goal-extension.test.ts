@@ -2,7 +2,8 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { type FauxResponseFactory, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it } from "vitest";
+import type { Component, TUI } from "@earendil-works/pi-tui";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	type GoalCheckpointV2,
 	type GoalContractUpdateOptions,
@@ -10,6 +11,7 @@ import {
 	GoalStore,
 	type GoalWriteResult,
 } from "../../../pi-xk-core/src/index.ts";
+import { createGoalDraftReviewComponent } from "../../../pi-xk-extension/src/goal-ui.ts";
 import {
 	createPiXkGoalBinding,
 	createPiXkGoalExtension,
@@ -24,7 +26,7 @@ import {
 	type PiXkGoalLifecycleIntent,
 	type PiXkSessionLink,
 } from "../../../pi-xk-extension/src/index.ts";
-import type { ExtensionUIContext } from "../../src/core/extensions/index.ts";
+import type { ExtensionUIContext, KeybindingsManager } from "../../src/core/extensions/index.ts";
 import type { CustomEntry, SessionEntry } from "../../src/core/session-manager.ts";
 import { type Theme, theme } from "../../src/modes/interactive/theme/theme.ts";
 import { createHarness, getMessageText, type Harness } from "./harness.ts";
@@ -35,6 +37,14 @@ type GoalBindingEntry = CustomEntry<PiXkSessionLink> & { data: PiXkSessionLink }
 type GoalCaptureEntry = CustomEntry<PiXkGoalCapture> & { data: PiXkGoalCapture };
 type GoalDraftEntry = CustomEntry<PiXkGoalDraft> & { data: PiXkGoalDraft };
 type GoalLifecycleIntentEntry = CustomEntry<PiXkGoalLifecycleIntent> & { data: PiXkGoalLifecycleIntent };
+type CustomUiOptions = Parameters<ExtensionUIContext["custom"]>[1];
+type CustomUiComponent = Component & { dispose?(): void };
+type CustomUiFactory<T> = (
+	tui: TUI,
+	theme: Theme,
+	keybindings: KeybindingsManager,
+	done: (result: T) => void,
+) => CustomUiComponent | Promise<CustomUiComponent>;
 
 function isGoalBindingEntry(entry: SessionEntry): entry is GoalBindingEntry {
 	return (
@@ -123,6 +133,9 @@ function createUiContext(overrides: {
 	select?: ExtensionUIContext["select"];
 	input?: ExtensionUIContext["input"];
 	notify?: ExtensionUIContext["notify"];
+	setStatus?: ExtensionUIContext["setStatus"];
+	custom?: ExtensionUIContext["custom"];
+	editor?: ExtensionUIContext["editor"];
 }): ExtensionUIContext {
 	return {
 		select: overrides.select ?? (async () => undefined),
@@ -130,7 +143,7 @@ function createUiContext(overrides: {
 		input: overrides.input ?? (async () => undefined),
 		notify: overrides.notify ?? (() => {}),
 		onTerminalInput: () => () => {},
-		setStatus: () => {},
+		setStatus: overrides.setStatus ?? (() => {}),
 		setWorkingMessage: () => {},
 		setWorkingVisible: () => {},
 		setWorkingIndicator: () => {},
@@ -139,11 +152,11 @@ function createUiContext(overrides: {
 		setFooter: () => {},
 		setHeader: () => {},
 		setTitle: () => {},
-		custom: async <T>() => undefined as T,
+		custom: overrides.custom ?? (async <T>() => undefined as T),
 		pasteToEditor: () => {},
 		setEditorText: () => {},
 		getEditorText: () => "",
-		editor: async () => undefined,
+		editor: overrides.editor ?? (async () => undefined),
 		addAutocompleteProvider: () => {},
 		setEditorComponent: () => {},
 		getEditorComponent: () => undefined,
@@ -156,6 +169,13 @@ function createUiContext(overrides: {
 		getToolsExpanded: () => false,
 		setToolsExpanded: () => {},
 	};
+}
+
+function createPlainTheme(): Theme {
+	return {
+		fg: (_color: string, text: string) => text,
+		bold: (text: string) => text,
+	} as unknown as Theme;
 }
 
 async function waitForAgent(harness: Harness): Promise<void> {
@@ -179,12 +199,84 @@ async function requestAndConfirmGoal(harness: Harness, objective: string): Promi
 }
 
 afterEach(() => {
+	vi.useRealTimers();
 	while (harnesses.length > 0) {
 		harnesses.pop()?.cleanup();
 	}
 });
 
 describe("Pi-XK Goal extension", () => {
+	it("shows live active Goal time in the native footer and freezes it while paused", async () => {
+		vi.useFakeTimers();
+		let now = new Date("2026-07-21T00:01:05.000Z");
+		const statuses: Array<{ key: string; text: string | undefined }> = [];
+		const notifications: string[] = [];
+		const harness = await createHarness({
+			extensionFactories: [createPiXkGoalExtension({ now: () => now })],
+		});
+		harnesses.push(harness);
+		const goalId = "goal_live_footer";
+		const store = new GoalStore(harness.tempDir);
+		const contract: GoalContractV2 = {
+			schema: "pi-xk.goal.contract.v2",
+			goalId,
+			title: "Show live Goal time",
+			objective: "Display active Goal execution time without replacing Pi's footer.",
+			constraints: [],
+			acceptance: [{ id: "A-1", kind: "artifact", description: "Show Goal time.", required: true }],
+			capabilities: { filesystem: "unrestricted", network: "unrestricted", spawn: "unrestricted" },
+			budgets: { tokens: 0, costCents: 0, wallSeconds: 0 },
+			ownerSessionId: harness.sessionManager.getSessionId(),
+			createdAt: "2026-07-21T00:00:00.000Z",
+			schemaVersion: 2,
+			nonGoals: [],
+			doneCondition: "The footer reports active execution time.",
+			pauseCondition: "The user pauses the Goal.",
+			finalReport: "Report the displayed times.",
+			executionAuthorization: "In-scope test and implementation edits are authorized.",
+		};
+		const created = await store.createGoal(contract, {
+			eventId: "evt-create-live-footer",
+			idempotencyKey: "create:live-footer",
+			actor: "user",
+			timestamp: contract.createdAt,
+		});
+		await store.appendLifecycleEvent(
+			goalId,
+			{ eventType: "goal_activated", payload: { sessionId: harness.sessionManager.getSessionId() } },
+			{
+				eventId: "evt-activate-live-footer",
+				idempotencyKey: "activate:live-footer",
+				actor: "user",
+				timestamp: contract.createdAt,
+				expectedHead: created.head,
+			},
+		);
+		harness.sessionManager.appendCustomEntry(PI_XK_SESSION_LINK_CUSTOM_TYPE, createPiXkGoalBinding(goalId, 0));
+		const uiContext = createUiContext({
+			setStatus: (key, text) => statuses.push({ key, text }),
+			notify: (message) => notifications.push(message),
+		});
+
+		await harness.session.bindExtensions({ uiContext, mode: "tui" });
+		expect(statuses.at(-1)).toEqual({ key: "pi-xk-goal", text: "Goal active · 1m 5s" });
+
+		now = new Date("2026-07-21T00:02:00.000Z");
+		await vi.advanceTimersByTimeAsync(1_000);
+		expect(statuses.at(-1)).toEqual({ key: "pi-xk-goal", text: "Goal active · 2m 0s" });
+
+		await harness.session.prompt("/goal pause inspect the footer");
+		expect(statuses.at(-1)).toEqual({ key: "pi-xk-goal", text: "Goal paused · 2m 0s" });
+
+		now = new Date("2026-07-21T00:03:00.000Z");
+		const statusCount = statuses.length;
+		await vi.advanceTimersByTimeAsync(5_000);
+		expect(statuses).toHaveLength(statusCount);
+
+		await harness.session.prompt("/goal status");
+		expect(notifications.at(-1)).toContain("wall 3m 0s, active 2m 0s, busy 0s");
+	});
+
 	it("keeps a submitted Goal draft in the session until the user confirms it", async () => {
 		const objective = "Draft a Goal without creating it immediately.";
 		const draftPrompts: string[] = [];
@@ -239,11 +331,13 @@ describe("Pi-XK Goal extension", () => {
 	});
 
 	it("uses native UI to revise a draft and confirm the revised contract", async () => {
-		const selectTitles: string[] = [];
-		const selectOptions: string[][] = [];
-		const inputCalls: Array<{ title: string; placeholder: string | undefined }> = [];
+		const dialogRenders: string[] = [];
+		const dialogOptions: Array<{ overlay?: boolean; overlayOptions?: unknown } | undefined> = [];
+		const editorCalls: Array<{ title: string; prefill: string | undefined }> = [];
+		const notifications: string[] = [];
 		const revisionPrompts: string[] = [];
-		const choices = ["修改草案", "确认，启动 Goal"];
+		const choices = ["revise", "confirm"];
+		const dialogTheme = createPlainTheme();
 		const harness = await createHarness({
 			extensionFactories: [createPiXkGoalExtension({ createGoalId: () => "goal_ui_draft" })],
 		});
@@ -270,14 +364,31 @@ describe("Pi-XK Goal extension", () => {
 				{ stopReason: "toolUse" },
 			),
 		]);
+		const custom = async <T>(factory: CustomUiFactory<T>, options?: CustomUiOptions): Promise<T> => {
+			dialogOptions.push(options);
+			const component = await factory(
+				{
+					terminal: { rows: 24 },
+					requestRender: () => {},
+				} as never,
+				dialogTheme,
+				{ matches: () => false } as unknown as KeybindingsManager,
+				() => {},
+			);
+			dialogRenders.push(component.render(80).join("\n"));
+			return choices.shift() as T;
+		};
 		const uiContext = createUiContext({
-			select: async (title, options) => {
-				selectTitles.push(title);
-				selectOptions.push(options);
-				return choices.shift();
+			notify: (message) => notifications.push(message),
+			select: async () => {
+				throw new Error("Goal draft review must not use ctx.ui.select");
 			},
-			input: async (title, placeholder) => {
-				inputCalls.push({ title, placeholder });
+			input: async () => {
+				throw new Error("Goal draft revision must not use ctx.ui.input");
+			},
+			custom,
+			editor: async (title, prefill) => {
+				editorCalls.push({ title, prefill });
 				return "Require explicit release evidence.";
 			},
 		});
@@ -286,20 +397,64 @@ describe("Pi-XK Goal extension", () => {
 		await harness.session.prompt("/goal Prepare a release Goal.");
 		await waitForAgent(harness);
 
-		expect(selectTitles).toHaveLength(2);
-		expect(selectTitles[0]).toContain("# Goal Draft");
-		expect(selectTitles[0]).not.toContain("passes..");
-		expect(selectTitles[1]).toContain("Revised drafted objective.");
-		expect(selectOptions).toEqual([
-			["确认，启动 Goal", "修改草案"],
-			["确认，启动 Goal", "修改草案"],
+		expect(notifications).toEqual([]);
+		expect(dialogRenders).toHaveLength(2);
+		expect(dialogRenders[0]).toContain("Goal Draft");
+		expect(dialogRenders[0].match(/Goal Draft/g)).toHaveLength(1);
+		expect(dialogRenders[0]).toContain("Initial drafted objective.");
+		expect(dialogRenders[0]).toContain("确认，启动 Goal");
+		expect(dialogRenders[0]).toContain("修改草案");
+		expect(dialogRenders[1]).toContain("Revised drafted objective.");
+		expect(dialogOptions).toEqual([
+			expect.objectContaining({ overlay: true }),
+			expect.objectContaining({ overlay: true }),
 		]);
-		expect(inputCalls).toEqual([{ title: "修改 Goal 草案", placeholder: "" }]);
+		expect(editorCalls).toEqual([{ title: "修改 Goal 草案", prefill: "" }]);
 		expect(revisionPrompts[1]).toContain("Revision feedback:\nRequire explicit release evidence.");
 		expect(getCurrentGoalDraft(harness)).toMatchObject({ state: "confirmed", goalId: "goal_ui_draft" });
 		const replayed = await new GoalStore(harness.tempDir).replayGoal("goal_ui_draft");
 		expect(replayed.contract.objective).toBe("Revised drafted objective.");
 		expect(replayed.lifecycle.status).toBe("ended");
+	});
+
+	it("supports scrolling, action selection, and cancellation in the Goal draft dialog", () => {
+		const results: string[] = [];
+		const keybindings = {
+			matches: (data: string, key: string) => data === key,
+		} as unknown as KeybindingsManager;
+		const tui = {
+			terminal: { rows: 12 },
+			requestRender: () => {},
+		};
+		const component = createGoalDraftReviewComponent({
+			markdown: Array.from({ length: 10 }, (_, index) => `Line ${index + 1}`).join("\n"),
+			tui,
+			theme: createPlainTheme(),
+			keybindings,
+			done: (result) => results.push(result),
+		});
+
+		expect(component.render(60).join("\n")).toContain("Line 1");
+		component.handleInput("tui.select.pageDown");
+		expect(component.render(60).join("\n")).toContain("Line 4");
+		tui.terminal.rows = 6;
+		const compactRender = component.render(60);
+		expect(compactRender).toHaveLength(6);
+		expect(compactRender.join("\n")).toContain("确认，启动 Goal");
+		expect(compactRender.join("\n")).toContain("修改草案");
+		component.handleInput("tui.select.down");
+		component.handleInput("tui.select.confirm");
+		expect(results).toEqual(["revise"]);
+
+		const cancelled = createGoalDraftReviewComponent({
+			markdown: "Draft",
+			tui,
+			theme: createPlainTheme(),
+			keybindings,
+			done: (result) => results.push(result),
+		});
+		cancelled.handleInput("tui.select.cancel");
+		expect(results).toEqual(["revise", "cancel"]);
 	});
 
 	it("supports no-UI review, revise, and cancel without creating Goal files", async () => {

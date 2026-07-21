@@ -21,6 +21,7 @@ import {
 	validateGoalLifecycleEventForContract,
 } from "pi-xk-core";
 import { Type } from "typebox";
+import { createGoalDraftReviewComponent, type GoalDraftReviewAction } from "./goal-ui.ts";
 import {
 	assertPiXkSessionLink,
 	createPiXkCheckpointRef,
@@ -510,9 +511,7 @@ const PI_XK_GOAL_DRAFT_KICKOFF_CUSTOM_TYPE = "pi-xk.goal-draft-kickoff.v1";
 
 const PI_XK_GOAL_DRAFT_REVIEW_CUSTOM_TYPE = "pi-xk.goal-draft-review.v1";
 
-const GOAL_DRAFT_CONFIRM_OPTION = "确认，启动 Goal";
-
-const GOAL_DRAFT_REVISE_OPTION = "修改草案";
+const PI_XK_GOAL_STATUS_KEY = "pi-xk-goal";
 
 interface GoalLifecycleWrite {
 	eventId: string;
@@ -738,9 +737,28 @@ function rejectGoalLifecycleIntent(
 }
 
 function formatDuration(milliseconds: number): string {
-	const seconds = Math.floor(milliseconds / 1000);
-	const minutes = Math.floor(seconds / 60);
+	const seconds = Math.max(0, Math.floor(milliseconds / 1000));
+	const days = Math.floor(seconds / 86_400);
+	const hours = Math.floor((seconds % 86_400) / 3_600);
+	const minutes = Math.floor((seconds % 3_600) / 60);
+	if (days > 0) return `${days}d ${hours}h ${minutes}m`;
+	if (hours > 0) return `${hours}h ${minutes}m`;
 	return minutes > 0 ? `${minutes}m ${seconds % 60}s` : `${seconds}s`;
+}
+
+interface GoalStatusSnapshot {
+	status: GoalLifecycleStatus;
+	activeElapsed: number;
+	observedAt: number;
+}
+
+function activeElapsedForStatus(snapshot: GoalStatusSnapshot, now: number): number {
+	if (snapshot.status !== "active") return snapshot.activeElapsed;
+	return snapshot.activeElapsed + Math.max(0, now - snapshot.observedAt);
+}
+
+function formatGoalFooterStatus(snapshot: GoalStatusSnapshot, now: number): string {
+	return `Goal ${snapshot.status} · ${formatDuration(activeElapsedForStatus(snapshot, now))}`;
 }
 
 function createGoalContract(
@@ -1411,17 +1429,32 @@ async function reviewGoalDraftWithUi(
 	options: PiXkGoalExtensionOptions,
 ): Promise<void> {
 	const draft = findCurrentGoalDraft(ctx);
-	if (!ctx.hasUI || !draft || draft.state !== "proposed" || draft.proposal === null) return;
-	const choice = await ctx.ui.select(renderGoalDraftMarkdown(draft), [
-		GOAL_DRAFT_CONFIRM_OPTION,
-		GOAL_DRAFT_REVISE_OPTION,
-	]);
-	if (choice === GOAL_DRAFT_CONFIRM_OPTION) {
+	if (ctx.mode !== "tui" || !ctx.hasUI || !draft || draft.state !== "proposed" || draft.proposal === null) return;
+	const choice = await ctx.ui.custom<GoalDraftReviewAction>(
+		(tui, theme, keybindings, done) =>
+			createGoalDraftReviewComponent({
+				markdown: renderGoalDraftMarkdown(draft),
+				tui,
+				theme,
+				keybindings,
+				done,
+			}),
+		{
+			overlay: true,
+			overlayOptions: {
+				anchor: "bottom-center",
+				width: "100%",
+				maxHeight: "100%",
+				margin: { left: 0, right: 0, bottom: 0 },
+			},
+		},
+	);
+	if (choice === "confirm") {
 		await confirmGoalDraft(pi, ctx, storeFor, options);
 		return;
 	}
-	if (choice !== GOAL_DRAFT_REVISE_OPTION) return;
-	const feedback = await ctx.ui.input("修改 Goal 草案", "");
+	if (choice !== "revise") return;
+	const feedback = await ctx.ui.editor("修改 Goal 草案", "");
 	if (!feedback?.trim()) return;
 	reviseGoalDraft(pi, ctx, options, feedback);
 }
@@ -1477,6 +1510,7 @@ function findCurrentKickoffMessageIndex(
 async function showGoalStatus(
 	ctx: ExtensionCommandContext,
 	storeFor: (projectRoot: string) => GoalStore,
+	options: PiXkGoalExtensionOptions,
 ): Promise<void> {
 	const binding = findCurrentGoalBinding(ctx);
 	if (!binding) {
@@ -1484,7 +1518,7 @@ async function showGoalStatus(
 		return;
 	}
 	const store = storeFor(ctx.cwd);
-	const replay = await store.replayGoal(binding.goalId);
+	const replay = await store.replayGoal(binding.goalId, { now: goalNow(options) });
 	const files = await store.inspectGoalFiles(binding.goalId);
 	ctx.ui.notify(
 		`Pi-XK Goal ${binding.goalId}: ${replay.lifecycle.status}; wall ${formatDuration(replay.lifecycle.wallElapsed)}, active ${formatDuration(replay.lifecycle.activeElapsed)}, busy ${formatDuration(replay.lifecycle.busyElapsed)}; objective ${files.objective.status}, state ${files.state.status}`,
@@ -1499,11 +1533,62 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 		let lastGoalRunOutcome: GoalRunOutcome = "aborted";
 		let currentRunKind: "draft" | "goal" | "other" = "other";
 		let retryTimer: ReturnType<typeof setTimeout> | undefined;
+		let goalStatusTimer: ReturnType<typeof setInterval> | undefined;
+		let goalStatusContext: ExtensionContext | undefined;
+		let goalStatusSnapshot: GoalStatusSnapshot | undefined;
 
 		const clearRetryTimer = () => {
 			if (retryTimer === undefined) return;
 			clearTimeout(retryTimer);
 			retryTimer = undefined;
+		};
+
+		const clearGoalStatusTimer = () => {
+			if (goalStatusTimer === undefined) return;
+			clearInterval(goalStatusTimer);
+			goalStatusTimer = undefined;
+		};
+
+		const renderGoalStatus = () => {
+			if (!goalStatusContext?.hasUI) return;
+			goalStatusContext.ui.setStatus(
+				PI_XK_GOAL_STATUS_KEY,
+				goalStatusSnapshot
+					? formatGoalFooterStatus(goalStatusSnapshot, (options.now?.() ?? new Date()).getTime())
+					: undefined,
+			);
+		};
+
+		const synchronizeGoalStatusTimer = () => {
+			if (goalStatusSnapshot?.status === "active" && goalStatusContext?.hasUI) {
+				if (goalStatusTimer !== undefined) return;
+				goalStatusTimer = setInterval(renderGoalStatus, 1_000);
+				goalStatusTimer.unref?.();
+				return;
+			}
+			clearGoalStatusTimer();
+		};
+
+		const refreshGoalStatus = async (ctx: ExtensionContext): Promise<void> => {
+			goalStatusContext = ctx;
+			const binding = findCurrentGoalBinding(ctx);
+			if (!binding) {
+				goalStatusSnapshot = undefined;
+				renderGoalStatus();
+				synchronizeGoalStatusTimer();
+				return;
+			}
+			const observedAt = (options.now?.() ?? new Date()).getTime();
+			const replay = await storeFor(ctx.cwd).replayGoal(binding.goalId, {
+				now: new Date(observedAt).toISOString(),
+			});
+			goalStatusSnapshot = {
+				status: replay.lifecycle.status,
+				activeElapsed: replay.lifecycle.activeElapsed,
+				observedAt,
+			};
+			renderGoalStatus();
+			synchronizeGoalStatusTimer();
 		};
 
 		const retryDelay = (failureCount: number): number => {
@@ -1752,6 +1837,7 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 				await synchronizeCheckpointState(pi, ctx, checkpointOptions);
 				await recoverOpenGoalRun(ctx, storeFor, options);
 				await processPendingGoalLifecycleIntent(ctx);
+				await refreshGoalStatus(ctx);
 			} catch (error) {
 				notifyGoalError(ctx, options, error);
 			}
@@ -1837,29 +1923,43 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 					if (settledRunKind === "draft" && draft?.state === "proposed") {
 						await reviewGoalDraftWithUi(pi, ctx, storeFor, options);
 					}
+					await refreshGoalStatus(ctx);
 					return;
 				}
-				if (await processPendingGoalLifecycleIntent(ctx)) return;
+				if (await processPendingGoalLifecycleIntent(ctx)) {
+					await refreshGoalStatus(ctx);
+					return;
+				}
 				await settleGoalRun(ctx, storeFor, options);
-				if (lastGoalRunOutcome === "aborted") return;
+				if (lastGoalRunOutcome === "aborted") {
+					await refreshGoalStatus(ctx);
+					return;
+				}
 				if (lastGoalRunOutcome === "error") {
 					consecutiveGoalFailures += 1;
 					scheduleRetry(ctx, retryDelay(consecutiveGoalFailures));
+					await refreshGoalStatus(ctx);
 					return;
 				}
 				consecutiveGoalFailures = 0;
 				await continueActiveGoal(pi, ctx, storeFor);
+				await refreshGoalStatus(ctx);
 			} catch (error) {
 				notifyGoalError(ctx, options, error);
 			}
 		});
 		pi.on("session_shutdown", async (_event, ctx) => {
 			clearRetryTimer();
+			clearGoalStatusTimer();
 			try {
 				await synchronizeCheckpointState(pi, ctx, checkpointOptions);
 				await processPendingGoalLifecycleIntent(ctx);
 			} catch (error) {
 				notifyGoalError(ctx, options, error);
+			} finally {
+				goalStatusSnapshot = undefined;
+				renderGoalStatus();
+				goalStatusContext = undefined;
 			}
 		});
 		pi.on("input", async (event, ctx) => {
@@ -1897,7 +1997,7 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 						return;
 					}
 					if (trimmed === "status") {
-						await showGoalStatus(ctx, storeFor);
+						await showGoalStatus(ctx, storeFor, options);
 						return;
 					}
 					if (trimmed === "review") {
@@ -1936,6 +2036,12 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 					await requestGoalDraft(pi, ctx, storeFor, options, objective);
 				} catch (error) {
 					notifyGoalError(ctx, options, error);
+				} finally {
+					try {
+						await refreshGoalStatus(ctx);
+					} catch (error) {
+						notifyGoalError(ctx, options, error);
+					}
 				}
 			},
 		});

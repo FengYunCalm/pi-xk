@@ -42,7 +42,7 @@ Pi's native `find` tool needs `fd`. On Ubuntu or Debian, install `fd-find`; Pi r
 /goal -- <objective>       Draft an objective beginning with a reserved subcommand.
 ```
 
-The captured objective is sent only to a hidden draft kickoff, not as a normal chat message. The draft model must submit one structured contract and cannot perform Goal work or call lifecycle tools. In interactive mode, Pi-XK displays the normalized Markdown through native `ctx.ui.select`; choosing revision opens an empty native `ctx.ui.input` and repeats the draft loop. In print or other no-UI modes, use the review, confirm, revise, and cancel commands above.
+The captured objective is sent only to a hidden draft kickoff, not as a normal chat message. The draft model must submit one structured contract and cannot perform Goal work or call lifecycle tools. In TUI mode, Pi-XK displays the normalized Markdown in a native full-width `ctx.ui.custom` dialog. Page Up and Page Down scroll the contract, the two actions confirm or revise it, Escape closes the dialog without changing the draft, and revision opens an empty native multi-line editor before repeating the draft loop. In print, RPC, or other no-TUI modes, use the review, confirm, revise, and cancel commands above.
 
 Confirmation is the first operation that creates `.pi-xk/goals/<goalId>`, its event log, `goal-objective.md`, and mutable `goal-state.md`. At the start of every active run, Pi-XK tells the model to read both files and audit required acceptance evidence.
 
@@ -51,6 +51,8 @@ Each session branch has one current Goal. A new draft is rejected while that Goa
 `pi_xk_start_goal`, `pi_xk_pause_goal`, and `pi_xk_end_goal` are model tools. Start requires a paused Goal plus new recovery evidence. Pause requires an audit of unmet required acceptance IDs, current evidence, the incomplete conclusion, any user request, and the next best action. End requires verification evidence for every required acceptance. Model pause and end requests are committed only after the final observable checkpoint is durable. A failed checkpoint leaves the lifecycle intent pending for a later safe-boundary retry; user `/goal end` remains an immediate terminal override.
 
 While a Goal is active, Pi-XK starts another run after a settled run. A normal assistant response, plan, or partial result does not end the Goal. The model must call `pi_xk_end_goal` only after it has updated `goal-state.md` and verified the objective and declared acceptance evidence. If it needs user input or an external change, it must update state and call `pi_xk_pause_goal`. There is no run-count completion limit. Provider failures leave the Goal active and retry with exponential backoff rather than fabricating an ended state.
+
+In TUI mode, Pi-XK adds a composable native footer status such as `Goal active · 12m 34s`. The timer displays lifecycle `activeElapsed`, updates once per second only while the Goal is active, and freezes while paused or after the Goal ends. It uses `ctx.ui.setStatus`; it does not replace Pi's footer or persist per-second events. `/goal status` reports `wall` time including pauses, `active` time excluding pauses, and closed-run `busy` time.
 
 ## Files And Recovery
 
