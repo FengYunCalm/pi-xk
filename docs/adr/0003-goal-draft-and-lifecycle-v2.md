@@ -24,6 +24,8 @@ Phase 1.7 已经让 active Goal 在普通模型回复后继续运行，但新 Go
 
 草案在 Pi session custom entry 中以 `goal_draft` 保存，状态只能沿以下有限集合变化：`requested`、`proposed`、`superseded`、`confirming`、`confirmed`、`cancelled`。它是会话恢复所需的暂态记录，不是 Goal event log，也不进入模型常规上下文。
 
+同一 session branch 只允许一个当前 Goal。当前绑定 Goal 仍为 active 或 paused 时拒绝创建新草案；必须先结束当前 Goal，避免只替换 binding 却把旧 Goal 留在不可见的 active 状态。
+
 ### 2. 合同 v2 是新写入格式，v1 保持可验证历史
 
 新增 `GoalContractV2`，在既有字段之外持久化：
@@ -52,7 +54,9 @@ active Goal 的模型可调用：
 - `pi_xk_pause_goal(reason, userRequest, nextBestAction, audit)`，仅允许 active Goal，且 audit 证明目标尚未满足；
 - `pi_xk_end_goal(outcome, reason, verifiedAcceptanceIds, finalEvidence, finalSummary)`，仅在全部 required acceptance 有验证证据后允许结束新的 v2 Goal。
 
-工具先追加 Pi session lifecycle intent；当前 run 的最终 checkpoint 成功后才写 Goal 事件和状态转换。start 成功后立即结束普通 turn，写入 `goal_resumed` 并开始新的 active kickoff。pause/end 成功后不自动续跑。无绑定、状态不匹配、缺少审计、非法 acceptance ID 或不完整验收必须返回明确错误。
+工具先追加 Pi session lifecycle intent；当前 run 的最终 turn checkpoint 已持久化到 Goal event log 后才写 Goal 事件和状态转换。checkpoint 失败时 intent 保持 `requested`，在后续安全边界重试；状态已经不兼容的旧 intent 写入 `rejected` 终态，不能无限重试或在未来意外生效。start 成功后立即结束普通 turn，写入 `goal_resumed` 并开始新的 active kickoff。pause/end 成功后不自动续跑。无绑定、状态不匹配、缺少审计、非法 acceptance ID 或不完整验收必须返回明确错误。
+
+`goal-objective.md` 是当前合同的规范投影。读取侧校验完整规范正文；合同更新和 projection rebuild 会原子重建 objective 文件。只保留正确 identity header 但修改正文必须诊断为 mismatched。
 
 paused Goal 收到普通用户输入时，只获得轻量恢复提示：先读取 pause audit 与新输入。只有新输入、外部变化或新证据解除阻塞时模型才可 start；恢复前不得执行 Goal 工作。用户 `/goal pause` 可由模型基于新证据恢复；用户 `/goal end` 立即结束且不可重新启动。
 

@@ -102,7 +102,7 @@ export interface PiXkGoalDraft {
 
 export type PiXkGoalLifecycleIntentAction = "start" | "pause" | "end";
 
-export type PiXkGoalLifecycleIntentState = "requested" | "committed";
+export type PiXkGoalLifecycleIntentState = "requested" | "committed" | "rejected";
 
 export interface PiXkGoalPauseAudit {
 	unmetRequiredAcceptanceIds: string[];
@@ -442,7 +442,7 @@ export function isPiXkGoalLifecycleIntent(value: unknown): value is PiXkStoredGo
 		!isGoalId(value.goalId) ||
 		!isGeneration(value.generation) ||
 		(value.actor !== "user" && value.actor !== "model") ||
-		(value.state !== "requested" && value.state !== "committed") ||
+		(value.state !== "requested" && value.state !== "committed" && value.state !== "rejected") ||
 		typeof value.runId !== "string" ||
 		typeof value.reason !== "string" ||
 		typeof value.nextBestAction !== "string" ||
@@ -660,7 +660,7 @@ export function createPiXkGoalLifecycleIntent(
 	if (intent.action !== "start" && intent.action !== "pause" && intent.action !== "end") {
 		throw new Error("Pi-XK Goal lifecycle intent action is invalid");
 	}
-	if (intent.state !== "requested" && intent.state !== "committed") {
+	if (intent.state !== "requested" && intent.state !== "committed" && intent.state !== "rejected") {
 		throw new Error("Pi-XK Goal lifecycle intent state is invalid");
 	}
 	if (intent.actor !== "user" && intent.actor !== "model") {

@@ -16,6 +16,7 @@ import {
 	type GoalContractV2,
 	GoalHeadConflictError,
 	type GoalLifecycleEventInput,
+	type GoalLifecycleStatus,
 	GoalStore,
 	validateGoalLifecycleEventForContract,
 } from "pi-xk-core";
@@ -113,6 +114,10 @@ export interface PiXkExtensionOptions {
 	onCheckpointError?: (error: Error) => void;
 	/** Internal lifecycle observer; this extension does not persist checkpoints unless goalStore is injected. */
 	onLifecycle?: (event: PiXkLifecycleEvent) => void;
+	/** Internal composition switch for hosts that serialize session recovery themselves. */
+	synchronizeOnSessionStart?: boolean;
+	/** Internal composition switch for hosts that settle lifecycle intents during shutdown. */
+	synchronizeOnSessionShutdown?: boolean;
 }
 
 function getGoalStore(options: PiXkExtensionOptions, ctx: ExtensionContext): GoalStore | undefined {
@@ -312,9 +317,9 @@ async function persistCheckpointIntent(
 	binding: PiXkSessionLink,
 	intent: PiXkCheckpointIntent,
 	options: PiXkExtensionOptions,
-): Promise<void> {
+): Promise<boolean> {
 	const goalStore = getGoalStore(options, ctx);
-	if (!goalStore) return;
+	if (!goalStore) return true;
 	try {
 		for (let attempt = 0; attempt < 2; attempt++) {
 			try {
@@ -329,14 +334,16 @@ async function persistCheckpointIntent(
 					},
 				);
 				appendCheckpointRef(pi, ctx, binding, result.event.eventId);
-				return;
+				return true;
 			} catch (error) {
 				if (attempt === 1) throw error;
 			}
 		}
 	} catch (error) {
 		reportCheckpointError(options, error);
+		return false;
 	}
+	return false;
 }
 
 async function synchronizeCheckpointRefs(
@@ -344,9 +351,9 @@ async function synchronizeCheckpointRefs(
 	ctx: ExtensionContext,
 	binding: PiXkSessionLink,
 	options: PiXkExtensionOptions,
-): Promise<void> {
+): Promise<boolean> {
 	const goalStore = getGoalStore(options, ctx);
-	if (!goalStore) return;
+	if (!goalStore) return true;
 	try {
 		const replay = await goalStore.replayGoal(binding.goalId);
 		if (replay.tailDiagnostic) {
@@ -357,8 +364,10 @@ async function synchronizeCheckpointRefs(
 			if (event.eventType !== "goal_checkpointed" || event.payload.checkpoint.sessionId !== sessionId) continue;
 			appendCheckpointRef(pi, ctx, binding, event.eventId);
 		}
+		return true;
 	} catch (error) {
 		reportCheckpointError(options, error);
+		return false;
 	}
 }
 
@@ -366,15 +375,17 @@ async function synchronizeCheckpointState(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	options: PiXkExtensionOptions,
-): Promise<void> {
-	if (!getGoalStore(options, ctx)) return;
+): Promise<boolean> {
+	if (!getGoalStore(options, ctx)) return true;
+	let synchronized = true;
 	const sessionId = ctx.sessionManager.getSessionId();
 	for (const binding of await getCheckpointBindings(options, ctx)) {
 		for (const intent of getCheckpointIntents(ctx, binding, sessionId)) {
-			await persistCheckpointIntent(pi, ctx, binding, intent, options);
+			if (!(await persistCheckpointIntent(pi, ctx, binding, intent, options))) synchronized = false;
 		}
-		await synchronizeCheckpointRefs(pi, ctx, binding, options);
+		if (!(await synchronizeCheckpointRefs(pi, ctx, binding, options))) synchronized = false;
 	}
+	return synchronized;
 }
 
 async function appendTurnCheckpointIntent(
@@ -451,7 +462,9 @@ export function createPiXkExtension(options: PiXkExtensionOptions = {}): Extensi
 					existingBindings.push(binding);
 				}
 			}
-			await synchronizeCheckpointState(pi, ctx, options);
+			if (options.synchronizeOnSessionStart !== false) {
+				await synchronizeCheckpointState(pi, ctx, options);
+			}
 		});
 		pi.on("turn_end", async (event, ctx) => {
 			for (const binding of await getCheckpointBindings(options, ctx)) {
@@ -483,7 +496,9 @@ export function createPiXkExtension(options: PiXkExtensionOptions = {}): Extensi
 			options.onLifecycle?.({ type: event.type });
 		});
 		pi.on("session_shutdown", async (event, ctx) => {
-			await synchronizeCheckpointState(pi, ctx, options);
+			if (options.synchronizeOnSessionShutdown !== false) {
+				await synchronizeCheckpointState(pi, ctx, options);
+			}
 			options.onLifecycle?.({ type: event.type, reason: event.reason });
 		});
 	};
@@ -705,6 +720,23 @@ function lifecycleWrite(
 	};
 }
 
+function appendRejectedGoalLifecycleIntent(pi: ExtensionAPI, intent: PiXkGoalLifecycleIntent, timestamp: string): void {
+	pi.appendEntry(
+		PI_XK_SESSION_LINK_CUSTOM_TYPE,
+		createPiXkGoalLifecycleIntent({ ...intent, state: "rejected", createdAt: timestamp }),
+	);
+}
+
+function rejectGoalLifecycleIntent(
+	pi: ExtensionAPI,
+	intent: PiXkGoalLifecycleIntent,
+	timestamp: string,
+	message: string,
+): never {
+	appendRejectedGoalLifecycleIntent(pi, intent, timestamp);
+	throw new Error(message);
+}
+
 function formatDuration(milliseconds: number): string {
 	const seconds = Math.floor(milliseconds / 1000);
 	const minutes = Math.floor(seconds / 60);
@@ -899,6 +931,77 @@ function lifecycleInputForIntent(intent: PiXkGoalLifecycleIntent): GoalLifecycle
 	};
 }
 
+function hasFinalRunCheckpoint(
+	ctx: ExtensionContext,
+	binding: PiXkSessionLink,
+	replay: Awaited<ReturnType<GoalStore["replayGoal"]>>,
+	intent: PiXkGoalLifecycleIntent,
+): boolean {
+	if (intent.runId.length === 0) return false;
+	const runStart = replay.events.find(
+		(event) => event.eventType === "goal_run_started" && event.payload.runId === intent.runId,
+	);
+	if (!runStart || runStart.eventType !== "goal_run_started") return false;
+	let lifecycleIntentSeen = false;
+	for (const entry of ctx.sessionManager.getBranch()) {
+		if (entry.type !== "custom" || entry.customType !== PI_XK_SESSION_LINK_CUSTOM_TYPE) continue;
+		if (isPiXkGoalLifecycleIntent(entry.data)) {
+			const storedIntent = normalizePiXkGoalLifecycleIntent(entry.data);
+			if (storedIntent.intentId === intent.intentId && storedIntent.state === "requested") {
+				lifecycleIntentSeen = true;
+			}
+			continue;
+		}
+		if (!lifecycleIntentSeen || !isPiXkCheckpointIntent(entry.data) || entry.data.reason !== "turn_end") continue;
+		if (
+			entry.data.goalId !== binding.goalId ||
+			entry.data.generation !== binding.generation ||
+			entry.data.sessionId !== runStart.payload.sessionId
+		) {
+			continue;
+		}
+		const expectedEventId = checkpointEventId(entry.data);
+		if (
+			replay.events.some(
+				(event) =>
+					event.eventType === "goal_checkpointed" &&
+					event.eventId === expectedEventId &&
+					event.payload.checkpoint.reason === "turn_end",
+			)
+		) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function lifecycleIntentStateError(intent: PiXkGoalLifecycleIntent, status: GoalLifecycleStatus): string | undefined {
+	if (intent.action === "start" && status !== "paused") return "only a paused Goal can be started";
+	if (intent.action === "pause" && status !== "active") return "only an active Goal can be paused";
+	if (intent.action === "end" && status !== "active" && status !== "paused") {
+		return "only an active or paused Goal can be ended";
+	}
+	return undefined;
+}
+
+async function isLifecycleIntentCheckpointReady(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	storeFor: (projectRoot: string) => GoalStore,
+	checkpointOptions: PiXkExtensionOptions,
+	goalOptions: PiXkGoalExtensionOptions,
+	intent: PiXkGoalLifecycleIntent,
+): Promise<boolean> {
+	if (intent.actor !== "model" || intent.action === "start") return true;
+	if (!(await synchronizeCheckpointState(pi, ctx, checkpointOptions))) return false;
+	const binding = findCurrentGoalBinding(ctx);
+	if (!binding || binding.goalId !== intent.goalId || binding.generation !== intent.generation) return false;
+	const replay = await storeFor(ctx.cwd).replayGoal(binding.goalId);
+	if (hasFinalRunCheckpoint(ctx, binding, replay, intent)) return true;
+	notifyGoalError(ctx, goalOptions, new Error("model lifecycle intent is waiting for a durable final checkpoint"));
+	return false;
+}
+
 async function settleGoalLifecycleIntent(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
@@ -914,7 +1017,7 @@ async function settleGoalLifecycleIntent(
 	const timestamp = goalNow(options);
 	if (intent.action === "start") {
 		if (replay.lifecycle.status !== "paused") {
-			throw new Error("only a paused Goal can be started");
+			rejectGoalLifecycleIntent(pi, intent, timestamp, "only a paused Goal can be started");
 		}
 		await appendGoalLifecycle(
 			store,
@@ -931,7 +1034,12 @@ async function settleGoalLifecycleIntent(
 	}
 	if (intent.runId.length > 0 && replay.lifecycle.openRunId) {
 		if (intent.runId !== replay.lifecycle.openRunId) {
-			throw new Error(`lifecycle intent ${intent.intentId} does not match the active Goal run`);
+			rejectGoalLifecycleIntent(
+				pi,
+				intent,
+				timestamp,
+				`lifecycle intent ${intent.intentId} does not match the active Goal run`,
+			);
 		}
 		await appendGoalLifecycle(
 			store,
@@ -943,7 +1051,7 @@ async function settleGoalLifecycleIntent(
 	}
 	if (intent.action === "pause") {
 		if (replay.lifecycle.status !== "active") {
-			throw new Error("only an active Goal can be paused");
+			rejectGoalLifecycleIntent(pi, intent, timestamp, "only an active Goal can be paused");
 		}
 		await appendGoalLifecycle(
 			store,
@@ -953,7 +1061,7 @@ async function settleGoalLifecycleIntent(
 		);
 	} else if (intent.action === "end") {
 		if (replay.lifecycle.status !== "active" && replay.lifecycle.status !== "paused") {
-			throw new Error("only an active or paused Goal can be ended");
+			rejectGoalLifecycleIntent(pi, intent, timestamp, "only an active or paused Goal can be ended");
 		}
 		await appendGoalLifecycle(
 			store,
@@ -1081,19 +1189,33 @@ function appendGoalDraft(pi: ExtensionAPI, draft: PiXkGoalDraft): void {
 	pi.appendEntry(PI_XK_SESSION_LINK_CUSTOM_TYPE, draft);
 }
 
-function requestGoalDraft(
-	pi: ExtensionAPI,
+async function assertGoalDraftAllowed(
 	ctx: ExtensionCommandContext | ExtensionContext,
-	options: PiXkGoalExtensionOptions,
-	objectiveInput: string,
-	captureId?: string,
-): void {
-	if (!ctx.isIdle()) throw new Error("the agent is still busy");
-	const objective = objectiveInput.trim();
-	if (objective.length === 0) throw new Error("a Goal objective is required");
+	storeFor: (projectRoot: string) => GoalStore,
+): Promise<void> {
 	if (isOutstandingGoalDraft(findCurrentGoalDraft(ctx))) {
 		throw new Error("a Goal draft is already awaiting review");
 	}
+	const binding = findCurrentGoalBinding(ctx);
+	if (!binding) return;
+	const replay = await storeFor(ctx.cwd).replayGoal(binding.goalId);
+	if (replay.lifecycle.status === "active" || replay.lifecycle.status === "paused") {
+		throw new Error("end the current Goal before drafting another Goal");
+	}
+}
+
+async function requestGoalDraft(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext | ExtensionContext,
+	storeFor: (projectRoot: string) => GoalStore,
+	options: PiXkGoalExtensionOptions,
+	objectiveInput: string,
+	captureId?: string,
+): Promise<void> {
+	if (!ctx.isIdle()) throw new Error("the agent is still busy");
+	const objective = objectiveInput.trim();
+	if (objective.length === 0) throw new Error("a Goal objective is required");
+	await assertGoalDraftAllowed(ctx, storeFor);
 	const timestamp = goalNow(options);
 	const draft = createPiXkGoalDraft({
 		draftId: `draft_${randomUUID().replaceAll("-", "")}`,
@@ -1398,7 +1520,9 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 			}, delayMs);
 		};
 
-		createPiXkExtension({
+		const checkpointOptions: PiXkExtensionOptions = {
+			synchronizeOnSessionStart: false,
+			synchronizeOnSessionShutdown: false,
 			resolveBindings: (ctx) => {
 				const binding = findCurrentGoalBinding(ctx);
 				return binding ? [binding] : [];
@@ -1418,7 +1542,27 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 					// Host diagnostics must not interrupt Pi lifecycle events.
 				}
 			},
-		})(pi);
+		};
+		createPiXkExtension(checkpointOptions)(pi);
+
+		const processPendingGoalLifecycleIntent = async (ctx: ExtensionContext): Promise<boolean> => {
+			const binding = findCurrentGoalBinding(ctx);
+			if (!binding) return false;
+			const intent = findPendingGoalLifecycleIntent(ctx, binding);
+			if (!intent) return false;
+			const replay = await storeFor(ctx.cwd).replayGoal(binding.goalId);
+			const stateError = lifecycleIntentStateError(intent, replay.lifecycle.status);
+			if (stateError) {
+				appendRejectedGoalLifecycleIntent(pi, intent, goalNow(options));
+				notifyGoalError(ctx, options, new Error(stateError));
+				return true;
+			}
+			if (!(await isLifecycleIntentCheckpointReady(pi, ctx, storeFor, checkpointOptions, options, intent))) {
+				return true;
+			}
+			await settleGoalLifecycleIntent(pi, ctx, storeFor, options);
+			return true;
+		};
 
 		pi.registerTool({
 			name: "pi_xk_submit_goal_draft",
@@ -1605,7 +1749,9 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 
 		pi.on("session_start", async (_event, ctx) => {
 			try {
+				await synchronizeCheckpointState(pi, ctx, checkpointOptions);
 				await recoverOpenGoalRun(ctx, storeFor, options);
+				await processPendingGoalLifecycleIntent(ctx);
 			} catch (error) {
 				notifyGoalError(ctx, options, error);
 			}
@@ -1693,7 +1839,7 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 					}
 					return;
 				}
-				if (await settleGoalLifecycleIntent(pi, ctx, storeFor, options)) return;
+				if (await processPendingGoalLifecycleIntent(ctx)) return;
 				await settleGoalRun(ctx, storeFor, options);
 				if (lastGoalRunOutcome === "aborted") return;
 				if (lastGoalRunOutcome === "error") {
@@ -1707,14 +1853,20 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 				notifyGoalError(ctx, options, error);
 			}
 		});
-		pi.on("session_shutdown", () => {
+		pi.on("session_shutdown", async (_event, ctx) => {
 			clearRetryTimer();
+			try {
+				await synchronizeCheckpointState(pi, ctx, checkpointOptions);
+				await processPendingGoalLifecycleIntent(ctx);
+			} catch (error) {
+				notifyGoalError(ctx, options, error);
+			}
 		});
 		pi.on("input", async (event, ctx) => {
 			const capture = findCurrentGoalCapture(ctx);
 			if (!capture || capture.state !== "open") return { action: "continue" };
 			try {
-				requestGoalDraft(pi, ctx, options, event.text, capture.captureId);
+				await requestGoalDraft(pi, ctx, storeFor, options, event.text, capture.captureId);
 			} catch (error) {
 				notifyGoalError(ctx, options, error);
 			}
@@ -1726,9 +1878,6 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 				const trimmed = args.trim();
 				try {
 					if (trimmed.length === 0) {
-						if (isOutstandingGoalDraft(findCurrentGoalDraft(ctx))) {
-							throw new Error("a Goal draft is already awaiting review");
-						}
 						const capture = findCurrentGoalCapture(ctx);
 						const timestamp = goalNow(options);
 						if (capture?.state === "open") {
@@ -1738,6 +1887,7 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 							);
 							ctx.ui.notify("Pi-XK Goal objective capture cancelled", "info");
 						} else {
+							await assertGoalDraftAllowed(ctx, storeFor);
 							pi.appendEntry(
 								PI_XK_SESSION_LINK_CUSTOM_TYPE,
 								createPiXkGoalCapture(`capture_${randomUUID().replaceAll("-", "")}`, "open", timestamp),
@@ -1783,7 +1933,7 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 						return;
 					}
 					const objective = trimmed.startsWith("--") ? trimmed.slice(2).trimStart() : args;
-					requestGoalDraft(pi, ctx, options, objective);
+					await requestGoalDraft(pi, ctx, storeFor, options, objective);
 				} catch (error) {
 					notifyGoalError(ctx, options, error);
 				}

@@ -1,6 +1,6 @@
-import { createHash } from "node:crypto";
-import { type FileHandle, open, readFile, unlink } from "node:fs/promises";
-import { join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { type FileHandle, open, readFile, rename, rm, unlink } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { GOAL_FILE_SCHEMA, type GoalContractV2 } from "./contract.ts";
 import { stableJsonStringify } from "./stable-json.ts";
 
@@ -181,6 +181,29 @@ async function writeExclusive(path: string, content: string): Promise<void> {
 	}
 }
 
+async function writeAtomic(path: string, content: string): Promise<void> {
+	const directory = dirname(path);
+	const temporaryPath = join(directory, `.goal-objective-${randomUUID()}.tmp`);
+	try {
+		const handle = await open(temporaryPath, "wx", 0o600);
+		try {
+			await handle.writeFile(content, "utf8");
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
+		await rename(temporaryPath, path);
+		const directoryHandle = await open(directory, "r");
+		try {
+			await directoryHandle.sync();
+		} finally {
+			await directoryHandle.close();
+		}
+	} finally {
+		await rm(temporaryPath, { force: true });
+	}
+}
+
 export async function createGoalFiles(goalDirectory: string, contract: GoalContractV2): Promise<void> {
 	const paths = goalFilePaths(goalDirectory);
 	let objectiveCreated = false;
@@ -195,6 +218,10 @@ export async function createGoalFiles(goalDirectory: string, contract: GoalContr
 		if (objectiveCreated) await unlink(paths.objective).catch(() => {});
 		throw error;
 	}
+}
+
+export async function writeGoalObjectiveProjection(goalDirectory: string, contract: GoalContractV2): Promise<void> {
+	await writeAtomic(goalFilePaths(goalDirectory).objective, renderObjective(contract));
 }
 
 function parseHeader(content: string): GoalFileHeader | undefined {
@@ -246,6 +273,9 @@ async function inspectGoalFile(
 		header.fingerprint !== expected.fingerprint
 	) {
 		return { path, status: "mismatched", detail: "identity header does not match the Goal contract" };
+	}
+	if (kind === "objective" && content !== renderObjective(contract)) {
+		return { path, status: "mismatched", detail: "objective content does not match the Goal contract" };
 	}
 	return { path, status: "valid" };
 }

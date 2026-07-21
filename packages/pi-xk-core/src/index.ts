@@ -98,6 +98,7 @@ export {
 	type GoalFilesDiagnostic,
 	goalIdentityFingerprint,
 	inspectGoalFiles,
+	writeGoalObjectiveProjection,
 } from "./goal-files.ts";
 export {
 	buildGoalReadModel,

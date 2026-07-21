@@ -797,6 +797,8 @@ pi_xk.artifact.*
 - 新 Goal 在用户确认前只存在于 Pi session draft entry；原生 UI 和无 UI 命令均提供确认、修订和取消，确认前不创建 Goal 目录或事件。
 - 新 writer 使用 `GoalContractV2`，历史 v1 hash 链只读并在 replay 时上转换；v2 合同要求非目标、完成/暂停条件、最终报告和执行授权。
 - 模型的 start/pause/end 工具经过 host 状态和 acceptance 校验；pause/end 仅在最终 checkpoint 后提交，普通模型回复仍会自动续跑。
+- 最终 checkpoint 必须已成为可重放的 Goal event；失败时 lifecycle intent 保持 pending。状态不再兼容的旧 intent 标记 rejected，不会在未来重复生效。
+- 当前 branch 的 Goal 未 ended 时拒绝新草案；`goal-objective.md` 按完整合同正文校验并在合同投影重建时同步刷新。
 - 每个逻辑段只提交本段文件；检查通过后推送。网络不可用时保留顺序本地提交，恢复网络后重新核验 fast-forward 再推送。
 
 必测故障：

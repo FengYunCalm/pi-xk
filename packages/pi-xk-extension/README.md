@@ -46,13 +46,15 @@ The captured objective is sent only to a hidden draft kickoff, not as a normal c
 
 Confirmation is the first operation that creates `.pi-xk/goals/<goalId>`, its event log, `goal-objective.md`, and mutable `goal-state.md`. At the start of every active run, Pi-XK tells the model to read both files and audit required acceptance evidence.
 
-`pi_xk_start_goal`, `pi_xk_pause_goal`, and `pi_xk_end_goal` are model tools. Start requires a paused Goal plus new recovery evidence. Pause requires an audit of unmet required acceptance IDs, current evidence, the incomplete conclusion, any user request, and the next best action. End requires verification evidence for every required acceptance. Model pause and end requests are committed only after the final observable checkpoint; user `/goal end` remains an immediate terminal override.
+Each session branch has one current Goal. A new draft is rejected while that Goal is active or paused; end the current Goal before creating another one. This prevents an old Goal from remaining active after its branch binding is replaced.
+
+`pi_xk_start_goal`, `pi_xk_pause_goal`, and `pi_xk_end_goal` are model tools. Start requires a paused Goal plus new recovery evidence. Pause requires an audit of unmet required acceptance IDs, current evidence, the incomplete conclusion, any user request, and the next best action. End requires verification evidence for every required acceptance. Model pause and end requests are committed only after the final observable checkpoint is durable. A failed checkpoint leaves the lifecycle intent pending for a later safe-boundary retry; user `/goal end` remains an immediate terminal override.
 
 While a Goal is active, Pi-XK starts another run after a settled run. A normal assistant response, plan, or partial result does not end the Goal. The model must call `pi_xk_end_goal` only after it has updated `goal-state.md` and verified the objective and declared acceptance evidence. If it needs user input or an external change, it must update state and call `pi_xk_pause_goal`. There is no run-count completion limit. Provider failures leave the Goal active and retry with exponential backoff rather than fabricating an ended state.
 
 ## Files And Recovery
 
-Each Goal is stored below:
+Each confirmed Goal is stored below the current project root. Pi-XK does not create a project-local `.pi` directory:
 
 ```text
 .pi-xk/goals/<goalId>/
@@ -63,7 +65,9 @@ Each Goal is stored below:
   goal-read-model.json
 ```
 
-`events.jsonl` is the Goal fact source. `contract.json` and `goal-read-model.json` are rebuildable projections. Pi session custom entries contain Goal bindings, pending drafts, lifecycle intents, and checkpoint references; drafts never become Goal events before confirmation. Do not edit Goal JSONL files by hand; use the SDK recovery APIs when a corruption diagnostic is reported.
+Project-scoped checkpoint artifacts are stored under `.pi-xk/artifacts/`. Before confirmation, a draft exists only as a Pi native session custom entry and creates nothing under the project `.pi-xk` directory.
+
+`events.jsonl` is the Goal fact source. `contract.json`, `goal-objective.md`, and `goal-read-model.json` are rebuildable projections; `goal-state.md` is the mutable execution state. Pi-XK validates the complete objective projection against the current contract, not only its identity header. Pi session custom entries contain Goal bindings, pending drafts, lifecycle intents, and checkpoint references; drafts never become Goal events before confirmation. Do not edit Goal JSONL files by hand; use the SDK recovery APIs when a corruption diagnostic is reported.
 
 ## Security Boundary
 

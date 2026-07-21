@@ -305,4 +305,34 @@ describe("Goal lifecycle and files", () => {
 		expect(await store.inspectGoalFiles(contract.goalId)).toMatchObject({ state: { status: "corrupt" } });
 		expect(await readFile(statePath, "utf8")).toBe("<!-- pi-xk-goal-file: invalid -->\n");
 	});
+
+	it("detects objective body tampering and refreshes it after a contract update", async () => {
+		const { store, projectRoot } = await createStore();
+		const contract = createContract("goal_objective_integrity");
+		const created = await store.createGoal(contract, {
+			eventId: "evt-create-objective-integrity",
+			idempotencyKey: "create:goal_objective_integrity",
+		});
+		const objectivePath = join(projectRoot, ".pi-xk", "goals", contract.goalId, "goal-objective.md");
+		const original = await readFile(objectivePath, "utf8");
+		const header = original.split("\n", 1)[0];
+		await writeFile(objectivePath, `${header}\n# Goal Objective\n\nTampered objective body.\n`);
+
+		expect(await store.inspectGoalFiles(contract.goalId)).toMatchObject({ objective: { status: "mismatched" } });
+
+		const updatedContract = {
+			...contract,
+			objective: "Use the updated contract objective.",
+		};
+		await store.updateGoalContract(updatedContract, {
+			eventId: "evt-update-objective-integrity",
+			idempotencyKey: "update:goal_objective_integrity",
+			expectedHead: created.head,
+		});
+
+		const refreshed = await readFile(objectivePath, "utf8");
+		expect(refreshed).toContain("Use the updated contract objective.");
+		expect(refreshed).not.toContain("Tampered objective body.");
+		expect(await store.inspectGoalFiles(contract.goalId)).toMatchObject({ objective: { status: "valid" } });
+	});
 });

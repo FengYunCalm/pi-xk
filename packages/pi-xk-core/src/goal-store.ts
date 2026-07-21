@@ -37,6 +37,7 @@ import {
 	createGoalFiles,
 	type GoalFilesDiagnostic,
 	inspectGoalFiles as inspectGoalFileArtifacts,
+	writeGoalObjectiveProjection,
 } from "./goal-files.ts";
 import {
 	buildGoalReadModel,
@@ -1266,6 +1267,7 @@ export class GoalStore {
 				events: [...replay.events, event],
 				lifecycle: projectGoalLifecycle([...replay.events, event], options.timestamp ?? new Date().toISOString()),
 			};
+			await writeGoalObjectiveProjection(paths.goalDirectory, contract);
 			await this.writeDerivedProjections(paths, nextReplay);
 			return { event, head: nextReplay.head };
 		});
@@ -1367,6 +1369,7 @@ export class GoalStore {
 		return await this.withGoalLock(paths, goalId, async () => {
 			const replay = await this.readReplay(paths, goalId);
 			if (replay.tailDiagnostic) throw new GoalRecoveryRequiredError(goalId);
+			await writeGoalObjectiveProjection(paths.goalDirectory, replay.contract);
 			await this.writeProjection(paths, replay);
 			return replay;
 		});

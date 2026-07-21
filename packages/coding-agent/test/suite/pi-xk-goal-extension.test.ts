@@ -3,10 +3,17 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { type FauxResponseFactory, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
-import { type GoalContractV2, GoalStore } from "../../../pi-xk-core/src/index.ts";
+import {
+	type GoalCheckpointV2,
+	type GoalContractUpdateOptions,
+	type GoalContractV2,
+	GoalStore,
+	type GoalWriteResult,
+} from "../../../pi-xk-core/src/index.ts";
 import {
 	createPiXkGoalBinding,
 	createPiXkGoalExtension,
+	createPiXkGoalLifecycleIntent,
 	isPiXkGoalCapture,
 	isPiXkGoalDraft,
 	isPiXkGoalLifecycleIntent,
@@ -156,7 +163,7 @@ async function waitForAgent(harness: Harness): Promise<void> {
 }
 
 async function waitForProviderCalls(harness: Harness, minimumCalls: number): Promise<void> {
-	for (let attempt = 0; attempt < 100; attempt++) {
+	for (let attempt = 0; attempt < 1_000; attempt++) {
 		if (harness.faux.state.callCount >= minimumCalls) return;
 		await new Promise<void>((resolve) => setTimeout(resolve, 5));
 	}
@@ -405,11 +412,16 @@ describe("Pi-XK Goal extension", () => {
 		expect(existsSync(join(harness.tempDir, ".pi-xk", "goals"))).toBe(false);
 	});
 
-	it("suppresses an existing active Goal while a replacement draft is pending", async () => {
+	it("rejects a replacement draft while the current Goal is still active", async () => {
 		const goalId = "goal_existing_active";
-		let draftRequest = "";
+		const goalErrors: string[] = [];
 		const harness = await createHarness({
-			extensionFactories: [createPiXkGoalExtension({ createGoalId: () => "goal_replacement_draft" })],
+			extensionFactories: [
+				createPiXkGoalExtension({
+					createGoalId: () => "goal_replacement_draft",
+					onGoalError: (error) => goalErrors.push(error.message),
+				}),
+			],
 		});
 		harnesses.push(harness);
 		const store = new GoalStore(harness.tempDir);
@@ -447,43 +459,93 @@ describe("Pi-XK Goal extension", () => {
 			},
 		);
 		harness.sessionManager.appendCustomEntry(PI_XK_SESSION_LINK_CUSTOM_TYPE, createPiXkGoalBinding(goalId, 0));
-		harness.setResponses([
-			(context) => {
-				draftRequest = context.messages.map((message) => getMessageText(message)).join("\n");
-				return draftResponse("Replacement draft objective.");
-			},
-			fauxAssistantMessage(
-				[
-					fauxToolCall("pi_xk_end_goal", {
-						outcome: "accepted",
-						reason: "invalid lifecycle change during draft review",
-						verifiedAcceptanceIds: ["A-1"],
-						finalEvidence: "No evidence should be committed.",
-						finalSummary: "The old Goal must remain active.",
-					}),
-				],
-				{ stopReason: "toolUse" },
-			),
-			fauxAssistantMessage("The pending draft remains isolated."),
-		]);
+		harness.setResponses([draftResponse("Replacement draft objective.")]);
 
 		await harness.session.bindExtensions({});
 		await harness.session.prompt("/goal Prepare a replacement Goal.");
-		await waitForAgent(harness);
-		await harness.session.prompt("Try to end the old Goal while the draft is pending.");
-		await waitForAgent(harness);
 
 		const replayed = await store.replayGoal(goalId);
 		expect(replayed.lifecycle.status).toBe("active");
 		expect(replayed.events.map((event) => event.eventType)).toEqual(["goal_created", "goal_activated"]);
-		expect(draftRequest).toContain("Draft the contract only");
-		expect(draftRequest).not.toContain("An active Pi-XK Goal is bound to this session.");
-		expect(
-			harness.session.messages
-				.filter((message) => message.role === "toolResult")
-				.map((message) => getMessageText(message)),
-		).toContain("Pi-XK Goal lifecycle tools are unavailable while a Goal draft is awaiting review.");
-		expect(getCurrentGoalDraft(harness)).toMatchObject({ state: "proposed", goalId: null });
+		expect(goalErrors).toEqual(["end the current Goal before drafting another Goal"]);
+		expect(getCurrentGoalDraft(harness)).toBeUndefined();
+		expect(harness.faux.state.callCount).toBe(0);
+	});
+
+	it("keeps a model end pending until its final checkpoint is durable", async () => {
+		class ControllableCheckpointGoalStore extends GoalStore {
+			checkpointWritesAllowed = false;
+
+			override async appendCheckpoint(
+				goalId: string,
+				checkpointInput: GoalCheckpointV2,
+				options: GoalContractUpdateOptions,
+			): Promise<GoalWriteResult> {
+				if (!this.checkpointWritesAllowed) throw new Error("injected checkpoint failure");
+				return await super.appendCheckpoint(goalId, checkpointInput, options);
+			}
+		}
+
+		let controlledStore: ControllableCheckpointGoalStore | undefined;
+		const checkpointErrors: string[] = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				createPiXkGoalExtension({
+					createGoalId: () => "goal_checkpoint_gated_end",
+					createGoalStore: (projectRoot) => {
+						controlledStore ??= new ControllableCheckpointGoalStore(projectRoot);
+						return controlledStore;
+					},
+					onGoalError: (error) => checkpointErrors.push(error.message),
+				}),
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			draftResponse("End only after a durable final checkpoint."),
+			fauxAssistantMessage(
+				[
+					fauxToolCall("pi_xk_end_goal", {
+						outcome: "accepted",
+						reason: "the acceptance evidence is complete",
+						verifiedAcceptanceIds: ["A-1"],
+						finalEvidence: "The final checkpoint must be durable.",
+						finalSummary: "The Goal is complete after checkpoint persistence.",
+					}),
+				],
+				{ stopReason: "toolUse" },
+			),
+		]);
+
+		await harness.session.bindExtensions({});
+		await requestAndConfirmGoal(harness, "Gate lifecycle settlement on checkpoint persistence.");
+		if (!controlledStore) throw new Error("controlled Goal store was not created");
+
+		const blocked = await controlledStore.replayGoal("goal_checkpoint_gated_end");
+		expect(blocked.lifecycle.status).toBe("active");
+		expect(blocked.events.some((event) => event.eventType === "goal_ended")).toBe(false);
+		expect(getGoalLifecycleIntents(harness)).toContainEqual(
+			expect.objectContaining({ action: "end", state: "requested" }),
+		);
+		expect(checkpointErrors).toContain("injected checkpoint failure");
+
+		controlledStore.checkpointWritesAllowed = true;
+		await harness.session.reload();
+
+		const recovered = await controlledStore.replayGoal("goal_checkpoint_gated_end");
+		expect({
+			status: recovered.lifecycle.status,
+			events: recovered.events.map((event) => event.eventType),
+			intents: getGoalLifecycleIntents(harness).map((intent) => ({
+				action: intent.action,
+				state: intent.state,
+			})),
+			errors: checkpointErrors,
+		}).toMatchObject({
+			status: "ended",
+			events: expect.arrayContaining(["goal_checkpointed", "goal_ended"]),
+			intents: expect.arrayContaining([expect.objectContaining({ action: "end", state: "committed" })]),
+		});
 	});
 
 	it("keeps an active Goal running until the model explicitly ends it and exposes the termination contract", async () => {
@@ -1017,6 +1079,75 @@ describe("Pi-XK Goal extension", () => {
 		const replayed = await new GoalStore(harness.tempDir).replayGoal(goalId!);
 		expect(replayed.lifecycle.status).toBe("ended");
 		expect(replayed.events.filter((event) => event.eventType === "goal_resumed")).toHaveLength(0);
+	});
+
+	it("retires a stale requested lifecycle intent instead of retrying it forever", async () => {
+		const goalErrors: string[] = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				createPiXkGoalExtension({
+					createGoalId: () => "goal_stale_intent",
+					onGoalError: (error) => goalErrors.push(error.message),
+				}),
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			draftResponse("Reject stale lifecycle intents."),
+			fauxAssistantMessage(
+				[
+					fauxToolCall("pi_xk_end_goal", {
+						outcome: "accepted",
+						reason: "the Goal is complete",
+						verifiedAcceptanceIds: ["A-1"],
+						finalEvidence: "The required evidence was verified.",
+						finalSummary: "The Goal is complete.",
+					}),
+				],
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage("Process the stale intent without changing the ended Goal."),
+		]);
+
+		await harness.session.bindExtensions({});
+		await requestAndConfirmGoal(harness, "Reject stale lifecycle intents.");
+		const binding = getGoalBindings(harness).at(-1);
+		if (!binding) throw new Error("Goal binding is missing");
+		harness.sessionManager.appendCustomEntry(
+			PI_XK_SESSION_LINK_CUSTOM_TYPE,
+			createPiXkGoalLifecycleIntent({
+				intentId: "intent_stale_pause",
+				goalId: binding.goalId,
+				generation: binding.generation,
+				actor: "model",
+				action: "pause",
+				state: "requested",
+				runId: "",
+				reason: "stale pause after end",
+				resumeEvidence: "",
+				userRequest: null,
+				nextBestAction: "Do not apply this stale action.",
+				audit: {
+					unmetRequiredAcceptanceIds: ["A-1"],
+					currentEvidence: "The Goal has already ended.",
+					incompleteConclusion: "This intent is stale.",
+				},
+				outcome: "",
+				verifiedAcceptanceIds: [],
+				finalEvidence: "",
+				finalSummary: "",
+				createdAt: "2026-07-21T00:00:00.000Z",
+			}),
+		);
+
+		await harness.session.prompt("Process the stale lifecycle intent.");
+		await waitForAgent(harness);
+
+		const staleStates = getGoalLifecycleIntents(harness)
+			.filter((intent) => intent.intentId === "intent_stale_pause")
+			.map((intent) => intent.state);
+		expect({ staleStates, goalErrors }).toMatchObject({ staleStates: ["requested", "rejected"] });
+		expect((await new GoalStore(harness.tempDir).replayGoal(binding.goalId)).lifecycle.status).toBe("ended");
 	});
 
 	it("rejects model lifecycle acceptance IDs outside the current contract", async () => {
