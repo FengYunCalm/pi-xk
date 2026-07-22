@@ -37,6 +37,7 @@ const commands = [
 		"test/suite/pi-xk-session-link.test.ts",
 		"test/suite/pi-xk-checkpoint-bridge.test.ts",
 		"test/suite/pi-xk-goal-extension.test.ts",
+		"test/suite/pi-xk-session-chain-controller.test.ts",
 		"test/suite/pi-xk-task-runner.test.ts",
 		"test/suite/pi-xk-task-extension.test.ts",
 		"test/suite/pi-xk-package-install.test.ts",
