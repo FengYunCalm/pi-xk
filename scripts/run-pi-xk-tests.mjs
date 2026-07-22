@@ -24,6 +24,9 @@ const commands = [
 		"test/goal-lifecycle.test.ts",
 		"test/artifact-store.test.ts",
 		"test/goal-read-model.test.ts",
+		"test/task-contract.test.ts",
+		"test/task-store.test.ts",
+		"test/task-read-model.test.ts",
 	],
 	[
 		"--workspace",
@@ -34,6 +37,8 @@ const commands = [
 		"test/suite/pi-xk-session-link.test.ts",
 		"test/suite/pi-xk-checkpoint-bridge.test.ts",
 		"test/suite/pi-xk-goal-extension.test.ts",
+		"test/suite/pi-xk-task-runner.test.ts",
+		"test/suite/pi-xk-task-extension.test.ts",
 		"test/suite/pi-xk-package-install.test.ts",
 	],
 ];

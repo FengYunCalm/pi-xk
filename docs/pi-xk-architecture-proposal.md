@@ -1,10 +1,10 @@
 # Pi-XK 架构策划案
 
-> **状态**：In implementation（Phase 0 与 Phase 1.1–1.8 已完成，Goal CLI 计时与草案 custom UI 已作为扩展层跟进；当前个人本机无限权限 profile 仍明确延后 Policy/沙箱，TaskSupervisor、通用 Context/memory 和其余 MVP 能力按路线图推进）
+> **状态**：In implementation（Phase 0、Phase 1.1–1.8 与 Task Run v1 已完成，Goal CLI 计时与草案 custom UI 已作为扩展层跟进；当前个人本机无限权限 profile 仍明确延后 Policy/沙箱，完整 TaskSupervisor、通用 Context/memory 和其余 MVP 能力按路线图推进）
 >
 > **版本**：1.0.0
 >
-> **日期**：2026-07-19
+> **日期**：2026-07-22
 >
 > **定位**：基于 Pi 的维护型 fork，加上可验证的领域层、任务编排层和安全边界。
 >
@@ -466,6 +466,8 @@ Host -> Context controller: rebuild L0/L1 from durable entries
 
 ## 9. TaskSupervisor：统一子代理、后台任务和恢复
 
+本节描述完整 Phase 3 的目标架构，不代表当前 Task Run v1 已具备这些能力。v1 只实现单个同工作区、in-process child `AgentSession`、结构化结果、取消与恢复；预算、deadline、retry、RPC、worktree、sandbox、DAG 和进程组治理仍以后续 Phase 3 为准。
+
 ### 9.1 TaskSpec
 
 所有 child agent、shell job、MCP 长任务和验证任务都使用一个任务合同：
@@ -812,6 +814,23 @@ pi_xk.artifact.*
 - 同一 idempotency key 重试不产生重复状态；
 - 删除索引和摘要 cache 后能从事实源重建。
 
+### 已完成实施切片：Task Run v1（个人 full-access profile）
+
+Policy/沙箱仍是 supervised、unattended 和不可信执行的前置条件，但当前个人本机 full-access profile 不需要先实现整套 Phase 2。Phase 3 的首个最小、不可并发扩张切片已经完成，为 Goal 拆分工作和未来反省 worker 提供真实执行底座：
+
+- `TaskSpecV1`、Task event log、hash/idempotency/CAS、read model 与 `task_link` session custom entry；
+- 只支持一个 in-process child `AgentSession`，并发固定为 1、禁止 nested spawn，不引入第三方 subagent runtime；
+- `pending -> running -> succeeded|failed|cancelled|orphaned` 生命周期和结构化 result envelope；
+- 父 session/Goal 的 start、status、cancel、reload recovery 与结果 artifact 引用；
+- child transcript 独立，父 session 只接收 task link 和最终 envelope，不复制整段对话；
+- 本切片不实现 Policy/沙箱，也不收紧现有 Pi 工具权限；child 明确继承启动 Pi 的用户权限。它只交付可追溯的单 Task 运行，不同时承诺 unattended、worktree 自动合并或后台修改 Resource。
+
+退出门槛：父取消能停止 child；graceful reload 确认停止后记录 `cancelled`，五秒内无法确认停止或 unclean restart 后遗留的 running Task 记录 `orphaned`；重复完成提交幂等；父 Goal 可读取 result envelope；实现继续位于 Pi-XK Core/Extension，Pi 原生 session 格式和 agent loop 不改。
+
+选择它而不是立即做反省引擎的原因：Observation worker、影子验证和候选补丁都需要可取消、可恢复、带结果 envelope 的 Task；先做 memory 会缺少稳定生产者，先做 Proposal 会缺少验证执行器，直接接 `pi-subagents` 则会提前引入第二套任务状态。
+
+Task Run v1 之外的完整 Phase 3 能力仍未实现：多 Task 并发与 DAG 调度、retry、预算、deadline、RPC child、worktree/合并、sandbox、Policy 重新求值、跨 descendant 取消和进程组回收。不得用 v1 的单 in-process child 通过测试来宣称这些能力已经完成。
+
 ### 16.3 Phase 2：Policy 与沙箱
 
 交付：
@@ -887,7 +906,8 @@ MVP 只包含：Pi 原生 session、Goal contract/event log、自动 checkpoint�
 | Compaction | token 超限、摘要模型超时、工具结果很大 | 保留配对边界，原始 entry 不丢，artifact 可取 |
 | Policy | symlink、shell wrapper、sudo、网络、凭据 | hard deny/ask/allow 与 effective policy 一致 |
 | Sandbox | backend 缺失、启动失败、超时、清理 | supervised/unattended fail closed，无残留挂载/进程 |
-| Task | child 成功、失败、取消、deadline、重启 | 状态与结果 envelope 可追溯，进程组被回收 |
+| Task V1 | 单 child 成功、失败、取消、reload、取消超时、重启、model switch、compaction | 状态与结果 envelope 可追溯；正常取消与 runtime 丢失可区分；父子 transcript 分离；终态不自动重跑 |
+| Task Phase 3 | 并发、DAG、retry、deadline、RPC、worktree、sandbox | 预算与策略生效；父取消回收所有 descendant 和进程组；未经验证不合并 diff |
 | Resource | untrusted project、冲突 Skill、reload 竞态 | trust gate、generation 原子切换、旧版本可恢复 |
 | MCP | lazy connect、OAuth、超大输出、server 崩溃 | token 不入日志，输出 guard、取消和错误 schema 生效 |
 | Learning | 注入样本、重复 proposal、人工修改基准 | 只生成 proposal，CAS 失效时拒绝覆盖 |
