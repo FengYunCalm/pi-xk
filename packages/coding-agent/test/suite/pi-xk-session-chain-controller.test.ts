@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { appendFile, mkdir, rm } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, type UserMessage } from "@earendil-works/pi-ai/compat";
@@ -168,6 +168,31 @@ describe("SessionChainController roots", () => {
 			role: "custom",
 			content: SESSION_CHAIN_ROOT_SUMMARY,
 		});
+	});
+
+	it("bootstraps a managed chain when Pi has only model, thinking, and session-name projections", async () => {
+		const projectRoot = await createTempDir();
+		const source = createPersistedSession(projectRoot, "bootstrap-projections", false);
+		source.appendModelChange("faux", "faux-model");
+		source.appendThinkingLevelChange("high");
+		source.appendSessionInfo("Projected session");
+		source.flushDurable();
+		const { host, getCurrentManager } = createHost(source);
+		const controller = new SessionChainController({
+			projectRoot,
+			createSessionManagerAt: (cwd, sessionFile, options) => SessionManager.createAt(cwd, sessionFile, options),
+		});
+
+		const binding = await controller.bootstrapManagedChain(host, { title: "Projected chain" });
+
+		expect(controller.getCurrentBinding(getCurrentManager())).toEqual(binding);
+		expect(getCurrentManager().getBranch()).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ type: "model_change", provider: "faux", modelId: "faux-model" }),
+				expect.objectContaining({ type: "thinking_level_change", thinkingLevel: "high" }),
+				expect.objectContaining({ type: "session_info", name: "Projected session" }),
+			]),
+		);
 	});
 
 	it("adopts an existing Pi JSONL as external-root without copying it", async () => {
@@ -471,6 +496,107 @@ describe("SessionChainController rollover", () => {
 		expect(report.diagnostics).toContainEqual(
 			expect.objectContaining({ severity: "error", code: "summary_artifact_invalid" }),
 		);
+	});
+});
+
+describe("SessionChainController branching", () => {
+	it("creates a successor branch without sealing or rewriting the source branch", async () => {
+		const projectRoot = await createTempDir();
+		const source = createPersistedSession(projectRoot, "branch-source");
+		const controller = new SessionChainController({ projectRoot });
+		const sourceBinding = await controller.adoptExternalRoot(source);
+		appendTurn(source, "branch from this work", "source branch result");
+		const sourceLeafId = source.getLeafId();
+		if (!sourceLeafId) throw new Error("branch source must have a leaf");
+		const sourceEntries = source.getEntries().length;
+		const { host, getCurrentManager } = createHost(source);
+
+		const result = await controller.continueBranch(host, {
+			reason: "continue historical work",
+			sourceEntryId: sourceLeafId,
+		});
+
+		const replay = await controller.getStore().replayChain(sourceBinding.chainId);
+		expect(replay.branches).toHaveLength(2);
+		expect(replay.branches[0]).toMatchObject({
+			branchId: sourceBinding.branchId,
+			headSegmentId: sourceBinding.segmentId,
+			segments: [{ segmentId: sourceBinding.segmentId, status: "active" }],
+		});
+		expect(replay.branches[1]).toMatchObject({
+			branchId: result.branchId,
+			forkedFrom: {
+				branchId: sourceBinding.branchId,
+				segmentId: sourceBinding.segmentId,
+				entryId: sourceLeafId,
+			},
+			headSegmentId: result.targetSegmentId,
+			segments: [{ ordinal: 1, status: "active", predecessorSegmentId: sourceBinding.segmentId }],
+		});
+		expect(source.getEntries()).toHaveLength(sourceEntries);
+		expect(source.getEntries().at(-1)?.type).toBe("message");
+		expect(controller.getCurrentBinding(getCurrentManager())).toMatchObject({
+			chainId: sourceBinding.chainId,
+			branchId: result.branchId,
+			segmentId: result.targetSegmentId,
+			ordinal: 1,
+		});
+		expect((await controller.doctor(sourceBinding.chainId)).diagnostics).toEqual([]);
+	});
+
+	it("creates a successor branch from a sealed historical Segment without rewriting the source", async () => {
+		const projectRoot = await createTempDir();
+		const source = createPersistedSession(projectRoot, "sealed-branch-source");
+		const controller = new SessionChainController({
+			projectRoot,
+			createSessionManagerAt: (cwd, sessionFile, options) => SessionManager.createAt(cwd, sessionFile, options),
+		});
+		const sourceBinding = await controller.adoptExternalRoot(source);
+		appendTurn(source, "historical branch point", "historical branch result");
+		const sourceEntryId = source.getLeafId();
+		const sourceFile = source.getSessionFile();
+		if (!sourceEntryId || !sourceFile) throw new Error("historical branch source must be persisted");
+		const { host, getCurrentManager } = createHost(source);
+		await controller.rollover(host, { reason: "seal historical branch source" });
+		appendTurn(getCurrentManager(), "newer branch work", "newer branch result");
+		const sealedBytes = await readFile(sourceFile, "utf8");
+
+		const result = await controller.createSuccessorBranch(host, {
+			reason: "continue sealed history",
+			source: {
+				chainId: sourceBinding.chainId,
+				branchId: sourceBinding.branchId,
+				segmentId: sourceBinding.segmentId,
+			},
+			sourceEntryId,
+		});
+
+		expect(await readFile(sourceFile, "utf8")).toBe(sealedBytes);
+		const replay = await controller.getStore().replayChain(sourceBinding.chainId);
+		const branch = replay.branches.find((candidate) => candidate.branchId === result.branchId);
+		expect(branch).toMatchObject({
+			forkedFrom: {
+				branchId: sourceBinding.branchId,
+				segmentId: sourceBinding.segmentId,
+				entryId: sourceEntryId,
+			},
+			headSegmentId: result.targetSegmentId,
+			segments: [{ ordinal: 1, status: "active", predecessorSegmentId: sourceBinding.segmentId }],
+		});
+		const target = SessionManager.open(result.sessionFile);
+		expect(controller.getCurrentBinding(target)).toMatchObject({
+			chainId: sourceBinding.chainId,
+			branchId: result.branchId,
+			segmentId: result.targetSegmentId,
+		});
+		const summary = await controller.getStore().readSegmentSummary(result.summaryArtifactId);
+		expect(summary).toMatchObject({
+			branchId: sourceBinding.branchId,
+			sourceSegmentId: sourceBinding.segmentId,
+			sourceLeafId: sourceEntryId,
+			targetSegmentId: result.targetSegmentId,
+		});
+		expect((await controller.doctor(sourceBinding.chainId)).diagnostics).toEqual([]);
 	});
 });
 

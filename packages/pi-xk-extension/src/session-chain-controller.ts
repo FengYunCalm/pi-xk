@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFile, stat } from "node:fs/promises";
+import { readFile, rm, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { SessionEntry, SessionManager } from "@earendil-works/pi-coding-agent";
+import type { ExtensionCommandContext, SessionEntry, SessionManager } from "@earendil-works/pi-coding-agent";
 import { SessionManager as PiSessionManager, sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
 import {
 	assertSessionBranchId,
@@ -116,6 +116,7 @@ export interface SessionChainRolloverHostOptions {
 	initializeTarget: (sessionManager: SessionManager) => Promise<void> | void;
 	finalizeSource: (sessionManager: SessionManager) => Promise<void> | void;
 	commit: (context: SessionChainRolloverCommitContext) => Promise<void> | void;
+	withSession?: (ctx: ExtensionCommandContext) => Promise<void>;
 }
 
 export type SessionChainRolloverHostResult =
@@ -141,6 +142,20 @@ export interface SessionChainControllerOptions {
 export interface SessionChainRootOptions {
 	title?: string | null;
 	initializeTarget?: (sessionManager: SessionManager) => Promise<void> | void;
+	withSession?: (ctx: ExtensionCommandContext) => Promise<void>;
+}
+
+export interface SessionChainManagedRootOptions {
+	chainId?: string;
+	branchId?: string;
+	segmentId?: string;
+	title?: string | null;
+}
+
+export interface SessionChainManagedRoot {
+	binding: PiXkSessionChainBindingV1;
+	sessionManager: SessionManager;
+	sessionFile: string;
 }
 
 export interface SessionChainRolloverOptions {
@@ -148,6 +163,7 @@ export interface SessionChainRolloverOptions {
 	actor?: SessionChainActor;
 	gates?: Partial<SessionChainGateState>;
 	initializeTarget?: (sessionManager: SessionManager) => Promise<void> | void;
+	withSession?: (ctx: ExtensionCommandContext) => Promise<void>;
 }
 
 export interface SessionChainRolloverResult {
@@ -156,6 +172,52 @@ export interface SessionChainRolloverResult {
 	branchId: string;
 	sourceSegmentId: string;
 	sourceLeafId: string;
+	targetSegmentId: string;
+	summaryArtifactId: string;
+}
+
+export interface SessionChainBranchOptions {
+	reason: string;
+	sourceEntryId: string;
+	actor?: SessionChainActor;
+	gates?: Partial<SessionChainGateState>;
+	initializeTarget?: (sessionManager: SessionManager) => Promise<void> | void;
+	withSession?: (ctx: ExtensionCommandContext) => Promise<void>;
+}
+
+export interface SessionChainBranchSource {
+	chainId: string;
+	branchId: string;
+	segmentId: string;
+}
+
+export interface SessionChainCreateBranchOptions {
+	reason: string;
+	source: SessionChainBranchSource;
+	sourceEntryId?: string;
+	actor?: SessionChainActor;
+	gates?: Partial<SessionChainGateState>;
+	initializeTarget?: (sessionManager: SessionManager) => Promise<void> | void;
+}
+
+export interface SessionChainCreatedBranchResult {
+	chainId: string;
+	fromBranchId: string;
+	branchId: string;
+	sourceSegmentId: string;
+	sourceEntryId: string;
+	targetSegmentId: string;
+	summaryArtifactId: string;
+	sessionFile: string;
+}
+
+export interface SessionChainBranchResult {
+	cancelled: boolean;
+	chainId: string;
+	fromBranchId: string;
+	branchId: string;
+	sourceSegmentId: string;
+	sourceEntryId: string;
 	targetSegmentId: string;
 	summaryArtifactId: string;
 }
@@ -385,15 +447,15 @@ function eventToken(): string {
 	return randomUUID().replaceAll("-", "");
 }
 
-function newChainId(): string {
+export function createSessionChainId(): string {
 	return `chain_${eventToken().slice(0, 20)}`;
 }
 
-function newBranchId(): string {
+export function createSessionChainBranchId(): string {
 	return `branch_${eventToken().slice(0, 20)}`;
 }
 
-function newSegmentId(): string {
+export function createSessionChainSegmentId(): string {
 	return randomUUID();
 }
 
@@ -434,8 +496,8 @@ function latestEntry<TEntry extends SessionEntry["type"]>(
 	return undefined;
 }
 
-function copySessionProjection(source: SessionManager, target: SessionManager): void {
-	const sourceBranch = source.getBranch();
+function copySessionProjection(source: SessionManager, target: SessionManager, sourceEntryId?: string): void {
+	const sourceBranch = source.getBranch(sourceEntryId);
 	const model = latestEntry(sourceBranch, "model_change");
 	if (model) target.appendModelChange(model.provider, model.modelId);
 	const thinking = latestEntry(sourceBranch, "thinking_level_change");
@@ -453,6 +515,15 @@ function copySessionProjection(source: SessionManager, target: SessionManager): 
 			break;
 		}
 	}
+}
+
+function hasOnlyBootstrapProjectionEntries(manager: SessionManager): boolean {
+	return manager
+		.getEntries()
+		.every(
+			(entry) =>
+				entry.type === "model_change" || entry.type === "thinking_level_change" || entry.type === "session_info",
+		);
 }
 
 function appendSummaryIn(manager: SessionManager, artifactId: string | null, carryForward: string): string {
@@ -539,6 +610,19 @@ export class SessionChainController {
 		return this.store;
 	}
 
+	async getSegmentFile(chainId: string, branchId: string, segmentId: string): Promise<string> {
+		const replay = await this.store.replayChain(chainId);
+		const branch = findBranch(replay, branchId);
+		const segment = findSegment(branch, segmentId);
+		return this.segmentPath(chainId, branchId, segment);
+	}
+
+	async getBranchHeadFile(chainId: string, branchId: string): Promise<string> {
+		const replay = await this.store.replayChain(chainId);
+		const branch = findBranch(replay, branchId);
+		return this.segmentPath(chainId, branchId, findSegment(branch, branch.headSegmentId));
+	}
+
 	private segmentPath(
 		chainId: string,
 		branchId: string,
@@ -602,13 +686,15 @@ export class SessionChainController {
 		if (this.getCurrentBinding(host.sessionManager)) {
 			throw new SessionChainControllerError("Current Pi session is already bound to a Session Chain");
 		}
-		if (host.sessionManager.getEntries().length > 0) {
-			throw new SessionChainControllerError("Managed Session Chain bootstrap requires a new, empty Pi session");
+		if (!hasOnlyBootstrapProjectionEntries(host.sessionManager)) {
+			throw new SessionChainControllerError(
+				"Managed Session Chain bootstrap requires a new Pi session without conversation body entries",
+			);
 		}
-		const chainId = newChainId();
-		const branchId = newBranchId();
+		const chainId = createSessionChainId();
+		const branchId = createSessionChainBranchId();
 		const createdAt = this.now();
-		const segment = this.managedSegment(newSegmentId(), 1, null, null, createdAt);
+		const segment = this.managedSegment(createSessionChainSegmentId(), 1, null, null, createdAt);
 		const binding = bindingFor(chainId, branchId, segment);
 		const targetSessionFile = this.segmentPath(chainId, branchId, segment);
 		const result = await host.rolloverSession({
@@ -641,9 +727,40 @@ export class SessionChainController {
 					},
 				);
 			},
+			...(options.withSession ? { withSession: options.withSession } : {}),
 		});
 		if (result.cancelled) throw new SessionChainControllerError("Managed Session Chain bootstrap was cancelled");
 		return binding;
+	}
+
+	async createManagedRoot(options: SessionChainManagedRootOptions = {}): Promise<SessionChainManagedRoot> {
+		const chainId = options.chainId ?? createSessionChainId();
+		const branchId = options.branchId ?? createSessionChainBranchId();
+		const createdAt = this.now();
+		const segment = this.managedSegment(options.segmentId ?? createSessionChainSegmentId(), 1, null, null, createdAt);
+		const binding = bindingFor(chainId, branchId, segment);
+		const sessionFile = this.segmentPath(chainId, branchId, segment);
+		const sessionManager = this.createSessionManagerAt(this.projectRoot, sessionFile, { id: segment.segmentId });
+		this.appendRootMarkers(sessionManager, binding);
+		flushSessionDurably(sessionManager);
+		await this.store.createChain(
+			{
+				schema: SESSION_CHAIN_SPEC_SCHEMA,
+				chainId,
+				title: options.title ?? null,
+				cwd: this.projectRoot,
+				rootBranchId: branchId,
+				rootSegment: segment,
+				createdAt,
+			},
+			{
+				eventId: `${chainId}:created`,
+				idempotencyKey: `${chainId}:created`,
+				actor: "runtime",
+				timestamp: createdAt,
+			},
+		);
+		return { binding, sessionManager, sessionFile };
 	}
 
 	async adoptExternalRoot(
@@ -656,8 +773,8 @@ export class SessionChainController {
 		if (!manager.isPersisted() || !sessionFile) {
 			throw new SessionChainControllerError("External Session Chain adoption requires a persisted Pi session");
 		}
-		const chainId = newChainId();
-		const branchId = newBranchId();
+		const chainId = createSessionChainId();
+		const branchId = createSessionChainBranchId();
 		const createdAt = this.now();
 		const segment: SessionSegmentDescriptorV1 = {
 			segmentId: manager.getSessionId(),
@@ -735,10 +852,15 @@ export class SessionChainController {
 		manager: SessionManager,
 		binding: PiXkSessionChainBindingV1,
 		segment: SessionSegmentProjectionV1,
+		sourceLeafId: string,
 	): SummarySelection {
-		const path = manager.getBranch();
-		const sourceLeafId = manager.getLeafId();
-		if (!sourceLeafId) throw new SessionChainControllerError("Session Chain Segment has no source leaf to summarize");
+		if (!manager.getEntry(sourceLeafId)) {
+			throw new SessionChainControllerError(`Session Chain source entry does not exist: ${sourceLeafId}`);
+		}
+		const path = manager.getBranch(sourceLeafId);
+		if (path.at(-1)?.id !== sourceLeafId) {
+			throw new SessionChainControllerError("Session Chain source entry is not reachable from the selected Segment");
+		}
 		const summaryIn = findSummaryInEntry(manager, binding);
 		let latestCompactionIndex = -1;
 		for (let index = path.length - 1; index >= 0; index--) {
@@ -812,14 +934,14 @@ export class SessionChainController {
 
 	private async createSegmentSummary(
 		host: SessionChainHost,
+		sourceManager: SessionManager,
 		binding: PiXkSessionChainBindingV1,
 		segment: SessionSegmentProjectionV1,
 		targetSegmentId: string,
+		sourceLeafId: string,
 	): Promise<{ summary: SegmentSummaryV1; sourceLeafId: string }> {
 		if (!host.model) throw new SessionChainControllerError("Session Chain rollover requires a selected model");
-		const sourceLeafId = host.sessionManager.getLeafId();
-		if (!sourceLeafId) throw new SessionChainControllerError("Session Chain Segment has no source leaf");
-		const selection = this.buildSummarySelection(host.sessionManager, binding, segment);
+		const selection = this.buildSummarySelection(sourceManager, binding, segment, sourceLeafId);
 		const maxOutputTokens = summaryBudget(host.model.contextWindow);
 		const generated = await host.summarizeSessionContext({
 			messages: selection.messages,
@@ -833,7 +955,12 @@ export class SessionChainController {
 			].join("\n"),
 			maxOutputTokens,
 		});
-		if (host.sessionManager.getLeafId() !== sourceLeafId) {
+		const afterSelection = this.buildSummarySelection(sourceManager, binding, segment, sourceLeafId);
+		if (
+			afterSelection.entriesHash !== selection.entriesHash ||
+			afterSelection.lastEntryId !== selection.lastEntryId ||
+			afterSelection.sourceEntries.length !== selection.sourceEntries.length
+		) {
 			throw new SessionChainControllerError("Session Chain source changed while its summary was being generated");
 		}
 		const envelope = parseSummaryEnvelope(generated.summary);
@@ -949,8 +1076,17 @@ export class SessionChainController {
 		if (branch.pendingRollover) {
 			throw new SessionChainControllerError("Session Chain recovery is required before another rollover");
 		}
-		const targetSegmentId = newSegmentId();
-		const generated = await this.createSegmentSummary(host, binding, segment, targetSegmentId);
+		const targetSegmentId = createSessionChainSegmentId();
+		const sourceLeafId = sourceManager.getLeafId();
+		if (!sourceLeafId) throw new SessionChainControllerError("Session Chain Segment has no source leaf to summarize");
+		const generated = await this.createSegmentSummary(
+			host,
+			sourceManager,
+			binding,
+			segment,
+			targetSegmentId,
+			sourceLeafId,
+		);
 		const summaryArtifactId = await this.store.putSegmentSummary(generated.summary);
 		const targetSegment = this.managedSegment(
 			targetSegmentId,
@@ -1034,6 +1170,7 @@ export class SessionChainController {
 						},
 					);
 				},
+				...(options.withSession ? { withSession: options.withSession } : {}),
 			});
 			if (hostResult.cancelled) {
 				await this.store.appendRolloverAborted(
@@ -1088,6 +1225,212 @@ export class SessionChainController {
 			}
 			throw error;
 		}
+	}
+
+	private async assertSealedSegmentIntegrity(segment: SessionSegmentProjectionV1, sessionFile: string): Promise<void> {
+		if (segment.status !== "sealed") return;
+		if (!segment.seal) {
+			throw new SessionChainControllerError(`Sealed Session Chain Segment has no seal: ${segment.segmentId}`);
+		}
+		const fileStat = await stat(sessionFile);
+		if (fileStat.size !== segment.seal.bytes || (await hashFile(sessionFile)) !== segment.seal.fileHash) {
+			throw new SessionChainControllerError(
+				`Sealed Session Chain Segment was modified after commit: ${segment.segmentId}`,
+			);
+		}
+	}
+
+	async createSuccessorBranch(
+		host: SessionChainHost,
+		options: SessionChainCreateBranchOptions,
+	): Promise<SessionChainCreatedBranchResult> {
+		if (!isNonEmptyString(options.reason)) throw new SessionChainControllerError("Branch reason is required");
+		this.assertGates(options.gates);
+		assertSessionChainId(options.source.chainId);
+		assertSessionBranchId(options.source.branchId);
+		assertSessionSegmentId(options.source.segmentId);
+
+		const replay = await this.store.replayChain(options.source.chainId);
+		const sourceBranch = findBranch(replay, options.source.branchId);
+		if (sourceBranch.pendingRollover) {
+			throw new SessionChainControllerError("Session Chain recovery is required before creating a branch");
+		}
+		const sourceSegment = findSegment(sourceBranch, options.source.segmentId);
+		if (sourceSegment.status === "prepared") {
+			throw new SessionChainControllerError("A prepared Session Chain Segment cannot be used as a branch source");
+		}
+		const sourceSessionFile = this.segmentPath(options.source.chainId, options.source.branchId, sourceSegment);
+		const activeSessionFile = host.sessionManager.getSessionFile();
+		const sourceManager =
+			activeSessionFile && resolve(activeSessionFile) === resolve(sourceSessionFile)
+				? host.sessionManager
+				: PiSessionManager.open(sourceSessionFile);
+		const sourceBinding = this.getCurrentBinding(sourceManager);
+		if (
+			!sourceBinding ||
+			sourceBinding.chainId !== options.source.chainId ||
+			sourceBinding.branchId !== options.source.branchId ||
+			sourceBinding.segmentId !== options.source.segmentId ||
+			sourceManager.getSessionId() !== options.source.segmentId
+		) {
+			throw new SessionChainControllerError("Session Chain branch source transcript does not match its topology");
+		}
+		const sourceEntryId = options.sourceEntryId ?? sourceManager.getLeafId();
+		if (!sourceEntryId || !sourceManager.getEntry(sourceEntryId)) {
+			throw new SessionChainControllerError("Session Chain branch source entry does not exist");
+		}
+		await this.assertSealedSegmentIntegrity(sourceSegment, sourceSessionFile);
+
+		const targetSegmentId = createSessionChainSegmentId();
+		const targetBranchId = createSessionChainBranchId();
+		const generated = await this.createSegmentSummary(
+			host,
+			sourceManager,
+			sourceBinding,
+			sourceSegment,
+			targetSegmentId,
+			sourceEntryId,
+		);
+		await this.assertSealedSegmentIntegrity(sourceSegment, sourceSessionFile);
+		const summaryArtifactId = await this.store.putSegmentSummary(generated.summary);
+		const createdAt = this.now();
+		const targetSegment = this.managedSegment(
+			targetSegmentId,
+			1,
+			sourceSegment.segmentId,
+			summaryArtifactId,
+			createdAt,
+		);
+		const targetBinding = bindingFor(options.source.chainId, targetBranchId, targetSegment);
+		const targetSessionFile = this.segmentPath(options.source.chainId, targetBranchId, targetSegment);
+		const targetManager = this.createSessionManagerAt(this.projectRoot, targetSessionFile, {
+			id: targetSegmentId,
+		});
+		targetManager.appendCustomEntry(PI_XK_SESSION_CHAIN_LINK_CUSTOM_TYPE, targetBinding);
+		copySessionProjection(sourceManager, targetManager, sourceEntryId);
+		await options.initializeTarget?.(targetManager);
+		appendSummaryIn(targetManager, summaryArtifactId, generated.summary.carryForwardMarkdown);
+		flushSessionDurably(targetManager);
+		this.targetMarkers(targetManager, targetBinding, generated.summary);
+
+		try {
+			await this.store.appendBranchCreated(
+				options.source.chainId,
+				{
+					branchId: targetBranchId,
+					fromBranchId: options.source.branchId,
+					sourceSegmentId: options.source.segmentId,
+					sourceEntryId,
+					segment: targetSegment,
+				},
+				{
+					eventId: `${options.source.chainId}:${targetBranchId}:created`,
+					idempotencyKey: `${options.source.chainId}:${targetBranchId}:created`,
+					expectedHead: replay.head,
+					actor: options.actor ?? "user",
+					timestamp: createdAt,
+				},
+			);
+		} catch (error) {
+			await rm(targetSessionFile, { force: true });
+			throw error;
+		}
+		return {
+			chainId: options.source.chainId,
+			fromBranchId: options.source.branchId,
+			branchId: targetBranchId,
+			sourceSegmentId: options.source.segmentId,
+			sourceEntryId,
+			targetSegmentId,
+			summaryArtifactId,
+			sessionFile: targetSessionFile,
+		};
+	}
+
+	async continueBranch(host: SessionChainHost, options: SessionChainBranchOptions): Promise<SessionChainBranchResult> {
+		if (!isNonEmptyString(options.reason)) throw new SessionChainControllerError("Branch reason is required");
+		if (!isNonEmptyString(options.sourceEntryId)) {
+			throw new SessionChainControllerError("Branch source entry ID is required");
+		}
+		this.assertGates(options.gates);
+		const sourceManager = host.sessionManager;
+		const { binding, replay, branch, segment } = await this.assertWritableHead(sourceManager);
+		if (branch.pendingRollover) {
+			throw new SessionChainControllerError("Session Chain recovery is required before creating a branch");
+		}
+		if (
+			sourceManager.getLeafId() !== options.sourceEntryId ||
+			!sourceManager.getBranch().some((entry) => entry.id === options.sourceEntryId)
+		) {
+			throw new SessionChainControllerError("Session Chain branch source must be the current Segment leaf");
+		}
+		const targetSegmentId = createSessionChainSegmentId();
+		const targetBranchId = createSessionChainBranchId();
+		const sourceLeafId = sourceManager.getLeafId();
+		if (!sourceLeafId) throw new SessionChainControllerError("Session Chain Segment has no source leaf to summarize");
+		const generated = await this.createSegmentSummary(
+			host,
+			sourceManager,
+			binding,
+			segment,
+			targetSegmentId,
+			sourceLeafId,
+		);
+		const summaryArtifactId = await this.store.putSegmentSummary(generated.summary);
+		const targetSegment = this.managedSegment(targetSegmentId, 1, segment.segmentId, summaryArtifactId, this.now());
+		const targetBinding = bindingFor(binding.chainId, targetBranchId, targetSegment);
+		const targetSessionFile = this.segmentPath(binding.chainId, targetBranchId, targetSegment);
+		const hostResult = await host.rolloverSession({
+			targetSessionFile,
+			targetSessionId: targetSegmentId,
+			reason: options.reason,
+			initializeTarget: async (target) => {
+				if (sourceManager.getLeafId() !== options.sourceEntryId) {
+					throw new SessionChainControllerError("Session Chain branch source changed before rollover freeze");
+				}
+				target.appendCustomEntry(PI_XK_SESSION_CHAIN_LINK_CUSTOM_TYPE, targetBinding);
+				copySessionProjection(sourceManager, target);
+				await options.initializeTarget?.(target);
+				appendSummaryIn(target, summaryArtifactId, generated.summary.carryForwardMarkdown);
+			},
+			finalizeSource: () => {
+				if (sourceManager.getLeafId() !== options.sourceEntryId) {
+					throw new SessionChainControllerError("Session Chain branch source changed before commit");
+				}
+			},
+			commit: async () => {
+				const targetManager = PiSessionManager.open(targetSessionFile);
+				this.targetMarkers(targetManager, targetBinding, generated.summary);
+				await this.store.appendBranchCreated(
+					binding.chainId,
+					{
+						branchId: targetBranchId,
+						fromBranchId: binding.branchId,
+						sourceSegmentId: binding.segmentId,
+						sourceEntryId: options.sourceEntryId,
+						segment: targetSegment,
+					},
+					{
+						eventId: `${binding.chainId}:${targetBranchId}:created`,
+						idempotencyKey: `${binding.chainId}:${targetBranchId}:created`,
+						expectedHead: replay.head,
+						actor: options.actor ?? "user",
+						timestamp: this.now(),
+					},
+				);
+			},
+			...(options.withSession ? { withSession: options.withSession } : {}),
+		});
+		return {
+			cancelled: hostResult.cancelled,
+			chainId: binding.chainId,
+			fromBranchId: binding.branchId,
+			branchId: targetBranchId,
+			sourceSegmentId: binding.segmentId,
+			sourceEntryId: options.sourceEntryId,
+			targetSegmentId,
+			summaryArtifactId,
+		};
 	}
 
 	private initializeRecoveredTarget(
@@ -1265,9 +1608,13 @@ export class SessionChainController {
 					}
 				} else {
 					const baseSummary = await readSummary(segment.summaryInArtifactId);
+					const acceptedSummaryBranches = new Set([
+						branch.branchId,
+						...(branch.forkedFrom ? [branch.forkedFrom.branchId] : []),
+					]);
 					if (
 						baseSummary.chainId !== chainId ||
-						baseSummary.branchId !== branch.branchId ||
+						!acceptedSummaryBranches.has(baseSummary.branchId) ||
 						baseSummary.targetSegmentId !== segment.segmentId
 					) {
 						this.addDiagnostic(
