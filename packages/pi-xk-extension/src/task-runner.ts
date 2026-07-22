@@ -14,6 +14,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import {
 	type TaskChildInfoV1,
+	type TaskReplay,
 	type TaskResultEnvelopeV1,
 	type TaskRole,
 	type TaskSpecV1,
@@ -51,6 +52,7 @@ export interface TaskRunnerStartInput {
 	thinkingLevel: ThinkingLevel;
 	builtinTools?: string[];
 	actor?: "user" | "model";
+	onEvent?: (replay: TaskReplay, eventId: string) => void | Promise<void>;
 }
 
 export interface TaskRunnerOptions {
@@ -74,11 +76,20 @@ interface ActiveChild {
 	taskId: string;
 	session: AgentSession;
 	child: TaskChildInfoV1;
-	settling: Promise<void>;
+	onEvent: TaskRunnerStartInput["onEvent"];
+	settling: Promise<TaskStatus>;
 	settled: boolean;
+	terminalWrite?: Promise<void>;
 }
 
 function taskPrompt(spec: TaskSpecV1): string {
+	const goalContext =
+		spec.parentGoalId === null
+			? []
+			: [
+					`Parent Goal objective: ${join(taskProjectGoalDirectory(spec.parentGoalId), "goal-objective.md")}`,
+					`Parent Goal state: ${join(taskProjectGoalDirectory(spec.parentGoalId), "goal-state.md")}`,
+				];
 	return [
 		"You are an independent Pi-XK Task child.",
 		"Complete only the TaskSpec below. Do not start a Goal or another Task, and do not edit Task/Goal event files.",
@@ -89,9 +100,14 @@ function taskPrompt(spec: TaskSpecV1): string {
 		`Task ID: ${spec.taskId}`,
 		`Role: ${spec.role}`,
 		`Expected result: ${spec.expectedResult}`,
+		...goalContext,
 		"Task prompt:",
 		spec.prompt,
 	].join("\n");
+}
+
+function taskProjectGoalDirectory(goalId: string): string {
+	return join(".pi-xk", "goals", goalId);
 }
 
 export class TaskRunner {
@@ -141,6 +157,7 @@ export class TaskRunner {
 			idempotencyKey: `${taskId}:created`,
 			actor: input.actor ?? "model",
 		});
+		await input.onEvent?.(await this.store.replayTask(taskId), created.event.eventId);
 		let childSession: AgentSession | undefined;
 		try {
 			const sessionDir = join(this.projectRoot, ".pi-xk", "tasks", taskId, "session");
@@ -205,49 +222,84 @@ export class TaskRunner {
 				expectedHead: created.head,
 				actor: "runtime",
 			});
+			await input.onEvent?.(await this.store.replayTask(taskId), started.event.eventId);
 			const active: ActiveChild = {
 				taskId,
 				session: childSession,
 				child: childInfo,
-				settling: Promise.resolve(),
+				onEvent: input.onEvent,
+				settling: Promise.resolve("running"),
 				settled: false,
 			};
 			this.active.set(taskId, active);
-			active.settling = this.runChild(spec, active, started.head.hash);
+			active.settling = this.runChild(spec, active);
 			return {
 				taskId,
 				childSessionId: childInfo.childSessionId,
 				childSessionFile: childInfo.childSessionFile,
-				completion: active.settling.then(async () => (await this.store.replayTask(taskId)).status),
+				completion: active.settling,
 				cancel: async (reason = "Task cancelled by user") => this.cancel(taskId, reason),
 			};
 		} catch (error) {
 			childSession?.dispose();
-			await this.store.recoverTaskOnStartup(taskId, error instanceof Error ? error.message : String(error));
+			const recovered = await this.store.recoverTaskOnStartup(
+				taskId,
+				error instanceof Error ? error.message : String(error),
+			);
+			const terminal = recovered.events.at(-1);
+			if (terminal) await input.onEvent?.(recovered, terminal.eventId);
 			throw error;
 		}
 	}
 
-	private async runChild(spec: TaskSpecV1, active: ActiveChild, _startedHash: string): Promise<void> {
+	private async runChild(spec: TaskSpecV1, active: ActiveChild): Promise<TaskStatus> {
+		let finalStatus: TaskStatus = "running";
 		try {
 			await active.session.prompt(taskPrompt(spec));
 			if (!active.settled) {
 				const replay = await this.store.replayTask(spec.taskId);
 				if (replay.status === "running") {
-					await this.finishMissingResult(spec.taskId, active, replay.head);
+					const lastAssistant = [...active.session.messages]
+						.reverse()
+						.find((message) => message.role === "assistant");
+					if (lastAssistant?.role === "assistant" && lastAssistant.stopReason === "error") {
+						await this.finishProviderError(
+							spec.taskId,
+							active,
+							replay,
+							new Error(lastAssistant.errorMessage ?? "Child provider returned an error"),
+						);
+					} else {
+						await this.finishMissingResult(spec.taskId, active, replay);
+					}
 				}
 			}
 		} catch (error) {
 			if (!active.settled) {
 				const replay = await this.store.replayTask(spec.taskId);
-				if (replay.status === "running") await this.finishProviderError(spec.taskId, active, replay.head, error);
+				if (replay.status === "running") await this.finishProviderError(spec.taskId, active, replay, error);
 			}
 		} finally {
+			await active.terminalWrite?.catch(() => {});
 			active.settled = true;
 			this.active.delete(spec.taskId);
 			active.session.dispose();
-			const status = (await this.store.replayTask(spec.taskId)).status;
-			await this.onSettled?.(spec.taskId, status);
+			finalStatus = (await this.store.replayTask(spec.taskId)).status;
+			try {
+				await this.onSettled?.(spec.taskId, finalStatus);
+			} catch {
+				// Delivery is recoverable from the terminal event and must not change Task facts.
+			}
+		}
+		return finalStatus;
+	}
+
+	private async publishEvent(active: ActiveChild, eventId: string): Promise<void> {
+		if (!active.onEvent) return;
+		try {
+			await active.onEvent(await this.store.replayTask(active.taskId), eventId);
+		} catch {
+			// Session links are recoverable projections and must not change Task facts.
 		}
 	}
 
@@ -273,20 +325,17 @@ export class TaskRunner {
 			endedAt: new Date().toISOString(),
 			error,
 		};
-		await this.store.appendTaskResult(taskId, result, {
+		const written = await this.store.appendTaskResult(taskId, result, {
 			eventId: `${taskId}:result`,
 			idempotencyKey: `${taskId}:result`,
 			expectedHead: replay.head,
 			actor: "runtime",
 		});
 		active.settled = true;
+		await this.publishEvent(active, written.event.eventId);
 	}
 
-	private async finishMissingResult(
-		taskId: string,
-		active: ActiveChild,
-		head: { sequence: number; hash: string },
-	): Promise<void> {
+	private async finishMissingResult(taskId: string, active: ActiveChild, replay: TaskReplay): Promise<void> {
 		const result: TaskResultEnvelopeV1 = {
 			schema: "pi-xk.task-result.v1",
 			taskId,
@@ -297,22 +346,24 @@ export class TaskRunner {
 			artifactIds: [],
 			childSessionId: active.child.childSessionId,
 			childSessionFile: active.child.childSessionFile,
-			startedAt: new Date().toISOString(),
+			startedAt: replay.events.find((event) => event.eventType === "task_started")?.timestamp ?? null,
 			endedAt: new Date().toISOString(),
 			error: { code: "missing_task_result", message: "Child ended without pi_xk_finish_task." },
 		};
-		await this.store.appendTaskResult(taskId, result, {
+		const written = await this.store.appendTaskResult(taskId, result, {
 			eventId: `${taskId}:missing-result`,
 			idempotencyKey: `${taskId}:missing-result`,
-			expectedHead: head,
+			expectedHead: replay.head,
 			actor: "runtime",
 		});
+		active.settled = true;
+		await this.publishEvent(active, written.event.eventId);
 	}
 
 	private async finishProviderError(
 		taskId: string,
 		active: ActiveChild,
-		head: { sequence: number; hash: string },
+		replay: TaskReplay,
 		error: unknown,
 	): Promise<void> {
 		const message = error instanceof Error ? error.message : String(error);
@@ -326,32 +377,43 @@ export class TaskRunner {
 			artifactIds: [],
 			childSessionId: active.child.childSessionId,
 			childSessionFile: active.child.childSessionFile,
-			startedAt: new Date().toISOString(),
+			startedAt: replay.events.find((event) => event.eventType === "task_started")?.timestamp ?? null,
 			endedAt: new Date().toISOString(),
 			error: { code: "provider_error", message },
 		};
-		await this.store.appendTaskResult(taskId, result, {
+		const written = await this.store.appendTaskResult(taskId, result, {
 			eventId: `${taskId}:provider-error`,
 			idempotencyKey: `${taskId}:provider-error`,
-			expectedHead: head,
+			expectedHead: replay.head,
 			actor: "runtime",
 		});
+		active.settled = true;
+		await this.publishEvent(active, written.event.eventId);
 	}
 
 	async cancel(taskId: string, reason = "Task cancelled by user"): Promise<void> {
 		const active = this.active.get(taskId);
-		if (!active || active.settled) return;
+		if (!active) return;
+		if (active.terminalWrite) {
+			await active.terminalWrite;
+			return;
+		}
+		if (active.settled) return;
 		active.settled = true;
-		await active.session.abort().catch(() => {});
-		const replay = await this.store.replayTask(taskId);
-		if (replay.status === "running") {
-			await this.store.appendTaskCancelled(taskId, reason, {
+		active.terminalWrite = (async () => {
+			const replay = await this.store.replayTask(taskId);
+			if (replay.status !== "running") return;
+			const written = await this.store.appendTaskCancelled(taskId, reason, {
 				eventId: `${taskId}:cancelled`,
 				idempotencyKey: `${taskId}:cancelled`,
 				expectedHead: replay.head,
 				actor: "user",
 			});
-		}
+			await this.publishEvent(active, written.event.eventId);
+		})();
+		await active.terminalWrite;
+		await active.session.abort().catch(() => {});
+		await active.settling;
 		active.session.dispose();
 		this.active.delete(taskId);
 	}

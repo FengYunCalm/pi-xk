@@ -15,6 +15,7 @@ describe("Pi-XK TaskRunner", () => {
 	it("runs a faux-provider child with an independent transcript and structured success", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
+		const lifecycleOrder: string[] = [];
 		harness.setResponses([
 			fauxAssistantMessage(
 				[
@@ -34,6 +35,9 @@ describe("Pi-XK TaskRunner", () => {
 			agentDir: join(harness.tempDir, "agent"),
 			modelRuntime: harness.modelRuntime,
 			settingsManager: harness.settingsManager,
+			onSettled: () => {
+				lifecycleOrder.push("settled");
+			},
 		});
 		const handle = await runner.start({
 			role: "verification",
@@ -41,10 +45,13 @@ describe("Pi-XK TaskRunner", () => {
 			expectedResult: "A structured verification result.",
 			parentSessionId: "session-parent",
 			parentEntryId: "entry-parent",
-			parentGoalId: null,
+			parentGoalId: "goal_parent",
 			model: harness.getModel(),
 			thinkingLevel: "medium",
 			builtinTools: [],
+			onEvent: (_replay, eventId) => {
+				lifecycleOrder.push(eventId.split(":").at(-1) ?? eventId);
+			},
 		});
 
 		expect(await handle.completion).toBe("succeeded");
@@ -53,11 +60,14 @@ describe("Pi-XK TaskRunner", () => {
 		const transcript = readFileSync(handle.childSessionFile, "utf8");
 		expect(transcript).toContain("pi_xk_finish_task");
 		expect(transcript).not.toContain("pi_xk_start_task");
+		expect(transcript).toContain(".pi-xk/goals/goal_parent/goal-objective.md");
+		expect(transcript).toContain(".pi-xk/goals/goal_parent/goal-state.md");
 		const inspected = await runner.getStore().inspectTask(handle.taskId);
 		expect(inspected.result).toMatchObject({
 			status: "succeeded",
 			summary: "Child verified the requested behavior.",
 		});
+		expect(lifecycleOrder).toEqual(["created", "started", "result", "settled"]);
 	});
 
 	it("treats a normal child reply without finish_task as an explicit failure", async () => {
@@ -85,5 +95,82 @@ describe("Pi-XK TaskRunner", () => {
 		expect(await handle.completion).toBe("failed");
 		const inspected = await runner.getStore().inspectTask(handle.taskId);
 		expect(inspected.result?.error?.code).toBe("missing_task_result");
+	});
+
+	it("records a child provider error separately from a missing finish result", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([
+			() => {
+				throw new Error("child provider unavailable");
+			},
+		]);
+		const runner = new TaskRunner({
+			projectRoot: harness.tempDir,
+			agentDir: join(harness.tempDir, "agent"),
+			modelRuntime: harness.modelRuntime,
+			settingsManager: harness.settingsManager,
+		});
+		const handle = await runner.start({
+			role: "research",
+			prompt: "Research one behavior.",
+			expectedResult: "A structured research result.",
+			parentSessionId: "session-parent",
+			parentEntryId: "entry-parent",
+			parentGoalId: null,
+			model: harness.getModel(),
+			thinkingLevel: "off",
+			builtinTools: [],
+		});
+
+		expect(await handle.completion).toBe("failed");
+		const inspected = await runner.getStore().inspectTask(handle.taskId);
+		expect(inspected.result).toMatchObject({
+			summary: "Child provider error: child provider unavailable",
+			error: { code: "provider_error", message: "child provider unavailable" },
+		});
+	});
+
+	it("settles cancellation before completion and onSettled observe the Task", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([
+			(_context, options) =>
+				new Promise((resolve) => {
+					const abort = () => resolve(fauxAssistantMessage("", { stopReason: "aborted" }));
+					if (options?.signal?.aborted) abort();
+					else options?.signal?.addEventListener("abort", abort, { once: true });
+				}),
+		]);
+		const settledStatuses: string[] = [];
+		const runner = new TaskRunner({
+			projectRoot: harness.tempDir,
+			agentDir: join(harness.tempDir, "agent"),
+			modelRuntime: harness.modelRuntime,
+			settingsManager: harness.settingsManager,
+			onSettled: (_taskId, status) => {
+				settledStatuses.push(status);
+			},
+		});
+		const handle = await runner.start({
+			role: "implementation",
+			prompt: "Wait until cancelled.",
+			expectedResult: "A cancelled Task.",
+			parentSessionId: "session-parent",
+			parentEntryId: "entry-parent",
+			parentGoalId: null,
+			model: harness.getModel(),
+			thinkingLevel: "off",
+			builtinTools: [],
+		});
+		for (let attempt = 0; attempt < 1_000 && harness.faux.state.callCount === 0; attempt++) {
+			await new Promise<void>((resolve) => setTimeout(resolve, 1));
+		}
+
+		await handle.cancel("cancelled by test");
+
+		expect(await handle.completion).toBe("cancelled");
+		expect(settledStatuses).toEqual(["cancelled"]);
+		expect((await runner.getStore().replayTask(handle.taskId)).status).toBe("cancelled");
 	});
 });

@@ -18,12 +18,17 @@ import {
 	type GoalLifecycleEventInput,
 	type GoalLifecycleStatus,
 	GoalStore,
+	type TaskReplay,
+	type TaskRole,
+	type TaskStatus,
+	type TaskStore,
 	validateGoalLifecycleEventForContract,
 } from "pi-xk-core";
 import { Type } from "typebox";
 import { createGoalDraftReviewComponent, type GoalDraftReviewAction } from "./goal-ui.ts";
+import { TaskRunner, type TaskRunnerHandle, type TaskRunnerOptions, type TaskRunnerStartInput } from "./task-runner.ts";
 
-export { TaskRunner, type TaskRunnerHandle, type TaskRunnerOptions, type TaskRunnerStartInput } from "./task-runner.ts";
+export { TaskRunner, type TaskRunnerHandle, type TaskRunnerOptions, type TaskRunnerStartInput };
 
 import {
 	assertPiXkSessionLink,
@@ -33,6 +38,7 @@ import {
 	createPiXkGoalCapture,
 	createPiXkGoalDraft,
 	createPiXkGoalLifecycleIntent,
+	createPiXkTaskLink,
 	createPiXkTurnCheckpointIntent,
 	isPiXkCheckpointIntent,
 	isPiXkCheckpointRef,
@@ -40,6 +46,7 @@ import {
 	isPiXkGoalDraft,
 	isPiXkGoalLifecycleIntent,
 	isPiXkSessionLink,
+	isPiXkTaskLink,
 	normalizePiXkGoalLifecycleIntent,
 	type PiXkCheckpointIntent,
 	type PiXkGoalCapture,
@@ -49,6 +56,7 @@ import {
 	type PiXkGoalPauseAudit,
 	type PiXkSessionLink,
 	type PiXkStoredGoalLifecycleIntent,
+	type PiXkTaskLink,
 } from "./session-link.ts";
 
 export {
@@ -519,6 +527,8 @@ const PI_XK_GOAL_DRAFT_KICKOFF_CUSTOM_TYPE = "pi-xk.goal-draft-kickoff.v1";
 
 const PI_XK_GOAL_DRAFT_REVIEW_CUSTOM_TYPE = "pi-xk.goal-draft-review.v1";
 
+export const PI_XK_TASK_RESULT_CUSTOM_TYPE = "pi-xk.task-result.v1";
+
 const PI_XK_GOAL_STATUS_KEY = "pi-xk-goal";
 
 interface GoalLifecycleWrite {
@@ -537,6 +547,8 @@ export interface PiXkGoalExtensionOptions {
 	retryDelayMs?: (consecutiveFailureCount: number) => number;
 	/** Test and SDK injection point for the project-local GoalStore. */
 	createGoalStore?: (projectRoot: string) => GoalStore;
+	/** Test and SDK injection point for the project-local Task runner. */
+	createTaskRunner?: (projectRoot: string, onSettled: TaskRunnerOptions["onSettled"]) => TaskRunner;
 	/** Optional non-fatal diagnostic receiver for Goal command and lifecycle errors. */
 	onGoalError?: (error: Error) => void;
 }
@@ -564,6 +576,55 @@ function findCurrentGoalBinding(ctx: ExtensionContext): PiXkSessionLink | undefi
 		}
 	}
 	return undefined;
+}
+
+export interface PiXkTaskResultMessage {
+	taskId: string;
+	terminalEventId: string;
+	status: Exclude<TaskStatus, "pending" | "running">;
+	summary: string;
+	evidence: Array<{ kind: "file" | "command" | "text"; value: string }>;
+	resultArtifactId: string;
+	childSessionId: string;
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function getTaskLinks(ctx: ExtensionContext): PiXkTaskLink[] {
+	const links: PiXkTaskLink[] = [];
+	for (const entry of ctx.sessionManager.getBranch()) {
+		if (
+			entry.type === "custom" &&
+			entry.customType === PI_XK_SESSION_LINK_CUSTOM_TYPE &&
+			isPiXkTaskLink(entry.data)
+		) {
+			links.push(entry.data);
+		}
+	}
+	return links;
+}
+
+function findLatestTaskLink(ctx: ExtensionContext, taskId?: string): PiXkTaskLink | undefined {
+	const links = getTaskLinks(ctx);
+	for (let index = links.length - 1; index >= 0; index--) {
+		const link = links[index];
+		if (link && (taskId === undefined || link.taskId === taskId)) return link;
+	}
+	return undefined;
+}
+
+function hasTaskResultMessage(ctx: ExtensionContext, terminalEventId: string): boolean {
+	return ctx.sessionManager
+		.getEntries()
+		.some(
+			(entry) =>
+				entry.type === "custom_message" &&
+				entry.customType === PI_XK_TASK_RESULT_CUSTOM_TYPE &&
+				isObjectRecord(entry.details) &&
+				entry.details.terminalEventId === terminalEventId,
+		);
 }
 
 function findCurrentGoalCapture(ctx: ExtensionContext): PiXkGoalCapture | undefined {
@@ -632,6 +693,20 @@ function notifyGoalError(ctx: ExtensionContext, options: PiXkGoalExtensionOption
 	}
 }
 
+function notifyTaskError(ctx: ExtensionContext, options: PiXkGoalExtensionOptions, error: unknown): void {
+	const normalized = normalizeError(error);
+	try {
+		options.onGoalError?.(normalized);
+	} catch {
+		// Host diagnostics must not break Task control flow.
+	}
+	try {
+		ctx.ui.notify(`Pi-XK Task: ${normalized.message}`, "error");
+	} catch {
+		// Replaced contexts can reject delayed notifications.
+	}
+}
+
 function goalRuntimePrompt(objectivePath: string, statePath: string): string {
 	return [
 		`An active Pi-XK Goal is bound to this session. Read ${objectivePath} and ${statePath} before substantive work.`,
@@ -639,6 +714,7 @@ function goalRuntimePrompt(objectivePath: string, statePath: string): string {
 		"Treat goal-state.md as the authoritative execution state. Do not repeat work already recorded as done or retry a rejected path unless code, inputs, evidence, or assumptions changed. Update done, open, rejected paths, evidence, next action, assumptions, and blockers whenever they materially change.",
 		"A normal assistant response does not end this Goal: Pi-XK continues active Goals into another run.",
 		"Continue whenever an in-scope action can still advance an unmet required acceptance. Ordinary text, partial results, token use, run count, or a written plan are never pause or end reasons.",
+		"Use pi_xk_start_task when one bounded research, implementation, verification, or review child can advance the Goal independently. After calling it, stop parent work; Pi-XK will resume this Goal only after the structured Task result is delivered.",
 		"Before calling pi_xk_pause_goal, update the state and record unmet required acceptance IDs, current evidence, an incomplete conclusion, blockers, any user request, and the next best action.",
 		"Call pi_xk_end_goal only after all required acceptance criteria have verification evidence; update the state with verified IDs, final evidence, and a final summary first.",
 	].join("\n");
@@ -767,6 +843,96 @@ function activeElapsedForStatus(snapshot: GoalStatusSnapshot, now: number): numb
 
 function formatGoalFooterStatus(snapshot: GoalStatusSnapshot, now: number): string {
 	return `Goal ${snapshot.status} · ${formatDuration(activeElapsedForStatus(snapshot, now))}`;
+}
+
+function appendTaskEventLink(pi: ExtensionAPI, ctx: ExtensionContext, replay: TaskReplay, eventId: string): void {
+	const links = getTaskLinks(ctx).filter((link) => link.taskId === replay.taskId);
+	if (links.some((link) => link.eventId === eventId)) return;
+	const generation = links.reduce((highest, link) => Math.max(highest, link.generation), -1) + 1;
+	pi.appendEntry(
+		PI_XK_SESSION_LINK_CUSTOM_TYPE,
+		createPiXkTaskLink(replay.taskId, replay.spec.parentGoalId, eventId, generation),
+	);
+}
+
+async function assertTaskStartAllowed(
+	ctx: ExtensionContext,
+	storeFor: (projectRoot: string) => GoalStore,
+): Promise<void> {
+	if (isOutstandingGoalDraft(findCurrentGoalDraft(ctx))) {
+		throw new Error("Tasks cannot start while a Goal draft is awaiting review");
+	}
+	const binding = findCurrentGoalBinding(ctx);
+	if (!binding) return;
+	const replay = await storeFor(ctx.cwd).replayGoal(binding.goalId);
+	if (replay.lifecycle.status !== "active") {
+		throw new Error(`Tasks require an active Goal or no Goal binding; current Goal is ${replay.lifecycle.status}`);
+	}
+}
+
+function taskResultMessage(
+	replay: TaskReplay,
+	inspection: Awaited<ReturnType<TaskStore["inspectTask"]>>,
+): PiXkTaskResultMessage {
+	const terminal = replay.events.at(-1);
+	const result = inspection.result;
+	if (
+		!terminal ||
+		(terminal.eventType !== "task_succeeded" &&
+			terminal.eventType !== "task_failed" &&
+			terminal.eventType !== "task_cancelled" &&
+			terminal.eventType !== "task_orphaned") ||
+		!result
+	) {
+		throw new Error(`Task ${replay.taskId} has no readable terminal result`);
+	}
+	return {
+		taskId: replay.taskId,
+		terminalEventId: terminal.eventId,
+		status: result.status,
+		summary: result.summary,
+		evidence: result.evidence.map((item) => ({ ...item })),
+		resultArtifactId: terminal.payload.resultArtifactId,
+		childSessionId: result.childSessionId,
+	};
+}
+
+function deliverTaskResult(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	message: PiXkTaskResultMessage,
+	triggerTurn: boolean,
+): void {
+	if (hasTaskResultMessage(ctx, message.terminalEventId)) return;
+	pi.sendMessage(
+		{
+			customType: PI_XK_TASK_RESULT_CUSTOM_TYPE,
+			content: `Pi-XK Task result:\n${JSON.stringify(message, null, 2)}`,
+			display: true,
+			details: message,
+		},
+		{ triggerTurn },
+	);
+}
+
+function formatTaskStatus(replay: TaskReplay, now: number): string {
+	const started = replay.events.find((event) => event.eventType === "task_started");
+	const terminal = replay.events.at(-1);
+	const endTime =
+		terminal && terminal.eventType !== "task_created" && terminal.eventType !== "task_started"
+			? Date.parse(terminal.timestamp)
+			: now;
+	const startedAt = started ? Date.parse(started.timestamp) : Date.parse(replay.spec.createdAt);
+	return [
+		`Task ${replay.taskId}`,
+		`status=${replay.status}`,
+		`role=${replay.spec.role}`,
+		`elapsed=${formatDuration(Math.max(0, endTime - startedAt))}`,
+		...(started?.eventType === "task_started" ? [`child=${started.payload.child.childSessionId}`] : []),
+		...(terminal && terminal.eventType !== "task_created" && terminal.eventType !== "task_started"
+			? [`summary=${terminal.payload.summary}`, `artifacts=${terminal.payload.artifactIds.join(",") || "none"}`]
+			: []),
+	].join(" · ");
 }
 
 function createGoalContract(
@@ -923,6 +1089,57 @@ function defaultUserPauseAudit(contract: GoalContractV2): PiXkGoalPauseAudit {
 		currentEvidence: "The user paused the Goal before all required acceptance evidence was recorded.",
 		incompleteConclusion: "The Goal remains incomplete until the required acceptance evidence is verified.",
 	};
+}
+
+function runtimePauseAudit(contract: GoalContractV2): PiXkGoalPauseAudit {
+	return {
+		unmetRequiredAcceptanceIds: requiredAcceptanceIds(contract),
+		currentEvidence: "Pi stopped the session or agent before a final acceptance audit was durable.",
+		incompleteConclusion:
+			"The Goal is conservatively paused and remains incomplete until a later run verifies every required acceptance.",
+	};
+}
+
+async function pauseActiveGoalForRuntime(
+	ctx: ExtensionContext,
+	storeFor: (projectRoot: string) => GoalStore,
+	options: PiXkGoalExtensionOptions,
+	reason: string,
+): Promise<boolean> {
+	const binding = findCurrentGoalBinding(ctx);
+	if (!binding) return false;
+	const store = storeFor(ctx.cwd);
+	let replay = await store.replayGoal(binding.goalId);
+	if (replay.lifecycle.status !== "active") return false;
+	const timestamp = goalNow(options);
+	if (replay.lifecycle.openRunId) {
+		await appendGoalLifecycle(
+			store,
+			binding.goalId,
+			{
+				eventType: "goal_run_interrupted",
+				payload: { runId: replay.lifecycle.openRunId, reason },
+			},
+			lifecycleWrite(binding.goalId, "runtime_run_interrupted", "runtime", timestamp),
+		);
+		replay = await store.replayGoal(binding.goalId);
+	}
+	if (replay.lifecycle.status !== "active" || replay.lifecycle.openRunId) return false;
+	await appendGoalLifecycle(
+		store,
+		binding.goalId,
+		{
+			eventType: "goal_paused",
+			payload: {
+				reason,
+				userRequest: null,
+				nextBestAction: "Review the pause audit and run /goal start when you are ready to continue.",
+				audit: runtimePauseAudit(replay.contract),
+			},
+		},
+		lifecycleWrite(binding.goalId, "runtime_paused", "runtime", timestamp),
+	);
+	return true;
 }
 
 function lifecycleInputForIntent(intent: PiXkGoalLifecycleIntent): GoalLifecycleEventInput {
@@ -1534,6 +1751,16 @@ async function showGoalStatus(
 	);
 }
 
+interface TaskParentState {
+	launchActor: "user" | "model";
+	parentSessionId: string;
+	runtimeNonce: string;
+	context: ExtensionContext;
+	parentSettled: boolean;
+	delivered: boolean;
+	autoResume: boolean;
+}
+
 export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}): ExtensionFactory {
 	const storeFor = createGoalStoreResolver(options);
 	return (pi) => {
@@ -1544,6 +1771,10 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 		let goalStatusTimer: ReturnType<typeof setInterval> | undefined;
 		let goalStatusContext: ExtensionContext | undefined;
 		let goalStatusSnapshot: GoalStatusSnapshot | undefined;
+		const runtimeNonce = randomUUID();
+		let acceptsTaskCallbacks = true;
+		const taskParents = new Map<string, TaskParentState>();
+		const taskRunners = new Map<string, TaskRunner>();
 
 		const clearRetryTimer = () => {
 			if (retryTimer === undefined) return;
@@ -1555,6 +1786,164 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 			if (goalStatusTimer === undefined) return;
 			clearInterval(goalStatusTimer);
 			goalStatusTimer = undefined;
+		};
+
+		const handleTaskSettled = async (taskId: string, _status: TaskStatus): Promise<void> => {
+			const parent = taskParents.get(taskId);
+			if (!parent) return;
+			if (
+				!acceptsTaskCallbacks ||
+				parent.runtimeNonce !== runtimeNonce ||
+				parent.context.sessionManager.getSessionId() !== parent.parentSessionId
+			) {
+				return;
+			}
+			const runner = taskRunners.get(parent.context.cwd);
+			if (!runner) return;
+			const replay = await runner.getStore().replayTask(taskId);
+			const terminal = replay.events.at(-1);
+			if (
+				!terminal ||
+				(terminal.eventType !== "task_succeeded" &&
+					terminal.eventType !== "task_failed" &&
+					terminal.eventType !== "task_cancelled" &&
+					terminal.eventType !== "task_orphaned")
+			) {
+				return;
+			}
+			appendTaskEventLink(pi, parent.context, replay, terminal.eventId);
+			if (parent.delivered) return;
+			if (parent.launchActor === "user" || !parent.autoResume) {
+				parent.delivered = true;
+				parent.context.ui.notify(`Pi-XK ${formatTaskStatus(replay, Date.now())}`, "info");
+				return;
+			}
+			if (!parent.parentSettled || !parent.context.isIdle()) return;
+			const inspection = await runner.getStore().inspectTask(taskId);
+			deliverTaskResult(pi, parent.context, taskResultMessage(replay, inspection), true);
+			parent.delivered = true;
+		};
+
+		const runnerFor = (projectRoot: string): TaskRunner => {
+			const existing = taskRunners.get(projectRoot);
+			if (existing) return existing;
+			const runner =
+				options.createTaskRunner?.(projectRoot, handleTaskSettled) ??
+				new TaskRunner({ projectRoot, onSettled: handleTaskSettled });
+			taskRunners.set(projectRoot, runner);
+			return runner;
+		};
+
+		const startTask = async (
+			ctx: ExtensionContext,
+			launchActor: "user" | "model",
+			role: TaskRole,
+			prompt: string,
+			expectedResult: string,
+		): Promise<TaskRunnerHandle> => {
+			if (!ctx.isIdle() && launchActor === "user") throw new Error("the parent agent is still busy");
+			clearRetryTimer();
+			await assertTaskStartAllowed(ctx, storeFor);
+			const runner = runnerFor(ctx.cwd);
+			if (runner.getActiveTaskId()) throw new Error(`Task ${runner.getActiveTaskId()} is already running`);
+			if (!ctx.model) throw new Error("no parent model is selected");
+			const binding = findCurrentGoalBinding(ctx);
+			const builtinTools = pi
+				.getActiveTools()
+				.filter((toolName) => ["read", "bash", "edit", "write", "grep", "find", "ls"].includes(toolName));
+			const handle = await runner.start({
+				role,
+				prompt,
+				expectedResult,
+				parentSessionId: ctx.sessionManager.getSessionId(),
+				parentEntryId: ctx.sessionManager.getLeafId() ?? ctx.sessionManager.getSessionId(),
+				parentGoalId: binding?.goalId ?? null,
+				model: ctx.model,
+				thinkingLevel: pi.getThinkingLevel(),
+				builtinTools,
+				actor: launchActor,
+				onEvent: (replay, eventId) => appendTaskEventLink(pi, ctx, replay, eventId),
+			});
+			taskParents.set(handle.taskId, {
+				launchActor,
+				parentSessionId: ctx.sessionManager.getSessionId(),
+				runtimeNonce,
+				context: ctx,
+				parentSettled: launchActor === "user",
+				delivered: false,
+				autoResume: launchActor === "model",
+			});
+			void handle.completion.catch((error) => notifyTaskError(ctx, options, error));
+			const replay = await runner.getStore().replayTask(handle.taskId);
+			for (const event of replay.events) {
+				if (event.eventType === "task_created" || event.eventType === "task_started") {
+					appendTaskEventLink(pi, ctx, replay, event.eventId);
+				}
+			}
+			if (replay.status !== "pending" && replay.status !== "running") {
+				await handleTaskSettled(handle.taskId, replay.status);
+			}
+			return handle;
+		};
+
+		const currentTaskReplay = async (ctx: ExtensionContext, taskId?: string): Promise<TaskReplay | undefined> => {
+			const link = findLatestTaskLink(ctx, taskId);
+			if (!link) return undefined;
+			const replay = await runnerFor(ctx.cwd).getStore().replayTask(link.taskId);
+			if (replay.spec.parentSessionId !== ctx.sessionManager.getSessionId()) return undefined;
+			return replay;
+		};
+
+		const reconcileSessionTasks = async (ctx: ExtensionContext): Promise<void> => {
+			const taskIds = [...new Set(getTaskLinks(ctx).map((link) => link.taskId))];
+			const store = runnerFor(ctx.cwd).getStore();
+			for (const taskId of taskIds) {
+				let replay = await store.replayTask(taskId);
+				if (replay.spec.parentSessionId !== ctx.sessionManager.getSessionId()) continue;
+				if (replay.status === "pending" || replay.status === "running") {
+					replay = await store.recoverTaskOnStartup(
+						taskId,
+						"Pi parent session restarted before the child settled.",
+					);
+					const terminal = replay.events.at(-1);
+					if (terminal) appendTaskEventLink(pi, ctx, replay, terminal.eventId);
+				}
+				if (replay.status === "pending" || replay.status === "running") continue;
+				const terminal = replay.events.at(-1);
+				if (!terminal || hasTaskResultMessage(ctx, terminal.eventId)) continue;
+				const inspection = await store.inspectTask(taskId);
+				deliverTaskResult(pi, ctx, taskResultMessage(replay, inspection), false);
+			}
+		};
+
+		const cancelTask = async (
+			ctx: ExtensionContext,
+			taskId: string,
+			reason: string,
+			pauseGoal: boolean,
+		): Promise<void> => {
+			const replay = await currentTaskReplay(ctx, taskId);
+			if (!replay) throw new Error(`Task ${taskId} does not belong to the current session branch`);
+			if (replay.status !== "running") throw new Error(`Task ${taskId} is ${replay.status}, not running`);
+			const parent = taskParents.get(taskId);
+			if (parent) parent.autoResume = false;
+			const runner = runnerFor(ctx.cwd);
+			if (runner.getActiveTaskId() === taskId) {
+				await runner.cancel(taskId, reason);
+			} else {
+				await runner.getStore().appendTaskCancelled(taskId, reason, {
+					eventId: `${taskId}:cancelled:${randomUUID().replaceAll("-", "")}`,
+					idempotencyKey: `${taskId}:cancelled:${replay.head.hash}`,
+					expectedHead: replay.head,
+					actor: "user",
+				});
+			}
+			const terminalReplay = await runner.getStore().replayTask(taskId);
+			const terminal = terminalReplay.events.at(-1);
+			if (terminal) appendTaskEventLink(pi, ctx, terminalReplay, terminal.eventId);
+			if (pauseGoal && replay.spec.parentGoalId) {
+				await pauseActiveGoalForRuntime(ctx, storeFor, options, `Task ${taskId} was cancelled by the user.`);
+			}
 		};
 
 		const renderGoalStatus = () => {
@@ -1738,7 +2127,8 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 				isOutstandingGoalDraft(findCurrentGoalDraft(ctx)) &&
 				(event.toolName === "pi_xk_start_goal" ||
 					event.toolName === "pi_xk_pause_goal" ||
-					event.toolName === "pi_xk_end_goal")
+					event.toolName === "pi_xk_end_goal" ||
+					event.toolName === "pi_xk_start_task")
 			) {
 				return {
 					block: true,
@@ -1839,8 +2229,53 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 				}
 			},
 		});
+		pi.registerTool({
+			name: "pi_xk_start_task",
+			label: "Start Task",
+			description:
+				"Start one independent Pi-XK child Task for bounded research, implementation, verification, or review. The parent run stops until the child submits a structured result.",
+			promptSnippet: "Delegate one bounded unit of work to a child Task and wait for its structured result.",
+			promptGuidelines: [
+				"Use pi_xk_start_task only when one bounded child can advance the current work independently.",
+				"After starting a Task, do not continue parent work in the same run; Pi-XK resumes after the child result.",
+			],
+			executionMode: "sequential",
+			parameters: Type.Object({
+				role: Type.Union([
+					Type.Literal("research"),
+					Type.Literal("implementation"),
+					Type.Literal("verification"),
+					Type.Literal("review"),
+				]),
+				prompt: Type.String({ minLength: 1, description: "Bounded child task instructions" }),
+				expectedResult: Type.String({
+					minLength: 1,
+					description: "Observable structured result expected from the child",
+				}),
+			}),
+			execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+				try {
+					const handle = await startTask(ctx, "model", params.role, params.prompt, params.expectedResult);
+					return {
+						content: [{ type: "text", text: `Task ${handle.taskId} started; parent work is suspended.` }],
+						details: { taskId: handle.taskId },
+						terminate: true,
+					};
+				} catch (error) {
+					return {
+						content: [{ type: "text", text: `Task start failed: ${normalizeError(error).message}` }],
+						details: {},
+					};
+				}
+			},
+		});
 
 		pi.on("session_start", async (_event, ctx) => {
+			try {
+				await reconcileSessionTasks(ctx);
+			} catch (error) {
+				notifyGoalError(ctx, options, error);
+			}
 			try {
 				await synchronizeCheckpointState(pi, ctx, checkpointOptions);
 				await recoverOpenGoalRun(ctx, storeFor, options);
@@ -1938,7 +2373,17 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 					await refreshGoalStatus(ctx);
 					return;
 				}
+				const latestTask = await currentTaskReplay(ctx);
+				const taskParent = latestTask ? taskParents.get(latestTask.taskId) : undefined;
+				if (latestTask && (latestTask.status === "running" || (taskParent && !taskParent.delivered))) {
+					await settleGoalRun(ctx, storeFor, options);
+					if (taskParent) taskParent.parentSettled = true;
+					if (latestTask.status !== "running") await handleTaskSettled(latestTask.taskId, latestTask.status);
+					await refreshGoalStatus(ctx);
+					return;
+				}
 				await settleGoalRun(ctx, storeFor, options);
+
 				if (lastGoalRunOutcome === "aborted") {
 					await refreshGoalStatus(ctx);
 					return;
@@ -1956,9 +2401,62 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 				notifyGoalError(ctx, options, error);
 			}
 		});
+		pi.on("session_before_tree", async (_event, ctx) => {
+			clearRetryTimer();
+			try {
+				const task = await currentTaskReplay(ctx);
+				if (task?.status === "running") {
+					await cancelTask(ctx, task.taskId, "Pi session tree navigation cancelled the child Task.", false);
+				}
+			} catch (error) {
+				notifyGoalError(ctx, options, error);
+				return { cancel: true };
+			}
+		});
+
 		pi.on("session_shutdown", async (_event, ctx) => {
 			clearRetryTimer();
 			clearGoalStatusTimer();
+			try {
+				const task = await currentTaskReplay(ctx);
+				if (task?.status === "running") {
+					const parent = taskParents.get(task.taskId);
+					if (parent) parent.autoResume = false;
+					let timeout: ReturnType<typeof setTimeout> | undefined;
+					try {
+						await Promise.race([
+							cancelTask(ctx, task.taskId, `Pi session shutdown: ${_event.reason}.`, false),
+							new Promise<never>((_resolve, reject) => {
+								timeout = setTimeout(() => reject(new Error("Task cancellation timed out")), 5_000);
+							}),
+						]);
+					} catch {
+						const replay = await runnerFor(ctx.cwd).getStore().replayTask(task.taskId);
+						if (replay.status === "running") {
+							await runnerFor(ctx.cwd)
+								.getStore()
+								.appendTaskOrphaned(
+									task.taskId,
+									"Pi shutdown could not confirm child cancellation within 5 seconds.",
+									{
+										eventId: `${task.taskId}:shutdown-orphaned`,
+										idempotencyKey: `${task.taskId}:shutdown-orphaned:${replay.head.hash}`,
+										expectedHead: replay.head,
+										actor: "runtime",
+									},
+								);
+							const orphaned = await runnerFor(ctx.cwd).getStore().replayTask(task.taskId);
+							const terminal = orphaned.events.at(-1);
+							if (terminal) appendTaskEventLink(pi, ctx, orphaned, terminal.eventId);
+						}
+					} finally {
+						if (timeout !== undefined) clearTimeout(timeout);
+					}
+				}
+			} catch (error) {
+				notifyGoalError(ctx, options, error);
+			}
+			acceptsTaskCallbacks = false;
 			try {
 				await synchronizeCheckpointState(pi, ctx, checkpointOptions);
 				await processPendingGoalLifecycleIntent(ctx);
@@ -1971,6 +2469,16 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 			}
 		});
 		pi.on("input", async (event, ctx) => {
+			try {
+				const task = await currentTaskReplay(ctx);
+				if (task?.status === "running" && !event.text.trimStart().startsWith("/task")) {
+					ctx.ui.notify(`Pi-XK Task ${task.taskId} is running. Use /task status or /task cancel.`, "warning");
+					return { action: "handled" };
+				}
+			} catch (error) {
+				notifyGoalError(ctx, options, error);
+				return { action: "handled" };
+			}
 			const capture = findCurrentGoalCapture(ctx);
 			if (!capture || capture.state !== "open") return { action: "continue" };
 			try {
@@ -1979,6 +2487,51 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 				notifyGoalError(ctx, options, error);
 			}
 			return { action: "handled" };
+		});
+		pi.registerCommand("task", {
+			description: "Start, inspect, or cancel the current Pi-XK child Task",
+			handler: async (args, ctx) => {
+				const trimmed = args.trim();
+				try {
+					if (trimmed === "status" || trimmed.startsWith("status ")) {
+						const taskId = trimmed.slice("status".length).trim() || undefined;
+						const replay = await currentTaskReplay(ctx, taskId);
+						if (!replay) {
+							ctx.ui.notify("Pi-XK Task: no Task is linked to the current session branch", "info");
+							return;
+						}
+						ctx.ui.notify(`Pi-XK ${formatTaskStatus(replay, Date.now())}`, "info");
+						return;
+					}
+					if (trimmed === "start" || trimmed.startsWith("start ")) {
+						const prompt = trimmed.slice("start".length).trim();
+						if (!prompt) throw new Error("usage: /task start <prompt>");
+						const handle = await startTask(
+							ctx,
+							"user",
+							"implementation",
+							prompt,
+							"Return a concise structured result with observable evidence.",
+						);
+						ctx.ui.notify(`Pi-XK Task ${handle.taskId} started`, "info");
+						return;
+					}
+					if (trimmed === "cancel" || trimmed.startsWith("cancel ")) {
+						const remainder = trimmed.slice("cancel".length).trim();
+						const [first, ...rest] = remainder.split(/\s+/).filter(Boolean);
+						const explicitTaskId = first?.startsWith("task_") ? first : undefined;
+						const replay = await currentTaskReplay(ctx, explicitTaskId);
+						if (!replay) throw new Error("no Task is linked to the current session branch");
+						const reason = explicitTaskId ? rest.join(" ") : remainder;
+						await cancelTask(ctx, replay.taskId, reason || "Task cancelled by user", true);
+						ctx.ui.notify(`Pi-XK Task ${replay.taskId} cancelled`, "info");
+						return;
+					}
+					throw new Error("usage: /task start <prompt> | /task status [taskId] | /task cancel [taskId] [reason]");
+				} catch (error) {
+					notifyTaskError(ctx, options, error);
+				}
+			},
 		});
 		pi.registerCommand("goal", {
 			description: "Create, control, or inspect the current Pi-XK Goal",
