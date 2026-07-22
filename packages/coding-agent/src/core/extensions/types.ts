@@ -30,6 +30,7 @@ import type {
 	SimpleStreamOptions,
 	TextContent,
 	ToolResultMessage,
+	Usage,
 } from "@earendil-works/pi-ai";
 import type {
 	AutocompleteItem,
@@ -296,6 +297,42 @@ export interface CompactOptions {
 	onError?: (error: Error) => void;
 }
 
+export interface SummarizeSessionContextOptions {
+	messages: AgentMessage[];
+	previousSummary?: string;
+	customInstructions?: string;
+	maxOutputTokens: number;
+	signal?: AbortSignal;
+}
+
+export interface SummarizeSessionContextResult {
+	summary: string;
+	model: { provider: string; modelId: string };
+	thinkingLevel: ThinkingLevel;
+	usage: Usage;
+}
+
+export interface SessionRolloverCommitContext {
+	sourceSessionFile: string;
+	sourceSessionId: string;
+	sourceLeafId: string | null;
+	targetSessionFile: string;
+	targetSessionId: string;
+	targetLeafId: string | null;
+}
+
+export interface RolloverSessionOptions {
+	targetSessionFile: string;
+	targetSessionId: string;
+	reason: string;
+	initializeTarget: (sessionManager: SessionManager) => Promise<void> | void;
+	finalizeSource: (sessionManager: SessionManager) => Promise<void> | void;
+	commit: (context: SessionRolloverCommitContext) => Promise<void> | void;
+	withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+}
+
+export type RolloverSessionResult = { cancelled: true } | ({ cancelled: false } & SessionRolloverCommitContext);
+
 /**
  * Context passed to extension event handlers.
  */
@@ -332,6 +369,10 @@ export interface ExtensionContext {
 	getContextUsage(): ContextUsage | undefined;
 	/** Trigger compaction without awaiting completion. */
 	compact(options?: CompactOptions): void;
+	/** Summarize supplied messages with the current model without modifying the transcript. */
+	summarizeSessionContext(options: SummarizeSessionContextOptions): Promise<SummarizeSessionContextResult>;
+	/** Replace the current physical session at a safe settled boundary. */
+	rolloverSession(options: RolloverSessionOptions): Promise<RolloverSessionResult>;
 	/** Get the current effective system prompt. */
 	getSystemPrompt(): string;
 }
@@ -550,7 +591,7 @@ export interface ResourcesDiscoverResult {
 export interface SessionStartEvent {
 	type: "session_start";
 	/** Why this session start happened. */
-	reason: "startup" | "reload" | "new" | "resume" | "fork";
+	reason: "startup" | "reload" | "new" | "resume" | "fork" | "rollover";
 	/** Previously active session file. Present for "new", "resume", and "fork". */
 	previousSessionFile?: string;
 }
@@ -574,6 +615,15 @@ export interface SessionBeforeForkEvent {
 	type: "session_before_fork";
 	entryId: string;
 	position: "before" | "at";
+}
+
+/** Fired before replacing a settled session with a rollover target (can be cancelled). */
+export interface SessionBeforeRolloverEvent {
+	type: "session_before_rollover";
+	reason: string;
+	sourceSessionFile: string;
+	targetSessionFile: string;
+	targetSessionId: string;
 }
 
 /** Fired before context compaction (can be cancelled or customized) */
@@ -603,7 +653,7 @@ export interface SessionCompactEvent {
 /** Fired before an extension runtime is torn down due to quit, reload, or session replacement. */
 export interface SessionShutdownEvent {
 	type: "session_shutdown";
-	reason: "quit" | "reload" | "new" | "resume" | "fork";
+	reason: "quit" | "reload" | "new" | "resume" | "fork" | "rollover";
 	/** Destination session file when shutting down due to session replacement. */
 	targetSessionFile?: string;
 }
@@ -644,6 +694,7 @@ export type SessionEvent =
 	| SessionInfoChangedEvent
 	| SessionBeforeSwitchEvent
 	| SessionBeforeForkEvent
+	| SessionBeforeRolloverEvent
 	| SessionBeforeCompactEvent
 	| SessionCompactEvent
 	| SessionShutdownEvent
@@ -1094,6 +1145,10 @@ export interface SessionBeforeForkResult {
 	skipConversationRestore?: boolean;
 }
 
+export interface SessionBeforeRolloverResult {
+	cancel?: boolean;
+}
+
 export interface SessionBeforeCompactResult {
 	cancel?: boolean;
 	compaction?: CompactionResult;
@@ -1178,6 +1233,10 @@ export interface ExtensionAPI {
 		handler: ExtensionHandler<SessionBeforeSwitchEvent, SessionBeforeSwitchResult>,
 	): void;
 	on(event: "session_before_fork", handler: ExtensionHandler<SessionBeforeForkEvent, SessionBeforeForkResult>): void;
+	on(
+		event: "session_before_rollover",
+		handler: ExtensionHandler<SessionBeforeRolloverEvent, SessionBeforeRolloverResult>,
+	): void;
 	on(
 		event: "session_before_compact",
 		handler: ExtensionHandler<SessionBeforeCompactEvent, SessionBeforeCompactResult>,
@@ -1611,6 +1670,8 @@ export interface ExtensionContextActions {
 	shutdown: () => void;
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (options?: CompactOptions) => void;
+	summarizeSessionContext?: (options: SummarizeSessionContextOptions) => Promise<SummarizeSessionContextResult>;
+	rolloverSession?: (options: RolloverSessionOptions) => Promise<RolloverSessionResult>;
 	getSystemPrompt: () => string;
 	getSystemPromptOptions?: () => BuildSystemPromptOptions;
 }

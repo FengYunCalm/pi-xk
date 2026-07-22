@@ -121,12 +121,16 @@ export type {
 	// Events - Resources
 	ResourcesDiscoverEvent,
 	ResourcesDiscoverResult,
+	RolloverSessionOptions,
+	RolloverSessionResult,
 	SendMessageHandler,
 	SendUserMessageHandler,
 	SessionBeforeCompactEvent,
 	SessionBeforeCompactResult,
 	SessionBeforeForkEvent,
 	SessionBeforeForkResult,
+	SessionBeforeRolloverEvent,
+	SessionBeforeRolloverResult,
 	SessionBeforeSwitchEvent,
 	SessionBeforeSwitchResult,
 	SessionBeforeTreeEvent,
@@ -134,6 +138,7 @@ export type {
 	SessionCompactEvent,
 	SessionEvent,
 	SessionInfoChangedEvent,
+	SessionRolloverCommitContext,
 	SessionShutdownEvent,
 	// Events - Session
 	SessionStartEvent,
@@ -142,6 +147,8 @@ export type {
 	SetLabelHandler,
 	SetModelHandler,
 	SetThinkingLevelHandler,
+	SummarizeSessionContextOptions,
+	SummarizeSessionContextResult,
 	TerminalInputHandler,
 	// Events - Tool
 	ToolCallEvent,

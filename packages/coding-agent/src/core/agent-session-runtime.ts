@@ -6,6 +6,8 @@ import type { AgentSessionRuntimeDiagnostic, AgentSessionServices } from "./agen
 import type {
 	ProjectTrustContext,
 	ReplacedSessionContext,
+	RolloverSessionOptions,
+	RolloverSessionResult,
 	SessionShutdownEvent,
 	SessionStartEvent,
 } from "./extensions/index.ts";
@@ -79,6 +81,8 @@ export class AgentSessionRuntime {
 	private readonly createRuntime: CreateAgentSessionRuntimeFactory;
 	private _diagnostics: AgentSessionRuntimeDiagnostic[];
 	private _modelFallbackMessage?: string;
+	private _unavailableReason?: string;
+	private _rolloverInProgress = false;
 
 	constructor(
 		_session: AgentSession,
@@ -92,6 +96,7 @@ export class AgentSessionRuntime {
 		this.createRuntime = createRuntime;
 		this._diagnostics = _diagnostics;
 		this._modelFallbackMessage = _modelFallbackMessage;
+		this.bindRolloverHandler(this._session);
 	}
 
 	get services(): AgentSessionServices {
@@ -99,6 +104,9 @@ export class AgentSessionRuntime {
 	}
 
 	get session(): AgentSession {
+		if (this._unavailableReason) {
+			throw new Error(this._unavailableReason);
+		}
 		return this._session;
 	}
 
@@ -179,6 +187,21 @@ export class AgentSessionRuntime {
 		this._services = result.services;
 		this._diagnostics = result.diagnostics;
 		this._modelFallbackMessage = result.modelFallbackMessage;
+		this._unavailableReason = undefined;
+		this.bindRolloverHandler(this._session);
+	}
+
+	private bindRolloverHandler(session: AgentSession): void {
+		session.setRolloverSessionHandler((options) => this.rolloverSession(options));
+	}
+
+	private assertRolloverSafe(session: AgentSession): void {
+		if (!session.isIdle || session.isCompacting || session.isBashRunning) {
+			throw new Error("Session rollover requires a settled, idle session");
+		}
+		if (session.pendingMessageCount > 0 || session.hasPendingNextTurnMessages) {
+			throw new Error("Session rollover is blocked while queued messages are pending");
+		}
 	}
 
 	private async finishSessionReplacement(withSession?: (ctx: ReplacedSessionContext) => Promise<void>): Promise<void> {
@@ -392,7 +415,111 @@ export class AgentSessionRuntime {
 		return { cancelled: false };
 	}
 
+	/**
+	 * Replace the current physical session after both transcript endpoints are
+	 * durably prepared and the extension-owned domain transaction commits.
+	 */
+	async rolloverSession(options: RolloverSessionOptions): Promise<RolloverSessionResult> {
+		if (this._rolloverInProgress) {
+			throw new Error("Session rollover is already in progress");
+		}
+		const sourceSession = this.session;
+		this._rolloverInProgress = true;
+		let sourceFrozen = false;
+		let sourceFinalized = false;
+		let replacementApplied = false;
+		try {
+			this.assertRolloverSafe(sourceSession);
+			const sourceManager = sourceSession.sessionManager;
+			const sourceSessionFile = sourceManager.getSessionFile();
+			if (!sourceManager.isPersisted() || !sourceSessionFile) {
+				throw new Error("Session rollover requires a persisted source session");
+			}
+			const targetSessionFile = resolvePath(options.targetSessionFile, this.cwd);
+			if (resolve(sourceSessionFile) === resolve(targetSessionFile)) {
+				throw new Error("Session rollover target must differ from the source session file");
+			}
+
+			const runner = sourceSession.extensionRunner;
+			if (runner.hasHandlers("session_before_rollover")) {
+				const result = await runner.emit({
+					type: "session_before_rollover",
+					reason: options.reason,
+					sourceSessionFile,
+					targetSessionFile,
+					targetSessionId: options.targetSessionId,
+				});
+				if (result?.cancel) {
+					return { cancelled: true };
+				}
+			}
+
+			this.assertRolloverSafe(sourceSession);
+			sourceSession.beginRollover();
+			sourceFrozen = true;
+
+			const targetManager = SessionManager.createAt(this.cwd, targetSessionFile, {
+				id: options.targetSessionId,
+			});
+			await options.initializeTarget(targetManager);
+			targetManager.flushDurable();
+
+			await options.finalizeSource(sourceManager);
+			sourceFinalized = true;
+			sourceManager.flushDurable();
+
+			const commitContext = {
+				sourceSessionFile,
+				sourceSessionId: sourceManager.getSessionId(),
+				sourceLeafId: sourceManager.getLeafId(),
+				targetSessionFile,
+				targetSessionId: targetManager.getSessionId(),
+				targetLeafId: targetManager.getLeafId(),
+			};
+			await options.commit(commitContext);
+
+			await this.teardownCurrent("rollover", targetSessionFile);
+			let result: CreateAgentSessionRuntimeResult;
+			try {
+				result = await this.createRuntime({
+					cwd: this.cwd,
+					agentDir: this.services.agentDir,
+					sessionManager: targetManager,
+					sessionStartEvent: {
+						type: "session_start",
+						reason: "rollover",
+						previousSessionFile: sourceSessionFile,
+					},
+				});
+			} catch (error) {
+				this._unavailableReason =
+					`No active session runtime remains after committed rollover target ${targetSessionFile}. ` +
+					"Restart Pi to open the committed target.";
+				throw error;
+			}
+			this.apply(result);
+			replacementApplied = true;
+			await this.finishSessionReplacement(options.withSession);
+			return { cancelled: false, ...commitContext };
+		} catch (error) {
+			if (sourceFrozen && !sourceFinalized) {
+				sourceSession.cancelRollover();
+			} else if (sourceFinalized && !replacementApplied && !this._unavailableReason) {
+				this._unavailableReason =
+					"No active session runtime remains after a prepared rollover finalized the source session. " +
+					"Restart Pi so Session Chain recovery can finish the transaction.";
+				sourceSession.dispose();
+			}
+			throw error;
+		} finally {
+			this._rolloverInProgress = false;
+		}
+	}
+
 	async dispose(): Promise<void> {
+		if (this._unavailableReason) {
+			return;
+		}
 		await emitSessionShutdownEvent(this.session.extensionRunner, {
 			type: "session_shutdown",
 			reason: "quit",

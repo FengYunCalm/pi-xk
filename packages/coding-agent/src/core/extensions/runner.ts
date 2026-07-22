@@ -51,11 +51,16 @@ import type {
 	ResolvedCommand,
 	ResourcesDiscoverEvent,
 	ResourcesDiscoverResult,
+	RolloverSessionOptions,
+	RolloverSessionResult,
 	SessionBeforeCompactResult,
 	SessionBeforeForkResult,
+	SessionBeforeRolloverResult,
 	SessionBeforeSwitchResult,
 	SessionBeforeTreeResult,
 	SessionShutdownEvent,
+	SummarizeSessionContextOptions,
+	SummarizeSessionContextResult,
 	ToolCallEvent,
 	ToolCallEventResult,
 	ToolResultEvent,
@@ -137,12 +142,20 @@ type RunnerEmitEvent = Exclude<
 
 type SessionBeforeEvent = Extract<
 	RunnerEmitEvent,
-	{ type: "session_before_switch" | "session_before_fork" | "session_before_compact" | "session_before_tree" }
+	{
+		type:
+			| "session_before_switch"
+			| "session_before_fork"
+			| "session_before_rollover"
+			| "session_before_compact"
+			| "session_before_tree";
+	}
 >;
 
 type SessionBeforeEventResult =
 	| SessionBeforeSwitchResult
 	| SessionBeforeForkResult
+	| SessionBeforeRolloverResult
 	| SessionBeforeCompactResult
 	| SessionBeforeTreeResult;
 
@@ -150,11 +163,13 @@ type RunnerEmitResult<TEvent extends RunnerEmitEvent> = TEvent extends { type: "
 	? SessionBeforeSwitchResult | undefined
 	: TEvent extends { type: "session_before_fork" }
 		? SessionBeforeForkResult | undefined
-		: TEvent extends { type: "session_before_compact" }
-			? SessionBeforeCompactResult | undefined
-			: TEvent extends { type: "session_before_tree" }
-				? SessionBeforeTreeResult | undefined
-				: undefined;
+		: TEvent extends { type: "session_before_rollover" }
+			? SessionBeforeRolloverResult | undefined
+			: TEvent extends { type: "session_before_compact" }
+				? SessionBeforeCompactResult | undefined
+				: TEvent extends { type: "session_before_tree" }
+					? SessionBeforeTreeResult | undefined
+					: undefined;
 
 export type ExtensionErrorListener = (error: ExtensionError) => void;
 
@@ -281,6 +296,14 @@ export class ExtensionRunner {
 	private hasPendingMessagesFn: () => boolean = () => false;
 	private getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	private compactFn: (options?: CompactOptions) => void = () => {};
+	private summarizeSessionContextFn: (
+		options: SummarizeSessionContextOptions,
+	) => Promise<SummarizeSessionContextResult> = async () => {
+		throw new Error("Session context summarization is not bound");
+	};
+	private rolloverSessionFn: (options: RolloverSessionOptions) => Promise<RolloverSessionResult> = async () => {
+		throw new Error("Session rollover is not bound");
+	};
 	private getSystemPromptFn: () => string = () => "";
 	private getSystemPromptOptionsFn: () => BuildSystemPromptOptions = () => ({ cwd: this.cwd });
 	private newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
@@ -343,6 +366,8 @@ export class ExtensionRunner {
 		this.shutdownHandler = contextActions.shutdown;
 		this.getContextUsageFn = contextActions.getContextUsage;
 		this.compactFn = contextActions.compact;
+		this.summarizeSessionContextFn = contextActions.summarizeSessionContext ?? this.summarizeSessionContextFn;
+		this.rolloverSessionFn = contextActions.rolloverSession ?? this.rolloverSessionFn;
 		this.getSystemPromptFn = contextActions.getSystemPrompt;
 		this.getSystemPromptOptionsFn = contextActions.getSystemPromptOptions ?? (() => ({ cwd: this.cwd }));
 
@@ -726,6 +751,14 @@ export class ExtensionRunner {
 				runner.assertActive();
 				runner.compactFn(options);
 			},
+			summarizeSessionContext: (options) => {
+				runner.assertActive();
+				return runner.summarizeSessionContextFn(options);
+			},
+			rolloverSession: (options) => {
+				runner.assertActive();
+				return runner.rolloverSessionFn(options);
+			},
 			getSystemPrompt: () => {
 				runner.assertActive();
 				return runner.getSystemPromptFn();
@@ -776,6 +809,7 @@ export class ExtensionRunner {
 		return (
 			event.type === "session_before_switch" ||
 			event.type === "session_before_fork" ||
+			event.type === "session_before_rollover" ||
 			event.type === "session_before_compact" ||
 			event.type === "session_before_tree"
 		);

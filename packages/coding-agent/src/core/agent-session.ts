@@ -57,6 +57,7 @@ import {
 	estimateContextTokens,
 	estimateTokens,
 	generateBranchSummary,
+	generateSummaryWithMetadata,
 	prepareCompaction,
 	shouldCompact,
 } from "./compaction/index.ts";
@@ -75,10 +76,14 @@ import {
 	type MessageStartEvent,
 	type MessageUpdateEvent,
 	type ReplacedSessionContext,
+	type RolloverSessionOptions,
+	type RolloverSessionResult,
 	type SessionBeforeCompactResult,
 	type SessionBeforeTreeResult,
 	type SessionStartEvent,
 	type ShutdownHandler,
+	type SummarizeSessionContextOptions,
+	type SummarizeSessionContextResult,
 	type ToolDefinition,
 	type ToolExecutionEndEvent,
 	type ToolExecutionStartEvent,
@@ -294,6 +299,7 @@ export class AgentSession {
 	private _isAgentRunActive = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
+	private _isRolloverPending = false;
 
 	/** Tracks pending steering messages for UI display. Removed when delivered. */
 	private _steeringMessages: string[] = [];
@@ -339,6 +345,7 @@ export class AgentSession {
 	private _extensionShutdownHandler?: ShutdownHandler;
 	private _extensionErrorListener?: ExtensionErrorListener;
 	private _extensionErrorUnsubscriber?: () => void;
+	private _rolloverSessionHandler?: (options: RolloverSessionOptions) => Promise<RolloverSessionResult>;
 
 	private _modelRuntime: ModelRuntime;
 
@@ -1103,6 +1110,10 @@ export class AgentSession {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		let messages: AgentMessage[] | undefined;
+		if (this._isRolloverPending) {
+			preflightResult?.(false);
+			throw new Error("Session rollover is in progress; the source transcript is read-only");
+		}
 
 		try {
 			// Handle extension commands first (execute immediately, even during streaming)
@@ -1418,6 +1429,9 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
+		if (this._isRolloverPending) {
+			throw new Error("Session rollover is in progress; the source transcript is read-only");
+		}
 		const appMessage = {
 			role: "custom" as const,
 			customType: message.customType,
@@ -1510,6 +1524,26 @@ export class AgentSession {
 		return this._steeringMessages.length + this._followUpMessages.length;
 	}
 
+	/** Whether extension messages are waiting for the next user turn. */
+	get hasPendingNextTurnMessages(): boolean {
+		return this._pendingNextTurnMessages.length > 0;
+	}
+
+	get isRolloverPending(): boolean {
+		return this._isRolloverPending;
+	}
+
+	beginRollover(): void {
+		if (this._isRolloverPending) {
+			throw new Error("Session rollover is already in progress");
+		}
+		this._isRolloverPending = true;
+	}
+
+	cancelRollover(): void {
+		this._isRolloverPending = false;
+	}
+
 	/** Get pending steering messages (read-only) */
 	getSteeringMessages(): readonly string[] {
 		return this._steeringMessages;
@@ -1538,6 +1572,41 @@ export class AgentSession {
 			return;
 		}
 		await this._getIdleWaitPromise();
+	}
+
+	/**
+	 * Summarize caller-supplied messages with the current model without changing
+	 * the active transcript or compaction state.
+	 */
+	async summarizeSessionContext(options: SummarizeSessionContextOptions): Promise<SummarizeSessionContextResult> {
+		if (!Number.isSafeInteger(options.maxOutputTokens) || options.maxOutputTokens <= 0) {
+			throw new Error("maxOutputTokens must be a positive integer");
+		}
+		if (!this.model) {
+			throw new Error(formatNoModelSelectedMessage());
+		}
+
+		const model = this.model;
+		const { apiKey, headers, env } = await this._getSummarizationRequestAuth(model);
+		const result = await generateSummaryWithMetadata(
+			options.messages,
+			model,
+			options.maxOutputTokens,
+			apiKey,
+			headers,
+			options.signal,
+			options.customInstructions,
+			options.previousSummary,
+			this.thinkingLevel,
+			this.agent.streamFn,
+			env,
+		);
+		return {
+			summary: result.summary,
+			model: { provider: model.provider, modelId: model.id },
+			thinkingLevel: this.thinkingLevel,
+			usage: result.usage,
+		};
 	}
 
 	// =========================================================================
@@ -2206,6 +2275,11 @@ export class AgentSession {
 		return this.settingsManager.getCompactionEnabled();
 	}
 
+	/** Bind the runtime-owned physical session replacement transaction. */
+	setRolloverSessionHandler(handler?: (options: RolloverSessionOptions) => Promise<RolloverSessionResult>): void {
+		this._rolloverSessionHandler = handler;
+	}
+
 	async bindExtensions(bindings: ExtensionBindings): Promise<void> {
 		if (bindings.uiContext !== undefined) {
 			this._extensionUIContext = bindings.uiContext;
@@ -2355,6 +2429,9 @@ export class AgentSession {
 					});
 				},
 				appendEntry: (customType, data) => {
+					if (this._isRolloverPending) {
+						throw new Error("Session rollover is in progress; the source transcript is read-only");
+					}
 					const entryId = this.sessionManager.appendCustomEntry(customType, data);
 					const entry = this.sessionManager.getEntry(entryId);
 					if (entry) {
@@ -2410,6 +2487,13 @@ export class AgentSession {
 							options?.onError?.(err);
 						}
 					})();
+				},
+				summarizeSessionContext: (options) => this.summarizeSessionContext(options),
+				rolloverSession: async (options) => {
+					if (!this._rolloverSessionHandler) {
+						throw new Error("Session rollover requires an AgentSessionRuntime host");
+					}
+					return this._rolloverSessionHandler(options);
 				},
 				getSystemPrompt: () => this.systemPrompt,
 				getSystemPromptOptions: () => this._baseSystemPromptOptions,

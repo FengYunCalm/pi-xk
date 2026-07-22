@@ -560,6 +560,49 @@ export async function generateSummary(
 		Math.floor(0.8 * reserveTokens),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
 	);
+	return (
+		await generateSummaryWithMetadata(
+			currentMessages,
+			model,
+			maxTokens,
+			apiKey,
+			headers,
+			signal,
+			customInstructions,
+			previousSummary,
+			thinkingLevel,
+			streamFn,
+			env,
+		)
+	).summary;
+}
+
+export interface SummaryGenerationResult {
+	summary: string;
+	usage: Usage;
+}
+
+/**
+ * Generate a compaction-style summary with an explicit output budget and
+ * return provider usage metadata without mutating a session transcript.
+ */
+export async function generateSummaryWithMetadata(
+	currentMessages: AgentMessage[],
+	model: Model<any>,
+	maxOutputTokens: number,
+	apiKey: string | undefined,
+	headers?: Record<string, string>,
+	signal?: AbortSignal,
+	customInstructions?: string,
+	previousSummary?: string,
+	thinkingLevel?: ThinkingLevel,
+	streamFn?: StreamFn,
+	env?: Record<string, string>,
+): Promise<SummaryGenerationResult> {
+	const maxTokens = Math.min(
+		Math.max(1, Math.floor(maxOutputTokens)),
+		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
+	);
 
 	// Use update prompt if we have a previous summary, otherwise initial prompt
 	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
@@ -605,7 +648,7 @@ export async function generateSummary(
 		.map((c) => c.text)
 		.join("\n");
 
-	return textContent;
+	return { summary: textContent, usage: response.usage };
 }
 
 // ============================================================================

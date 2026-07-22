@@ -6,6 +6,7 @@ import {
 	closeSync,
 	createReadStream,
 	existsSync,
+	fsyncSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
@@ -14,7 +15,7 @@ import {
 	writeFileSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
-import { join, resolve } from "path";
+import { dirname, join, resolve } from "path";
 import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
@@ -943,6 +944,62 @@ export class SessionManager {
 		return this.sessionFile;
 	}
 
+	/**
+	 * Force the complete session file and its containing directory to stable
+	 * storage. Unlike normal lazy persistence, this also materializes sessions
+	 * that do not yet contain an assistant message.
+	 */
+	flushDurable(): void {
+		if (!this.persist || !this.sessionFile) {
+			throw new Error("Durable flush requires a persisted session");
+		}
+
+		const fileExists = existsSync(this.sessionFile);
+		if (!this.flushed) {
+			if (fileExists && statSync(this.sessionFile).size > 0) {
+				throw new Error(`Refusing to overwrite an existing untracked session file: ${this.sessionFile}`);
+			}
+			const fd = openSync(this.sessionFile, fileExists ? "r+" : "wx");
+			try {
+				for (const entry of this.fileEntries) {
+					writeFileSync(fd, `${JSON.stringify(entry)}\n`);
+				}
+				fsyncSync(fd);
+			} finally {
+				closeSync(fd);
+			}
+			this.flushed = true;
+		} else {
+			if (!fileExists) {
+				throw new Error(`Session file disappeared before durable flush: ${this.sessionFile}`);
+			}
+			const fd = openSync(this.sessionFile, "r");
+			try {
+				fsyncSync(fd);
+			} finally {
+				closeSync(fd);
+			}
+		}
+
+		let directoryFd: number | undefined;
+		try {
+			directoryFd = openSync(dirname(this.sessionFile), "r");
+			fsyncSync(directoryFd);
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			const unsupportedOnWindows =
+				process.platform === "win32" &&
+				(code === "EINVAL" || code === "ENOTSUP" || code === "EPERM" || code === "EISDIR");
+			if (!unsupportedOnWindows) {
+				throw error;
+			}
+		} finally {
+			if (directoryFd !== undefined) {
+				closeSync(directoryFd);
+			}
+		}
+	}
+
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
 
@@ -1441,6 +1498,17 @@ export class SessionManager {
 	static create(cwd: string, sessionDir?: string, options?: NewSessionOptions): SessionManager {
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
 		return new SessionManager(cwd, dir, undefined, true, options);
+	}
+
+	/** Create a new persisted session at an exact file path without writing it yet. */
+	static createAt(cwd: string, sessionFile: string, options?: NewSessionOptions): SessionManager {
+		const resolvedSessionFile = resolvePath(sessionFile);
+		if (existsSync(resolvedSessionFile)) {
+			throw new Error(`Target session file already exists: ${resolvedSessionFile}`);
+		}
+		const manager = new SessionManager(cwd, dirname(resolvedSessionFile), undefined, true, options);
+		manager.sessionFile = resolvedSessionFile;
+		return manager;
 	}
 
 	/**
