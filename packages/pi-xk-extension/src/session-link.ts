@@ -2,6 +2,8 @@ export const PI_XK_SESSION_LINK_SCHEMA = "pi-xk.session-link.v1";
 
 export const PI_XK_SESSION_LINK_KIND = "goal_binding";
 
+export const PI_XK_TASK_LINK_KIND = "task_link";
+
 export const PI_XK_CHECKPOINT_REF_KIND = "checkpoint_ref";
 
 export const PI_XK_CHECKPOINT_INTENT_KIND = "checkpoint_intent";
@@ -16,6 +18,15 @@ export interface PiXkSessionLink {
 	schema: typeof PI_XK_SESSION_LINK_SCHEMA;
 	kind: typeof PI_XK_SESSION_LINK_KIND;
 	goalId: string;
+	generation: number;
+}
+
+export interface PiXkTaskLink {
+	schema: typeof PI_XK_SESSION_LINK_SCHEMA;
+	kind: typeof PI_XK_TASK_LINK_KIND;
+	taskId: string;
+	goalId: string | null;
+	eventId: string;
 	generation: number;
 }
 
@@ -173,6 +184,10 @@ function isGoalId(value: unknown): value is string {
 	return GOAL_ID_PATTERN.test(value);
 }
 
+function isTaskId(value: unknown): value is string {
+	return isNonEmptyString(value) && /^task_[A-Za-z0-9][A-Za-z0-9_-]*$/.test(value);
+}
+
 function isGeneration(value: unknown): value is number {
 	return typeof value === "number" && Number.isInteger(value) && value >= 0;
 }
@@ -328,6 +343,20 @@ export function isPiXkSessionLink(value: unknown): value is PiXkSessionLink {
 		value.schema === PI_XK_SESSION_LINK_SCHEMA &&
 		value.kind === PI_XK_SESSION_LINK_KIND &&
 		isGoalId(value.goalId) &&
+		isGeneration(value.generation)
+	);
+}
+
+export function isPiXkTaskLink(value: unknown): value is PiXkTaskLink {
+	if (!isRecord(value) || !hasExactKeys(value, ["schema", "kind", "taskId", "goalId", "eventId", "generation"])) {
+		return false;
+	}
+	return (
+		value.schema === PI_XK_SESSION_LINK_SCHEMA &&
+		value.kind === PI_XK_TASK_LINK_KIND &&
+		isTaskId(value.taskId) &&
+		(value.goalId === null || isGoalId(value.goalId)) &&
+		isNonEmptyString(value.eventId) &&
 		isGeneration(value.generation)
 	);
 }
@@ -553,6 +582,23 @@ export function createPiXkGoalBinding(goalId: string, generation: number): PiXkS
 	};
 }
 
+export function createPiXkTaskLink(
+	taskId: string,
+	goalId: string | null,
+	eventId: string,
+	generation: number,
+): PiXkTaskLink {
+	if (!isTaskId(taskId)) throw new Error("Pi-XK task link taskId must use the task_<safe-id> format");
+	return {
+		schema: PI_XK_SESSION_LINK_SCHEMA,
+		kind: PI_XK_TASK_LINK_KIND,
+		taskId,
+		goalId: goalId === null ? null : assertGoalIdValue(goalId),
+		eventId: assertNonEmptyString(eventId, "eventId"),
+		generation: assertGeneration(generation),
+	};
+}
+
 export function createPiXkCheckpointRef(goalId: string, eventId: string, generation: number): PiXkCheckpointRef {
 	return {
 		schema: PI_XK_SESSION_LINK_SCHEMA,
@@ -692,5 +738,11 @@ export function createPiXkGoalLifecycleIntent(
 export function assertPiXkSessionLink(value: unknown): asserts value is PiXkSessionLink {
 	if (!isPiXkSessionLink(value)) {
 		throw new Error("Pi-XK session link must use the pi-xk.session-link.v1 goal_binding schema");
+	}
+}
+
+export function assertPiXkTaskLink(value: unknown): asserts value is PiXkTaskLink {
+	if (!isPiXkTaskLink(value)) {
+		throw new Error("Pi-XK task link must use the pi-xk.session-link.v1 task_link schema");
 	}
 }

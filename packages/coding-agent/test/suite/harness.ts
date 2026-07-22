@@ -19,6 +19,7 @@ import { AgentSession, type AgentSessionEvent } from "../../src/core/agent-sessi
 import { AuthStorage } from "../../src/core/auth-storage.ts";
 import type { ExtensionRunner } from "../../src/core/extensions/index.ts";
 import { convertToLlm } from "../../src/core/messages.ts";
+import type { ModelRuntime } from "../../src/core/model-runtime.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import type { Settings } from "../../src/core/settings-manager.ts";
 import { SettingsManager } from "../../src/core/settings-manager.ts";
@@ -77,6 +78,7 @@ export interface Harness {
 	session: AgentSession;
 	sessionManager: SessionManager;
 	settingsManager: SettingsManager;
+	modelRuntime: ModelRuntime;
 	authStorage: AuthStorage;
 	faux: FauxProviderRegistration;
 	models: [Model<string>, ...Model<string>[]];
@@ -173,12 +175,13 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 	const resourceLoader =
 		options.resourceLoader ?? createTestResourceLoader(extensionsResult ? { extensionsResult } : undefined);
 
+	const modelRuntime = getModelRuntime(modelRegistry);
 	const session = new AgentSession({
 		agent,
 		sessionManager,
 		settingsManager,
 		cwd: tempDir,
-		modelRuntime: getModelRuntime(modelRegistry),
+		modelRuntime,
 		resourceLoader,
 		baseToolsOverride: toolMap,
 		initialActiveToolNames: options.initialActiveToolNames,
@@ -196,6 +199,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		session,
 		sessionManager,
 		settingsManager,
+		modelRuntime,
 		authStorage,
 		faux: fauxProvider,
 		models: fauxProvider.models,

@@ -22,6 +22,9 @@ import {
 } from "pi-xk-core";
 import { Type } from "typebox";
 import { createGoalDraftReviewComponent, type GoalDraftReviewAction } from "./goal-ui.ts";
+
+export { TaskRunner, type TaskRunnerHandle, type TaskRunnerOptions, type TaskRunnerStartInput } from "./task-runner.ts";
+
 import {
 	assertPiXkSessionLink,
 	createPiXkCheckpointRef,
@@ -50,12 +53,14 @@ import {
 
 export {
 	assertPiXkSessionLink,
+	assertPiXkTaskLink,
 	createPiXkCheckpointRef,
 	createPiXkCompactionCheckpointIntent,
 	createPiXkGoalBinding,
 	createPiXkGoalCapture,
 	createPiXkGoalDraft,
 	createPiXkGoalLifecycleIntent,
+	createPiXkTaskLink,
 	createPiXkTurnCheckpointIntent,
 	isPiXkCheckpointIntent,
 	isPiXkCheckpointRef,
@@ -63,6 +68,7 @@ export {
 	isPiXkGoalDraft,
 	isPiXkGoalLifecycleIntent,
 	isPiXkSessionLink,
+	isPiXkTaskLink,
 	normalizePiXkGoalLifecycleIntent,
 	PI_XK_CHECKPOINT_INTENT_KIND,
 	PI_XK_CHECKPOINT_REF_KIND,
@@ -71,6 +77,7 @@ export {
 	PI_XK_GOAL_LIFECYCLE_INTENT_KIND,
 	PI_XK_SESSION_LINK_KIND,
 	PI_XK_SESSION_LINK_SCHEMA,
+	PI_XK_TASK_LINK_KIND,
 	type PiXkCheckpointIntent,
 	type PiXkCheckpointRef,
 	type PiXkCompactionCheckpointIntent,
@@ -87,6 +94,7 @@ export {
 	type PiXkGoalPauseAudit,
 	type PiXkSessionLink,
 	type PiXkStoredGoalLifecycleIntent,
+	type PiXkTaskLink,
 	type PiXkTurnCheckpointIntent,
 } from "./session-link.ts";
 

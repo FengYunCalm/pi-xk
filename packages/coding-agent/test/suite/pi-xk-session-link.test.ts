@@ -10,13 +10,16 @@ import {
 	createPiXkExtension,
 	createPiXkGoalBinding,
 	createPiXkGoalDraft,
+	createPiXkTaskLink,
 	createPiXkTurnCheckpointIntent,
 	isPiXkCheckpointIntent,
 	isPiXkCheckpointRef,
 	isPiXkSessionLink,
+	isPiXkTaskLink,
 	PI_XK_SESSION_LINK_CUSTOM_TYPE,
 	type PiXkLifecycleEvent,
 	type PiXkSessionLink,
+	type PiXkTaskLink,
 } from "../../../pi-xk-extension/src/index.ts";
 import { type CustomEntry, type SessionEntry, SessionManager } from "../../src/core/session-manager.ts";
 import { createHarness, type Harness } from "./harness.ts";
@@ -25,6 +28,10 @@ function isPiXkSessionLinkEntry(entry: SessionEntry): entry is CustomEntry<PiXkS
 	return (
 		entry.type === "custom" && entry.customType === PI_XK_SESSION_LINK_CUSTOM_TYPE && isPiXkSessionLink(entry.data)
 	);
+}
+
+function isPiXkTaskLinkEntry(entry: SessionEntry): entry is CustomEntry<PiXkTaskLink> {
+	return entry.type === "custom" && entry.customType === PI_XK_SESSION_LINK_CUSTOM_TYPE && isPiXkTaskLink(entry.data);
 }
 
 describe("Pi-XK session link integration", () => {
@@ -79,6 +86,24 @@ describe("Pi-XK session link integration", () => {
 		expect(isPiXkCheckpointRef({ ...checkpointRef, unexpected: "payload" })).toBe(false);
 		expect(isPiXkCheckpointIntent({ ...turnIntent, unexpected: "payload" })).toBe(false);
 		expect(isPiXkCheckpointIntent({ ...compactionIntent, unexpected: "payload" })).toBe(false);
+	});
+
+	it("validates task links without embedding Task facts", () => {
+		const link = createPiXkTaskLink("task_link_schema", "goal_schema", "evt-task-started", 3);
+		expect(isPiXkTaskLink(link)).toBe(true);
+		expect(isPiXkTaskLink({ ...link, result: { status: "succeeded" } })).toBe(false);
+		expect(() => createPiXkTaskLink("task-link-schema", null, "evt-task-started", 3)).toThrow("taskId");
+		expect(() => createPiXkTaskLink("task_link_schema", null, "", 3)).toThrow("eventId");
+	});
+
+	it("persists task links as custom entries and keeps them out of model context", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const link = createPiXkTaskLink("task_persisted_link", null, "evt-task-terminal", 0);
+		harness.sessionManager.appendCustomEntry(PI_XK_SESSION_LINK_CUSTOM_TYPE, link);
+		const entry = harness.sessionManager.getEntries().find(isPiXkTaskLinkEntry);
+		expect(entry?.data).toEqual(link);
+		expect(harness.sessionManager.buildSessionContext().messages).toEqual([]);
 	});
 
 	it("keeps draft acceptance shapes aligned with GoalContractV2", () => {
