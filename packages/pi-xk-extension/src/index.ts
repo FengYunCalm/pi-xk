@@ -2431,24 +2431,14 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 							}),
 						]);
 					} catch {
-						const replay = await runnerFor(ctx.cwd).getStore().replayTask(task.taskId);
-						if (replay.status === "running") {
-							await runnerFor(ctx.cwd)
-								.getStore()
-								.appendTaskOrphaned(
-									task.taskId,
-									"Pi shutdown could not confirm child cancellation within 5 seconds.",
-									{
-										eventId: `${task.taskId}:shutdown-orphaned`,
-										idempotencyKey: `${task.taskId}:shutdown-orphaned:${replay.head.hash}`,
-										expectedHead: replay.head,
-										actor: "runtime",
-									},
-								);
-							const orphaned = await runnerFor(ctx.cwd).getStore().replayTask(task.taskId);
-							const terminal = orphaned.events.at(-1);
-							if (terminal) appendTaskEventLink(pi, ctx, orphaned, terminal.eventId);
-						}
+						const runner = runnerFor(ctx.cwd);
+						await runner.orphan(
+							task.taskId,
+							"Pi shutdown could not confirm child cancellation within 5 seconds.",
+						);
+						const orphaned = await runner.getStore().replayTask(task.taskId);
+						const terminal = orphaned.events.at(-1);
+						if (terminal) appendTaskEventLink(pi, ctx, orphaned, terminal.eventId);
 					} finally {
 						if (timeout !== undefined) clearTimeout(timeout);
 					}
@@ -2471,7 +2461,7 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 		pi.on("input", async (event, ctx) => {
 			try {
 				const task = await currentTaskReplay(ctx);
-				if (task?.status === "running" && !event.text.trimStart().startsWith("/task")) {
+				if (task?.status === "running" && !/^\/task(?:\s|$)/.test(event.text.trimStart())) {
 					ctx.ui.notify(`Pi-XK Task ${task.taskId} is running. Use /task status or /task cancel.`, "warning");
 					return { action: "handled" };
 				}

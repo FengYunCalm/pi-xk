@@ -79,6 +79,7 @@ interface ActiveChild {
 	onEvent: TaskRunnerStartInput["onEvent"];
 	settling: Promise<TaskStatus>;
 	settled: boolean;
+	detached: boolean;
 	terminalWrite?: Promise<void>;
 }
 
@@ -230,6 +231,7 @@ export class TaskRunner {
 				onEvent: input.onEvent,
 				settling: Promise.resolve("running"),
 				settled: false,
+				detached: false,
 			};
 			this.active.set(taskId, active);
 			active.settling = this.runChild(spec, active);
@@ -285,10 +287,12 @@ export class TaskRunner {
 			this.active.delete(spec.taskId);
 			active.session.dispose();
 			finalStatus = (await this.store.replayTask(spec.taskId)).status;
-			try {
-				await this.onSettled?.(spec.taskId, finalStatus);
-			} catch {
-				// Delivery is recoverable from the terminal event and must not change Task facts.
+			if (!active.detached) {
+				try {
+					await this.onSettled?.(spec.taskId, finalStatus);
+				} catch {
+					// Delivery is recoverable from the terminal event and must not change Task facts.
+				}
 			}
 		}
 		return finalStatus;
@@ -401,6 +405,8 @@ export class TaskRunner {
 		if (active.settled) return;
 		active.settled = true;
 		active.terminalWrite = (async () => {
+			await active.session.abort();
+			if (active.detached) return;
 			const replay = await this.store.replayTask(taskId);
 			if (replay.status !== "running") return;
 			const written = await this.store.appendTaskCancelled(taskId, reason, {
@@ -412,10 +418,30 @@ export class TaskRunner {
 			await this.publishEvent(active, written.event.eventId);
 		})();
 		await active.terminalWrite;
-		await active.session.abort().catch(() => {});
 		await active.settling;
 		active.session.dispose();
 		this.active.delete(taskId);
+	}
+
+	async orphan(taskId: string, reason: string): Promise<void> {
+		const active = this.active.get(taskId);
+		if (active) {
+			active.settled = true;
+			active.detached = true;
+		}
+		const replay = await this.store.replayTask(taskId);
+		if (replay.status === "running") {
+			const written = await this.store.appendTaskOrphaned(taskId, reason, {
+				eventId: `${taskId}:orphaned`,
+				idempotencyKey: `${taskId}:orphaned:${replay.head.hash}`,
+				expectedHead: replay.head,
+				actor: "runtime",
+			});
+			if (active) await this.publishEvent(active, written.event.eventId);
+		}
+		if (!active) return;
+		this.active.delete(taskId);
+		active.session.dispose();
 	}
 
 	async cancelAll(reason: string): Promise<void> {

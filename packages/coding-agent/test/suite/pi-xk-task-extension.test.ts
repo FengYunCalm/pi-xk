@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	type GoalContractV2,
 	GoalStore,
@@ -28,6 +28,7 @@ const harnesses: Harness[] = [];
 const pendingReleases: Array<() => void> = [];
 
 afterEach(() => {
+	vi.useRealTimers();
 	while (pendingReleases.length > 0) pendingReleases.pop()?.();
 	while (harnesses.length > 0) harnesses.pop()?.cleanup();
 });
@@ -360,7 +361,10 @@ describe("Pi-XK Task extension", () => {
 			extensionFactories: [taskExtension(() => harness)],
 		});
 		harnesses.push(harness);
-		harness.setResponses([abortResponse()]);
+		harness.setResponses([
+			abortResponse(),
+			fauxAssistantMessage("This lookalike command must not reach the parent."),
+		]);
 		await harness.session.bindExtensions({ uiContext: testUi(notifications) });
 		const goalStore = await createActiveGoal(harness, "goal_user_task_cancel");
 
@@ -371,6 +375,9 @@ describe("Pi-XK Task extension", () => {
 		);
 		const callsBeforeInput = harness.faux.state.callCount;
 		await harness.session.prompt("This input must not reach the parent model.");
+		expect(harness.faux.state.callCount).toBe(callsBeforeInput);
+		expect(notifications.at(-1)).toContain("Use /task status or /task cancel");
+		await harness.session.prompt("/taskish This is ordinary input, not a Task command.");
 		expect(harness.faux.state.callCount).toBe(callsBeforeInput);
 		expect(notifications.at(-1)).toContain("Use /task status or /task cancel");
 		await harness.session.prompt("/task start A second concurrent Task must be rejected.");
@@ -631,6 +638,44 @@ describe("Pi-XK Task extension", () => {
 		await within("second session reload", harness.session.reload());
 		expect(taskResultEntries(harness)).toHaveLength(1);
 		expect(taskLinks(harness).map((link) => link.eventId)).toHaveLength(3);
+	});
+
+	it("marks a Task orphaned when shutdown cannot confirm cancellation within five seconds", async () => {
+		let harness: Harness;
+		let releaseChild: (() => void) | undefined;
+		let observeAbort: (() => void) | undefined;
+		const abortObserved = new Promise<void>((resolve) => {
+			observeAbort = resolve;
+		});
+		harness = await createHarness({
+			extensionFactories: [taskExtension(() => harness)],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			(_context, options) =>
+				new Promise((resolve) => {
+					releaseChild = () => resolve(fauxAssistantMessage("", { stopReason: "aborted" }));
+					pendingReleases.push(() => releaseChild?.());
+					if (options?.signal?.aborted) observeAbort?.();
+					else options?.signal?.addEventListener("abort", () => observeAbort?.(), { once: true });
+				}),
+		]);
+		await harness.session.bindExtensions({});
+		const store = new TaskStore(harness.tempDir);
+
+		await harness.session.prompt("/task start Ignore cancellation until the runtime disconnects.");
+		await waitFor("the shutdown timeout Task to run", async () =>
+			(await store.listTasks()).some((task) => task.status === "running"),
+		);
+
+		vi.useFakeTimers();
+		const reload = harness.session.reload();
+		await abortObserved;
+		await vi.advanceTimersByTimeAsync(5_000);
+		await reload;
+		vi.useRealTimers();
+
+		expect((await store.listTasks()).map((task) => task.status)).toEqual(["orphaned"]);
 	});
 
 	it("cancels a running Task before session tree navigation", async () => {
