@@ -321,15 +321,26 @@ export interface SessionRolloverCommitContext {
 	targetLeafId: string | null;
 }
 
-export interface RolloverSessionOptions {
+interface RolloverSessionBaseOptions {
 	targetSessionFile: string;
 	targetSessionId: string;
 	reason: string;
+	withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+}
+
+export interface CreateRolloverSessionOptions extends RolloverSessionBaseOptions {
+	reuseTarget?: false;
 	initializeTarget: (sessionManager: SessionManager) => Promise<void> | void;
 	finalizeSource: (sessionManager: SessionManager) => Promise<void> | void;
 	commit: (context: SessionRolloverCommitContext) => Promise<void> | void;
-	withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 }
+
+export interface ReuseRolloverSessionOptions extends RolloverSessionBaseOptions {
+	/** Open an already durable target without replaying initialization or domain commit callbacks. */
+	reuseTarget: true;
+}
+
+export type RolloverSessionOptions = CreateRolloverSessionOptions | ReuseRolloverSessionOptions;
 
 export type RolloverSessionResult = { cancelled: true } | ({ cancelled: false } & SessionRolloverCommitContext);
 

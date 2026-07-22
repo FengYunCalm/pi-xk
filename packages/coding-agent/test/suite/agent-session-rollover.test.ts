@@ -277,6 +277,27 @@ describe("AgentSessionRuntime rollover", () => {
 		expect(targetSessionFile.startsWith(join(tempDir, "segments"))).toBe(true);
 	});
 
+	it("reuses an already committed target without writing either transaction callback", async () => {
+		const { runtime, tempDir } = await createRuntimeForTest(() => {});
+		await runtime.session.prompt("seed source");
+		const targetSessionFile = join(tempDir, "segments", "000002_recovered.jsonl");
+		const target = SessionManager.createAt(tempDir, targetSessionFile, { id: "recovered-segment" });
+		target.appendCustomMessageEntry("session_chain_summary_in", "recovered carry forward", false);
+		target.flushDurable();
+
+		const result = await runtime.rolloverSession({
+			targetSessionFile,
+			targetSessionId: "recovered-segment",
+			reason: "recover committed chain head",
+			reuseTarget: true,
+		});
+
+		expect(result).toMatchObject({ cancelled: false, targetSessionId: "recovered-segment" });
+		expect(runtime.session.sessionFile).toBe(targetSessionFile);
+		expect(runtime.session.sessionId).toBe("recovered-segment");
+		expect(readFileSync(targetSessionFile, "utf8").match(/session_chain_summary_in/g)).toHaveLength(1);
+	});
+
 	it("honors cancellation before running rollover callbacks", async () => {
 		let callbackCalled = false;
 		const { runtime, tempDir } = await createRuntimeForTest((pi) => {

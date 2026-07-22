@@ -458,15 +458,30 @@ export class AgentSessionRuntime {
 			sourceSession.beginRollover();
 			sourceFrozen = true;
 
-			const targetManager = SessionManager.createAt(this.cwd, targetSessionFile, {
-				id: options.targetSessionId,
-			});
-			await options.initializeTarget(targetManager);
-			targetManager.flushDurable();
+			let targetManager: SessionManager;
+			if (options.reuseTarget === true) {
+				if (!existsSync(targetSessionFile)) {
+					throw new Error(`Committed rollover target does not exist: ${targetSessionFile}`);
+				}
+				targetManager = SessionManager.open(targetSessionFile);
+				assertSessionCwdExists(targetManager, this.cwd);
+				if (targetManager.getSessionId() !== options.targetSessionId) {
+					throw new Error(
+						`Committed rollover target ID mismatch: expected ${options.targetSessionId}, got ${targetManager.getSessionId()}`,
+					);
+				}
+				sourceFinalized = true;
+			} else {
+				targetManager = SessionManager.createAt(this.cwd, targetSessionFile, {
+					id: options.targetSessionId,
+				});
+				await options.initializeTarget(targetManager);
+				targetManager.flushDurable();
 
-			await options.finalizeSource(sourceManager);
-			sourceFinalized = true;
-			sourceManager.flushDurable();
+				await options.finalizeSource(sourceManager);
+				sourceFinalized = true;
+				sourceManager.flushDurable();
+			}
 
 			const commitContext = {
 				sourceSessionFile,
@@ -476,7 +491,9 @@ export class AgentSessionRuntime {
 				targetSessionId: targetManager.getSessionId(),
 				targetLeafId: targetManager.getLeafId(),
 			};
-			await options.commit(commitContext);
+			if (options.reuseTarget !== true) {
+				await options.commit(commitContext);
+			}
 
 			await this.teardownCurrent("rollover", targetSessionFile);
 			let result: CreateAgentSessionRuntimeResult;
