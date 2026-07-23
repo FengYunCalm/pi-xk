@@ -78,6 +78,19 @@ Task 可从普通会话或 Goal 启动，只引用父 `chainId/branchId/segmentI
 
 compaction 继续按 context token 触发；rollover 独立按物理字节数、entry 数和实测加载成本触发。v1 soft threshold 为 16 MiB/4,000 entries，hard threshold 为 64 MiB/16,000 entries，只在 settled 边界评估。
 
+### 加载性能基线
+
+2026-07-24 在 WSL2 Linux 6.6、Node v24.14.1、AMD Ryzen 9 8940HX 上生成含 4 KiB custom entry 的合法 Pi JSONL，并在独立测量进程中对 `SessionManager.open()` 运行三次；表中为打开耗时中位数和第一次冷加载的 RSS 增量。测量不包含 TypeScript runtime 启动时间。
+
+| 目标文件 | 实际文件 | entries | open 中位数 | 冷加载 RSS 增量 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 MiB | 1.003 MiB | 247 | 101 ms | 4.0 MiB |
+| 8 MiB | 8.001 MiB | 1,971 | 294 ms | 19.9 MiB |
+| 32 MiB | 32.002 MiB | 7,883 | 422 ms | 102.2 MiB |
+| 128 MiB | 128.000 MiB | 31,524 | 1,240 ms | 351.8 MiB |
+
+因此 soft threshold 放在 16 MiB/4,000 entries，使正常 settled 边界在 32 MiB 量级前主动轮转；hard threshold 放在 64 MiB/16,000 entries，避免继续增长到已出现秒级打开和数百 MiB 冷加载内存的 128 MiB 量级。该基线用于 v1 默认值，不代表所有磁盘、CPU 或真实消息分布；Host 或数据形态变化后应重新测量。
+
 ## 后果
 
 正面后果：

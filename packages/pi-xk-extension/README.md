@@ -1,6 +1,6 @@
-# Pi-XK Goal And Task Extension
+# Pi-XK Goal, Task, And Session Chain Extension
 
-Pi-XK adds durable Goal and single-child Task workflows to Pi without modifying Pi core. Pi keeps the parent conversation and tool transcript; Pi-XK keeps Goal/Task events, checkpoint evidence, artifacts, derived read models, and each child transcript under the project `.pi-xk` directory.
+Pi-XK adds durable Goal, single-child Task, and Session Chain workflows to Pi without changing Pi's agent loop, provider, or native message format. Pi keeps each physical JSONL transcript; Pi-XK keeps Goal/Task/chain events, checkpoint evidence, artifacts, derived read models, and child transcripts under the project `.pi-xk` directory.
 
 ## Local Installation
 
@@ -38,7 +38,7 @@ Pi's native `find` tool needs `fd`. On Ubuntu or Debian, install `fd-find`; Pi r
 /goal pause [reason]       Pause the active Goal and interrupt a busy run.
 /goal start                Resume a paused Goal; active and ended Goals are rejected.
 /goal status               Show Goal state, diagnostics, and timing.
-/goal end [reason]         End the active Goal after its final checkpoint.
+/goal end [reason]         Immediately end the active or paused Goal by explicit user request.
 /goal -- <objective>       Draft an objective beginning with a reserved subcommand.
 ```
 
@@ -48,9 +48,20 @@ Confirmation is the first operation that creates `.pi-xk/goals/<goalId>`, its ev
 
 Each session branch has one current Goal. A new draft is rejected while that Goal is active or paused; end the current Goal before creating another one. This prevents an old Goal from remaining active after its branch binding is replaced.
 
-`pi_xk_start_goal`, `pi_xk_pause_goal`, and `pi_xk_end_goal` are model tools. Start requires a paused Goal plus new recovery evidence. Pause requires an audit of unmet required acceptance IDs, current evidence, the incomplete conclusion, any user request, and the next best action. End requires verification evidence for every required acceptance. Model pause and end requests are committed only after the final observable checkpoint is durable. A failed checkpoint leaves the lifecycle intent pending for a later safe-boundary retry; user `/goal end` remains an immediate terminal override.
+`pi_xk_start_goal`, `pi_xk_pause_goal`, and `pi_xk_end_goal` are model tools. Start requires a paused Goal plus new recovery evidence. Pause requires an audit of unmet required acceptance IDs, current evidence, the incomplete conclusion, any user request, and the next best action. End requires verification evidence for every required acceptance. Model pause and end requests are committed only after the final observable checkpoint is durable. A failed checkpoint leaves the lifecycle intent pending at later safe boundaries in the same live runtime; shutdown, startup, or tree navigation commits it only if the checkpoint is already durable, otherwise rejects it before the conservative pause. User `/goal end` remains an immediate terminal override.
 
-While a Goal is active, Pi-XK starts another run after a settled run. A normal assistant response, plan, or partial result does not end the Goal. The model must call `pi_xk_end_goal` only after it has updated `goal-state.md` and verified the objective and declared acceptance evidence. If it needs user input or an external change, it must update state and call `pi_xk_pause_goal`. There is no run-count completion limit. Provider failures leave the Goal active and retry with exponential backoff rather than fabricating an ended state.
+While a Goal is active in the current live session, Pi-XK starts another run after a settled run. A normal assistant response, plan, or partial result does not end the Goal. The model must call `pi_xk_end_goal` only after it has updated `goal-state.md` and verified the objective and declared acceptance evidence. If it needs user input or an external change, it must update state and call `pi_xk_pause_goal`. There is no run-count completion limit. Provider failures leave the Goal active and retry with exponential backoff while that session remains live rather than fabricating an ended state.
+
+An active Goal is conservatively paused when Pi gracefully quits, reloads extensions, switches to another/new/forked session, aborts the agent run, or navigates the session tree. A later startup also detects an active Goal left by an unclean process exit, interrupts any open run, and pauses it without contacting the provider. Reopening never auto-resumes the Goal: inspect `/goal status`, then run `/goal start` manually. A stale uncommitted start intent is rejected during recovery instead of being replayed.
+
+| Pi action | Goal effect |
+| --- | --- |
+| Quit, signal shutdown, reload, new session, resume another session, fork/clone | The old session pauses its active Goal; the reopened session remains paused. |
+| Unclean crash or forced kill | The next startup recovers any open run and pauses the still-active Goal. |
+| Agent abort | The open run becomes interrupted and the Goal pauses. |
+| Session tree undo/navigation | Navigation first pauses the active Goal; failure cancels navigation. The same Goal binding is reattached after navigation because the Goal event log is not rewound with the Pi branch. |
+| Model switch | No lifecycle event, generation change, or binding change. The next run uses the newly selected model. |
+| Compaction | Checkpoint evidence is written, but the Goal is not paused and Pi's native summary/tree semantics remain unchanged. |
 
 In TUI mode, Pi-XK adds a composable native footer status such as `Goal active · 12m 34s`. The timer displays lifecycle `activeElapsed`, updates once per second only while the Goal is active, and freezes while paused or after the Goal ends. It uses `ctx.ui.setStatus`; it does not replace Pi's footer or persist per-second events. `/goal status` reports `wall` time including pauses, `active` time excluding pauses, and closed-run `busy` time.
 
@@ -69,6 +80,23 @@ Only one Task can run at a time. While it is running, ordinary user input is rej
 
 Task states are `pending -> running -> succeeded|failed|cancelled|orphaned`. Graceful shutdown, extension reload, and tree navigation request child cancellation; confirmed cancellation records `cancelled`, while a child that does not settle within the five-second shutdown window records `orphaned` and is detached. A failed tree-navigation cancellation rejects the navigation. Startup marks a leftover `pending` Task cancelled and a leftover `running` Task orphaned, then backfills a missing terminal result message without starting the parent model. Terminal Tasks never restart. Model switching and parent compaction do not change Task state; the child keeps its launch-time provider/model and thinking-level snapshot.
 
+## Session Chain Commands
+
+```text
+/chain                              Select a logical Session Chain head.
+/chain status                       Show the current chain, branch, Segment, size, summary, and rollover gates.
+/chain history                      Show the Segment and branch topology.
+/chain summary [segmentId]          Show the Segment's summary-in, delta, and carry-forward summary.
+/chain rollover [reason]            Request a safe manual physical rollover.
+/chain resume <chainId|prefix>      Switch to a logical chain head.
+/chain continue <segmentId> [entryId]  Create a successor branch from historical work.
+/chain doctor                       Replay the chain, recover a prepared rollover, and report diagnostics.
+```
+
+A long logical conversation is a `SessionChain` composed of complete native Pi JSONL Segments. New empty sessions are placed in a project-local managed Segment; an existing Pi transcript is adopted once as an external root without copying it. At a settled boundary, Pi-XK automatically rolls over after 16 MiB or 4,000 entries; at 64 MiB or 16,000 entries it must roll over before the next provider turn. It never rolls over while a Task is running or awaiting delivery, a Goal draft is open, or a Goal lifecycle intent is unsettled.
+
+Rollover writes a provenance-bearing progressive summary, seals the previous Segment, and replaces only the runtime's physical session. Active Goals continue through this replacement without a pause, while normal quit/reload/new/resume/fork still preserve their conservative Goal-pause behavior. Compaction remains Pi-native and independent. Continuing after a historical Segment or tree position always creates a successor branch; sealed Segments are never rewritten. Pi-XK adds a compact `Chain <id> · S<n> · <size>` footer status alongside Pi's native footer.
+
 ## Files And Recovery
 
 Each confirmed Goal is stored below the current project root. Pi-XK does not create a project-local `.pi` directory:
@@ -84,15 +112,25 @@ Each confirmed Goal is stored below the current project root. Pi-XK does not cre
 .pi-xk/tasks/<taskId>/
   events.jsonl
   task-read-model.json
-  session/
+  session/                      # TaskSpec V1 compatibility only
     <child-session>.jsonl
+
+.pi-xk/sessions/
+  catalog.json
+  chains/<chainId>/
+    events.jsonl
+    chain-read-model.json
+    locks/
+    branches/<branchId>/segments/<ordinal>_<session-id>.jsonl
 ```
 
 Project-scoped checkpoint and Task result artifacts are stored under `.pi-xk/artifacts/`. Before Goal confirmation, a draft exists only as a Pi native session custom entry and creates nothing under the project `.pi-xk` directory.
 
-`events.jsonl` is the Goal fact source. `contract.json`, `goal-objective.md`, and `goal-read-model.json` are rebuildable projections; `goal-state.md` is the mutable execution state. Pi-XK validates the complete objective projection against the current contract, not only its identity header. Pi session custom entries contain Goal bindings, pending drafts, lifecycle intents, and checkpoint references; drafts never become Goal events before confirmation. Do not edit Goal JSONL files by hand; use the SDK recovery APIs when a corruption diagnostic is reported.
+Each domain's `events.jsonl` is its fact source. Goal contract/read-model files and Task read models are rebuildable projections; `goal-state.md` is the mutable execution state. Pi-XK validates the complete objective projection against the current contract, not only its identity header. An idempotent create retry repairs missing derived projections without duplicating the initial event. Pi session custom entries contain Goal bindings, pending drafts, lifecycle intents, checkpoint references, and small `task_link` references; they never contain the child transcript or complete Task read model. A draft without a bound Goal remains recoverable from the Pi session, while an impossible stale outstanding draft beside an active or paused bound Goal is retired during recovery. Do not edit Goal or Task JSONL files by hand; use the SDK recovery APIs when a corruption diagnostic is reported.
 
-For Tasks, `events.jsonl` is the fact source, `task-read-model.json` is rebuildable, and parent-session `task_link` entries store only event references. Complete result envelopes remain in the project artifact store and child messages remain in the child transcript.
+For Tasks, `events.jsonl` is the fact source, `task-read-model.json` is rebuildable, and parent-session `task_link` entries store only event references. Complete result envelopes remain in the project artifact store and child messages remain in the child transcript. A V2 Task started from a Session Chain records the parent `chainId/branchId/segmentId/entryId`; its `childChainId` points into `.pi-xk/sessions/chains/`. The `.pi-xk/tasks/<taskId>/session/` path is retained only for V1 Task facts, which remain readable without rewriting historical events or hashes.
+
+For Session Chains, `events.jsonl` is the topology fact source. `chain-read-model.json` and the project `catalog.json` are rebuildable indexes. A sealed Segment records its final file hash, leaf, and progressive-summary artifact; the `/chain doctor` command reports a changed sealed file as corruption instead of rewriting it. Prepared rollover recovery either commits the durable target, rebuilds the missing target from the recorded identity, or aborts back to the writable source Segment.
 
 ## Security Boundary
 

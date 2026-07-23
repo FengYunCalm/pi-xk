@@ -54,7 +54,7 @@ active Goal 的模型可调用：
 - `pi_xk_pause_goal(reason, userRequest, nextBestAction, audit)`，仅允许 active Goal，且 audit 证明目标尚未满足；
 - `pi_xk_end_goal(outcome, reason, verifiedAcceptanceIds, finalEvidence, finalSummary)`，仅在全部 required acceptance 有验证证据后允许结束新的 v2 Goal。
 
-工具先追加 Pi session lifecycle intent；当前 run 的最终 turn checkpoint 已持久化到 Goal event log 后才写 Goal 事件和状态转换。checkpoint 失败时 intent 保持 `requested`，在后续安全边界重试；状态已经不兼容的旧 intent 写入 `rejected` 终态，不能无限重试或在未来意外生效。start 成功后立即结束普通 turn，写入 `goal_resumed` 并开始新的 active kickoff。pause/end 成功后不自动续跑。无绑定、状态不匹配、缺少审计、非法 acceptance ID 或不完整验收必须返回明确错误。
+工具先追加 Pi session lifecycle intent；当前 run 的最终 turn checkpoint 已持久化到 Goal event log 后才写 Goal 事件和状态转换。checkpoint 失败时 intent 在当前 live runtime 的后续安全边界重试；遇到 shutdown、startup 或 tree navigation 时，只有 checkpoint 已 durable 的 pause/end 可先提交，其余 intent 写入 `rejected` 终态。start intent 不跨这些 runtime 边界恢复。start 成功后立即结束普通 turn，写入 `goal_resumed` 并开始新的 active kickoff。pause/end 成功后不自动续跑。无绑定、状态不匹配、缺少审计、非法 acceptance ID 或不完整验收必须返回明确错误。
 
 `goal-objective.md` 是当前合同的规范投影。读取侧校验完整规范正文；合同更新和 projection rebuild 会原子重建 objective 文件。只保留正确 identity header 但修改正文必须诊断为 mismatched。
 
@@ -72,7 +72,24 @@ TUI footer 通过 `ctx.ui.setStatus` 显示当前 Goal 状态和 `activeElapsed`
 
 草案对话框、滚动和多行修订全部由 `pi-xk-extension` 使用 Pi 公开 UI API 实现。第三方问答、工具展示和 context bar 仅作为 UX 证据，不进入运行时依赖，也不修改 `packages/coding-agent/src` 或 `packages/tui`。
 
-### 7. 分段交付与 Git
+### 7. Session、树与模型生命周期
+
+active Goal 的自动续跑只属于当前 live session。以下边界必须保守暂停，而不是在新 runtime 自动继续：
+
+| 边界 | 决策 |
+| --- | --- |
+| graceful quit、signal shutdown、reload、new、resume、fork/clone | `session_shutdown` 在 teardown 前中断 open run 并写 runtime pause；新 session 启动后保持 paused。 |
+| SIGKILL、进程崩溃等未执行 shutdown hook 的退出 | 下次 `session_start` 恢复遗留 open run，并在任何 provider 调用前写 runtime pause。 |
+| agent aborted | open run 写 interrupted，Goal 写 paused，不安排重试或续跑。 |
+| session tree undo/navigation | `session_before_tree` 先同步安全 checkpoint、处理可提交 intent 并暂停；失败返回 cancel。`session_tree` 重挂同一 Goal binding，因为独立 event log 不随 Pi branch 回滚。 |
+| model switch | 不改变 Goal lifecycle、generation 或 binding；下一次 active run 使用 Pi 当前模型。 |
+| compaction | 只写 checkpoint evidence，保持 lifecycle 不变，不替换 Pi summary。 |
+
+跨 shutdown/startup/tree 的未提交 `start` intent 一律 rejected，不能让旧动作自动恢复 Goal。可验证的 pause/end intent 可在最终 checkpoint 已 durable 时先提交；其余 intent rejected 后再保守暂停。恢复后必须由用户显式 `/goal start`，模型只能在一个新的普通输入回合中依据新证据请求恢复。
+
+草案单独遵循 Pi session 分支：没有绑定 Goal 的 requested/proposed/confirming 草案可在会话恢复后继续 review/confirm/revise；若恢复时同一 branch 已绑定 active/paused Goal，残留 outstanding draft 被视为不可能状态并退役。若 confirming 草案的 goalId 已与 binding 匹配，则恢复为 confirmed，避免重复创建。
+
+### 8. 分段交付与 Git
 
 实现按 ADR、Core V2、模型工具与提示词、草案 UI/命令/文档四段进行。每段完成后运行定向测试、`npm run test:pi-xk`、`npm run check` 与 `git diff --check`，只暂存该段文件并创建 Conventional Commit。
 
@@ -83,7 +100,7 @@ TUI footer 通过 `ctx.ui.setStatus` 显示当前 Goal 状态和 `activeElapsed`
 - 用户始终拥有新 Goal 的创建、取消和最终终止权；模型仅在已确认 Goal 内做可审计的生命周期判断。
 - 草案不会污染项目 `.pi-xk` 目录，但 session 恢复需要能重建其待确认状态。
 - v1 数据保持可重放，v2 的更强验证只用于新 writer，避免历史 hash 链被破坏。
-- 自动续跑不再依赖 run 上限；是否暂停或结束由验收证据和 host 校验共同决定。
+- 自动续跑不再依赖 run 上限；在 live session 内是否暂停或结束由验收证据和 host 校验共同决定，runtime 关闭和树导航按上表保守暂停。
 - CLI 计时和草案交互是可删除的扩展投影；不会成为 Goal 或 Pi session 的新事实源。
 - 本阶段不实现通用 Context/memory、TaskSupervisor、Policy/沙箱、外部问答依赖或未确认 Goal 的自动执行。
 
@@ -94,3 +111,4 @@ TUI footer 通过 `ctx.ui.setStatus` 显示当前 Goal 状态和 `activeElapsed`
 3. faux provider 覆盖模型恢复用户或模型暂停、pause audit、end acceptance、非法 start 和 checkpoint 后提交顺序。
 4. active Goal 在普通回复后继续；pause/end 后不续跑；ended Goal 拒绝 start。
 5. TUI footer 的 active 时间逐秒更新并在 pause/end 后冻结；草案 custom UI 覆盖滚动、确认、修订、取消和无 UI 降级。
+6. quit/reload/new/resume/fork、unclean startup recovery、agent abort 和 tree navigation 均留下 paused Goal；model switch 与 compaction 不改变 lifecycle；恢复必须手动 start。

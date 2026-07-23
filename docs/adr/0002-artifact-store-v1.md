@@ -51,6 +51,8 @@ ID 固定为 `sha256:<lowercase-hex>`，只在同一 project scope 内寻址；�
 
 event 已落盘而 contract/read-model 投影写入失败时，事件仍是事实；调用方得到错误诊断。`rebuildContractProjection` 和 `rebuildGoalReadModel` 是显式恢复 API。`loadGoalReadModel` 会重放当前事件并重新检查 artifact diagnostics；base hash、投影或 artifact 状态有差异时拒绝把旧文件表示为当前事实。
 
+Goal 首个 `goal_created` 事件也使用同目录临时文件、文件同步、原子 rename 和目录同步发布，不跟随遗留的 `events.jsonl` symlink 目标。若发布失败且无法重放出同一事件，本次创建的初始 Markdown 文件会被移除；若事件已经 durable 而投影缺失，相同 idempotency key 的重试会重建 objective、contract 和 read-model 投影，不追加第二个创建事件。
+
 ## 后果
 
 - Pi session 继续是完整对话与工具结果事实源，Goal JSONL 继续是 Goal 事实源；custom entry 只保存 binding、intent 和 event ref。
@@ -61,5 +63,5 @@ event 已落盘而 contract/read-model 投影写入失败时，事件仍是事�
 ## 验证门
 
 1. Artifact schema、路径、脱敏、并发去重、篡改检测和 fsync/publish/directory-sync 故障测试。
-2. v1 hash replay/upcast、v2 hash/CAS/idempotency、artifact 缺失或损坏、read-model 删除/失效/重建测试。
+2. v1 hash replay/upcast、v2 hash/CAS/idempotency、首次事件原子发布与投影重建、artifact 缺失或损坏、read-model 删除/失效/重建测试。
 3. Pi faux harness 验证工具结果先于 v2 evidence checkpoint，reload/fork 不重复写 ref，compaction-before 不替换 Pi 原生 summary。

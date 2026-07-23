@@ -1,6 +1,6 @@
 # Pi-XK 架构策划案
 
-> **状态**：In implementation（Phase 0、Phase 1.1–1.8 与 Task Run v1 已完成，Goal CLI 计时与草案 custom UI 已作为扩展层跟进；当前个人本机无限权限 profile 仍明确延后 Policy/沙箱，完整 TaskSupervisor、通用 Context/memory 和其余 MVP 能力按路线图推进）
+> **状态**：In implementation（Phase 0、Phase 1.1–1.8 与 Task Run v1 已完成；当前个人本机无限权限 profile 仍延后 Policy/沙箱，完整 Phase 3 调度能力、通用 Context/memory、Proposal/反省闭环和其余能力按依赖顺序推进）
 >
 > **版本**：1.0.0
 >
@@ -50,6 +50,7 @@ Pi-XK 不从头重写 Agent，也不把一个大型 Pi fork 整体吞入本仓�
 | 来源 | 重点 | 证据性质 |
 | --- | --- | --- |
 | `/mnt/c/Users/23916/Desktop/记事本.md` | Pi Agent v3.1 原始策划、目录、压缩、子代理和自我进化假设 | 用户草案，待审计 |
+| 用户提供的《Agent 自进化/反省机制独立策划案》 | 异步观察信号、聚合 worker、候选补丁、影子验证和结构化经验 | 用户增量策划；吸收工作流，不照搬 API、存储和自动应用结论 |
 | `packages/agent/src/agent-loop.ts` | provider 请求、工具批次、turn、steering/follow-up、abort 生命周期 | 本地源码事实 |
 | `packages/agent/src/harness/agent-harness.ts` | session、资源、运行配置、写入队列和扩展生命周期 | 本地源码事实 |
 | `packages/agent/src/types.ts` | `transformContext`、`turn_end`、`agent_end`、steering/follow-up 等契约 | 本地源码事实 |
@@ -71,6 +72,7 @@ Pi-XK 不从头重写 Agent，也不把一个大型 Pi fork 整体吞入本仓�
 - **Artifact**：大文本、报告、diff、日志和测试结果等不可变对象；通过内容寻址引用。
 - **Resource**：Skill、规则、模板、extension、MCP 配置等可加载能力。
 - **Proposal**：对 Resource、规则或代码的候选变更，必须经过验证和审批才能生效。
+- **Observation**：从工具失败、用户纠正、重复犹豫或资源老化中提取的低权限证据记录；它只能推动分析或 proposal，不能直接修改 Resource 或进入系统提示。
 - **Read model / index / cache**：由事实源重建的加速视图，损坏时删除并重建，不参与裁决事实。
 
 ## 2. 对 Pi Agent v3.1 的敌对审计
@@ -210,13 +212,19 @@ flowchart TD
 
 /project/.pi-xk/                     # 项目级状态（必须经过 trust gate）
 ├── config.json                      # 只能收紧全局策略
+├── artifacts/                       # 项目级不可变大对象，内容寻址
 ├── goals/
 │   └── <goal-id>/
 │       ├── contract.json            # 当前合同的可重建、人类可读投影
 │       ├── events.jsonl             # Goal 合同与状态的唯一可变事实源
-│       ├── read-model.json          # 进度等可重建缓存
-│       └── artifacts/               # 大对象引用或本地对象
+│       ├── goal-objective.md         # 供 Agent 读取的只读合同正文投影
+│       ├── goal-state.md             # identity-matched 的可变执行状态
+│       └── goal-read-model.json      # 生命周期/checkpoint 等可重建查询视图
 ├── tasks/                           # Task 事件/索引
+├── learning/
+│   ├── observations.jsonl           # 追加式观察事实；不原地写 processed 标记
+│   ├── claims/                      # 可过期 work claim/lease，不是事实源
+│   └── indexes/                     # 按 resource/signal 聚合的可重建索引
 ├── proposals/                       # 项目资源 proposal
 ├── cache/                           # 可重建缓存
 └── locks/
@@ -281,10 +289,11 @@ packages/pi-xk-testkit/         # faux provider、沙箱替身、故障注入
 | 事实域 | 唯一事实源 | 可以派生 | 不允许作为事实源 |
 | --- | --- | --- | --- |
 | 对话/工具分支 | Pi append-only JSONL session tree | 搜索索引、摘要、统计 | manifest/history 的复制品 |
-| Goal 合同与状态 | events.jsonl 中的 goal_created/update 事件 | contract.json、read-model.json、报表 | 模型写出的自然语言摘要 |
+| Goal 合同与生命周期 | events.jsonl 中的 goal_created/update/lifecycle/checkpoint 事件 | contract.json、goal-objective.md、goal-read-model.json、报表 | 模型写出的自然语言摘要 |
 | Task 生命周期 | Task event log | 队列视图、UI 状态 | 进程是否仍存在的猜测 |
 | 大型输出 | 内容寻址 artifact object | SQLite/FTS 索引 | prompt 中的截断文本 |
 | Resource/Policy | 版本化文件 + lock/integrity metadata | effective policy、metadata cache | 每次工具调用临时拼接的 prompt |
+| Observation/Proposal | 观察事件日志与 Proposal 事件日志 | 待处理队列、聚合评分、审批 UI、指标 | 带 `processed` 字段的可变队列、反省日志或模型作文 |
 
 Pi 的 custom、custom_message、compaction、branch_summary entry 可以保存小型不可变领域引用，例如 goal_binding、checkpoint_ref、task_link。它们不能承载整个 Goal read model，也不能被模型自由构造后直接信任。
 
@@ -367,7 +376,7 @@ Artifact ID 建议为 sha256:<digest>，对象内容不可变，旁边保存：�
 4. compaction 前；
 5. 正常 shutdown、abort 或捕获到可恢复错误时。
 
-checkpoint payload 包含：目标进度、验收条件状态、已验证事实、修改文件、命令与结果 artifact、关键决策、阻塞项、下一步、证据引用和置信度。写入失败不能回滚主 session，也不能假装成功；运行界面显示诊断，后台可按幂等键重试。
+checkpoint 的最终领域契约应能引用目标进度、验收状态、已验证事实、修改文件、命令结果、关键决策、阻塞项和下一步，但大内容必须保留在原 Pi entry 或 artifact 中，事件只保存稳定引用。当前 Phase 1 writer 只持久化 runtime 生成的 session/leaf/turn/工具计数/原因 provenance、source entry IDs 与 evidence artifact 引用；它不读取或复制 `goal-state.md`、prompt、工具参数或工具结果正文。后续增加结构化进度字段时必须通过新 schema 和 upcaster 演进，不能把未来目标描述成当前已经采集的数据。写入失败不能回滚主 session，也不能假装成功；运行界面显示诊断，后台可按幂等键重试。
 
 可选的 goal_update 工具只接受 schema 化 patch，例如状态枚举、验收项 ID 和 artifact 引用；不接受“把任意自然语言写进全局状态”。
 
@@ -389,7 +398,7 @@ checkpoint payload 包含：目标进度、验收条件状态、已验证事实�
 
 ### 7.4 Goal 草案与生命周期决策
 
-新 Goal 先以 Pi session `goal_draft` custom entry 存在，状态为 `requested`、`proposed`、`superseded`、`confirming`、`confirmed` 或 `cancelled`。草案确认前不得创建 `.pi-xk/goals/<goalId>`、Goal JSONL、合同投影或 `goal-objective.md`/`goal-state.md`。Pi 原生 `ctx.ui.select` 与 `ctx.ui.input` 提供确认和修订；无 UI 环境使用等价 `/goal` 子命令。
+新 Goal 先以 Pi session `goal_draft` custom entry 存在，状态为 `requested`、`proposed`、`superseded`、`confirming`、`confirmed` 或 `cancelled`。草案确认前不得创建 `.pi-xk/goals/<goalId>`、Goal JSONL、合同投影或 `goal-objective.md`/`goal-state.md`。Pi 原生 `ctx.ui.custom` 提供可滚动的确认/修订对话框，修订使用 `ctx.ui.editor`；无 UI 环境使用等价 `/goal` 子命令。
 
 草案模型只能提交草案。已确认 Goal 的模型可提出 start、pause 和 end，但 host 按合同与当前状态校验工具参数。pause 必须声明未达 required acceptance、证据与阻塞；end 必须覆盖新的 v2 Goal 的所有 required acceptance。每个工具先写 session intent，最终 checkpoint 后才提交 Goal 生命周期事件。paused Goal 只有在新输入、外部变化或新证据解除阻塞后才可恢复；end 后不得重启。
 
@@ -460,6 +469,7 @@ Host -> Context controller: rebuild L0/L1 from durable entries
 
 - 用户明确批准的事实可进入项目或用户级 memory source；每条事实有来源、更新时间、过期策略和敏感级别。
 - 失败、纠正和经验先进入观察事件，不直接进入系统提示。
+- 明确的工具错误、验收失败和用户显式纠正是强信号；编辑距离、犹豫词和时间衰减只能作为弱信号，不能单独触发 Resource 修改。
 - FTS/SQLite 只保存检索索引，删除后由 source/artifact 重建。
 - secret scanner 和 redaction 在写入前执行；检测到凭据、token、cookie 或个人数据时默认拒绝持久化。
 - 记忆注入采用最小相关片段和预算上限，显示 provenance，避免把未验证旧结论伪装成规则。
@@ -639,19 +649,54 @@ MCP 集成优先采用成熟的 Pi adapter，而不是把 MCP server 逻辑散�
 
 Extension 注册工具、命令、事件和 UI 时必须提供 source identity、版本和 cleanup 函数。扩展异常遵循显式错误策略：观察/指标失败可隔离，权限、schema、持久化失败按 fail closed 处理。扩展不得直接修改另一个扩展的状态目录；跨扩展通信通过 typed event 或 artifact 引用。
 
-## 12. 受控的自我改进
+## 12. Observation、反省与受控自我改进
 
-### 12.1 触发条件
+本节吸收“主会话低干扰记录、单独 worker 聚合、候选补丁影子验证、验证后再沉淀经验”的闭环，但不采用可变 `error_queue.jsonl`、固定十分钟轮询、回避词即报错、固定 70% 自动合并、直接写 Skill 或把记忆文件无来源地拼入 system prompt。自我改进是 Observation -> Analysis -> Proposal -> Verification -> Approval -> Apply 的领域流程，不是后台模型获得写全局资源的权限。
+
+### 12.1 观察信号与可信度
 
 取消固定的“每 N 步自动改进”。初期只允许：
 
 1. 用户显式执行 /learn、/review 或批准一个观察任务；
-2. session settle/shutdown 后的低频后台分析；
+2. session settle/shutdown 后对已经持久化事实做低优先级分析；
 3. 达到证据数量、失败重复度和 cooldown 条件，同时未超出成本预算。
 
 错误 turn、未验证的工具输出、含疑似 prompt injection 的输入和正在发生的 mutation 不触发全局学习。失败采用指数退避，不在失败时增加自动权限。
 
-### 12.2 Proposal 状态机
+观察信号分四级，聚合器必须保留来源而不能把它们压成一个模糊分数：
+
+| 信号 | 可信度 | 捕获方式 | 允许推动的下一步 |
+| --- | --- | --- | --- |
+| 工具/测试/验收硬失败 | 高 | `tool_result`、Goal acceptance、Task result envelope | 直接进入同 Resource 的证据聚合 |
+| 用户显式纠正或 `/learn` | 高 | `input`、steering/follow-up 与被纠正 entry ID 的显式关联 | 生成 observation；达到门槛后可起草 proposal |
+| 重复不确定、反复改口、低置信表达 | 低 | `agent_end` 后的有界分类器；关键词只能作为候选特征 | 只增加审查优先级，不能单独改 Skill |
+| 资源老化或外部来源变化 | 中 | Resource metadata 的 `lastVerifiedAt`、版本/hash 或用户授权的外部检查 | 创建 refresh task，不直接判定旧内容错误 |
+
+不能假设 Pi 存在“用户编辑前后文本”或 `getConversation()` API。若产品以后提供明确的消息编辑事件，可把编辑距离作为辅助特征；当前版本只记录用户显式纠正及其关联 entry。也不依赖不存在的 `assistant_response` 或 `idle` 事件。
+
+### 12.2 Observation Store 与 worker claim
+
+- 主 session 只追加一个小型、版本化 observation，保存 signal kind、resource identity、source entry/event/artifact IDs、时间、置信度和去重 hash；正文、完整 prompt 和大输出仍留在 Pi session 或 artifact。
+- `observations.jsonl` 是 append-only 事实源。待处理状态由 `observation_claimed`、`analysis_completed`、`proposal_linked` 或 `dismissed` 等事件派生，不原地把 `processed: false` 改成 true。
+- worker 使用带 owner、nonce、generation、createdAt、expiresAt 的 claim/lease。崩溃后过期 claim 可重领；锁文件只是并发协调，不是处理完成的证据。
+- 单例是每个 scope 的调度约束，不是进程内永不失效的全局 singleton。用户级与不同项目可以各自排队，但同一 observation 只能被一个有效 claim 消费。
+- observer/指标失败不能回滚用户 turn；但 observation 未 durable 时必须显示诊断，不能声称已经进入学习队列。
+
+Pi 扩展接入点固定为真实 API：`tool_result` 捕获硬失败候选，`turn_end`/`agent_end` 在 transcript 已落盘后提交 observation，`input` 只处理显式纠正，`session_shutdown` 尝试有界 flush。调度由 TaskSupervisor、显式 `/learn` 或独立 worker 驱动，不伪造不存在的 idle hook。
+
+### 12.3 聚合、反省任务与候选变更
+
+聚合按 `resourceId + integrity/baseRevision + signal kind` 建立观察窗口，至少考虑重复失败数、不同 session/Goal 的复现数、最近一次成功证据、证据新鲜度和 cooldown。简单加权分数只用于排序，不作为自动应用判决。
+
+达到分析门槛后创建一个有界 Task，而不是直接依赖 `pi-subagents`：
+
+1. 输入为目标 Resource 当前 revision、有限观察窗口、失败证据 artifact、最近成功基线和明确非目标；
+2. worker 只能输出诊断或最小 diff artifact，不得覆盖整个 skills 目录；
+3. Task result envelope 保存假设、候选 diff、受影响场景、未解释证据和建议验证；
+4. 分析失败只结束本次 claim，并按 cooldown/attempt policy 决定是否重试或转人工；
+5. `pi-subagents` 可在 TaskSupervisor 契约稳定后作为 adapter benchmark，不能成为 Observation/Proposal 的事实源。
+
+### 12.4 Proposal 状态机
 
 ~~~text
 drafted -> validated -> awaiting_approval -> applied
@@ -674,7 +719,15 @@ drafted -> validated -> awaiting_approval -> applied
 | baseRevision | CAS 基准 hash，人工修改后自动失效 |
 | provenance | 生成模型、prompt/template 版本、时间和参与者 |
 
-### 12.3 应用门槛
+### 12.5 影子验证与应用门槛
+
+验证必须比较 baseline 与 candidate，而不是只计算一个“补丁后成功率”：
+
+- 重放历史失败输入，同时运行已知成功案例和 Resource 自身 contract tests；
+- 区分确定性检查、模型评分与人工评价，保存每项 evaluator 的版本和原始结果 artifact；
+- 70% 一类阈值只能作为某个 evaluator 的配置，不能覆盖必过测试、严重回归或 baseRevision/CAS 失效；
+- candidate 改善目标样本但破坏既有成功样本时，proposal 保持 rejected/awaiting review，不能自动合并；
+- 无法安全重放的外部副作用场景只生成诊断和人工验证计划，不伪造 shadow success。
 
 - 全局 Skill、规则、权限、网络、依赖、可执行代码：始终人工批准。
 - 项目级纯文档或提示片段：也必须 schema 校验、重复检测、隔离 smoke test 和 CAS；默认人工批准。
@@ -683,6 +736,12 @@ drafted -> validated -> awaiting_approval -> applied
 - 被拒绝 proposal 不能在下次观察中悄悄改名重提；使用 evidence hash 去重。
 
 “自我进化”在这里意味着可追溯的候选改进流水线，不意味着 Agent 获得自行重写权限。
+
+### 12.6 结构化经验沉淀
+
+只有 proposal 已批准、应用并通过 post-apply verification 后，才允许生成结构化经验候选。经验至少包含 resourceId、appliedRevision、fixedScenario、evidence IDs、验证前后指标、有效期和适用边界；它首先进入 Phase 4 的人类可读 memory source，而不是单独维护一份不可追溯的 `memory.jsonl`。
+
+memory 检索索引可以重建。注入必须通过 `before_agent_start`/`context` 的预算与 provenance 规则，只选择与当前 Goal/Task 匹配的已批准片段；失败 observation、被拒 proposal、模型犹豫词和未验证总结永远不能直接进入系统提示。
 
 ## 13. Claude Code 能力映射
 
@@ -740,6 +799,8 @@ pi_xk.sandbox.*
 pi_xk.resource.*
 pi_xk.compaction.*
 pi_xk.proposal.*
+pi_xk.observation.*
+pi_xk.learning.*
 pi_xk.artifact.*
 ~~~
 
@@ -754,6 +815,7 @@ pi_xk.artifact.*
 - policy ask/allow/deny、sandbox 启动失败和越界尝试；
 - MCP 连接、超时、输出 guard 截断和 OAuth 失败；
 - proposal 验证通过、批准、拒绝、回滚和重复率；
+- observation 的信号分布、去重率、claim 超时、从 observation 到 proposal 的转化率，以及 candidate 对基线的回归数；
 - provider token/cost 只能以最小必要粒度记录并支持关闭。
 
 ### 15.3 备份、保留和删除
@@ -788,14 +850,15 @@ pi_xk.artifact.*
 - 工具结果已持久化后的 `turn_end` 与 `session_before_compact` 的自动 checkpoint；
 - artifact store、redaction 和可重建 read model。
 
-**2026-07-21 实现状态：** Phase 1.1–1.5 已完成 Goal contract/event log、Pi binding/ref、`turn_end`（工具结果已持久化后）与 `session_before_compact` 的 checkpoint evidence、项目作用域 artifact store、v1 读取 upcast 和可重建 `goal-read-model.json`。Phase 1.6 已验证 Pi 原生本地 package 安装、冷启动自动发现和用户级 `/goal` 命令注册；`pi-xk-extension` 提供安装/恢复说明和无网络 runtime preflight。Phase 1.7 已实现活跃 Goal 的连续 run：普通模型回复不会结束 Goal，只有模型 `pi_xk_end_goal` 或用户 `/goal end` 会写入 ended；不以 run 数量作为终止条件，provider 失败保持 Goal active 并按指数退避重试。Phase 1.8 已实现 session 内 Goal 草案、Pi 原生确认/修订循环、无 UI 审阅命令、确认前零 Goal 落盘、`GoalContractV2` 与 v1 原始 hash/replay 兼容，以及模型 start/pause/end 的状态、审计、acceptance 和最终 checkpoint 校验。后续 CLI UI 跟进通过 `ctx.ui.setStatus` 显示逐秒 active 时间，并用 `ctx.ui.custom` 提供可滚动的草案确认/修订对话框；实现仍完全位于扩展层。Goal 专用的 objective/state-path 执行与恢复提示已通过 `before_agent_start` 与 kickoff context 注入；尚未实现的是通用 L0/L1/L2 Context controller。artifact 默认只保存 runtime 生成的 provenance，不复制 Pi transcript、Goal state 或工具正文；Policy、artifact retention/GC 与 memory 仍未实现。
+**2026-07-23 实现状态：** Phase 1.1–1.8 和 Task Run v1 均已完成。Session Chain v1 进一步把长期逻辑会话拆为完整原生 Pi JSONL Segment：新空会话进入项目级 managed Segment，既有 Pi session 作为不复制的 external root 被采用，`events.jsonl` 是拓扑事实源，而 catalog/read model 可重建。soft（16 MiB/4,000 entries）只在 settled 后轮转，hard（64 MiB/16,000 entries）在下一次 provider turn 前强制轮转；Task 运行、Task 结果待交付、Goal 草案或 lifecycle intent 会阻止轮转。每次轮转以渐进 summary-in/delta/carry-forward artifact 封存旧段、创建新段并替换 runtime；active Goal 在 `reason: "rollover"` 下继续，不触发保守 pause，普通 quit/reload/new/resume/fork、agent abort 和 tree navigation 的暂停规则不变。Task V2 从普通会话或 Goal 记录父 `chainId/branchId/segmentId/entryId`，child 自身从 managed SessionChain 起步；Task V1 保持原 hash 并仅在读取时 upcast。Pi 原生 session、tree、compaction、provider 和消息 schema 均未替换；`/chain` 仅管理逻辑链，原生 `/resume` 仍管理单个物理 session。尚未实现的是通用 L0/L1/L2 Context controller、long-term memory、完整 TaskSupervisor（并发/DAG/retry/budget/deadline/RPC/worktree/sandbox）以及 Policy、artifact retention/GC。
 
 #### Phase 1.7：Goal 连续执行（已完成）
 
-- 每个 active Goal 在一次 agent run settled 后自动启动下一次隐藏 kickoff；模型的普通文本、计划或部分结果都不是终止信号。
+- 每个 active Goal 在当前 live session 的一次 agent run settled 后自动启动下一次隐藏 kickoff；模型的普通文本、计划或部分结果都不是终止信号。
 - 模型必须先更新 `goal-state.md` 并验证目标与验收证据，再调用 `pi_xk_end_goal`；需要用户输入或外部变化时调用 `pi_xk_pause_goal`。用户仍可用 `/goal pause` 或 `/goal end` 覆盖运行。
 - 不设置最大 run 数；Goal 的语义完成权由模型的显式 end 工具调用决定。provider error 不会伪造 ended，而是在当前 live session 内指数退避重试。
-- 自动续跑沿用既有 checkpoint、生命周期和 branch binding；它不是 TaskSupervisor、后台 child agent 或无人值守沙箱的替代品。
+- Goal 自动续跑沿用既有 checkpoint、生命周期和 branch binding，本身不承担 Task 调度或沙箱职责；Task Run v1 由独立的 Task event log 和 child `AgentSession` 承担单子任务运行。
+- runtime 关闭、会话切换、agent abort 或 tree navigation 会保守暂停；重开后不自动续跑，必须手动 `/goal start`。model switch 和 compaction 不改变 lifecycle。
 
 #### Phase 1.8：Goal 草案与模型全生命周期控制（已完成）
 
@@ -805,6 +868,7 @@ pi_xk.artifact.*
 - 最终 checkpoint 必须已成为可重放的 Goal event；失败时 lifecycle intent 保持 pending。状态不再兼容的旧 intent 标记 rejected，不会在未来重复生效。
 - 当前 branch 的 Goal 未 ended 时拒绝新草案；`goal-objective.md` 按完整合同正文校验并在合同投影重建时同步刷新。
 - TUI footer 以 `setStatus` 显示 active 时间且不替换原生 footer；草案使用可滚动 custom dialog 和多行 revision editor，无 TUI 时继续使用命令降级。
+- graceful shutdown 与会话切换会中断 open run 并暂停 active Goal；unclean crash 在下次 startup 恢复后暂停。tree undo 先暂停并重挂 binding；旧 start intent 不跨 runtime 自动生效。
 - 每个逻辑段只提交本段文件；检查通过后推送。网络不可用时保留顺序本地提交，恢复网络后重新核验 fast-forward 再推送。
 
 必测故障：
@@ -830,6 +894,19 @@ Policy/沙箱仍是 supervised、unattended 和不可信执行的前置条件，
 选择它而不是立即做反省引擎的原因：Observation worker、影子验证和候选补丁都需要可取消、可恢复、带结果 envelope 的 Task；先做 memory 会缺少稳定生产者，先做 Proposal 会缺少验证执行器，直接接 `pi-subagents` 则会提前引入第二套任务状态。
 
 Task Run v1 之外的完整 Phase 3 能力仍未实现：多 Task 并发与 DAG 调度、retry、预算、deadline、RPC child、worktree/合并、sandbox、Policy 重新求值、跨 descendant 取消和进程组回收。不得用 v1 的单 in-process child 通过测试来宣称这些能力已经完成。
+
+### 已完成实施切片：Session Chain v1
+
+Session Chain v1 独立于完整 Phase 3：它只解决一个长期逻辑会话如何由多个完整原生 Pi JSONL 物理文件承接，不把 SessionChain、Task、Compaction 或 Goal 互相替代。
+
+- `.pi-xk/sessions/chains/<chainId>/events.jsonl` 记录 chain/branch/segment 拓扑；`catalog.json` 与 read model 可删除重建；
+- 每个 sealed Segment 固定拥有 summary-in、原生正文与含 delta/carry-forward 的 summary-out；摘要携带 source 范围/hash、base summary、模型和 token provenance，失败不 seal；
+- 两阶段 `rollover_prepared -> rollover_committed|rollover_aborted` 确保 source summary-out 与 target JSONL durable 后才提升 branch head；startup/`/chain doctor` 能按 marker 恢复 prepared 状态；
+- host 只新增非破坏性的 `summarizeSessionContext`、`rolloverSession`、`session_before_rollover` 和 lifecycle reason `rollover`。不设置 `SessionHeader.parentSession`，不改原生 entry schema；
+- `/chain` 提供 picker、status、history、summary、manual rollover、resume、history continue 和 doctor；footer 额外显示当前链与 Segment 体积；
+- rollover 会原样迁移 Goal binding，Task V2 绑定父 chain ref；历史继续创建 successor branch，sealed 文件不重写。
+
+退出门槛：每个 Segment 单独可被 Pi 打开；summary 递进且与 artifact hash 对应；prepared 崩溃能明确 commit/rebuild/abort；硬阈值绝不把普通输入送入未轮转的 provider turn；Goal/Task gate 阻止不安全轮转；active Goal 在真实 rollover 后仍由 replacement runtime 继续。
 
 ### 16.3 Phase 2：Policy 与沙箱
 
@@ -882,7 +959,8 @@ Task Run v1 之外的完整 Phase 3 能力仍未实现：多 Task 并发与 DAG 
 
 交付：
 
-- /learn、proposal schema、隔离验证、人工审批、CAS、rollback 和 generation reload；
+- Observation Store、/learn、证据聚合、proposal schema、baseline/candidate 影子验证、人工审批、CAS、rollback 和 generation reload；
+- 反省 worker 通过 TaskSupervisor 运行；验证通过的 applied proposal 才能产生结构化 memory 候选；
 - 先接入 pi-mcp-adapter 和一个 review UI 作为可选扩展；
 - 对 permission/taskflow/memory 组件做 adapter benchmark，而不是直接替代核心；
 - 发布文档、迁移工具、故障排查手册和安全模型。
@@ -895,13 +973,14 @@ Task Run v1 之外的完整 Phase 3 能力仍未实现：多 Task 并发与 DAG 
 
 ### 16.7 最小可行版本（MVP）
 
-MVP 只包含：Pi 原生 session、Goal contract/event log、自动 checkpoint、基础 policy ask/deny、一个隔离 worker、artifact 引用和 crash recovery。MCP、长期记忆、自动 proposal 和复杂 DAG 都可以在 MVP 之后加入。这样可以先证明“可恢复和不越权”，再证明“更聪明”。
+当前个人 full-access profile 的首个可用基线已经由 Pi 原生 session、Goal contract/event log、自动 checkpoint、artifact 引用和 crash recovery 构成。面向 supervised/unattended 的产品化 MVP 才额外要求基础 policy ask/deny 与一个隔离 worker。MCP、长期记忆、自动 proposal 和复杂 DAG 都在这两个基线之后加入，避免把尚无执行底座的“更聪明”机制提前塞入主会话。
 
 ## 17. 验收矩阵
 
 | 类别 | 场景 | 通过条件 |
 | --- | --- | --- |
-| Session | 新建、resume、branch、fork、clone | Pi 原生 tree 语义不变，绑定引用可重建 |
+| Session | quit、reload、新建、resume、branch、fork、clone、unclean restart | Pi 原生 tree 语义不变；active Goal 在 runtime 边界暂停，binding 可重建，恢复必须手动 start |
+| Model | active/paused/ended 时切换模型 | 不写 Goal lifecycle、不改变 generation/binding；后续 run 使用当前模型 |
 | State | 并发 checkpoint、重复提交、尾部半行 | 无 lost update、无重复应用、诊断明确 |
 | Compaction | token 超限、摘要模型超时、工具结果很大 | 保留配对边界，原始 entry 不丢，artifact 可取 |
 | Policy | symlink、shell wrapper、sudo、网络、凭据 | hard deny/ask/allow 与 effective policy 一致 |
@@ -910,7 +989,7 @@ MVP 只包含：Pi 原生 session、Goal contract/event log、自动 checkpoint�
 | Task Phase 3 | 并发、DAG、retry、deadline、RPC、worktree、sandbox | 预算与策略生效；父取消回收所有 descendant 和进程组；未经验证不合并 diff |
 | Resource | untrusted project、冲突 Skill、reload 竞态 | trust gate、generation 原子切换、旧版本可恢复 |
 | MCP | lazy connect、OAuth、超大输出、server 崩溃 | token 不入日志，输出 guard、取消和错误 schema 生效 |
-| Learning | 注入样本、重复 proposal、人工修改基准 | 只生成 proposal，CAS 失效时拒绝覆盖 |
+| Learning | 硬失败、用户纠正、犹豫词、资源老化、重复 proposal、人工修改基准 | 弱信号不单独改资源；只生成 proposal；baseline 回归或 CAS 失效时拒绝覆盖 |
 | Supply chain | 新 npm 包、lifecycle script、许可证变更 | lock、license、notice、安装脚本和替换方案齐全 |
 | Privacy | secret、个人数据、删除请求 | redaction、生存期和 tombstone 行为可验证 |
 
@@ -924,6 +1003,8 @@ MVP 只包含：Pi 原生 session、Goal contract/event log、自动 checkpoint�
 4. provider cost 的计量精度和匿名化：不同 provider 的 usage 字段不一致，不能以估算值冒充账单事实。
 5. memory 的默认保留期限和用户删除语义：须结合隐私需求、磁盘成本和审计要求。
 6. 外部组件是否直接依赖：先用 adapter/contract test；只有维护成本低于自维护且边界清晰才纳入 lock。
+7. Observation 的默认保留窗口与跨项目聚合：默认项目隔离；只有用户级 Resource 且证据已脱敏时才允许用户级聚合。
+8. 模型型 shadow evaluator 的稳定性：必须与确定性检查分开计分，并在 proposal 中记录 evaluator/model/prompt revision。
 
 每个闸门都需要一份 ADR、一个最小实验和一个可回退方案；没有实验就保持保守默认。
 

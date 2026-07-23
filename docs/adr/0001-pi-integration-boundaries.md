@@ -42,7 +42,9 @@ Pi interactive / print / RPC host
 | turn_end / agent_settled | [Extension events](../../packages/coding-agent/docs/extensions.md) | turn_end 自动写 checkpoint；agent_settled 处理最终审计和延后操作 | 不在 agent_end 假定任务已彻底静止；Pi 可能继续 retry、compact 或消费 follow-up |
 | session_before_compact / session_compact | [Extension events](../../packages/coding-agent/docs/extensions.md) | 前者写 checkpoint intent，后者记录 compaction artifact/ref | 默认不替换 Pi compaction summary；失败不破坏原 session |
 | project_trust / resources_discover | [Extension events](../../packages/coding-agent/docs/extensions.md)、[resource-loader.ts](../../packages/coding-agent/src/core/resource-loader.ts) | 用户级 Pi-XK extension 在 trust 前运行；信任后再读取项目级 Pi-XK 资源 | 沿用 Pi 的 trust 语义；Phase 0 不额外建立工具权限层 |
-| session_shutdown / session_start | [Extension events](../../packages/coding-agent/docs/extensions.md) | 释放运行时句柄、重建只读 index 与 generation | replacement 后旧 ctx、旧 pi 和旧 SessionManager 都可能失效 |
+| session_shutdown / session_start | [Extension events](../../packages/coding-agent/docs/extensions.md) | shutdown 时暂停 active Goal；startup 恢复遗留 open run 后保持 paused，并重建只读 index 与 generation | replacement 后旧 ctx、旧 pi 和旧 SessionManager 都可能失效；不得自动恢复 Goal |
+| session_before_tree / session_tree | [Extension events](../../packages/coding-agent/docs/extensions.md) | 导航前暂停 active Goal，导航后重挂同一 binding 并清理失效草案/capture | Goal event log 不随 Pi branch 回滚；暂停失败必须取消导航 |
+| model_select | [Extension events](../../packages/coding-agent/docs/extensions.md) | 仅接受 Pi 的模型切换；下一个 run 使用新模型 | 不写 Goal lifecycle、不换 generation、不改 binding |
 | AgentSession SDK | [sdk.md](../../packages/coding-agent/docs/sdk.md) | 只读 child 或嵌入式控制面可创建独立 in-process session | 写入/不可信工作不共享父 workspace |
 | RPC process/supervisor | [rpc-process.ts](../../packages/orchestrator/src/rpc-process.ts)、[supervisor.ts](../../packages/orchestrator/src/supervisor.ts) | 作为将来隔离 child Pi 进程的传输与事件通道 | 不把它误用为预算、进程组、sandbox 或恢复系统 |
 
@@ -100,6 +102,8 @@ Pi 完成 assistant 消息和工具结果
 任何一次 checkpoint 写入失败都不能回滚 Pi turn。扩展必须显示可恢复诊断，并在下一个安全边界按 idempotency key 重试。
 
 在 session_before_compact 中，Pi-XK 仅执行 checkpoint intent 和来源记录；在 session_compact 中记录 Pi 保存的 compaction entry 与 artifact 引用。MVP 不提供自定义摘要，不改变 Pi 的 compaction 选择和 session tree。这样避免两套摘要链竞争事实。
+
+Goal 的运行时边界与 compaction 分离：quit、reload、new/resume/fork、agent abort 和 session tree navigation 会把 active Goal 转为 paused；compaction 和 model selection 不改变 Goal lifecycle。正常 shutdown 未执行完成的强杀无法运行 hook，因此下次 `session_start` 必须恢复 open run 并保守暂停。恢复时不得重放未提交的 start intent；用户必须显式 `/goal start`。
 
 ### 4. Resource、trust 与 generation
 

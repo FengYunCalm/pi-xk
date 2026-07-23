@@ -88,6 +88,17 @@ Task Run v1 不实现：
 
 完整 Phase 3 可在此单 child runner 上扩展，但不得改变 V1 事实日志与父子 transcript 分离边界。
 
+## TaskSpec V2 与 Session Chain 补充
+
+2026-07-24 起，新 Task 在父 session 已绑定 Session Chain 时写入 `pi-xk.task.spec.v2`：
+
+- `parent` 固定引用父 `chainId/branchId/segmentId/entryId`，不再把物理 session ID 当长期父身份；
+- `childChainId` 指向 child 自己的 managed Session Chain，child transcript 位于 `.pi-xk/sessions/chains/<childChainId>`；
+- Task 与 SessionChain 仍是独立领域对象：Task 生命周期不会随 Segment rollover 重建，单个长 Task 也可在后续版本跨多个 Segment；
+- 普通会话与 Goal 会话均走相同 V2 路径。未绑定 Session Chain 的 SDK/兼容入口仍可创建 V1 Task；这不是新数据的首选路径。
+
+既有 `pi-xk.task.spec.v1` 事件、hash、child transcript 路径和 read model 事实保持原样，不做落盘迁移。需要统一展示时只对已通过 V1 严格校验的 spec 做确定性内存 upcast；upcast 不写回事件日志。单 child、same-workspace、父屏障、取消和恢复语义不变。
+
 ## 后果
 
 优点：
