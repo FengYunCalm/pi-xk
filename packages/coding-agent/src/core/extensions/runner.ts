@@ -304,6 +304,9 @@ export class ExtensionRunner {
 	private rolloverSessionFn: (options: RolloverSessionOptions) => Promise<RolloverSessionResult> = async () => {
 		throw new Error("Session rollover is not bound");
 	};
+	private flushSessionFn: () => void = () => {
+		throw new Error("Durable session flush is not bound");
+	};
 	private getSystemPromptFn: () => string = () => "";
 	private getSystemPromptOptionsFn: () => BuildSystemPromptOptions = () => ({ cwd: this.cwd });
 	private newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
@@ -368,6 +371,7 @@ export class ExtensionRunner {
 		this.compactFn = contextActions.compact;
 		this.summarizeSessionContextFn = contextActions.summarizeSessionContext ?? this.summarizeSessionContextFn;
 		this.rolloverSessionFn = contextActions.rolloverSession ?? this.rolloverSessionFn;
+		this.flushSessionFn = contextActions.flushSession ?? this.flushSessionFn;
 		this.getSystemPromptFn = contextActions.getSystemPrompt;
 		this.getSystemPromptOptionsFn = contextActions.getSystemPromptOptions ?? (() => ({ cwd: this.cwd }));
 
@@ -758,6 +762,10 @@ export class ExtensionRunner {
 			rolloverSession: (options) => {
 				runner.assertActive();
 				return runner.rolloverSessionFn(options);
+			},
+			flushSession: () => {
+				runner.assertActive();
+				runner.flushSessionFn();
 			},
 			getSystemPrompt: () => {
 				runner.assertActive();

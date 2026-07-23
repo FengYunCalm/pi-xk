@@ -2,7 +2,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFile, rm, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ExtensionCommandContext, SessionEntry, SessionManager } from "@earendil-works/pi-coding-agent";
+import type {
+	ReadonlySessionManager,
+	ReplacedSessionContext,
+	SessionEntry,
+	SessionManager,
+} from "@earendil-works/pi-coding-agent";
 import { SessionManager as PiSessionManager, sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
 import {
 	assertSessionBranchId,
@@ -116,7 +121,7 @@ export interface SessionChainRolloverHostOptions {
 	initializeTarget: (sessionManager: SessionManager) => Promise<void> | void;
 	finalizeSource: (sessionManager: SessionManager) => Promise<void> | void;
 	commit: (context: SessionChainRolloverCommitContext) => Promise<void> | void;
-	withSession?: (ctx: ExtensionCommandContext) => Promise<void>;
+	withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 }
 
 export type SessionChainRolloverHostResult =
@@ -124,7 +129,7 @@ export type SessionChainRolloverHostResult =
 	| ({ cancelled: false } & SessionChainRolloverCommitContext);
 
 export interface SessionChainHost {
-	readonly sessionManager: SessionManager;
+	readonly sessionManager: ReadonlySessionManager;
 	readonly model: { contextWindow: number } | undefined;
 	summarizeSessionContext(options: SessionChainSummarizeOptions): Promise<SessionChainSummarizeResult>;
 	rolloverSession(options: SessionChainRolloverHostOptions): Promise<SessionChainRolloverHostResult>;
@@ -142,7 +147,13 @@ export interface SessionChainControllerOptions {
 export interface SessionChainRootOptions {
 	title?: string | null;
 	initializeTarget?: (sessionManager: SessionManager) => Promise<void> | void;
-	withSession?: (ctx: ExtensionCommandContext) => Promise<void>;
+	withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+}
+
+export interface SessionChainExternalRootOptions {
+	title?: string | null;
+	appendMarkers: (binding: PiXkSessionChainBindingV1, summaryIn: PiXkSessionChainSummaryInV1) => Promise<void> | void;
+	flush: () => Promise<void> | void;
 }
 
 export interface SessionChainManagedRootOptions {
@@ -163,7 +174,7 @@ export interface SessionChainRolloverOptions {
 	actor?: SessionChainActor;
 	gates?: Partial<SessionChainGateState>;
 	initializeTarget?: (sessionManager: SessionManager) => Promise<void> | void;
-	withSession?: (ctx: ExtensionCommandContext) => Promise<void>;
+	withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 }
 
 export interface SessionChainRolloverResult {
@@ -182,7 +193,7 @@ export interface SessionChainBranchOptions {
 	actor?: SessionChainActor;
 	gates?: Partial<SessionChainGateState>;
 	initializeTarget?: (sessionManager: SessionManager) => Promise<void> | void;
-	withSession?: (ctx: ExtensionCommandContext) => Promise<void>;
+	withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 }
 
 export interface SessionChainBranchSource {
@@ -496,7 +507,7 @@ function latestEntry<TEntry extends SessionEntry["type"]>(
 	return undefined;
 }
 
-function copySessionProjection(source: SessionManager, target: SessionManager, sourceEntryId?: string): void {
+function copySessionProjection(source: ReadonlySessionManager, target: SessionManager, sourceEntryId?: string): void {
 	const sourceBranch = source.getBranch(sourceEntryId);
 	const model = latestEntry(sourceBranch, "model_change");
 	if (model) target.appendModelChange(model.provider, model.modelId);
@@ -517,7 +528,7 @@ function copySessionProjection(source: SessionManager, target: SessionManager, s
 	}
 }
 
-function hasOnlyBootstrapProjectionEntries(manager: SessionManager): boolean {
+function hasOnlyBootstrapProjectionEntries(manager: ReadonlySessionManager): boolean {
 	return manager
 		.getEntries()
 		.every(
@@ -526,17 +537,24 @@ function hasOnlyBootstrapProjectionEntries(manager: SessionManager): boolean {
 		);
 }
 
-function appendSummaryIn(manager: SessionManager, artifactId: string | null, carryForward: string): string {
-	const details: PiXkSessionChainSummaryInV1 = {
+export function createSessionChainSummaryInMarker(
+	artifactId: string | null,
+	carryForward: string,
+): PiXkSessionChainSummaryInV1 {
+	return {
 		schema: PI_XK_SESSION_CHAIN_MARKER_SCHEMA,
 		kind: "summary_in",
 		artifactId,
 		carryForwardHash: hashText(carryForward),
 	};
+}
+
+function appendSummaryIn(manager: SessionManager, artifactId: string | null, carryForward: string): string {
+	const details = createSessionChainSummaryInMarker(artifactId, carryForward);
 	return manager.appendCustomMessageEntry(PI_XK_SESSION_CHAIN_SUMMARY_IN_CUSTOM_TYPE, carryForward, false, details);
 }
 
-function findSummaryInEntry(manager: SessionManager, binding: PiXkSessionChainBindingV1) {
+function findSummaryInEntry(manager: ReadonlySessionManager, binding: PiXkSessionChainBindingV1) {
 	for (const entry of manager.getBranch()) {
 		if (
 			entry.type === "custom_message" &&
@@ -561,7 +579,7 @@ function findSummaryInEntry(manager: SessionManager, binding: PiXkSessionChainBi
 }
 
 function findSummaryOutEntry(
-	manager: SessionManager,
+	manager: ReadonlySessionManager,
 	artifactId: string,
 	targetSegmentId: string,
 ): { entry: Extract<SessionEntry, { type: "custom" }>; marker: PiXkSessionChainSummaryOutV1 } | undefined {
@@ -659,7 +677,7 @@ export class SessionChainController {
 		};
 	}
 
-	getCurrentBinding(manager: SessionManager): PiXkSessionChainBindingV1 | null {
+	getCurrentBinding(manager: Pick<SessionManager, "getBranch">): PiXkSessionChainBindingV1 | null {
 		const branch = manager.getBranch();
 		for (let index = branch.length - 1; index >= 0; index--) {
 			const entry = branch[index];
@@ -807,7 +825,51 @@ export class SessionChainController {
 		return binding;
 	}
 
-	private async assertWritableHead(manager: SessionManager): Promise<{
+	async adoptExternalRootWithHost(
+		manager: Pick<SessionManager, "getBranch" | "getSessionFile" | "getSessionId">,
+		options: SessionChainExternalRootOptions,
+	): Promise<PiXkSessionChainBindingV1> {
+		const existing = this.getCurrentBinding(manager);
+		if (existing) return existing;
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile) {
+			throw new SessionChainControllerError("External Session Chain adoption requires a persisted Pi session");
+		}
+		const chainId = createSessionChainId();
+		const branchId = createSessionChainBranchId();
+		const createdAt = this.now();
+		const segment: SessionSegmentDescriptorV1 = {
+			segmentId: manager.getSessionId(),
+			ordinal: 1,
+			location: { kind: "external-root", absolutePath: resolve(sessionFile) },
+			predecessorSegmentId: null,
+			summaryInArtifactId: null,
+			createdAt,
+		};
+		const binding = bindingFor(chainId, branchId, segment);
+		await options.appendMarkers(binding, createSessionChainSummaryInMarker(null, SESSION_CHAIN_ROOT_SUMMARY));
+		await options.flush();
+		await this.store.createChain(
+			{
+				schema: SESSION_CHAIN_SPEC_SCHEMA,
+				chainId,
+				title: options.title ?? null,
+				cwd: this.projectRoot,
+				rootBranchId: branchId,
+				rootSegment: segment,
+				createdAt,
+			},
+			{
+				eventId: `${chainId}:created`,
+				idempotencyKey: `${chainId}:created`,
+				actor: "runtime",
+				timestamp: createdAt,
+			},
+		);
+		return binding;
+	}
+
+	private async assertWritableHead(manager: ReadonlySessionManager): Promise<{
 		binding: PiXkSessionChainBindingV1;
 		replay: SessionChainReplay;
 		branch: SessionBranchProjectionV1;
@@ -849,7 +911,7 @@ export class SessionChainController {
 	}
 
 	private buildSummarySelection(
-		manager: SessionManager,
+		manager: ReadonlySessionManager,
 		binding: PiXkSessionChainBindingV1,
 		segment: SessionSegmentProjectionV1,
 		sourceLeafId: string,
@@ -934,7 +996,7 @@ export class SessionChainController {
 
 	private async createSegmentSummary(
 		host: SessionChainHost,
-		sourceManager: SessionManager,
+		sourceManager: ReadonlySessionManager,
 		binding: PiXkSessionChainBindingV1,
 		segment: SessionSegmentProjectionV1,
 		targetSegmentId: string,
@@ -1010,7 +1072,11 @@ export class SessionChainController {
 		}
 	}
 
-	private async sourceSeal(sourceManager: SessionManager, summaryArtifactId: string, summaryOutEntryId: string) {
+	private async sourceSeal(
+		sourceManager: ReadonlySessionManager,
+		summaryArtifactId: string,
+		summaryOutEntryId: string,
+	) {
 		const sourceFile = sourceManager.getSessionFile();
 		if (!sourceFile) throw new SessionChainControllerError("Session Chain source file is missing");
 		if (sourceManager.getLeafId() !== summaryOutEntryId) {
@@ -1130,8 +1196,8 @@ export class SessionChainController {
 					await options.initializeTarget?.(target);
 					appendSummaryIn(target, summaryArtifactId, generated.summary.carryForwardMarkdown);
 				},
-				finalizeSource: () => {
-					if (sourceManager.getLeafId() !== generated.sourceLeafId) {
+				finalizeSource: (frozenSource) => {
+					if (frozenSource.getLeafId() !== generated.sourceLeafId) {
 						throw new SessionChainControllerError("Session Chain source changed before summary-out");
 					}
 					const marker: PiXkSessionChainSummaryOutV1 = {
@@ -1145,7 +1211,7 @@ export class SessionChainController {
 						segmentDeltaHash: hashText(generated.summary.segmentDeltaMarkdown),
 						carryForwardHash: hashText(generated.summary.carryForwardMarkdown),
 					};
-					summaryOutEntryId = sourceManager.appendCustomEntry(PI_XK_SESSION_CHAIN_SUMMARY_OUT_CUSTOM_TYPE, marker);
+					summaryOutEntryId = frozenSource.appendCustomEntry(PI_XK_SESSION_CHAIN_SUMMARY_OUT_CUSTOM_TYPE, marker);
 				},
 				commit: async () => {
 					if (!summaryOutEntryId) throw new SessionChainControllerError("Session Chain source was not finalized");
@@ -1393,8 +1459,8 @@ export class SessionChainController {
 				await options.initializeTarget?.(target);
 				appendSummaryIn(target, summaryArtifactId, generated.summary.carryForwardMarkdown);
 			},
-			finalizeSource: () => {
-				if (sourceManager.getLeafId() !== options.sourceEntryId) {
+			finalizeSource: (frozenSource) => {
+				if (frozenSource.getLeafId() !== options.sourceEntryId) {
 					throw new SessionChainControllerError("Session Chain branch source changed before commit");
 				}
 			},
@@ -1434,7 +1500,7 @@ export class SessionChainController {
 	}
 
 	private initializeRecoveredTarget(
-		source: SessionManager,
+		source: ReadonlySessionManager,
 		target: SessionManager,
 		binding: PiXkSessionChainBindingV1,
 		summary: SegmentSummaryV1,
@@ -1529,7 +1595,7 @@ export class SessionChainController {
 	}
 
 	async getThreshold(
-		manager: SessionManager,
+		manager: ReadonlySessionManager,
 	): Promise<SessionChainThresholdInput & { threshold: SessionChainThreshold }> {
 		const sessionFile = manager.getSessionFile();
 		if (!sessionFile) throw new SessionChainControllerError("Session Chain threshold requires a persisted session");
@@ -1538,7 +1604,7 @@ export class SessionChainController {
 		return { bytes, entries, threshold: evaluateSessionChainThreshold({ bytes, entries }) };
 	}
 
-	async getCurrentStatus(manager: SessionManager): Promise<SessionChainCurrentStatus | null> {
+	async getCurrentStatus(manager: ReadonlySessionManager): Promise<SessionChainCurrentStatus | null> {
 		const binding = this.getCurrentBinding(manager);
 		if (!binding) return null;
 		const replay = await this.store.replayChain(binding.chainId);
@@ -1570,7 +1636,7 @@ export class SessionChainController {
 		};
 	}
 
-	async isCurrentWritableHead(manager: SessionManager): Promise<boolean> {
+	async isCurrentWritableHead(manager: ReadonlySessionManager): Promise<boolean> {
 		return (await this.getCurrentStatus(manager))?.writableHead ?? false;
 	}
 
@@ -1588,7 +1654,7 @@ export class SessionChainController {
 		chainId: string,
 		branch: SessionBranchProjectionV1,
 		segment: SessionSegmentProjectionV1,
-		manager: SessionManager,
+		manager: ReadonlySessionManager,
 		binding: PiXkSessionChainBindingV1 | null,
 		diagnostics: SessionChainDiagnostic[],
 		readSummary: (artifactId: string) => Promise<SegmentSummaryV1>,

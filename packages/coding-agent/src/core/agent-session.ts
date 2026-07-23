@@ -2495,6 +2495,7 @@ export class AgentSession {
 					}
 					return this._rolloverSessionHandler(options);
 				},
+				flushSession: () => this.sessionManager.flushDurable(),
 				getSystemPrompt: () => this.systemPrompt,
 				getSystemPromptOptions: () => this._baseSystemPromptOptions,
 			},

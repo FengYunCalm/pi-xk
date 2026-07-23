@@ -14,7 +14,7 @@ import {
 	type TaskHead,
 	type TaskReadModel,
 	type TaskResultEnvelopeV1,
-	type TaskSpecV1,
+	type TaskSpec,
 	type TaskStatus,
 	type TaskTerminalEventPayload,
 	type TaskTerminalStatus,
@@ -22,7 +22,7 @@ import {
 	validateTaskChildInfo,
 	validateTaskReadModel,
 	validateTaskResultEnvelopeV1,
-	validateTaskSpecV1,
+	validateTaskSpec,
 } from "./task-contract.ts";
 import { buildTaskReadModel, sameTaskReadModel, TaskReadModelStaleError } from "./task-read-model.ts";
 
@@ -107,7 +107,7 @@ export interface TaskTailDiagnostic {
 
 export interface TaskReplay {
 	taskId: string;
-	spec: TaskSpecV1;
+	spec: TaskSpec;
 	head: TaskHead;
 	events: TaskEvent[];
 	status: TaskStatus;
@@ -133,6 +133,7 @@ export interface TaskWriteResult {
 
 export interface TaskListFilter {
 	parentSessionId?: string;
+	parentChainId?: string;
 	parentGoalId?: string | null;
 	status?: TaskStatus;
 }
@@ -278,7 +279,7 @@ function parseEvent(value: unknown, lineNumber: number): TaskEvent {
 		if (eventType === "task_created") {
 			if (Object.keys(value.payload).sort().join(",") !== "spec")
 				throw new TaskValidationError("create payload is invalid");
-			payload = { spec: validateTaskSpecV1(value.payload.spec) };
+			payload = { spec: validateTaskSpec(value.payload.spec) };
 		} else if (eventType === "task_started") {
 			if (Object.keys(value.payload).sort().join(",") !== "child")
 				throw new TaskValidationError("start payload is invalid");
@@ -309,7 +310,7 @@ function parseEvent(value: unknown, lineNumber: number): TaskEvent {
 	}
 }
 
-function project(events: readonly TaskEvent[]): { spec: TaskSpecV1; status: TaskStatus; resultArtifactId?: string } {
+function project(events: readonly TaskEvent[]): { spec: TaskSpec; status: TaskStatus; resultArtifactId?: string } {
 	const created = events[0];
 	if (!created || created.eventType !== "task_created")
 		throw new TaskCorruptionError("Task event log must begin with task_created");
@@ -503,8 +504,8 @@ export class TaskStore {
 			throw new TaskHeadConflictError(expected, actual);
 	}
 
-	async createTask(specInput: TaskSpecV1, options: TaskMutationOptions): Promise<TaskWriteResult> {
-		const spec = validateTaskSpecV1(specInput);
+	async createTask(specInput: TaskSpec, options: TaskMutationOptions): Promise<TaskWriteResult> {
+		const spec = validateTaskSpec(specInput);
 		const paths = this.paths(spec.taskId);
 		return await this.withLock(paths, spec.taskId, async () => {
 			const meta = this.mutationMeta(spec.taskId, options);
@@ -735,7 +736,18 @@ export class TaskStore {
 		const tasks: TaskReplay[] = [];
 		for (const taskId of taskIds.sort()) {
 			const replay = await this.replayTask(taskId);
-			if (filter.parentSessionId !== undefined && replay.spec.parentSessionId !== filter.parentSessionId) continue;
+			if (
+				filter.parentSessionId !== undefined &&
+				(replay.spec.schema !== "pi-xk.task.spec.v1" || replay.spec.parentSessionId !== filter.parentSessionId)
+			) {
+				continue;
+			}
+			if (
+				filter.parentChainId !== undefined &&
+				(replay.spec.schema !== "pi-xk.task.spec.v2" || replay.spec.parent.chainId !== filter.parentChainId)
+			) {
+				continue;
+			}
 			if (filter.parentGoalId !== undefined && replay.spec.parentGoalId !== filter.parentGoalId) continue;
 			if (filter.status !== undefined && replay.status !== filter.status) continue;
 			tasks.push(replay);

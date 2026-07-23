@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	type GoalContractV2,
 	GoalStore,
+	SessionChainStore,
 	type TaskChildInfoV1,
 	type TaskSpecV1,
 	TaskStore,
@@ -20,7 +21,9 @@ import {
 	type PiXkGoalExtensionOptions,
 	TaskRunner,
 } from "../../../pi-xk-extension/src/index.ts";
+import type { PiXkSessionChainBindingV1 } from "../../../pi-xk-extension/src/session-chain-controller.ts";
 import type { ExtensionUIContext } from "../../src/core/extensions/index.ts";
+import { SessionManager } from "../../src/core/session-manager.ts";
 import { type Theme, theme } from "../../src/modes/interactive/theme/theme.ts";
 import { createHarness, getMessageText, type Harness } from "./harness.ts";
 
@@ -43,6 +46,7 @@ function taskExtension(getHarness: () => Harness, options: PiXkGoalExtensionOpti
 				agentDir: join(projectRoot, "agent"),
 				modelRuntime: harness.modelRuntime,
 				settingsManager: harness.settingsManager,
+				createSessionManagerAt: (cwd, sessionFile, options) => SessionManager.createAt(cwd, sessionFile, options),
 				onSettled,
 			});
 		},
@@ -208,6 +212,52 @@ function taskSpec(taskId: string, parentSessionId: string): TaskSpecV1 {
 }
 
 describe("Pi-XK Task extension", () => {
+	it("uses TaskSpecV2 and an independent child chain in a normal chained session", async () => {
+		let harness: Harness;
+		harness = await createHarness({
+			extensionFactories: [taskExtension(() => harness)],
+		});
+		harnesses.push(harness);
+		harness.setResponses([finishTaskResponse("Normal-session child completed.")]);
+		await harness.session.bindExtensions({});
+		const parentBinding: PiXkSessionChainBindingV1 = {
+			schema: "pi-xk.session-chain-link.v1",
+			kind: "segment_link",
+			chainId: "chain_parent_normal",
+			branchId: "branch_parent_normal",
+			segmentId: "segment-parent-normal",
+			ordinal: 1,
+			predecessorSegmentId: null,
+			summaryInArtifactId: null,
+			createdAt: "2026-07-23T00:00:00.000Z",
+		};
+		harness.sessionManager.appendCustomEntry("pi-xk.session-chain-link", parentBinding);
+
+		await harness.session.prompt("/task start Verify Task V2 outside Goal mode.");
+		const store = new TaskStore(harness.tempDir);
+		await waitFor("the chained user Task to settle", async () =>
+			(await store.listTasks()).some((task) => task.status === "succeeded"),
+		);
+		const task = (await store.listTasks())[0];
+		expect(task?.spec).toMatchObject({
+			schema: "pi-xk.task.spec.v2",
+			parent: {
+				chainId: parentBinding.chainId,
+				branchId: parentBinding.branchId,
+				segmentId: parentBinding.segmentId,
+			},
+			parentGoalId: null,
+		});
+		if (task?.spec.schema !== "pi-xk.task.spec.v2") throw new Error("expected TaskSpecV2");
+		const childChain = await new SessionChainStore(harness.tempDir).replayChain(task.spec.childChainId);
+		const started = task.events.find((event) => event.eventType === "task_started");
+		expect(started?.eventType).toBe("task_started");
+		expect(childChain.branches[0]?.headSegmentId).toBe(
+			started?.eventType === "task_started" ? started.payload.child.childSessionId : undefined,
+		);
+		expect(taskResultEntries(harness)).toHaveLength(0);
+	});
+
 	it("exposes the parent start tool and child-only finish tool, then resumes the Goal once", async () => {
 		let harness: Harness;
 		const parentToolSets: string[][] = [];

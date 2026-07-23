@@ -384,6 +384,8 @@ export interface ExtensionContext {
 	summarizeSessionContext(options: SummarizeSessionContextOptions): Promise<SummarizeSessionContextResult>;
 	/** Replace the current physical session at a safe settled boundary. */
 	rolloverSession(options: RolloverSessionOptions): Promise<RolloverSessionResult>;
+	/** Force the current persisted session file and its directory to stable storage. */
+	flushSession(): void;
 	/** Get the current effective system prompt. */
 	getSystemPrompt(): string;
 }
@@ -1683,6 +1685,7 @@ export interface ExtensionContextActions {
 	compact: (options?: CompactOptions) => void;
 	summarizeSessionContext?: (options: SummarizeSessionContextOptions) => Promise<SummarizeSessionContextResult>;
 	rolloverSession?: (options: RolloverSessionOptions) => Promise<RolloverSessionResult>;
+	flushSession?: () => void;
 	getSystemPrompt: () => string;
 	getSystemPromptOptions?: () => BuildSystemPromptOptions;
 }

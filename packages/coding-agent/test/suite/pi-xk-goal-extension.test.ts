@@ -1,8 +1,10 @@
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { type FauxResponseFactory, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import type { Component, TUI } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	type GoalCheckpointV2,
@@ -14,6 +16,7 @@ import {
 import { createGoalDraftReviewComponent } from "../../../pi-xk-extension/src/goal-ui.ts";
 import {
 	createPiXkGoalBinding,
+	createPiXkGoalDraft,
 	createPiXkGoalExtension,
 	createPiXkGoalLifecycleIntent,
 	isPiXkGoalCapture,
@@ -129,6 +132,48 @@ function draftResponse(objective: string) {
 	});
 }
 
+async function createActiveGoal(harness: Harness, goalId: string): Promise<GoalStore> {
+	const store = new GoalStore(harness.tempDir);
+	const proposal = draftProposal(`Exercise lifecycle behavior for ${goalId}.`);
+	const contract: GoalContractV2 = {
+		schema: "pi-xk.goal.contract.v2",
+		goalId,
+		title: proposal.title,
+		objective: proposal.objective,
+		constraints: proposal.constraints,
+		acceptance: proposal.acceptance,
+		capabilities: { filesystem: "unrestricted", network: "unrestricted", spawn: "unrestricted" },
+		budgets: { tokens: 0, costCents: 0, wallSeconds: 0 },
+		ownerSessionId: harness.sessionManager.getSessionId(),
+		createdAt: "2026-07-21T00:00:00.000Z",
+		schemaVersion: 2,
+		nonGoals: proposal.nonGoals,
+		doneCondition: proposal.doneCondition,
+		pauseCondition: proposal.pauseCondition,
+		finalReport: proposal.finalReport,
+		executionAuthorization: proposal.executionAuthorization,
+	};
+	const created = await store.createGoal(contract, {
+		eventId: `evt-create-${goalId}`,
+		idempotencyKey: `create:${goalId}`,
+		actor: "user",
+		timestamp: contract.createdAt,
+	});
+	await store.appendLifecycleEvent(
+		goalId,
+		{ eventType: "goal_activated", payload: { sessionId: harness.sessionManager.getSessionId() } },
+		{
+			eventId: `evt-activate-${goalId}`,
+			idempotencyKey: `activate:${goalId}`,
+			actor: "user",
+			timestamp: contract.createdAt,
+			expectedHead: created.head,
+		},
+	);
+	harness.sessionManager.appendCustomEntry(PI_XK_SESSION_LINK_CUSTOM_TYPE, createPiXkGoalBinding(goalId, 0));
+	return store;
+}
+
 function createUiContext(overrides: {
 	select?: ExtensionUIContext["select"];
 	input?: ExtensionUIContext["input"];
@@ -206,6 +251,290 @@ afterEach(() => {
 });
 
 describe("Pi-XK Goal extension", () => {
+	it("pauses an active Goal recovered at session startup instead of continuing it", async () => {
+		const harness = await createHarness({
+			extensionFactories: [createPiXkGoalExtension()],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const store = await createActiveGoal(harness, "goal_recovered_paused");
+
+		await harness.session.bindExtensions({});
+
+		const replayed = await store.replayGoal("goal_recovered_paused");
+		expect(replayed.lifecycle.status).toBe("paused");
+		expect(replayed.lifecycle.lastPause).toMatchObject({
+			actor: "runtime",
+			reason: expect.stringContaining("session start"),
+			audit: { unmetRequiredAcceptanceIds: ["A-1"] },
+		});
+		expect(harness.faux.state.callCount).toBe(0);
+	});
+
+	it("rejects an uncommitted start intent during startup and keeps the Goal paused", async () => {
+		const harness = await createHarness({
+			extensionFactories: [createPiXkGoalExtension()],
+		});
+		harnesses.push(harness);
+		const goalId = "goal_stale_start_intent";
+		const store = await createActiveGoal(harness, goalId);
+		const active = await store.replayGoal(goalId);
+		await store.appendLifecycleEvent(
+			goalId,
+			{
+				eventType: "goal_paused",
+				payload: {
+					reason: "wait for explicit restart",
+					userRequest: null,
+					nextBestAction: "Run /goal start manually.",
+					audit: {
+						unmetRequiredAcceptanceIds: ["A-1"],
+						currentEvidence: "The Goal is not complete.",
+						incompleteConclusion: "Manual recovery is required.",
+					},
+				},
+			},
+			{
+				eventId: "evt-pause-stale-start-intent",
+				idempotencyKey: "pause:stale-start-intent",
+				actor: "runtime",
+				timestamp: "2026-07-21T00:01:00.000Z",
+				expectedHead: active.head,
+			},
+		);
+		harness.sessionManager.appendCustomEntry(
+			PI_XK_SESSION_LINK_CUSTOM_TYPE,
+			createPiXkGoalLifecycleIntent({
+				intentId: "intent-stale-start",
+				goalId,
+				generation: 0,
+				actor: "model",
+				action: "start",
+				state: "requested",
+				runId: "",
+				reason: "resume before the process stopped",
+				resumeEvidence: "Evidence from the interrupted process.",
+				userRequest: null,
+				nextBestAction: "",
+				audit: { unmetRequiredAcceptanceIds: [], currentEvidence: "", incompleteConclusion: "" },
+				outcome: "",
+				verifiedAcceptanceIds: [],
+				finalEvidence: "",
+				finalSummary: "",
+				createdAt: "2026-07-21T00:01:30.000Z",
+			}),
+		);
+
+		await harness.session.bindExtensions({});
+
+		const replayed = await store.replayGoal(goalId);
+		expect(replayed.lifecycle.status).toBe("paused");
+		expect(replayed.events.filter((event) => event.eventType === "goal_resumed")).toHaveLength(0);
+		expect(
+			getGoalLifecycleIntents(harness)
+				.filter((intent) => intent.intentId === "intent-stale-start")
+				.map((intent) => intent.state),
+		).toEqual(["requested", "rejected"]);
+		expect(harness.faux.state.callCount).toBe(0);
+	});
+
+	it("pauses an active Goal despite a stale draft and retires that draft after reload", async () => {
+		const harness = await createHarness({
+			extensionFactories: [createPiXkGoalExtension()],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const goalId = "goal_shutdown_with_stale_draft";
+		const store = await createActiveGoal(harness, goalId);
+		harness.sessionManager.appendCustomEntry(
+			PI_XK_SESSION_LINK_CUSTOM_TYPE,
+			createPiXkGoalDraft({
+				draftId: "draft_stale_during_shutdown",
+				state: "requested",
+				objective: "This stale draft must not block Goal shutdown.",
+				revisionFeedback: null,
+				proposal: null,
+				goalId: null,
+				createdAt: "2026-07-21T00:01:00.000Z",
+			}),
+		);
+
+		await harness.session.reload();
+
+		expect((await store.replayGoal(goalId)).lifecycle.status).toBe("paused");
+		expect(getCurrentGoalDraft(harness)?.state).toBe("cancelled");
+		expect(harness.faux.state.callCount).toBe(0);
+	});
+
+	it("pauses an active Goal on graceful shutdown and leaves it paused after reload", async () => {
+		const harness = await createHarness({
+			extensionFactories: [createPiXkGoalExtension()],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({ uiContext: createUiContext({}) });
+		const store = await createActiveGoal(harness, "goal_shutdown_paused");
+
+		await harness.session.reload();
+
+		const replayed = await store.replayGoal("goal_shutdown_paused");
+		expect(replayed.lifecycle.status).toBe("paused");
+		expect(replayed.lifecycle.lastPause).toMatchObject({
+			actor: "runtime",
+			reason: expect.stringContaining("session shutdown: reload"),
+		});
+		expect(replayed.events.filter((event) => event.eventType === "goal_paused")).toHaveLength(1);
+		expect(harness.faux.state.callCount).toBe(0);
+	});
+
+	it("pauses an active Goal when its agent run is aborted", async () => {
+		const harness = await createHarness({
+			extensionFactories: [createPiXkGoalExtension()],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const store = await createActiveGoal(harness, "goal_agent_aborted");
+		harness.setResponses([fauxAssistantMessage("", { stopReason: "aborted" })]);
+
+		await harness.session.prompt("Start a Goal run that will be aborted.");
+		await waitForAgent(harness);
+
+		const replayed = await store.replayGoal("goal_agent_aborted");
+		expect(replayed.lifecycle.status).toBe("paused");
+		expect(replayed.lifecycle.lastPause).toMatchObject({
+			actor: "runtime",
+			reason: expect.stringContaining("agent run aborted"),
+		});
+		expect(replayed.lifecycle.runs.at(-1)?.status).toBe("interrupted");
+	});
+
+	it("commits a pending user pause for a busy open Goal run", async () => {
+		let releaseTool: (() => void) | undefined;
+		const toolRelease = new Promise<void>((resolve) => {
+			releaseTool = resolve;
+		});
+		const waitTool: AgentTool = {
+			name: "wait_for_user_pause",
+			label: "Wait for user pause",
+			description: "Hold the Goal run open until the test releases it.",
+			parameters: Type.Object({}),
+			execute: async () => {
+				await toolRelease;
+				return { content: [{ type: "text", text: "released" }], details: {} };
+			},
+		};
+		const harness = await createHarness({
+			tools: [waitTool],
+			extensionFactories: [createPiXkGoalExtension()],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const goalId = "goal_user_pause_during_abort";
+		const store = await createActiveGoal(harness, goalId);
+		harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("wait_for_user_pause", {})], { stopReason: "toolUse" }),
+		]);
+		const sawToolStart = new Promise<void>((resolve) => {
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type !== "tool_execution_start" || event.toolName !== "wait_for_user_pause") return;
+				unsubscribe();
+				resolve();
+			});
+		});
+
+		const promptPromise = harness.session.prompt("Start a Goal run that the user will pause.");
+		await sawToolStart;
+		const running = await store.replayGoal(goalId);
+		if (!running.lifecycle.openRunId) throw new Error("Goal run did not open before the abort");
+		harness.sessionManager.appendCustomEntry(
+			PI_XK_SESSION_LINK_CUSTOM_TYPE,
+			createPiXkGoalLifecycleIntent({
+				intentId: "intent_user_pause_during_abort",
+				goalId,
+				generation: 0,
+				actor: "user",
+				action: "pause",
+				state: "requested",
+				runId: running.lifecycle.openRunId,
+				reason: "the user paused the busy Goal",
+				resumeEvidence: "",
+				userRequest: "the user paused the busy Goal",
+				nextBestAction: "Wait for /goal start.",
+				audit: {
+					unmetRequiredAcceptanceIds: ["A-1"],
+					currentEvidence: "The active run was interrupted by the user.",
+					incompleteConclusion: "Acceptance A-1 remains incomplete.",
+				},
+				outcome: "ended",
+				verifiedAcceptanceIds: [],
+				finalEvidence: "",
+				finalSummary: "",
+				createdAt: "2026-07-21T00:01:00.000Z",
+			}),
+		);
+		const abortPromise = harness.session.abort();
+		releaseTool?.();
+		await abortPromise;
+		await promptPromise;
+
+		const replayed = await store.replayGoal(goalId);
+		expect(replayed.lifecycle.lastPause).toMatchObject({
+			actor: "user",
+			reason: "the user paused the busy Goal",
+		});
+		expect(
+			getGoalLifecycleIntents(harness)
+				.filter((intent) => intent.intentId === "intent_user_pause_during_abort")
+				.map((intent) => intent.state),
+		).toEqual(["requested", "committed"]);
+	});
+
+	it("pauses and preserves the current Goal binding across session tree undo", async () => {
+		const harness = await createHarness({
+			extensionFactories: [createPiXkGoalExtension()],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("baseline response")]);
+		await harness.session.bindExtensions({});
+		await harness.session.prompt("Create a branch point before the Goal binding.");
+		await waitForAgent(harness);
+		const target = harness.sessionManager
+			.getEntries()
+			.find((entry) => entry.type === "message" && entry.message.role === "assistant");
+		if (!target) throw new Error("tree navigation target is missing");
+		const store = await createActiveGoal(harness, "goal_tree_undo");
+
+		await harness.session.navigateTree(target.id);
+
+		const replayed = await store.replayGoal("goal_tree_undo");
+		expect(replayed.lifecycle.status).toBe("paused");
+		expect(replayed.lifecycle.lastPause?.reason).toContain("session tree navigation");
+		expect(getCurrentGoalId(harness)).toBe("goal_tree_undo");
+		expect(harness.faux.state.callCount).toBe(1);
+	});
+
+	it("keeps Goal lifecycle and binding unchanged when the user switches models", async () => {
+		const harness = await createHarness({
+			models: [
+				{ id: "faux-1", name: "One" },
+				{ id: "faux-2", name: "Two" },
+			],
+			extensionFactories: [createPiXkGoalExtension()],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const store = await createActiveGoal(harness, "goal_model_switch");
+		const before = await store.replayGoal("goal_model_switch");
+
+		await harness.session.setModel(harness.getModel("faux-2")!);
+
+		const after = await store.replayGoal("goal_model_switch");
+		expect(after.lifecycle.status).toBe("active");
+		expect(after.events).toEqual(before.events);
+		expect(getGoalBindings(harness)).toEqual([
+			expect.objectContaining({ goalId: "goal_model_switch", generation: 0 }),
+		]);
+	});
+
 	it("shows live active Goal time in the native footer and freezes it while paused", async () => {
 		vi.useFakeTimers();
 		let now = new Date("2026-07-21T00:01:05.000Z");
@@ -215,6 +544,11 @@ describe("Pi-XK Goal extension", () => {
 			extensionFactories: [createPiXkGoalExtension({ now: () => now })],
 		});
 		harnesses.push(harness);
+		const uiContext = createUiContext({
+			setStatus: (key, text) => statuses.push({ key, text }),
+			notify: (message) => notifications.push(message),
+		});
+		await harness.session.bindExtensions({ uiContext, mode: "tui" });
 		const goalId = "goal_live_footer";
 		const store = new GoalStore(harness.tempDir);
 		const contract: GoalContractV2 = {
@@ -253,12 +587,7 @@ describe("Pi-XK Goal extension", () => {
 			},
 		);
 		harness.sessionManager.appendCustomEntry(PI_XK_SESSION_LINK_CUSTOM_TYPE, createPiXkGoalBinding(goalId, 0));
-		const uiContext = createUiContext({
-			setStatus: (key, text) => statuses.push({ key, text }),
-			notify: (message) => notifications.push(message),
-		});
-
-		await harness.session.bindExtensions({ uiContext, mode: "tui" });
+		await harness.session.prompt("/goal status");
 		expect(statuses.at(-1)).toEqual({ key: "pi-xk-goal", text: "Goal active · 1m 5s" });
 
 		now = new Date("2026-07-21T00:02:00.000Z");
@@ -579,6 +908,7 @@ describe("Pi-XK Goal extension", () => {
 			],
 		});
 		harnesses.push(harness);
+		await harness.session.bindExtensions({});
 		const store = new GoalStore(harness.tempDir);
 		const contract: GoalContractV2 = {
 			schema: "pi-xk.goal.contract.v2",
@@ -616,7 +946,6 @@ describe("Pi-XK Goal extension", () => {
 		harness.sessionManager.appendCustomEntry(PI_XK_SESSION_LINK_CUSTOM_TYPE, createPiXkGoalBinding(goalId, 0));
 		harness.setResponses([draftResponse("Replacement draft objective.")]);
 
-		await harness.session.bindExtensions({});
 		await harness.session.prompt("/goal Prepare a replacement Goal.");
 
 		const replayed = await store.replayGoal(goalId);
@@ -1380,6 +1709,7 @@ describe("Pi-XK Goal extension", () => {
 			extensionFactories: [createPiXkGoalExtension()],
 		});
 		harnesses.push(harness);
+		await harness.session.bindExtensions({});
 		const store = new GoalStore(harness.tempDir);
 		const contract: GoalContractV2 = {
 			schema: "pi-xk.goal.contract.v2",
@@ -1449,7 +1779,6 @@ describe("Pi-XK Goal extension", () => {
 			),
 		]);
 
-		await harness.session.bindExtensions({});
 		await harness.session.prompt("/goal pause wait for the user target environment");
 		const paused = await store.replayGoal(goalId);
 		expect(paused.lifecycle.status).toBe("paused");

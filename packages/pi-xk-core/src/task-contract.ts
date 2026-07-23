@@ -1,4 +1,9 @@
-export const TASK_SPEC_SCHEMA = "pi-xk.task.spec.v1";
+import { createHash } from "node:crypto";
+import { assertSessionBranchId, assertSessionChainId, assertSessionSegmentId } from "./session-chain-contract.ts";
+
+export const TASK_SPEC_V1_SCHEMA = "pi-xk.task.spec.v1";
+export const TASK_SPEC_V2_SCHEMA = "pi-xk.task.spec.v2";
+export const TASK_SPEC_SCHEMA = TASK_SPEC_V2_SCHEMA;
 export const TASK_RESULT_SCHEMA = "pi-xk.task-result.v1";
 export const TASK_EVENT_SCHEMA = "pi-xk.task-event.v1";
 export const TASK_READ_MODEL_SCHEMA = "pi-xk.task-read-model.v1";
@@ -9,7 +14,7 @@ export type TaskTerminalStatus = Exclude<TaskStatus, "pending" | "running">;
 export type TaskEvidenceKind = "file" | "command" | "text";
 
 export interface TaskSpecV1 {
-	schema: typeof TASK_SPEC_SCHEMA;
+	schema: typeof TASK_SPEC_V1_SCHEMA;
 	taskId: string;
 	parentSessionId: string;
 	parentEntryId: string;
@@ -21,6 +26,33 @@ export interface TaskSpecV1 {
 	allowNestedSpawn: false;
 	createdAt: string;
 }
+
+export interface TaskParentChainRefV2 {
+	chainId: string;
+	branchId: string;
+	segmentId: string;
+	entryId: string;
+}
+
+export interface TaskSpecV2 {
+	schema: typeof TASK_SPEC_V2_SCHEMA;
+	taskId: string;
+	parent: TaskParentChainRefV2;
+	/** Type-only migration aid; V2 JSON strictly rejects legacy parent fields. */
+	readonly parentSessionId?: never;
+	/** Type-only migration aid; V2 JSON strictly rejects legacy parent fields. */
+	readonly parentEntryId?: never;
+	parentGoalId: string | null;
+	childChainId: string;
+	role: TaskRole;
+	prompt: string;
+	expectedResult: string;
+	workspaceMode: "same-workspace";
+	allowNestedSpawn: false;
+	createdAt: string;
+}
+
+export type TaskSpec = TaskSpecV1 | TaskSpecV2;
 
 export interface TaskEvidence {
 	kind: TaskEvidenceKind;
@@ -58,7 +90,7 @@ export interface TaskChildInfoV1 {
 }
 
 export interface TaskCreatedEventPayload {
-	spec: TaskSpecV1;
+	spec: TaskSpec;
 }
 
 export interface TaskStartedEventPayload {
@@ -126,7 +158,7 @@ export interface TaskReadModel {
 	taskId: string;
 	sequence: number;
 	baseHash: string;
-	spec: TaskSpecV1;
+	spec: TaskSpec;
 	status: TaskStatus;
 	createdAt: string;
 	startedAt?: string;
@@ -190,6 +222,23 @@ export function assertTaskId(taskId: string): void {
 	}
 }
 
+function validateTaskRole(value: unknown): TaskRole {
+	const role = requireNonEmptyString(value, "role");
+	if (role !== "research" && role !== "implementation" && role !== "verification" && role !== "review") {
+		throw new TaskValidationError("role is invalid");
+	}
+	return role;
+}
+
+function validateParentGoalId(value: unknown): string | null {
+	if (value === null) return null;
+	const goalId = requireNonEmptyString(value, "parentGoalId");
+	if (!/^goal_[A-Za-z0-9][A-Za-z0-9_-]*$/.test(goalId)) {
+		throw new TaskValidationError("parentGoalId must use the goal_<safe-id> format");
+	}
+	return goalId;
+}
+
 export function validateTaskSpecV1(value: unknown): TaskSpecV1 {
 	if (!isRecord(value)) throw new TaskValidationError("Task spec must be an object");
 	requireExactKeys(
@@ -209,37 +258,127 @@ export function validateTaskSpecV1(value: unknown): TaskSpecV1 {
 		],
 		"Task spec",
 	);
-	if (value.schema !== TASK_SPEC_SCHEMA) throw new TaskValidationError("Task spec schema is unsupported");
+	if (value.schema !== TASK_SPEC_V1_SCHEMA) throw new TaskValidationError("Task spec schema is unsupported");
 	const taskId = requireNonEmptyString(value.taskId, "taskId");
 	assertTaskId(taskId);
-	const role = requireNonEmptyString(value.role, "role");
-	if (role !== "research" && role !== "implementation" && role !== "verification" && role !== "review") {
-		throw new TaskValidationError("role is invalid");
-	}
-	if (value.parentGoalId !== null && typeof value.parentGoalId !== "string") {
-		throw new TaskValidationError("parentGoalId must be a string or null");
-	}
+	const role = validateTaskRole(value.role);
 	if (value.workspaceMode !== "same-workspace") throw new TaskValidationError("workspaceMode is invalid");
 	if (value.allowNestedSpawn !== false) throw new TaskValidationError("nested spawn is disabled");
 	return {
-		schema: TASK_SPEC_SCHEMA,
+		schema: TASK_SPEC_V1_SCHEMA,
 		taskId,
 		parentSessionId: requireNonEmptyString(value.parentSessionId, "parentSessionId"),
 		parentEntryId: requireNonEmptyString(value.parentEntryId, "parentEntryId"),
-		parentGoalId: (() => {
-			if (value.parentGoalId === null) return null;
-			const goalId = requireNonEmptyString(value.parentGoalId, "parentGoalId");
-			if (!/^goal_[A-Za-z0-9][A-Za-z0-9_-]*$/.test(goalId)) {
-				throw new TaskValidationError("parentGoalId must use the goal_<safe-id> format");
-			}
-			return goalId;
-		})(),
+		parentGoalId: validateParentGoalId(value.parentGoalId),
 		role,
 		prompt: requireNonEmptyString(value.prompt, "prompt"),
 		expectedResult: requireNonEmptyString(value.expectedResult, "expectedResult"),
 		workspaceMode: "same-workspace",
 		allowNestedSpawn: false,
 		createdAt: requireIso(value.createdAt, "createdAt"),
+	};
+}
+
+function validateTaskParentChainRefV2(value: unknown): TaskParentChainRefV2 {
+	if (!isRecord(value)) throw new TaskValidationError("Task parent chain ref must be an object");
+	requireExactKeys(value, ["chainId", "branchId", "segmentId", "entryId"], "Task parent chain ref");
+	const chainId = requireNonEmptyString(value.chainId, "parent.chainId");
+	const branchId = requireNonEmptyString(value.branchId, "parent.branchId");
+	const segmentId = requireNonEmptyString(value.segmentId, "parent.segmentId");
+	try {
+		assertSessionChainId(chainId);
+		assertSessionBranchId(branchId);
+		assertSessionSegmentId(segmentId);
+	} catch (error) {
+		throw new TaskValidationError(error instanceof Error ? error.message : "Task parent chain ref is invalid");
+	}
+	return {
+		chainId,
+		branchId,
+		segmentId,
+		entryId: requireNonEmptyString(value.entryId, "parent.entryId"),
+	};
+}
+
+export function validateTaskSpecV2(value: unknown): TaskSpecV2 {
+	if (!isRecord(value)) throw new TaskValidationError("Task spec must be an object");
+	requireExactKeys(
+		value,
+		[
+			"schema",
+			"taskId",
+			"parent",
+			"parentGoalId",
+			"childChainId",
+			"role",
+			"prompt",
+			"expectedResult",
+			"workspaceMode",
+			"allowNestedSpawn",
+			"createdAt",
+		],
+		"Task spec",
+	);
+	if (value.schema !== TASK_SPEC_V2_SCHEMA) throw new TaskValidationError("Task spec schema is unsupported");
+	const taskId = requireNonEmptyString(value.taskId, "taskId");
+	assertTaskId(taskId);
+	const childChainId = requireNonEmptyString(value.childChainId, "childChainId");
+	try {
+		assertSessionChainId(childChainId);
+	} catch (error) {
+		throw new TaskValidationError(error instanceof Error ? error.message : "childChainId is invalid");
+	}
+	if (value.workspaceMode !== "same-workspace") throw new TaskValidationError("workspaceMode is invalid");
+	if (value.allowNestedSpawn !== false) throw new TaskValidationError("nested spawn is disabled");
+	return {
+		schema: TASK_SPEC_V2_SCHEMA,
+		taskId,
+		parent: validateTaskParentChainRefV2(value.parent),
+		parentGoalId: validateParentGoalId(value.parentGoalId),
+		childChainId,
+		role: validateTaskRole(value.role),
+		prompt: requireNonEmptyString(value.prompt, "prompt"),
+		expectedResult: requireNonEmptyString(value.expectedResult, "expectedResult"),
+		workspaceMode: "same-workspace",
+		allowNestedSpawn: false,
+		createdAt: requireIso(value.createdAt, "createdAt"),
+	};
+}
+
+export function validateTaskSpec(value: unknown): TaskSpec {
+	if (!isRecord(value)) throw new TaskValidationError("Task spec must be an object");
+	if (value.schema === TASK_SPEC_V1_SCHEMA) return validateTaskSpecV1(value);
+	if (value.schema === TASK_SPEC_V2_SCHEMA) return validateTaskSpecV2(value);
+	throw new TaskValidationError("Task spec schema is unsupported");
+}
+
+function legacyTaskToken(value: string): string {
+	return createHash("sha256").update(value, "utf8").digest("hex").slice(0, 20);
+}
+
+export function upcastTaskSpec(specInput: TaskSpec): TaskSpecV2 {
+	const spec = validateTaskSpec(specInput);
+	if (spec.schema === TASK_SPEC_V2_SCHEMA) {
+		return { ...spec, parent: { ...spec.parent } };
+	}
+	const parentToken = legacyTaskToken(spec.parentSessionId);
+	return {
+		schema: TASK_SPEC_V2_SCHEMA,
+		taskId: spec.taskId,
+		parent: {
+			chainId: `chain_legacy_${parentToken}`,
+			branchId: `branch_legacy_${parentToken}`,
+			segmentId: `legacy-${parentToken}`,
+			entryId: spec.parentEntryId,
+		},
+		parentGoalId: spec.parentGoalId,
+		childChainId: `chain_legacy_${legacyTaskToken(spec.taskId)}`,
+		role: spec.role,
+		prompt: spec.prompt,
+		expectedResult: spec.expectedResult,
+		workspaceMode: "same-workspace",
+		allowNestedSpawn: false,
+		createdAt: spec.createdAt,
 	};
 }
 
@@ -400,7 +539,7 @@ export function validateTaskReadModel(value: unknown): TaskReadModel {
 		})(),
 		sequence: value.sequence,
 		baseHash: value.baseHash,
-		spec: validateTaskSpecV1(value.spec),
+		spec: validateTaskSpec(value.spec),
 		status: status as TaskStatus,
 		createdAt: requireIso(value.createdAt, "createdAt"),
 		...(value.startedAt === undefined ? {} : { startedAt: requireIso(value.startedAt, "startedAt") }),

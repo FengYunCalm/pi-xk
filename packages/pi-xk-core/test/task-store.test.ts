@@ -9,7 +9,9 @@ import {
 	TaskRecoveryRequiredError,
 	type TaskResultEnvelopeV1,
 	type TaskSpecV1,
+	type TaskSpecV2,
 	TaskStore,
+	upcastTaskSpec,
 } from "../src/index.ts";
 
 const tempDirs: string[] = [];
@@ -47,6 +49,27 @@ function createResult(taskId: string): TaskResultEnvelopeV1 {
 	};
 }
 
+function createSpecV2(taskId: string): TaskSpecV2 {
+	return {
+		schema: "pi-xk.task.spec.v2",
+		taskId,
+		parent: {
+			chainId: "chain_parent",
+			branchId: "branch_parent",
+			segmentId: "segment-parent",
+			entryId: "entry-parent",
+		},
+		parentGoalId: null,
+		childChainId: `chain_${taskId}`,
+		role: "implementation",
+		prompt: "Implement one chain-bound change.",
+		expectedResult: "A concise chain-bound report.",
+		workspaceMode: "same-workspace",
+		allowNestedSpawn: false,
+		createdAt: "2026-07-22T00:00:00.000Z",
+	};
+}
+
 async function createStore(): Promise<{ store: TaskStore; projectRoot: string }> {
 	const projectRoot = join(tmpdir(), `pi-xk-task-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 	await mkdir(projectRoot, { recursive: true });
@@ -62,6 +85,25 @@ afterEach(async () => {
 });
 
 describe("TaskStore", () => {
+	it("stores V2 facts while replaying V1 bytes and hashes unchanged", async () => {
+		const { store, projectRoot } = await createStore();
+		const legacy = createSpec("task_v1_replay");
+		await store.createTask(legacy, { eventId: "evt-v1", idempotencyKey: "create:v1" });
+		const legacyPath = join(projectRoot, ".pi-xk", "tasks", legacy.taskId, "events.jsonl");
+		const beforeReplay = await readFile(legacyPath, "utf8");
+		const legacyReplay = await store.replayTask(legacy.taskId);
+		expect(await readFile(legacyPath, "utf8")).toBe(beforeReplay);
+		expect(legacyReplay.events[0]?.hash).toBe(JSON.parse(beforeReplay.trim()).hash);
+		expect(upcastTaskSpec(legacyReplay.spec)).toMatchObject({
+			schema: "pi-xk.task.spec.v2",
+			parent: { entryId: legacy.parentEntryId },
+		});
+
+		const current = createSpecV2("task_v2_replay");
+		await store.createTask(current, { eventId: "evt-v2", idempotencyKey: "create:v2" });
+		expect((await store.replayTask(current.taskId)).spec).toEqual(current);
+	});
+
 	it("creates, starts, and completes a hash-chained Task", async () => {
 		const { store } = await createStore();
 		const spec = createSpec("task_happy_path");

@@ -1,4 +1,4 @@
-import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -117,6 +117,104 @@ describe("GoalStore", () => {
 		await expect(store.createGoal({ ...contract, title: "Different payload" }, options)).rejects.toBeInstanceOf(
 			GoalIdempotencyConflictError,
 		);
+	});
+
+	it("publishes the initial event without following a stale destination and repairs projections on retry", async () => {
+		const { store, projectRoot } = await createStore();
+		const contract = createContract("goal_create_recovery");
+		const goalDirectory = join(projectRoot, ".pi-xk", "goals", contract.goalId);
+		const eventsPath = join(goalDirectory, "events.jsonl");
+		const projectionPath = join(goalDirectory, "contract.json");
+		const objectivePath = join(goalDirectory, "goal-objective.md");
+		await mkdir(goalDirectory, { recursive: true });
+		await symlink("missing/events.jsonl", eventsPath);
+
+		const created = await store.createGoal(contract, {
+			eventId: "evt-create-recovery",
+			idempotencyKey: "create:goal-create-recovery",
+		});
+		expect((await store.replayGoal(contract.goalId)).events).toHaveLength(1);
+
+		await Promise.all([rm(projectionPath), rm(objectivePath)]);
+		const retry = await store.createGoal(contract, {
+			eventId: "evt-create-recovery-retry",
+			idempotencyKey: "create:goal-create-recovery",
+		});
+
+		expect(retry).toEqual(created);
+		expect(JSON.parse(await readFile(projectionPath, "utf8"))).toMatchObject({
+			sequence: 1,
+			baseHash: created.head.hash,
+			contract,
+		});
+		expect(await readFile(objectivePath, "utf8")).toContain(contract.objective);
+	});
+
+	it("rejects contract updates after a Goal has ended", async () => {
+		const { store } = await createStore();
+		const contract = createContract("goal_ended_contract_update");
+		const created = await store.createGoal(contract, {
+			eventId: "evt-create-ended-contract-update",
+			idempotencyKey: "create:ended-contract-update",
+		});
+		const activated = await store.appendLifecycleEvent(
+			contract.goalId,
+			{ eventType: "goal_activated", payload: { sessionId: contract.ownerSessionId } },
+			{
+				eventId: "evt-activate-ended-contract-update",
+				idempotencyKey: "activate:ended-contract-update",
+				expectedHead: created.head,
+			},
+		);
+		const ended = await store.appendLifecycleEvent(
+			contract.goalId,
+			{
+				eventType: "goal_ended",
+				payload: {
+					outcome: "completed",
+					reason: "the required acceptance is complete",
+					verifiedAcceptanceIds: ["A-1"],
+					finalEvidence: "The required acceptance was verified.",
+					finalSummary: "The Goal is complete.",
+				},
+			},
+			{
+				eventId: "evt-end-ended-contract-update",
+				idempotencyKey: "end:ended-contract-update",
+				expectedHead: activated.head,
+			},
+		);
+
+		await expect(
+			store.updateGoalContract(
+				{ ...contract, title: "Must remain immutable after end" },
+				{
+					eventId: "evt-update-ended-contract-update",
+					idempotencyKey: "update:ended-contract-update",
+					expectedHead: ended.head,
+				},
+			),
+		).rejects.toThrow("ended Goal");
+	});
+
+	it("rejects contract owner changes that would invalidate Goal file identity", async () => {
+		const { store } = await createStore();
+		const contract = createContract("goal_owner_immutable");
+		const created = await store.createGoal(contract, {
+			eventId: "evt-create-owner-immutable",
+			idempotencyKey: "create:owner-immutable",
+		});
+
+		await expect(
+			store.updateGoalContract(
+				{ ...contract, ownerSessionId: "session-other" },
+				{
+					eventId: "evt-update-owner-immutable",
+					idempotencyKey: "update:owner-immutable",
+					expectedHead: created.head,
+				},
+			),
+		).rejects.toThrow("ownerSessionId");
 	});
 
 	it("appends an idempotent checkpoint without changing the current contract", async () => {

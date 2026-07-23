@@ -2,7 +2,9 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
+import { SessionChainStore } from "../../../pi-xk-core/src/index.ts";
 import { TaskRunner } from "../../../pi-xk-extension/src/task-runner.ts";
+import { SessionManager } from "../../src/core/session-manager.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
 describe("Pi-XK TaskRunner", () => {
@@ -35,6 +37,7 @@ describe("Pi-XK TaskRunner", () => {
 			agentDir: join(harness.tempDir, "agent"),
 			modelRuntime: harness.modelRuntime,
 			settingsManager: harness.settingsManager,
+			createSessionManagerAt: (cwd, sessionFile, options) => SessionManager.createAt(cwd, sessionFile, options),
 			onSettled: () => {
 				lifecycleOrder.push("settled");
 			},
@@ -43,8 +46,12 @@ describe("Pi-XK TaskRunner", () => {
 			role: "verification",
 			prompt: "Verify one behavior.",
 			expectedResult: "A structured verification result.",
-			parentSessionId: "session-parent",
-			parentEntryId: "entry-parent",
+			parentChain: {
+				chainId: "chain_parent",
+				branchId: "branch_parent",
+				segmentId: "segment-parent",
+				entryId: "entry-parent",
+			},
 			parentGoalId: "goal_parent",
 			model: harness.getModel(),
 			thinkingLevel: "medium",
@@ -63,6 +70,18 @@ describe("Pi-XK TaskRunner", () => {
 		expect(transcript).toContain(".pi-xk/goals/goal_parent/goal-objective.md");
 		expect(transcript).toContain(".pi-xk/goals/goal_parent/goal-state.md");
 		const inspected = await runner.getStore().inspectTask(handle.taskId);
+		expect(inspected.replay.spec).toMatchObject({
+			schema: "pi-xk.task.spec.v2",
+			parent: { chainId: "chain_parent", branchId: "branch_parent", segmentId: "segment-parent" },
+		});
+		if (inspected.replay.spec.schema !== "pi-xk.task.spec.v2") throw new Error("expected TaskSpecV2");
+		expect(handle.childSessionFile).toContain(
+			join(".pi-xk", "sessions", "chains", inspected.replay.spec.childChainId),
+		);
+		const childChain = await new SessionChainStore(harness.tempDir).replayChain(inspected.replay.spec.childChainId);
+		expect(childChain.branches[0]?.headSegmentId).toBe(handle.childSessionId);
+		expect(transcript).toContain("pi-xk.session-chain-link");
+		expect(existsSync(join(harness.tempDir, ".pi-xk", "tasks", handle.taskId, "session"))).toBe(false);
 		expect(inspected.result).toMatchObject({
 			status: "succeeded",
 			summary: "Child verified the requested behavior.",

@@ -2,9 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
 	type TaskResultEnvelopeV1,
 	type TaskSpecV1,
+	type TaskSpecV2,
 	TaskValidationError,
+	upcastTaskSpec,
 	validateTaskResultEnvelopeV1,
 	validateTaskSpecV1,
+	validateTaskSpecV2,
 } from "../src/index.ts";
 
 function createSpec(): TaskSpecV1 {
@@ -40,6 +43,27 @@ function createResult(): TaskResultEnvelopeV1 {
 	};
 }
 
+function createSpecV2(): TaskSpecV2 {
+	return {
+		schema: "pi-xk.task.spec.v2",
+		taskId: "task_contract_v2",
+		parent: {
+			chainId: "chain_parent",
+			branchId: "branch_parent",
+			segmentId: "segment-parent",
+			entryId: "entry-parent",
+		},
+		parentGoalId: "goal_parent",
+		childChainId: "chain_child",
+		role: "verification",
+		prompt: "Verify the V2 Task contract.",
+		expectedResult: "A chain-bound result envelope.",
+		workspaceMode: "same-workspace",
+		allowNestedSpawn: false,
+		createdAt: "2026-07-22T00:00:00.000Z",
+	};
+}
+
 describe("Task contracts", () => {
 	it("strictly validates TaskSpecV1", () => {
 		expect(validateTaskSpecV1(createSpec())).toEqual(createSpec());
@@ -47,6 +71,33 @@ describe("Task contracts", () => {
 		expect(() => validateTaskSpecV1({ ...createSpec(), taskId: "../task" })).toThrow("task_<safe-id>");
 		expect(() => validateTaskSpecV1({ ...createSpec(), role: "planner" })).toThrow("role");
 		expect(() => validateTaskSpecV1({ ...createSpec(), allowNestedSpawn: true })).toThrow("nested spawn");
+	});
+
+	it("strictly validates TaskSpecV2 chain references", () => {
+		expect(validateTaskSpecV2(createSpecV2())).toEqual(createSpecV2());
+		expect(() => validateTaskSpecV2({ ...createSpecV2(), parentSessionId: "legacy" })).toThrow(TaskValidationError);
+		expect(() =>
+			validateTaskSpecV2({
+				...createSpecV2(),
+				parent: { ...createSpecV2().parent, chainId: "../outside" },
+			}),
+		).toThrow("chain_<safe-id>");
+		expect(() => validateTaskSpecV2({ ...createSpecV2(), childChainId: "child" })).toThrow("chain_<safe-id>");
+	});
+
+	it("deterministically upcasts V1 without changing its original fields", () => {
+		const legacy = createSpec();
+		const upcast = upcastTaskSpec(legacy);
+
+		expect(upcast).toMatchObject({
+			schema: "pi-xk.task.spec.v2",
+			taskId: legacy.taskId,
+			parent: { entryId: legacy.parentEntryId },
+			parentGoalId: legacy.parentGoalId,
+			role: legacy.role,
+		});
+		expect(upcastTaskSpec(legacy)).toEqual(upcast);
+		expect(legacy).toEqual(createSpec());
 	});
 
 	it("validates TaskResultEnvelopeV1 and terminal error rules", () => {

@@ -21,14 +21,23 @@ import {
 	type TaskReplay,
 	type TaskRole,
 	type TaskStatus,
-	type TaskStore,
+	TaskStore,
 	validateGoalLifecycleEventForContract,
 } from "pi-xk-core";
 import { Type } from "typebox";
 import { createGoalDraftReviewComponent, type GoalDraftReviewAction } from "./goal-ui.ts";
+import {
+	isPiXkSessionChainBinding,
+	type PiXkSessionChainBindingV1,
+	type SessionChainGateState,
+} from "./session-chain-controller.ts";
 import { TaskRunner, type TaskRunnerHandle, type TaskRunnerOptions, type TaskRunnerStartInput } from "./task-runner.ts";
 
 export { TaskRunner, type TaskRunnerHandle, type TaskRunnerOptions, type TaskRunnerStartInput };
+export {
+	createPiXkSessionChainExtension,
+	type PiXkSessionChainExtensionOptions,
+} from "./session-chain-extension.ts";
 
 import {
 	assertPiXkSessionLink,
@@ -551,6 +560,8 @@ export interface PiXkGoalExtensionOptions {
 	createTaskRunner?: (projectRoot: string, onSettled: TaskRunnerOptions["onSettled"]) => TaskRunner;
 	/** Optional non-fatal diagnostic receiver for Goal command and lifecycle errors. */
 	onGoalError?: (error: Error) => void;
+	/** Production composition hook: defer the next active Goal run while Session Chain rolls over. */
+	shouldDeferGoalContinuation?: (ctx: ExtensionContext) => boolean | Promise<boolean>;
 }
 
 function normalizeError(error: unknown): Error {
@@ -574,6 +585,13 @@ function findCurrentGoalBinding(ctx: ExtensionContext): PiXkSessionLink | undefi
 		) {
 			return entry.data;
 		}
+	}
+	return undefined;
+}
+
+function findCurrentSessionChainBinding(ctx: ExtensionContext): PiXkSessionChainBindingV1 | undefined {
+	for (const entry of [...ctx.sessionManager.getBranch()].reverse()) {
+		if (entry.type === "custom" && isPiXkSessionChainBinding(entry.data)) return entry.data;
 	}
 	return undefined;
 }
@@ -615,6 +633,42 @@ function findLatestTaskLink(ctx: ExtensionContext, taskId?: string): PiXkTaskLin
 	return undefined;
 }
 
+function taskBelongsToContext(replay: TaskReplay, ctx: ExtensionContext): boolean {
+	if (replay.spec.schema === "pi-xk.task.spec.v1") {
+		return replay.spec.parentSessionId === ctx.sessionManager.getSessionId();
+	}
+	const binding = findCurrentSessionChainBinding(ctx);
+	return (
+		binding !== undefined &&
+		replay.spec.parent.chainId === binding.chainId &&
+		replay.spec.parent.branchId === binding.branchId
+	);
+}
+
+async function findTaskForContext(
+	store: TaskStore,
+	ctx: ExtensionContext,
+	taskId?: string,
+): Promise<TaskReplay | undefined> {
+	const link = findLatestTaskLink(ctx, taskId);
+	if (link) {
+		const replay = await store.replayTask(link.taskId);
+		return taskBelongsToContext(replay, ctx) ? replay : undefined;
+	}
+	if (taskId) {
+		const replay = await store.replayTask(taskId);
+		return taskBelongsToContext(replay, ctx) ? replay : undefined;
+	}
+	const binding = findCurrentSessionChainBinding(ctx);
+	if (!binding) return undefined;
+	const candidates = (await store.listTasks({ parentChainId: binding.chainId }))
+		.filter(
+			(replay) => replay.spec.schema === "pi-xk.task.spec.v2" && replay.spec.parent.branchId === binding.branchId,
+		)
+		.sort((left, right) => Date.parse(right.spec.createdAt) - Date.parse(left.spec.createdAt));
+	return candidates[0];
+}
+
 function hasTaskResultMessage(ctx: ExtensionContext, terminalEventId: string): boolean {
 	return ctx.sessionManager
 		.getEntries()
@@ -625,6 +679,28 @@ function hasTaskResultMessage(ctx: ExtensionContext, terminalEventId: string): b
 				isObjectRecord(entry.details) &&
 				entry.details.terminalEventId === terminalEventId,
 		);
+}
+
+export async function getPiXkSessionChainGateState(ctx: ExtensionContext): Promise<SessionChainGateState> {
+	const latestLink = findLatestTaskLink(ctx);
+	const task = latestLink ? await new TaskStore(ctx.cwd).replayTask(latestLink.taskId) : undefined;
+	const terminal = task?.events.at(-1);
+	const taskResultPending =
+		task !== undefined &&
+		task.events[0]?.actor === "model" &&
+		task.status !== "pending" &&
+		task.status !== "running" &&
+		terminal !== undefined &&
+		!hasTaskResultMessage(ctx, terminal.eventId);
+	const goalBinding = findCurrentGoalBinding(ctx);
+	return {
+		taskRunning: task?.status === "pending" || task?.status === "running",
+		taskResultPending,
+		goalDraftPending:
+			findCurrentGoalCapture(ctx)?.state === "open" || isOutstandingGoalDraft(findCurrentGoalDraft(ctx)),
+		goalLifecycleIntentPending:
+			goalBinding !== undefined && findPendingGoalLifecycleIntent(ctx, goalBinding) !== undefined,
+	};
 }
 
 function findCurrentGoalCapture(ctx: ExtensionContext): PiXkGoalCapture | undefined {
@@ -1771,6 +1847,8 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 		let goalStatusTimer: ReturnType<typeof setInterval> | undefined;
 		let goalStatusContext: ExtensionContext | undefined;
 		let goalStatusSnapshot: GoalStatusSnapshot | undefined;
+		let treeGoalBinding: PiXkSessionLink | undefined;
+		let treeGoalDraft: PiXkGoalDraft | undefined;
 		const runtimeNonce = randomUUID();
 		let acceptsTaskCallbacks = true;
 		const taskParents = new Map<string, TaskParentState>();
@@ -1848,6 +1926,7 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 			if (runner.getActiveTaskId()) throw new Error(`Task ${runner.getActiveTaskId()} is already running`);
 			if (!ctx.model) throw new Error("no parent model is selected");
 			const binding = findCurrentGoalBinding(ctx);
+			const chainBinding = findCurrentSessionChainBinding(ctx);
 			const builtinTools = pi
 				.getActiveTools()
 				.filter((toolName) => ["read", "bash", "edit", "write", "grep", "find", "ls"].includes(toolName));
@@ -1855,8 +1934,19 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 				role,
 				prompt,
 				expectedResult,
-				parentSessionId: ctx.sessionManager.getSessionId(),
-				parentEntryId: ctx.sessionManager.getLeafId() ?? ctx.sessionManager.getSessionId(),
+				...(chainBinding
+					? {
+							parentChain: {
+								chainId: chainBinding.chainId,
+								branchId: chainBinding.branchId,
+								segmentId: chainBinding.segmentId,
+								entryId: ctx.sessionManager.getLeafId() ?? chainBinding.segmentId,
+							},
+						}
+					: {
+							parentSessionId: ctx.sessionManager.getSessionId(),
+							parentEntryId: ctx.sessionManager.getLeafId() ?? ctx.sessionManager.getSessionId(),
+						}),
 				parentGoalId: binding?.goalId ?? null,
 				model: ctx.model,
 				thinkingLevel: pi.getThinkingLevel(),
@@ -1887,11 +1977,7 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 		};
 
 		const currentTaskReplay = async (ctx: ExtensionContext, taskId?: string): Promise<TaskReplay | undefined> => {
-			const link = findLatestTaskLink(ctx, taskId);
-			if (!link) return undefined;
-			const replay = await runnerFor(ctx.cwd).getStore().replayTask(link.taskId);
-			if (replay.spec.parentSessionId !== ctx.sessionManager.getSessionId()) return undefined;
-			return replay;
+			return findTaskForContext(runnerFor(ctx.cwd).getStore(), ctx, taskId);
 		};
 
 		const reconcileSessionTasks = async (ctx: ExtensionContext): Promise<void> => {
@@ -1899,7 +1985,7 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 			const store = runnerFor(ctx.cwd).getStore();
 			for (const taskId of taskIds) {
 				let replay = await store.replayTask(taskId);
-				if (replay.spec.parentSessionId !== ctx.sessionManager.getSessionId()) continue;
+				if (!taskBelongsToContext(replay, ctx)) continue;
 				if (replay.status === "pending" || replay.status === "running") {
 					replay = await store.recoverTaskOnStartup(
 						taskId,
@@ -1947,23 +2033,42 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 		};
 
 		const renderGoalStatus = () => {
-			if (!goalStatusContext?.hasUI) return;
-			goalStatusContext.ui.setStatus(
-				PI_XK_GOAL_STATUS_KEY,
-				goalStatusSnapshot
-					? formatGoalFooterStatus(goalStatusSnapshot, (options.now?.() ?? new Date()).getTime())
-					: undefined,
-			);
+			const context = goalStatusContext;
+			if (!context) return;
+			try {
+				if (!context.hasUI) return;
+				context.ui.setStatus(
+					PI_XK_GOAL_STATUS_KEY,
+					goalStatusSnapshot
+						? formatGoalFooterStatus(goalStatusSnapshot, (options.now?.() ?? new Date()).getTime())
+						: undefined,
+				);
+			} catch {
+				// A reload/session replacement invalidates the old context while a
+				// detached status timer may still have one callback queued.
+				clearGoalStatusTimer();
+				if (goalStatusContext === context) {
+					goalStatusContext = undefined;
+					goalStatusSnapshot = undefined;
+				}
+			}
 		};
 
 		const synchronizeGoalStatusTimer = () => {
-			if (goalStatusSnapshot?.status === "active" && goalStatusContext?.hasUI) {
-				if (goalStatusTimer !== undefined) return;
-				goalStatusTimer = setInterval(renderGoalStatus, 1_000);
-				goalStatusTimer.unref?.();
-				return;
+			try {
+				if (goalStatusSnapshot?.status === "active" && goalStatusContext?.hasUI) {
+					if (goalStatusTimer !== undefined) return;
+					goalStatusTimer = setInterval(renderGoalStatus, 1_000);
+					goalStatusTimer.unref?.();
+					return;
+				}
+			} catch {
+				goalStatusContext = undefined;
+				goalStatusSnapshot = undefined;
 			}
-			clearGoalStatusTimer();
+			if (goalStatusTimer !== undefined) {
+				clearGoalStatusTimer();
+			}
 		};
 
 		const refreshGoalStatus = async (ctx: ExtensionContext): Promise<void> => {
@@ -2044,6 +2149,62 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 			}
 			await settleGoalLifecycleIntent(pi, ctx, storeFor, options);
 			return true;
+		};
+
+		const processRecoverableGoalLifecycleIntent = async (ctx: ExtensionContext): Promise<boolean> => {
+			const binding = findCurrentGoalBinding(ctx);
+			if (!binding) return false;
+			const intent = findPendingGoalLifecycleIntent(ctx, binding);
+			if (!intent) return false;
+			if (intent.action === "start") {
+				appendRejectedGoalLifecycleIntent(pi, intent, goalNow(options));
+				return true;
+			}
+			return await processPendingGoalLifecycleIntent(ctx);
+		};
+
+		const rejectPendingGoalLifecycleIntent = (ctx: ExtensionContext): boolean => {
+			const binding = findCurrentGoalBinding(ctx);
+			if (!binding) return false;
+			const intent = findPendingGoalLifecycleIntent(ctx, binding);
+			if (!intent) return false;
+			appendRejectedGoalLifecycleIntent(pi, intent, goalNow(options));
+			return true;
+		};
+
+		const reconcileBoundGoalDraft = async (ctx: ExtensionContext): Promise<void> => {
+			const binding = findCurrentGoalBinding(ctx);
+			const draft = findCurrentGoalDraft(ctx);
+			if (!binding || !draft || !isOutstandingGoalDraft(draft)) return;
+			const replay = await storeFor(ctx.cwd).replayGoal(binding.goalId);
+			if (replay.lifecycle.status === "ended") return;
+			if (draft.state === "confirming" && draft.goalId === binding.goalId && draft.proposal !== null) {
+				appendGoalDraft(
+					pi,
+					createPiXkGoalDraft({
+						draftId: draft.draftId,
+						state: "confirmed",
+						objective: draft.objective,
+						revisionFeedback: draft.revisionFeedback,
+						proposal: draft.proposal,
+						goalId: binding.goalId,
+						createdAt: goalNow(options),
+					}),
+				);
+				return;
+			}
+			appendGoalDraft(
+				pi,
+				createPiXkGoalDraft({
+					draftId: draft.draftId,
+					state: "cancelled",
+					objective: draft.objective,
+					revisionFeedback: draft.revisionFeedback,
+					proposal: draft.proposal,
+					goalId: null,
+					createdAt: goalNow(options),
+				}),
+			);
 		};
 
 		pi.registerTool({
@@ -2270,7 +2431,7 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 			},
 		});
 
-		pi.on("session_start", async (_event, ctx) => {
+		pi.on("session_start", async (event, ctx) => {
 			try {
 				await reconcileSessionTasks(ctx);
 			} catch (error) {
@@ -2278,9 +2439,28 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 			}
 			try {
 				await synchronizeCheckpointState(pi, ctx, checkpointOptions);
-				await recoverOpenGoalRun(ctx, storeFor, options);
-				await processPendingGoalLifecycleIntent(ctx);
+				if (event.reason !== "rollover") {
+					await recoverOpenGoalRun(ctx, storeFor, options);
+					await processRecoverableGoalLifecycleIntent(ctx);
+					rejectPendingGoalLifecycleIntent(ctx);
+				}
+			} catch (error) {
+				notifyGoalError(ctx, options, error);
+			}
+			try {
+				if (event.reason !== "rollover") {
+					await pauseActiveGoalForRuntime(
+						ctx,
+						storeFor,
+						options,
+						event.reason === "startup"
+							? "Pi session start recovered an active Goal."
+							: `Pi session start after ${event.reason}.`,
+					);
+					await reconcileBoundGoalDraft(ctx);
+				}
 				await refreshGoalStatus(ctx);
+				if (event.reason === "rollover") await continueActiveGoal(pi, ctx, storeFor);
 			} catch (error) {
 				notifyGoalError(ctx, options, error);
 			}
@@ -2382,12 +2562,12 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 					await refreshGoalStatus(ctx);
 					return;
 				}
-				await settleGoalRun(ctx, storeFor, options);
-
 				if (lastGoalRunOutcome === "aborted") {
+					await pauseActiveGoalForRuntime(ctx, storeFor, options, "Pi agent run aborted before Goal completion.");
 					await refreshGoalStatus(ctx);
 					return;
 				}
+				await settleGoalRun(ctx, storeFor, options);
 				if (lastGoalRunOutcome === "error") {
 					consecutiveGoalFailures += 1;
 					scheduleRetry(ctx, retryDelay(consecutiveGoalFailures));
@@ -2395,6 +2575,10 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 					return;
 				}
 				consecutiveGoalFailures = 0;
+				if (await options.shouldDeferGoalContinuation?.(ctx)) {
+					await refreshGoalStatus(ctx);
+					return;
+				}
 				await continueActiveGoal(pi, ctx, storeFor);
 				await refreshGoalStatus(ctx);
 			} catch (error) {
@@ -2412,14 +2596,70 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 				notifyGoalError(ctx, options, error);
 				return { cancel: true };
 			}
+			treeGoalBinding = findCurrentGoalBinding(ctx);
+			treeGoalDraft = findCurrentGoalDraft(ctx);
+			if (!treeGoalBinding) return;
+			try {
+				await synchronizeCheckpointState(pi, ctx, checkpointOptions);
+				await processRecoverableGoalLifecycleIntent(ctx);
+				rejectPendingGoalLifecycleIntent(ctx);
+				await pauseActiveGoalForRuntime(ctx, storeFor, options, "Pi session tree navigation paused the Goal.");
+			} catch (error) {
+				treeGoalBinding = undefined;
+				treeGoalDraft = undefined;
+				notifyGoalError(ctx, options, error);
+				return { cancel: true };
+			}
 		});
-
+		pi.on("session_tree", async (_event, ctx) => {
+			const binding = treeGoalBinding;
+			const sourceDraft = treeGoalDraft;
+			treeGoalBinding = undefined;
+			treeGoalDraft = undefined;
+			try {
+				if (binding) {
+					const currentBinding = findCurrentGoalBinding(ctx);
+					if (!currentBinding || !isSameBinding(currentBinding, binding)) {
+						pi.appendEntry(PI_XK_SESSION_LINK_CUSTOM_TYPE, binding);
+					}
+				}
+				const currentDraft = findCurrentGoalDraft(ctx);
+				if (binding && sourceDraft?.state === "confirmed" && sourceDraft.goalId === binding.goalId) {
+					if (currentDraft?.state !== "confirmed" || currentDraft.goalId !== binding.goalId) {
+						appendGoalDraft(pi, createPiXkGoalDraft(sourceDraft));
+					}
+				} else if (currentDraft && isOutstandingGoalDraft(currentDraft)) {
+					appendGoalDraft(
+						pi,
+						createPiXkGoalDraft({
+							draftId: currentDraft.draftId,
+							state: "cancelled",
+							objective: currentDraft.objective,
+							revisionFeedback: currentDraft.revisionFeedback,
+							proposal: currentDraft.proposal,
+							goalId: null,
+							createdAt: goalNow(options),
+						}),
+					);
+				}
+				const currentCapture = findCurrentGoalCapture(ctx);
+				if (currentCapture?.state === "open") {
+					pi.appendEntry(
+						PI_XK_SESSION_LINK_CUSTOM_TYPE,
+						createPiXkGoalCapture(currentCapture.captureId, "cancelled", goalNow(options)),
+					);
+				}
+				await refreshGoalStatus(ctx);
+			} catch (error) {
+				notifyGoalError(ctx, options, error);
+			}
+		});
 		pi.on("session_shutdown", async (_event, ctx) => {
 			clearRetryTimer();
 			clearGoalStatusTimer();
 			try {
 				const task = await currentTaskReplay(ctx);
-				if (task?.status === "running") {
+				if (_event.reason !== "rollover" && task?.status === "running") {
 					const parent = taskParents.get(task.taskId);
 					if (parent) parent.autoResume = false;
 					let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -2449,14 +2689,28 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 			acceptsTaskCallbacks = false;
 			try {
 				await synchronizeCheckpointState(pi, ctx, checkpointOptions);
-				await processPendingGoalLifecycleIntent(ctx);
+				if (_event.reason !== "rollover") {
+					await processRecoverableGoalLifecycleIntent(ctx);
+					rejectPendingGoalLifecycleIntent(ctx);
+				}
 			} catch (error) {
 				notifyGoalError(ctx, options, error);
-			} finally {
-				goalStatusSnapshot = undefined;
-				renderGoalStatus();
-				goalStatusContext = undefined;
 			}
+			if (_event.reason !== "rollover") {
+				try {
+					await pauseActiveGoalForRuntime(ctx, storeFor, options, `Pi session shutdown: ${_event.reason}.`);
+				} catch (error) {
+					notifyGoalError(ctx, options, error);
+				}
+				try {
+					await reconcileBoundGoalDraft(ctx);
+				} catch (error) {
+					notifyGoalError(ctx, options, error);
+				}
+			}
+			goalStatusSnapshot = undefined;
+			renderGoalStatus();
+			goalStatusContext = undefined;
 		});
 		pi.on("input", async (event, ctx) => {
 			try {

@@ -1043,6 +1043,13 @@ export class GoalStore {
 		}
 	}
 
+	private async removeInitialGoalFiles(paths: GoalPaths): Promise<void> {
+		await Promise.all([
+			rm(join(paths.goalDirectory, "goal-objective.md"), { force: true }),
+			rm(join(paths.goalDirectory, "goal-state.md"), { force: true }),
+		]);
+	}
+
 	private buildEvent(
 		contract: GoalContractV2,
 		eventType: GoalContractEventType,
@@ -1144,11 +1151,31 @@ export class GoalStore {
 			if (existing) {
 				if (existing.tailDiagnostic) throw new GoalRecoveryRequiredError(contract.goalId);
 				const retry = this.ensureRetryMatches(existing, event);
-				if (retry) return retry;
+				if (retry) {
+					await writeGoalObjectiveProjection(paths.goalDirectory, existing.contract);
+					await this.writeDerivedProjections(paths, existing);
+					return retry;
+				}
 				throw new GoalAlreadyExistsError(contract.goalId);
 			}
 			await createGoalFiles(paths.goalDirectory, contract);
-			await this.appendEvent(paths, event);
+			try {
+				await this.replaceEvents(paths, `${stableJsonStringify(event)}\n`);
+			} catch (error) {
+				// A rename can succeed while directory sync reports an error. Preserve a
+				// valid event in that case; otherwise remove files created by this attempt
+				// so the same idempotency key can be retried cleanly.
+				let eventPublished = false;
+				try {
+					const recovered = await this.readReplay(paths, contract.goalId);
+					eventPublished =
+						recovered.events.length === 1 && this.ensureRetryMatches(recovered, event) !== undefined;
+				} catch {
+					eventPublished = false;
+				}
+				if (!eventPublished) await this.removeInitialGoalFiles(paths);
+				throw error;
+			}
 			const replay: GoalReplay = {
 				goalId: contract.goalId,
 				contract,
@@ -1257,6 +1284,12 @@ export class GoalStore {
 			}
 			if (contract.createdAt !== replay.contract.createdAt) {
 				throw new GoalValidationError("Goal updates cannot change createdAt");
+			}
+			if (contract.ownerSessionId !== replay.contract.ownerSessionId) {
+				throw new GoalValidationError("Goal updates cannot change ownerSessionId");
+			}
+			if (replay.lifecycle.status === "ended") {
+				throw new GoalValidationError("ended Goal contracts cannot be updated");
 			}
 			await this.appendEvent(paths, event);
 			const nextReplay: GoalReplay = {

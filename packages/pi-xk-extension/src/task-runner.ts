@@ -17,11 +17,17 @@ import {
 	type TaskReplay,
 	type TaskResultEnvelopeV1,
 	type TaskRole,
-	type TaskSpecV1,
+	type TaskSpec,
+	type TaskSpecV2,
 	type TaskStatus,
 	TaskStore,
 } from "pi-xk-core";
 import { type Static, Type } from "typebox";
+import {
+	type CreateSessionManagerAt,
+	createSessionChainId,
+	SessionChainController,
+} from "./session-chain-controller.ts";
 
 const finishParameters = Type.Object({
 	status: Type.Union([Type.Literal("succeeded"), Type.Literal("failed")]),
@@ -41,12 +47,10 @@ const finishParameters = Type.Object({
 
 type FinishTaskInput = Static<typeof finishParameters>;
 
-export interface TaskRunnerStartInput {
+interface TaskRunnerStartCommon {
 	role: TaskRole;
 	prompt: string;
 	expectedResult: string;
-	parentSessionId: string;
-	parentEntryId: string;
 	parentGoalId: string | null;
 	model: Model<any>;
 	thinkingLevel: ThinkingLevel;
@@ -55,12 +59,27 @@ export interface TaskRunnerStartInput {
 	onEvent?: (replay: TaskReplay, eventId: string) => void | Promise<void>;
 }
 
+export type TaskRunnerStartInput = TaskRunnerStartCommon &
+	(
+		| {
+				parentChain: TaskSpecV2["parent"];
+				parentSessionId?: never;
+				parentEntryId?: never;
+		  }
+		| {
+				parentChain?: never;
+				parentSessionId: string;
+				parentEntryId: string;
+		  }
+	);
+
 export interface TaskRunnerOptions {
 	projectRoot: string;
 	agentDir?: string;
 	modelRuntime?: ModelRuntime;
 	settingsManager?: SettingsManager;
 	store?: TaskStore;
+	createSessionManagerAt?: CreateSessionManagerAt;
 	onSettled?: (taskId: string, status: TaskStatus) => void | Promise<void>;
 }
 
@@ -83,7 +102,7 @@ interface ActiveChild {
 	terminalWrite?: Promise<void>;
 }
 
-function taskPrompt(spec: TaskSpecV1): string {
+function taskPrompt(spec: TaskSpec): string {
 	const goalContext =
 		spec.parentGoalId === null
 			? []
@@ -101,6 +120,13 @@ function taskPrompt(spec: TaskSpecV1): string {
 		`Task ID: ${spec.taskId}`,
 		`Role: ${spec.role}`,
 		`Expected result: ${spec.expectedResult}`,
+		...(spec.schema === "pi-xk.task.spec.v2"
+			? [
+					`Parent chain: ${spec.parent.chainId}/${spec.parent.branchId}/${spec.parent.segmentId}`,
+					`Parent entry: ${spec.parent.entryId}`,
+					`Child chain: ${spec.childChainId}`,
+				]
+			: []),
 		...goalContext,
 		"Task prompt:",
 		spec.prompt,
@@ -117,6 +143,7 @@ export class TaskRunner {
 	private readonly modelRuntime: ModelRuntime | undefined;
 	private readonly settingsManager: SettingsManager | undefined;
 	private readonly store: TaskStore;
+	private readonly createSessionManagerAt: CreateSessionManagerAt | undefined;
 	private readonly onSettled: ((taskId: string, status: TaskStatus) => void | Promise<void>) | undefined;
 	private readonly active = new Map<string, ActiveChild>();
 
@@ -126,6 +153,7 @@ export class TaskRunner {
 		this.modelRuntime = options.modelRuntime;
 		this.settingsManager = options.settingsManager;
 		this.store = options.store ?? new TaskStore(options.projectRoot);
+		this.createSessionManagerAt = options.createSessionManagerAt;
 		this.onSettled = options.onSettled;
 	}
 
@@ -140,19 +168,34 @@ export class TaskRunner {
 	async start(input: TaskRunnerStartInput): Promise<TaskRunnerHandle> {
 		if (this.getActiveTaskId()) throw new Error("A Task is already running for this parent session");
 		const taskId = `task_${randomUUID().replaceAll("-", "").slice(0, 20)}`;
-		const spec: TaskSpecV1 = {
-			schema: "pi-xk.task.spec.v1",
-			taskId,
-			parentSessionId: input.parentSessionId,
-			parentEntryId: input.parentEntryId,
-			parentGoalId: input.parentGoalId,
-			role: input.role,
-			prompt: input.prompt,
-			expectedResult: input.expectedResult,
-			workspaceMode: "same-workspace",
-			allowNestedSpawn: false,
-			createdAt: new Date().toISOString(),
-		};
+		const createdAt = new Date().toISOString();
+		const spec: TaskSpec = input.parentChain
+			? {
+					schema: "pi-xk.task.spec.v2",
+					taskId,
+					parent: { ...input.parentChain },
+					parentGoalId: input.parentGoalId,
+					childChainId: createSessionChainId(),
+					role: input.role,
+					prompt: input.prompt,
+					expectedResult: input.expectedResult,
+					workspaceMode: "same-workspace",
+					allowNestedSpawn: false,
+					createdAt,
+				}
+			: {
+					schema: "pi-xk.task.spec.v1",
+					taskId,
+					parentSessionId: input.parentSessionId,
+					parentEntryId: input.parentEntryId,
+					parentGoalId: input.parentGoalId,
+					role: input.role,
+					prompt: input.prompt,
+					expectedResult: input.expectedResult,
+					workspaceMode: "same-workspace",
+					allowNestedSpawn: false,
+					createdAt,
+				};
 		const created = await this.store.createTask(spec, {
 			eventId: `${taskId}:created`,
 			idempotencyKey: `${taskId}:created`,
@@ -161,8 +204,19 @@ export class TaskRunner {
 		await input.onEvent?.(await this.store.replayTask(taskId), created.event.eventId);
 		let childSession: AgentSession | undefined;
 		try {
-			const sessionDir = join(this.projectRoot, ".pi-xk", "tasks", taskId, "session");
-			const sessionManager = SessionManager.create(this.projectRoot, sessionDir);
+			const legacySessionDir = join(this.projectRoot, ".pi-xk", "tasks", taskId, "session");
+			const sessionManager =
+				spec.schema === "pi-xk.task.spec.v2"
+					? (
+							await new SessionChainController({
+								projectRoot: this.projectRoot,
+								...(this.createSessionManagerAt ? { createSessionManagerAt: this.createSessionManagerAt } : {}),
+							}).createManagedRoot({
+								chainId: spec.childChainId,
+								title: `Task ${taskId}`,
+							})
+						).sessionManager
+					: SessionManager.create(this.projectRoot, legacySessionDir);
 			const settingsManager = this.settingsManager ?? SettingsManager.create(this.projectRoot, this.agentDir);
 			const resourceLoader = new DefaultResourceLoader({
 				cwd: this.projectRoot,
@@ -174,7 +228,7 @@ export class TaskRunner {
 			await resourceLoader.reload();
 			const childInfoBase = {
 				childSessionId: sessionManager.getSessionId(),
-				childSessionFile: sessionManager.getSessionFile() ?? join(sessionDir, "child.jsonl"),
+				childSessionFile: sessionManager.getSessionFile() ?? join(legacySessionDir, "child.jsonl"),
 				provider: input.model.provider,
 				modelId: input.model.id,
 				thinkingLevel: input.thinkingLevel,
@@ -254,7 +308,7 @@ export class TaskRunner {
 		}
 	}
 
-	private async runChild(spec: TaskSpecV1, active: ActiveChild): Promise<TaskStatus> {
+	private async runChild(spec: TaskSpec, active: ActiveChild): Promise<TaskStatus> {
 		let finalStatus: TaskStatus = "running";
 		try {
 			await active.session.prompt(taskPrompt(spec));
