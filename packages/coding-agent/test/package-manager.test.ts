@@ -1118,6 +1118,7 @@ Content`,
 		it("should recognize github URLs without git: prefix", async () => {
 			const events: ProgressEvent[] = [];
 			packageManager.setProgressCallback((event) => events.push(event));
+			const runCommandSpy = vi.spyOn(packageManager as any, "runCommand").mockResolvedValue(undefined);
 			const previousGitTerminalPrompt = process.env.GIT_TERMINAL_PROMPT;
 			process.env.GIT_TERMINAL_PROMPT = "0";
 
@@ -1138,6 +1139,11 @@ Content`,
 
 			// Should have attempted clone, not thrown unsupported error
 			expect(events.some((e) => e.type === "start" && e.action === "install")).toBe(true);
+			expect(runCommandSpy).toHaveBeenCalledWith("git", [
+				"clone",
+				"https://github.com/nonexistent/repo",
+				expect.any(String),
+			]);
 		});
 
 		it("should parse package source types from docs examples", () => {
