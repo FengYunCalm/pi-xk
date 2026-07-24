@@ -1830,8 +1830,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 		return models;
 	} catch (error) {
 		console.error("Failed to load models.dev data:", error);
-		if (generatorOptions.strict) throw error;
-		return [];
+		throw error;
 	}
 }
 

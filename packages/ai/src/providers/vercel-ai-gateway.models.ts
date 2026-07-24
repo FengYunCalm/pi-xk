@@ -161,6 +161,14 @@ export const VERCEL_AI_GATEWAY_MODELS = values as {
 		id: "anthropic/claude-opus-4.8-fast";
 		provider: "vercel-ai-gateway";
 	};
+	"anthropic/claude-opus-5": Model<"anthropic-messages"> & {
+		id: "anthropic/claude-opus-5";
+		provider: "vercel-ai-gateway";
+	};
+	"anthropic/claude-opus-5-fast": Model<"anthropic-messages"> & {
+		id: "anthropic/claude-opus-5-fast";
+		provider: "vercel-ai-gateway";
+	};
 	"anthropic/claude-sonnet-4": Model<"anthropic-messages"> & {
 		id: "anthropic/claude-sonnet-4";
 		provider: "vercel-ai-gateway";
@@ -265,6 +273,14 @@ export const VERCEL_AI_GATEWAY_MODELS = values as {
 		id: "google/gemini-3.5-flash";
 		provider: "vercel-ai-gateway";
 	};
+	"google/gemini-3.5-flash-lite": Model<"anthropic-messages"> & {
+		id: "google/gemini-3.5-flash-lite";
+		provider: "vercel-ai-gateway";
+	};
+	"google/gemini-3.6-flash": Model<"anthropic-messages"> & {
+		id: "google/gemini-3.6-flash";
+		provider: "vercel-ai-gateway";
+	};
 	"google/gemma-4-26b-a4b-it": Model<"anthropic-messages"> & {
 		id: "google/gemma-4-26b-a4b-it";
 		provider: "vercel-ai-gateway";
@@ -279,6 +295,10 @@ export const VERCEL_AI_GATEWAY_MODELS = values as {
 	};
 	"inception/mercury-coder-small": Model<"anthropic-messages"> & {
 		id: "inception/mercury-coder-small";
+		provider: "vercel-ai-gateway";
+	};
+	"inclusionai/ling-3.0-flash-free": Model<"anthropic-messages"> & {
+		id: "inclusionai/ling-3.0-flash-free";
 		provider: "vercel-ai-gateway";
 	};
 	"interfaze/interfaze-beta": Model<"anthropic-messages"> & {
@@ -629,6 +649,14 @@ export const VERCEL_AI_GATEWAY_MODELS = values as {
 		id: "openai/o4-mini";
 		provider: "vercel-ai-gateway";
 	};
+	"poolside/laguna-s-2.1": Model<"anthropic-messages"> & {
+		id: "poolside/laguna-s-2.1";
+		provider: "vercel-ai-gateway";
+	};
+	"poolside/laguna-s-2.1-free": Model<"anthropic-messages"> & {
+		id: "poolside/laguna-s-2.1-free";
+		provider: "vercel-ai-gateway";
+	};
 	"sakana/fugu-ultra": Model<"anthropic-messages"> & {
 		id: "sakana/fugu-ultra";
 		provider: "vercel-ai-gateway";
@@ -639,6 +667,10 @@ export const VERCEL_AI_GATEWAY_MODELS = values as {
 	};
 	"stepfun/step-3.7-flash": Model<"anthropic-messages"> & {
 		id: "stepfun/step-3.7-flash";
+		provider: "vercel-ai-gateway";
+	};
+	"tencent/hy3": Model<"anthropic-messages"> & {
+		id: "tencent/hy3";
 		provider: "vercel-ai-gateway";
 	};
 	"thinkingmachines/inkling": Model<"anthropic-messages"> & {

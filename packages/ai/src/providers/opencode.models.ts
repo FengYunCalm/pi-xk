@@ -37,6 +37,10 @@ export const OPENCODE_MODELS = values as {
 		id: "claude-opus-4-8";
 		provider: "opencode";
 	};
+	"claude-opus-5": Model<"anthropic-messages"> & {
+		id: "claude-opus-5";
+		provider: "opencode";
+	};
 	"claude-sonnet-4": Model<"anthropic-messages"> & {
 		id: "claude-sonnet-4";
 		provider: "opencode";
@@ -75,6 +79,14 @@ export const OPENCODE_MODELS = values as {
 	};
 	"gemini-3.5-flash": Model<"google-generative-ai"> & {
 		id: "gemini-3.5-flash";
+		provider: "opencode";
+	};
+	"gemini-3.5-flash-lite": Model<"google-generative-ai"> & {
+		id: "gemini-3.5-flash-lite";
+		provider: "opencode";
+	};
+	"gemini-3.6-flash": Model<"google-generative-ai"> & {
+		id: "gemini-3.6-flash";
 		provider: "opencode";
 	};
 	"glm-5": Model<"openai-completions"> & {
@@ -173,10 +185,6 @@ export const OPENCODE_MODELS = values as {
 		id: "grok-build-0.1";
 		provider: "opencode";
 	};
-	"hy3-free": Model<"openai-completions"> & {
-		id: "hy3-free";
-		provider: "opencode";
-	};
 	"kimi-k2.5": Model<"openai-completions"> & {
 		id: "kimi-k2.5";
 		provider: "opencode";
@@ -187,6 +195,14 @@ export const OPENCODE_MODELS = values as {
 	};
 	"kimi-k2.7-code": Model<"openai-completions"> & {
 		id: "kimi-k2.7-code";
+		provider: "opencode";
+	};
+	"laguna-s-2.1-free": Model<"openai-completions"> & {
+		id: "laguna-s-2.1-free";
+		provider: "opencode";
+	};
+	"ling-3.0-flash-free": Model<"openai-completions"> & {
+		id: "ling-3.0-flash-free";
 		provider: "opencode";
 	};
 	"mimo-v2.5-free": Model<"openai-completions"> & {

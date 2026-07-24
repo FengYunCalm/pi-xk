@@ -85,6 +85,14 @@ export const OPENROUTER_MODELS = values as {
 		id: "anthropic/claude-opus-4.8-fast";
 		provider: "openrouter";
 	};
+	"anthropic/claude-opus-5": Model<"openai-completions"> & {
+		id: "anthropic/claude-opus-5";
+		provider: "openrouter";
+	};
+	"anthropic/claude-opus-5-fast": Model<"openai-completions"> & {
+		id: "anthropic/claude-opus-5-fast";
+		provider: "openrouter";
+	};
 	"anthropic/claude-sonnet-4": Model<"openai-completions"> & {
 		id: "anthropic/claude-sonnet-4";
 		provider: "openrouter";
@@ -229,6 +237,14 @@ export const OPENROUTER_MODELS = values as {
 		id: "google/gemini-3.5-flash";
 		provider: "openrouter";
 	};
+	"google/gemini-3.5-flash-lite": Model<"openai-completions"> & {
+		id: "google/gemini-3.5-flash-lite";
+		provider: "openrouter";
+	};
+	"google/gemini-3.6-flash": Model<"openai-completions"> & {
+		id: "google/gemini-3.6-flash";
+		provider: "openrouter";
+	};
 	"google/gemma-3-12b-it": Model<"openai-completions"> & {
 		id: "google/gemma-3-12b-it";
 		provider: "openrouter";
@@ -269,6 +285,10 @@ export const OPENROUTER_MODELS = values as {
 		id: "inclusionai/ling-2.6-flash";
 		provider: "openrouter";
 	};
+	"inclusionai/ling-3.0-flash:free": Model<"openai-completions"> & {
+		id: "inclusionai/ling-3.0-flash:free";
+		provider: "openrouter";
+	};
 	"inclusionai/ring-2.6-1t": Model<"openai-completions"> & {
 		id: "inclusionai/ring-2.6-1t";
 		provider: "openrouter";
@@ -283,6 +303,10 @@ export const OPENROUTER_MODELS = values as {
 	};
 	"kwaipilot/kat-coder-pro-v2.5": Model<"openai-completions"> & {
 		id: "kwaipilot/kat-coder-pro-v2.5";
+		provider: "openrouter";
+	};
+	"meituan/longcat-2.0": Model<"openai-completions"> & {
+		id: "meituan/longcat-2.0";
 		provider: "openrouter";
 	};
 	"meta-llama/llama-3.1-70b-instruct": Model<"openai-completions"> & {
@@ -733,6 +757,14 @@ export const OPENROUTER_MODELS = values as {
 		id: "poolside/laguna-m.1:free";
 		provider: "openrouter";
 	};
+	"poolside/laguna-s-2.1": Model<"openai-completions"> & {
+		id: "poolside/laguna-s-2.1";
+		provider: "openrouter";
+	};
+	"poolside/laguna-s-2.1:free": Model<"openai-completions"> & {
+		id: "poolside/laguna-s-2.1:free";
+		provider: "openrouter";
+	};
 	"poolside/laguna-xs-2.1": Model<"openai-completions"> & {
 		id: "poolside/laguna-xs-2.1";
 		provider: "openrouter";
@@ -951,10 +983,6 @@ export const OPENROUTER_MODELS = values as {
 	};
 	"tencent/hy3-preview": Model<"openai-completions"> & {
 		id: "tencent/hy3-preview";
-		provider: "openrouter";
-	};
-	"tencent/hy3:free": Model<"openai-completions"> & {
-		id: "tencent/hy3:free";
 		provider: "openrouter";
 	};
 	"thedrummer/unslopnemo-12b": Model<"openai-completions"> & {

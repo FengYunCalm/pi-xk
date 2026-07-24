@@ -56,9 +56,12 @@ type BuiltinModelApi<
 export function getBuiltinModel<TProvider extends BuiltinProvider, TModelId extends keyof (typeof MODELS)[TProvider]>(
 	provider: TProvider,
 	modelId: TModelId,
-): Model<BuiltinModelApi<TProvider, TModelId>> {
+): Model<BuiltinModelApi<TProvider, TModelId>>;
+/** Runtime catalogs can omit older or provider-specific IDs; keep those reads dynamically typed. */
+export function getBuiltinModel(provider: BuiltinProvider, modelId: string): Model<Api>;
+export function getBuiltinModel(provider: BuiltinProvider, modelId: string): Model<Api> {
 	const models = MODELS[provider] as Record<string, Model<Api>> | undefined;
-	return models?.[modelId as string] as Model<BuiltinModelApi<TProvider, TModelId>>;
+	return models?.[modelId] as Model<Api>;
 }
 
 export function getBuiltinProviders(): BuiltinProvider[] {
