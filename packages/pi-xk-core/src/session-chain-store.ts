@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
+import type { Dirent } from "node:fs";
 import { type FileHandle, mkdir, open, readdir, readFile, rename, rm, unlink } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
-import { ArtifactStore } from "./artifact-store.ts";
+import { ArtifactStore, validateArtifactMetadata } from "./artifact-store.ts";
 import {
 	assertSessionBranchId,
 	assertSessionChainArtifactId,
@@ -9,14 +10,18 @@ import {
 	assertSessionChainId,
 	assertSessionSegmentId,
 	type BranchCreatedPayloadV1,
+	CHAIN_ROLLUP_SCHEMA,
 	type ChainMetadataUpdatedPayloadV1,
 	isSessionChainRecord,
 	type RolloverAbortedPayloadV1,
 	type RolloverCommittedPayloadV1,
 	type RolloverPreparedPayloadV1,
+	type RollupFailedPayloadV1,
+	type RollupPublishedPayloadV1,
 	SEGMENT_SUMMARY_SCHEMA,
 	SESSION_CHAIN_CATALOG_SCHEMA,
 	SESSION_CHAIN_EVENT_SCHEMA,
+	SESSION_CHAIN_EVENT_V2_SCHEMA,
 	type SegmentSummaryV1,
 	type SessionBranchProjectionV1,
 	type SessionChainActor,
@@ -26,6 +31,7 @@ import {
 	type SessionChainEventType,
 	type SessionChainHead,
 	type SessionChainReadModelV1,
+	type SessionChainRollupV1,
 	type SessionChainSpecV1,
 	SessionChainValidationError,
 	type SessionSegmentDescriptorV1,
@@ -35,6 +41,7 @@ import {
 	validateSessionChainExactKeys,
 	validateSessionChainNonEmptyString,
 	validateSessionChainNonNegativeInteger,
+	validateSessionChainRollupV1,
 	validateSessionChainSpecV1,
 	validateSessionChainTimestamp,
 	validateSessionChainTitle,
@@ -155,7 +162,7 @@ export interface SessionChainWriteResult {
 }
 
 interface SessionChainEventWithoutHash {
-	schema: typeof SESSION_CHAIN_EVENT_SCHEMA;
+	schema: typeof SESSION_CHAIN_EVENT_SCHEMA | typeof SESSION_CHAIN_EVENT_V2_SCHEMA;
 	eventId: string;
 	chainId: string;
 	sequence: number;
@@ -164,7 +171,7 @@ interface SessionChainEventWithoutHash {
 	timestamp: string;
 	prevHash: string | null;
 	payload: SessionChainEvent["payload"];
-	schemaVersion: 1;
+	schemaVersion: 1 | 2;
 	idempotencyKey: string;
 }
 
@@ -197,6 +204,8 @@ function cloneBranch(branch: SessionBranchProjectionV1): SessionBranchProjection
 			location: { ...segment.location },
 			...(segment.seal ? { seal: { ...segment.seal } } : {}),
 		})),
+		rollups: branch.rollups.map((rollup) => ({ ...rollup })),
+		rollupFailures: branch.rollupFailures.map((failure) => ({ ...failure })),
 		...(branch.pendingRollover
 			? {
 					pendingRollover: {
@@ -338,6 +347,65 @@ function validateMetadataPayload(value: unknown): ChainMetadataUpdatedPayloadV1 
 	return { title: validateSessionChainTitle(value.title) };
 }
 
+function requirePositiveInteger(value: unknown, field: string): number {
+	const number = validateSessionChainNonNegativeInteger(value, field);
+	if (number === 0) throw new SessionChainValidationError(`${field} must be positive`);
+	return number;
+}
+
+function validateRollupPublishedPayload(value: unknown): RollupPublishedPayloadV1 {
+	if (!isSessionChainRecord(value)) {
+		throw new SessionChainValidationError("rollup_published payload must be an object");
+	}
+	validateSessionChainExactKeys(
+		value,
+		["branchId", "windowIndex", "startOrdinal", "endOrdinal", "artifactId", "sourceDigest"],
+		"rollup_published payload",
+	);
+	const branchId = validateSessionChainNonEmptyString(value.branchId, "branchId");
+	assertSessionBranchId(branchId);
+	const startOrdinal = requirePositiveInteger(value.startOrdinal, "startOrdinal");
+	const endOrdinal = requirePositiveInteger(value.endOrdinal, "endOrdinal");
+	if (endOrdinal < startOrdinal) throw new SessionChainValidationError("Rollup ordinal range must be ordered");
+	return {
+		branchId,
+		windowIndex: requirePositiveInteger(value.windowIndex, "windowIndex"),
+		startOrdinal,
+		endOrdinal,
+		artifactId: assertSessionChainArtifactId(value.artifactId, "artifactId"),
+		sourceDigest: assertSessionChainHash(value.sourceDigest, "sourceDigest"),
+	};
+}
+
+function validateRollupFailedPayload(value: unknown): RollupFailedPayloadV1 {
+	if (!isSessionChainRecord(value)) {
+		throw new SessionChainValidationError("rollup_failed payload must be an object");
+	}
+	validateSessionChainExactKeys(
+		value,
+		["branchId", "windowIndex", "startOrdinal", "endOrdinal", "stage", "errorCode", "retryable", "attempt"],
+		"rollup_failed payload",
+	);
+	const branchId = validateSessionChainNonEmptyString(value.branchId, "branchId");
+	assertSessionBranchId(branchId);
+	const startOrdinal = requirePositiveInteger(value.startOrdinal, "startOrdinal");
+	const endOrdinal = requirePositiveInteger(value.endOrdinal, "endOrdinal");
+	if (endOrdinal < startOrdinal) throw new SessionChainValidationError("Rollup ordinal range must be ordered");
+	if (typeof value.retryable !== "boolean") {
+		throw new SessionChainValidationError("retryable must be a boolean");
+	}
+	return {
+		branchId,
+		windowIndex: requirePositiveInteger(value.windowIndex, "windowIndex"),
+		startOrdinal,
+		endOrdinal,
+		stage: validateSessionChainNonEmptyString(value.stage, "stage"),
+		errorCode: validateSessionChainNonEmptyString(value.errorCode, "errorCode"),
+		retryable: value.retryable,
+		attempt: requirePositiveInteger(value.attempt, "attempt"),
+	};
+}
+
 function parsePayload(eventType: SessionChainEventType, value: unknown): SessionChainEvent["payload"] {
 	if (eventType === "chain_created") {
 		if (!isSessionChainRecord(value))
@@ -349,6 +417,8 @@ function parsePayload(eventType: SessionChainEventType, value: unknown): Session
 	if (eventType === "rollover_committed") return validateCommittedPayload(value);
 	if (eventType === "rollover_aborted") return validateAbortedPayload(value);
 	if (eventType === "branch_created") return validateBranchPayload(value);
+	if (eventType === "rollup_published") return validateRollupPublishedPayload(value);
+	if (eventType === "rollup_failed") return validateRollupFailedPayload(value);
 	return validateMetadataPayload(value);
 }
 
@@ -372,7 +442,9 @@ function parseEvent(value: unknown, lineNumber: number): SessionChainEvent {
 	];
 	try {
 		validateSessionChainExactKeys(value, required, `Session Chain event ${lineNumber}`);
-		if (value.schema !== SESSION_CHAIN_EVENT_SCHEMA || value.schemaVersion !== 1) {
+		const isV1 = value.schema === SESSION_CHAIN_EVENT_SCHEMA && value.schemaVersion === 1;
+		const isV2 = value.schema === SESSION_CHAIN_EVENT_V2_SCHEMA && value.schemaVersion === 2;
+		if (!isV1 && !isV2) {
 			throw new SessionChainValidationError("event schema is unsupported");
 		}
 		const chainId = validateSessionChainNonEmptyString(value.chainId, "chainId");
@@ -388,12 +460,20 @@ function parseEvent(value: unknown, lineNumber: number): SessionChainEvent {
 				"rollover_aborted",
 				"branch_created",
 				"chain_metadata_updated",
+				"rollup_published",
+				"rollup_failed",
 			].includes(eventType)
 		) {
 			throw new SessionChainValidationError("eventType is invalid");
 		}
+		if (isV1 && (eventType === "rollup_published" || eventType === "rollup_failed")) {
+			throw new SessionChainValidationError("Rollup events require event schema v2");
+		}
+		if (isV2 && eventType !== "rollup_published" && eventType !== "rollup_failed") {
+			throw new SessionChainValidationError("event schema v2 is reserved for Rollup events");
+		}
 		const withoutHash: SessionChainEventWithoutHash = {
-			schema: SESSION_CHAIN_EVENT_SCHEMA,
+			schema: isV2 ? SESSION_CHAIN_EVENT_V2_SCHEMA : SESSION_CHAIN_EVENT_SCHEMA,
 			eventId: validateSessionChainNonEmptyString(value.eventId, "eventId"),
 			chainId,
 			sequence,
@@ -402,7 +482,7 @@ function parseEvent(value: unknown, lineNumber: number): SessionChainEvent {
 			timestamp: validateSessionChainTimestamp(value.timestamp, "timestamp"),
 			prevHash: value.prevHash === null ? null : assertSessionChainHash(value.prevHash, "prevHash"),
 			payload: parsePayload(eventType, value.payload),
-			schemaVersion: 1,
+			schemaVersion: isV2 ? 2 : 1,
 			idempotencyKey: validateSessionChainNonEmptyString(value.idempotencyKey, "idempotencyKey"),
 		};
 		const hash = assertSessionChainHash(value.hash, "hash");
@@ -549,7 +629,36 @@ function applyEvent(
 			},
 			headSegmentId: payload.segment.segmentId,
 			segments: [{ ...cloneSegment(payload.segment), status: "active" }],
+			rollups: [],
+			rollupFailures: [],
 		});
+		return title;
+	}
+	if (event.eventType === "rollup_published") {
+		const payload = event.payload;
+		const branch = requireBranch(branches, payload.branchId);
+		if (branch.rollups.some((rollup) => rollup.windowIndex === payload.windowIndex)) {
+			throw new SessionChainLifecycleTransitionError(`Rollup window already exists: ${payload.windowIndex}`);
+		}
+		const previous = branch.rollups.at(-1);
+		const expectedWindow = (previous?.windowIndex ?? 0) + 1;
+		const expectedStart = (previous?.endOrdinal ?? 0) + 1;
+		if (payload.windowIndex !== expectedWindow || payload.startOrdinal !== expectedStart) {
+			throw new SessionChainLifecycleTransitionError("Rollup windows must be contiguous and ordered");
+		}
+		for (let ordinal = payload.startOrdinal; ordinal <= payload.endOrdinal; ordinal++) {
+			const segment = branch.segments.find((candidate) => candidate.ordinal === ordinal);
+			if (!segment || segment.status !== "sealed" || !segment.seal) {
+				throw new SessionChainLifecycleTransitionError(`Rollup source Segment S${ordinal} is not sealed`);
+			}
+		}
+		branch.rollups.push({ ...payload, eventId: event.eventId, publishedAt: event.timestamp });
+		return title;
+	}
+	if (event.eventType === "rollup_failed") {
+		const payload = event.payload;
+		const branch = requireBranch(branches, payload.branchId);
+		branch.rollupFailures.push({ ...payload, eventId: event.eventId, failedAt: event.timestamp });
 		return title;
 	}
 	if (event.eventType === "chain_metadata_updated") return event.payload.title;
@@ -573,6 +682,8 @@ function project(events: readonly SessionChainEvent[]): {
 			forkedFrom: null,
 			headSegmentId: spec.rootSegment.segmentId,
 			segments: [{ ...cloneSegment(spec.rootSegment), status: "active" }],
+			rollups: [],
+			rollupFailures: [],
 		},
 	];
 	let title = spec.title;
@@ -806,6 +917,88 @@ export class SessionChainStore {
 		}
 	}
 
+	async putChainRollup(rollupInput: SessionChainRollupV1): Promise<string> {
+		const rollup = validateSessionChainRollupV1(rollupInput);
+		const metadata = await this.artifacts.put({
+			contentType: "application/json",
+			value: rollup,
+			producer: CHAIN_ROLLUP_SCHEMA,
+			sensitivity: "internal",
+			sourceIds: [rollup.chainId, rollup.branchId, ...rollup.segmentIds, ...rollup.summaryArtifactIds],
+			createdAt: rollup.provenance.generatedAt,
+		});
+		return metadata.artifactId;
+	}
+
+	async readChainRollup(artifactId: string): Promise<SessionChainRollupV1> {
+		assertSessionChainArtifactId(artifactId, "artifactId");
+		const stored = await this.artifacts.read(artifactId);
+		try {
+			return validateSessionChainRollupV1(JSON.parse(stored.content) as unknown);
+		} catch (error) {
+			throw new SessionChainCorruptionError(
+				`Session Chain Rollup artifact is invalid: ${error instanceof Error ? error.message : artifactId}`,
+			);
+		}
+	}
+
+	async findChainRollupArtifacts(input: {
+		chainId: string;
+		branchId: string;
+		windowIndex: number;
+		sourceDigest?: string;
+	}): Promise<string[]> {
+		assertSessionChainId(input.chainId);
+		assertSessionBranchId(input.branchId);
+		if (!Number.isInteger(input.windowIndex) || input.windowIndex <= 0) {
+			throw new SessionChainValidationError("Rollup windowIndex must be positive");
+		}
+		if (input.sourceDigest !== undefined) assertSessionChainHash(input.sourceDigest, "sourceDigest");
+		const objectsDirectory = join(this.projectRoot, ".pi-xk", "artifacts", "objects");
+		let prefixes: Dirent[];
+		try {
+			prefixes = await readdir(objectsDirectory, { withFileTypes: true });
+		} catch (error) {
+			if (isErrno(error, "ENOENT")) return [];
+			throw error;
+		}
+		const matches: string[] = [];
+		for (const prefix of prefixes
+			.filter((entry) => entry.isDirectory())
+			.sort((left, right) => left.name.localeCompare(right.name))) {
+			const directory = join(objectsDirectory, prefix.name);
+			const files = (await readdir(directory, { withFileTypes: true }))
+				.filter((entry) => entry.isFile() && /^[a-f0-9]{64}\.json$/.test(entry.name))
+				.sort((left, right) => left.name.localeCompare(right.name));
+			for (const file of files) {
+				let metadata: ReturnType<typeof validateArtifactMetadata>;
+				try {
+					metadata = validateArtifactMetadata(
+						JSON.parse(await readFile(join(directory, file.name), "utf8")) as unknown,
+					);
+				} catch {
+					continue;
+				}
+				if (metadata.producer !== CHAIN_ROLLUP_SCHEMA) continue;
+				let rollup: SessionChainRollupV1;
+				try {
+					rollup = await this.readChainRollup(metadata.artifactId);
+				} catch {
+					continue;
+				}
+				if (
+					rollup.chainId === input.chainId &&
+					rollup.branchId === input.branchId &&
+					rollup.windowIndex === input.windowIndex &&
+					(input.sourceDigest === undefined || rollup.sourceDigest === input.sourceDigest)
+				) {
+					matches.push(metadata.artifactId);
+				}
+			}
+		}
+		return matches.sort();
+	}
+
 	async createChain(
 		specInput: SessionChainSpecV1,
 		options: SessionChainMutationOptions,
@@ -896,24 +1089,53 @@ export class SessionChainStore {
 		return await this.append(chainId, "chain_metadata_updated", validateMetadataPayload(payloadInput), options);
 	}
 
+	async appendRollupPublished(
+		chainId: string,
+		payloadInput: RollupPublishedPayloadV1,
+		options: SessionChainAppendOptions,
+	): Promise<SessionChainWriteResult> {
+		const payload = validateRollupPublishedPayload(payloadInput);
+		const rollup = await this.readChainRollup(payload.artifactId);
+		if (
+			rollup.chainId !== chainId ||
+			rollup.branchId !== payload.branchId ||
+			rollup.windowIndex !== payload.windowIndex ||
+			rollup.startOrdinal !== payload.startOrdinal ||
+			rollup.endOrdinal !== payload.endOrdinal ||
+			rollup.sourceDigest !== payload.sourceDigest
+		) {
+			throw new SessionChainValidationError("Rollup artifact identity does not match the published event");
+		}
+		return await this.append(chainId, "rollup_published", payload, options, 2);
+	}
+
+	async appendRollupFailed(
+		chainId: string,
+		payloadInput: RollupFailedPayloadV1,
+		options: SessionChainAppendOptions,
+	): Promise<SessionChainWriteResult> {
+		return await this.append(chainId, "rollup_failed", validateRollupFailedPayload(payloadInput), options, 2);
+	}
+
 	private async append(
 		chainId: string,
 		eventType: Exclude<SessionChainEventType, "chain_created">,
 		payload: SessionChainEvent["payload"],
 		options: SessionChainAppendOptions,
+		schemaVersion: 1 | 2 = 1,
 	): Promise<SessionChainWriteResult> {
 		const paths = this.paths(chainId);
 		return await this.withFileLock(paths.lockPath, paths.locksDirectory, chainId, async () => {
 			const replay = await this.readReplay(paths, chainId);
 			if (replay.tailDiagnostic) throw new SessionChainRecoveryRequiredError(chainId);
 			const event = createEvent({
-				schema: SESSION_CHAIN_EVENT_SCHEMA,
+				schema: schemaVersion === 2 ? SESSION_CHAIN_EVENT_V2_SCHEMA : SESSION_CHAIN_EVENT_SCHEMA,
 				...this.mutationMeta(chainId, options),
 				sequence: replay.head.sequence + 1,
 				eventType,
 				prevHash: replay.head.hash,
 				payload,
-				schemaVersion: 1,
+				schemaVersion,
 			});
 			const retry = this.retry(replay, event);
 			if (retry) {

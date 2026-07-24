@@ -1,6 +1,6 @@
 # ADR 0004：Task Run v1 单子任务运行器
 
-- 状态：Accepted
+- 状态：Accepted and implemented
 - 日期：2026-07-22
 - 作用域：`pi-xk-core`、`pi-xk-extension`
 

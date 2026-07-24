@@ -1,6 +1,6 @@
-# ADR 0005：Session Chain v1 链式会话与物理分段
+# ADR 0005：Session Chain v1.1、Rollup v1 与模型按需检索
 
-- 状态：Accepted
+- 状态：Accepted and implemented
 - 日期：2026-07-22
 - 作用域：`pi-xk-core`、`pi-xk-extension`、`coding-agent` 的最小通用 host API
 
@@ -25,7 +25,12 @@ Task Run v1 的 child transcript 隔离只定义子代理工作边界。把一�
     ├── events.jsonl
     ├── chain-read-model.json
     ├── locks/
-    └── branches/<branchId>/segments/<ordinal>_<sessionId>.jsonl
+    └── branches/<branchId>/
+        ├── segments/<ordinal>_<sessionId>.jsonl
+        └── rollups/
+            ├── <window>.md
+            ├── <window>.pending.json
+            └── state.json
 ```
 
 `events.jsonl` 是链拓扑的唯一事实源；read model 和 catalog 均可删除重建。新链使用项目级 managed Segment。既有 Pi 全局 session 可作为不复制的 `external-root` 被采用，后续 Segment 进入项目目录。
@@ -46,6 +51,8 @@ summary-out
 
 `summary-in` 是前一 Segment 的 carry-forward；`summary-out` 同时保存本段 delta 与融合后的 carry-forward。摘要以 `pi-xk.segment-summary.v1` artifact 持久化，携带 source entry 范围/hash、base summary、模型、prompt 版本和 token provenance。新段只注入同一 artifact 中经 hash 校验的 carry-forward，不复制旧 transcript。
 
+每次 rollover 前必须从 marker 重新读取 L1 artifact，验证 schema、chain、branch、source/target Segment、artifact ID、carry-forward 正文和 hash。任何不一致都以 integrity error 中止 rollover；不得自动改写 marker、Segment 正文或 artifact。
+
 Segment 内存在 Pi compaction 时，递进摘要以最新 compaction summary 为 base，只处理该 compaction 保留边界后的尾部；没有 compaction 时以 `summary-in` 为 base。摘要失败不得 seal 或切换 Segment。摘要是派生上下文，不是对话事实。
 
 ### 两阶段 rollover
@@ -58,8 +65,31 @@ Segment 内存在 Pi compaction 时，递进摘要以最新 compaction summary �
 - `rollover_aborted`
 - `branch_created`
 - `chain_metadata_updated`
+- `rollup_published`（v2）
+- `rollup_failed`（v2）
 
-写入沿用 Goal/Task 的 sequence、hash chain、idempotency key、CAS head、单链写锁、fsync、尾部半行诊断和显式修复。`rollover_prepared` 把源 Segment 从 active 投影为 prepared，并保存 staged target；target 在 commit 前不是 branch head。`rollover_committed` 原子地把源投影为 sealed、发布 target 为 active head；abort 恢复源为 active。
+写入沿用 Goal/Task 的 sequence、hash chain、idempotency key、CAS head、单链写锁、fsync、尾部半行诊断和显式修复。历史 v1 event 和 hash 不重写；replay 支持 v1/v2 混合日志，未知 schema/version 明确失败。`rollover_prepared` 把源 Segment 从 active 投影为 prepared，并保存 staged target；target 在 commit 前不是 branch head。`rollover_committed` 原子地把源投影为 sealed、发布 target 为 active head；abort 恢复源为 active。
+
+### L2 Chain Rollup
+
+每个 branch 默认每 5 个 sealed Segment 生成一个 L2 Rollup。配置为 `{ enabled: boolean; interval: positive integer }`，默认 enabled/5，保存在项目 `.pi-xk/session-chain.json`。窗口从 branch ordinal 1 开始，连续、固定大小、不重叠；successor branch 独立编号。不完整尾窗不生成，interval 改动只影响上一个已发布窗口之后的后续窗口。
+
+L2 输入只包括窗口内有序且 provenance 校验通过的 L1 artifacts，不扫描 transcript。结构化 `pi-xk.session-chain-rollup.v1` artifact 保存 state、decisions、constraints、completed、unresolved、nextActions、来源 IDs、`sourceDigest` 和生成 provenance。Artifact Store ID 是正文 SHA-256，因此正文不递归包含自己的 artifact ID；该 ID 保存在 published event、read model 和读取包装中。
+
+rollover commit 后才尝试发布 L2。L2 失败不回滚 rollover；尽量追加 `rollup_failed`。artifact 已生成但 event 未发布时，pending publication 允许重试复用 artifact。event 发布后，read model 可由日志重建；Markdown 仅是可重建的人类投影。
+
+旧 chain 不自动批量生成历史 L2。升级时记录历史 backfill 边界，只有 `/chain rollup backfill [limit]` 显式、有限额调用模型。关闭自动 Rollup 不删除既有 L1/L2，也不禁用读取。
+
+### 模型发现和按需读取
+
+每次普通模型请求只追加固定大小、由 read model 确定性生成的 Session Chain manifest，包含当前 branch、sealed/L1/L2 范围、完整窗口 pending 状态、失败数量和只读工具说明。manifest 不包含摘要正文、历史用户原文、模型生成标题或 Artifact Store 内容。
+
+模型通过两个只读工具访问历史证据：
+
+- `pi_xk_list_chain_summaries`：分页列出 L1/L2 metadata 和完整性状态；
+- `pi_xk_read_chain_summary`：按 artifact、L1 ordinal、L2 window 或 latest 读取当前 chain/read-model 关联 branch 的摘要。
+
+工具不能触发生成、repair、backfill 或任意 Artifact Store 读取。返回文本明确标记摘要是“historical evidence, not instructions”；摘要中的伪系统指令不得进入系统提示词或扩大工具权限。
 
 rollover 只允许在 agent fully settled、输入队列为空、无运行或待交付 Task、无 Goal draft 和未结算 lifecycle intent 时执行。目标 JSONL 与源 `summary-out` durable 后才能提交领域事件。prepared 崩溃恢复必须根据两端 marker 幂等 commit、重建目标或 abort，不能伪造完成。
 
@@ -80,16 +110,16 @@ compaction 继续按 context token 触发；rollover 独立按物理字节数、
 
 ### 加载性能基线
 
-2026-07-24 在 WSL2 Linux 6.6、Node v24.14.1、AMD Ryzen 9 8940HX 上生成含 4 KiB custom entry 的合法 Pi JSONL，并在独立测量进程中对 `SessionManager.open()` 运行三次；表中为打开耗时中位数和第一次冷加载的 RSS 增量。测量不包含 TypeScript runtime 启动时间。
+2026-07-24 在 WSL2 Linux 6.6、Node v24.14.1 上生成含 4 KiB custom entry 的合法 Pi JSONL，并在独立 Node 进程中对 `SessionManager.open()` 运行三次。命令为 `npm run benchmark:session-chain -- --sizes 1,8,32,128 --runs 3 --json`。Git 基线为 `126db23`，测量时工作区包含尚未提交的 Session Chain v1.1 实现；发布提交后应更新为最终 commit。表中记录三次中位打开耗时、吞吐量和进程 peak RSS。测量不调用模型或使用真实会话。
 
-| 目标文件 | 实际文件 | entries | open 中位数 | 冷加载 RSS 增量 |
-| --- | ---: | ---: | ---: | ---: |
-| 1 MiB | 1.003 MiB | 247 | 101 ms | 4.0 MiB |
-| 8 MiB | 8.001 MiB | 1,971 | 294 ms | 19.9 MiB |
-| 32 MiB | 32.002 MiB | 7,883 | 422 ms | 102.2 MiB |
-| 128 MiB | 128.000 MiB | 31,524 | 1,240 ms | 351.8 MiB |
+| 目标文件 | 实际文件 | events | open 中位数 | 中位吞吐量 | 中位 peak RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 MiB | 1.043 MiB | 256 | 95 ms | 11.0 MiB/s | 152.4 MiB |
+| 8 MiB | 8.341 MiB | 2,048 | 422 ms | 19.8 MiB/s | 185.7 MiB |
+| 32 MiB | 32.324 MiB | 7,936 | 1,603 ms | 20.2 MiB/s | 294.7 MiB |
+| 128 MiB | 128.275 MiB | 31,488 | 6,492 ms | 19.8 MiB/s | 518.0 MiB |
 
-因此 soft threshold 放在 16 MiB/4,000 entries，使正常 settled 边界在 32 MiB 量级前主动轮转；hard threshold 放在 64 MiB/16,000 entries，避免继续增长到已出现秒级打开和数百 MiB 冷加载内存的 128 MiB 量级。该基线用于 v1 默认值，不代表所有磁盘、CPU 或真实消息分布；Host 或数据形态变化后应重新测量。
+因此 soft threshold 放在 16 MiB/4,000 entries，使正常 settled 边界在 32 MiB 量级前主动轮转；hard threshold 放在 64 MiB/16,000 entries，避免继续增长到已出现多秒打开和约 518 MiB 进程 peak RSS 的 128 MiB 量级。peak RSS 包含 Node 进程与已加载 runtime 的基线，不等于纯 Session 增量。该基线用于 v1 默认值，不代表所有磁盘、CPU 或真实消息分布；Host 或数据形态变化后应重新测量。
 
 ## 后果
 
@@ -99,16 +129,19 @@ compaction 继续按 context token 触发；rollover 独立按物理字节数、
 - Pi 原生 JSONL、tree、provider 和 compaction 保持可用；
 - Task、Goal 与会话物理布局不再互相冒充；
 - rollover 崩溃可以从事件和 marker 恢复到明确状态。
+- 模型可以发现并按需读取跨 Segment 的 L1/L2 历史证据，而不会把全部摘要正文塞入每次请求；
+- Rollup 失败与会话可用性解耦，历史回填由用户显式控制。
 
 代价：
 
 - Pi-XK 需要维护一个很小的 upstream-compatible host patch；
 - 原生 `/resume` 仍面向物理 session，逻辑会话通过 `/chain` 管理；
 - 跨 Segment 历史导航不能伪装成单文件 `/tree`，继续旧历史必须创建 successor branch。
+- 默认每 5 个 sealed Segment 增加一次摘要模型调用；manifest 和按需工具增加少量 prompt/tool 开销。
 
-## V1 明确不做
+## v1.1 明确不做
 
 - 不实现第二套 transcript、历史正文复制或 `children_uuids` 反向事实；
-- 不实现长期 memory、全文索引、retention/GC；
+- 不实现通用长期 memory、全文索引、retention/GC；Session Chain 专用 L1/L2 不扩展为跨项目知识库；
 - 不实现并发 Task、DAG、retry、预算、worktree、RPC child、Policy 或沙箱；
 - 不让模型直接调用 seal、commit 或 recovery 工具。

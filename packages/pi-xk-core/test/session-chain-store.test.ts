@@ -3,9 +3,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+	CHAIN_ROLLUP_SCHEMA,
 	SEGMENT_SUMMARY_SCHEMA,
 	SESSION_CHAIN_SPEC_SCHEMA,
 	type SegmentSummaryV1,
+	type SessionChainRollupV1,
 	type SessionChainSpecV1,
 	type SessionSegmentDescriptorV1,
 } from "../src/session-chain-contract.ts";
@@ -66,6 +68,34 @@ function createSummary(chainId: string): SegmentSummaryV1 {
 			inputTokens: 800,
 			outputTokens: 160,
 			generatedAt: "2026-07-22T00:01:00.000Z",
+		},
+	};
+}
+
+function createRollup(chainId: string, summaryArtifactId: string): SessionChainRollupV1 {
+	return {
+		schema: CHAIN_ROLLUP_SCHEMA,
+		chainId,
+		branchId: "branch_main",
+		windowIndex: 1,
+		startOrdinal: 1,
+		endOrdinal: 1,
+		segmentIds: ["session-root"],
+		summaryArtifactIds: [summaryArtifactId],
+		sourceDigest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+		rollup: {
+			state: "The first Segment is sealed.",
+			decisions: ["Publish a Rollup event."],
+			constraints: ["Keep v1 events unchanged."],
+			completed: ["Window one was summarized."],
+			unresolved: [],
+			nextActions: ["Continue with S2."],
+		},
+		provenance: {
+			generator: "pi-xk",
+			model: "faux/faux-model",
+			promptVersion: "session-chain-rollup-v1",
+			generatedAt: "2026-07-22T00:04:00.000Z",
 		},
 	};
 }
@@ -157,6 +187,109 @@ describe("SessionChainStore", () => {
 			["session-next", "active"],
 		]);
 		expect(branch?.pendingRollover).toBeUndefined();
+	});
+
+	it("replays mixed v1 and v2 events with a verified Rollup artifact", async () => {
+		const { store } = await createStore();
+		const spec = createSpec("chain_rollup_events");
+		const created = await store.createChain(spec, {
+			eventId: "event-created",
+			idempotencyKey: "create:chain_rollup_events",
+		});
+		const summaryArtifactId = await store.putSegmentSummary(createSummary(spec.chainId));
+		const target: SessionSegmentDescriptorV1 = {
+			segmentId: "session-next",
+			ordinal: 2,
+			location: { kind: "managed", fileName: "000002_session-next.jsonl" },
+			predecessorSegmentId: "session-root",
+			summaryInArtifactId: summaryArtifactId,
+			createdAt: "2026-07-22T00:02:00.000Z",
+		};
+		const prepared = await store.appendRolloverPrepared(
+			spec.chainId,
+			{
+				branchId: "branch_main",
+				sourceSegmentId: "session-root",
+				sourceLeafId: "leaf-root",
+				targetSegment: target,
+				summaryArtifactId,
+				reason: "rollup fixture",
+			},
+			{
+				eventId: "event-prepared",
+				idempotencyKey: "rollup-fixture:prepared",
+				expectedHead: created.head,
+			},
+		);
+		const committed = await store.appendRolloverCommitted(
+			spec.chainId,
+			{
+				branchId: "branch_main",
+				sourceSegmentId: "session-root",
+				targetSegmentId: "session-next",
+				sourceSeal: {
+					bytes: 4096,
+					fileHash: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+					leafId: "summary-out-entry",
+					summaryArtifactId,
+					summaryOutEntryId: "summary-out-entry",
+				},
+				targetMarkers: { chainLinkEntryId: "chain-link-entry", summaryInEntryId: "summary-in-entry" },
+			},
+			{
+				eventId: "event-committed",
+				idempotencyKey: "rollup-fixture:committed",
+				expectedHead: prepared.head,
+			},
+		);
+		const rollup = createRollup(spec.chainId, summaryArtifactId);
+		const artifactId = await store.putChainRollup(rollup);
+		expect(
+			await store.findChainRollupArtifacts({
+				chainId: spec.chainId,
+				branchId: "branch_main",
+				windowIndex: 1,
+				sourceDigest: rollup.sourceDigest,
+			}),
+		).toEqual([artifactId]);
+		const published = await store.appendRollupPublished(
+			spec.chainId,
+			{
+				branchId: "branch_main",
+				windowIndex: 1,
+				startOrdinal: 1,
+				endOrdinal: 1,
+				artifactId,
+				sourceDigest: rollup.sourceDigest,
+			},
+			{
+				eventId: "event-rollup",
+				idempotencyKey: "rollup-fixture:published",
+				expectedHead: committed.head,
+			},
+		);
+		await store.appendMetadataUpdated(
+			spec.chainId,
+			{ title: "After Rollup" },
+			{
+				eventId: "event-after-rollup",
+				idempotencyKey: "rollup-fixture:metadata",
+				expectedHead: published.head,
+			},
+		);
+
+		const replay = await store.replayChain(spec.chainId);
+		expect(replay.events.map((event) => [event.schemaVersion, event.eventType])).toEqual([
+			[1, "chain_created"],
+			[1, "rollover_prepared"],
+			[1, "rollover_committed"],
+			[2, "rollup_published"],
+			[1, "chain_metadata_updated"],
+		]);
+		expect(replay.branches[0]?.rollups).toEqual([
+			expect.objectContaining({ artifactId, windowIndex: 1, startOrdinal: 1, endOrdinal: 1 }),
+		]);
+		expect(await store.readChainRollup(artifactId)).toEqual(rollup);
 	});
 
 	it("deduplicates retries and rejects stale heads and invalid transitions", async () => {

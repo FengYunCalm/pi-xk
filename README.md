@@ -31,6 +31,23 @@ To learn more about Pi:
 | **[@earendil-works/pi-agent-core](packages/agent)** | Agent runtime with tool calling and state management |
 | **[@earendil-works/pi-coding-agent](packages/coding-agent)** | Interactive coding agent CLI |
 | **[@earendil-works/pi-tui](packages/tui)** | Terminal UI library with differential rendering |
+| **[pi-xk-core](packages/pi-xk-core)** | Private Pi-XK Goal, Task, Session Chain, and artifact domain contracts and stores |
+| **[pi-xk-extension](packages/pi-xk-extension)** | Private local Pi extension composing Goal, Task, and Session Chain workflows |
+
+## Pi-XK
+
+This fork also contains Pi-XK, an extension-first workflow layer for durable Goals, bounded child Tasks, project artifacts, and long-running Session Chains composed of native Pi JSONL segments. It preserves Pi's provider, agent loop, session tree, message schema, and compaction model.
+
+Pi-XK is currently a private, repository-local package intended for trusted personal full-access use. It does not yet provide a capability policy, sandbox, concurrent task scheduler, general context controller, or long-term memory.
+
+- [Pi-XK documentation](docs/pi-xk/README.md)
+- [Getting started](docs/pi-xk/getting-started.md)
+- [Design and boundaries](docs/pi-xk/design-and-boundaries.md)
+- [Operations and recovery](docs/pi-xk/operations-and-recovery.md)
+- [Compatibility and user impact](docs/pi-xk/compatibility-and-impact.md)
+- [Session Chain Rollups and model retrieval](docs/pi-xk/session-chain-rollups-and-model-retrieval.md)
+- [Pi-XK host patch boundary](docs/pi-xk/host-patch-boundary.md)
+- [Extension package reference](packages/pi-xk-extension/README.md)
 
 For Slack/chat automation and workflows see [earendil-works/pi-chat](https://github.com/earendil-works/pi-chat).
 

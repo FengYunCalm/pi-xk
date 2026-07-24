@@ -59,6 +59,16 @@ For the full first-run flow, see [Quickstart](quickstart.md).
 - [Custom models](models.md) - add model entries for supported provider APIs.
 - [Custom providers](custom-provider.md) - implement custom APIs and OAuth flows.
 
+## Pi-XK Fork Features
+
+This fork includes the private, repository-local Pi-XK workflow extension for durable Goals, bounded child Tasks, project artifacts, and long-running Session Chains. It is not part of the generic upstream Pi command surface and currently targets trusted personal full-access use.
+
+- [Pi-XK overview](../../../docs/pi-xk/README.md) - implemented capabilities and documentation map.
+- [Getting started](../../../docs/pi-xk/getting-started.md) - build, local installation, and first workflows.
+- [Compatibility and impact](../../../docs/pi-xk/compatibility-and-impact.md) - input, model-call, session, disk, and security effects.
+- [Session Chain Rollups](../../../docs/pi-xk/session-chain-rollups-and-model-retrieval.md) - L1/L2 contracts, model manifest, read-only tools, and backfill.
+- [Host patch boundary](../../../docs/pi-xk/host-patch-boundary.md) - fork-only runtime surface and upstream upgrade checks.
+
 ## Programmatic usage
 
 - [SDK](sdk.md) - embed pi in Node.js applications.

@@ -2,9 +2,11 @@ import { isAbsolute } from "node:path";
 
 export const SESSION_CHAIN_SPEC_SCHEMA = "pi-xk.session-chain.spec.v1";
 export const SESSION_CHAIN_EVENT_SCHEMA = "pi-xk.session-chain-event.v1";
+export const SESSION_CHAIN_EVENT_V2_SCHEMA = "pi-xk.session-chain-event.v2";
 export const SESSION_CHAIN_READ_MODEL_SCHEMA = "pi-xk.session-chain-read-model.v1";
 export const SESSION_CHAIN_CATALOG_SCHEMA = "pi-xk.session-chain-catalog.v1";
 export const SEGMENT_SUMMARY_SCHEMA = "pi-xk.segment-summary.v1";
+export const CHAIN_ROLLUP_SCHEMA = "pi-xk.session-chain-rollup.v1";
 
 const HASH_PATTERN = /^sha256:[a-f0-9]{64}$/;
 const CHAIN_ID_PATTERN = /^chain_[A-Za-z0-9][A-Za-z0-9_-]*$/;
@@ -67,6 +69,37 @@ export interface SegmentSummaryV1 {
 	generator: SegmentSummaryGeneratorV1;
 }
 
+export interface SessionChainRollupContentV1 {
+	state: string;
+	decisions: string[];
+	constraints: string[];
+	completed: string[];
+	unresolved: string[];
+	nextActions: string[];
+}
+
+export interface SessionChainRollupProvenanceV1 {
+	generator: string;
+	model: string;
+	promptVersion: string;
+	generatedAt: string;
+}
+
+/** Immutable Artifact Store body. The content-addressed artifact ID lives in events and read envelopes. */
+export interface SessionChainRollupV1 {
+	schema: typeof CHAIN_ROLLUP_SCHEMA;
+	chainId: string;
+	branchId: string;
+	windowIndex: number;
+	startOrdinal: number;
+	endOrdinal: number;
+	segmentIds: string[];
+	summaryArtifactIds: string[];
+	sourceDigest: string;
+	rollup: SessionChainRollupContentV1;
+	provenance: SessionChainRollupProvenanceV1;
+}
+
 export interface RolloverPreparedPayloadV1 {
 	branchId: string;
 	sourceSegmentId: string;
@@ -114,20 +147,42 @@ export interface ChainMetadataUpdatedPayloadV1 {
 	title: string | null;
 }
 
+export interface RollupPublishedPayloadV1 {
+	branchId: string;
+	windowIndex: number;
+	startOrdinal: number;
+	endOrdinal: number;
+	artifactId: string;
+	sourceDigest: string;
+}
+
+export interface RollupFailedPayloadV1 {
+	branchId: string;
+	windowIndex: number;
+	startOrdinal: number;
+	endOrdinal: number;
+	stage: string;
+	errorCode: string;
+	retryable: boolean;
+	attempt: number;
+}
+
 export type SessionChainEventType =
 	| "chain_created"
 	| "rollover_prepared"
 	| "rollover_committed"
 	| "rollover_aborted"
 	| "branch_created"
-	| "chain_metadata_updated";
+	| "chain_metadata_updated"
+	| "rollup_published"
+	| "rollup_failed";
 
 export interface ChainCreatedEventPayloadV1 {
 	spec: SessionChainSpecV1;
 }
 
 interface SessionChainEventBase<TEventType extends SessionChainEventType, TPayload> {
-	schema: typeof SESSION_CHAIN_EVENT_SCHEMA;
+	schema: typeof SESSION_CHAIN_EVENT_SCHEMA | typeof SESSION_CHAIN_EVENT_V2_SCHEMA;
 	eventId: string;
 	chainId: string;
 	sequence: number;
@@ -136,7 +191,7 @@ interface SessionChainEventBase<TEventType extends SessionChainEventType, TPaylo
 	timestamp: string;
 	prevHash: string | null;
 	payload: TPayload;
-	schemaVersion: 1;
+	schemaVersion: 1 | 2;
 	idempotencyKey: string;
 	hash: string;
 }
@@ -147,7 +202,9 @@ export type SessionChainEvent =
 	| SessionChainEventBase<"rollover_committed", RolloverCommittedPayloadV1>
 	| SessionChainEventBase<"rollover_aborted", RolloverAbortedPayloadV1>
 	| SessionChainEventBase<"branch_created", BranchCreatedPayloadV1>
-	| SessionChainEventBase<"chain_metadata_updated", ChainMetadataUpdatedPayloadV1>;
+	| SessionChainEventBase<"chain_metadata_updated", ChainMetadataUpdatedPayloadV1>
+	| SessionChainEventBase<"rollup_published", RollupPublishedPayloadV1>
+	| SessionChainEventBase<"rollup_failed", RollupFailedPayloadV1>;
 
 export interface SessionChainHead {
 	sequence: number;
@@ -169,6 +226,16 @@ export interface PendingRolloverProjectionV1 {
 	reason: string;
 }
 
+export interface SessionChainRollupProjectionV1 extends RollupPublishedPayloadV1 {
+	eventId: string;
+	publishedAt: string;
+}
+
+export interface SessionChainRollupFailureProjectionV1 extends RollupFailedPayloadV1 {
+	eventId: string;
+	failedAt: string;
+}
+
 export interface SessionBranchProjectionV1 {
 	branchId: string;
 	createdAt: string;
@@ -179,6 +246,8 @@ export interface SessionBranchProjectionV1 {
 	} | null;
 	headSegmentId: string;
 	segments: SessionSegmentProjectionV1[];
+	rollups: SessionChainRollupProjectionV1[];
+	rollupFailures: SessionChainRollupFailureProjectionV1[];
 	pendingRollover?: PendingRolloverProjectionV1;
 }
 
@@ -456,6 +525,104 @@ export function validateSegmentSummaryV1(value: unknown): SegmentSummaryV1 {
 		segmentDeltaMarkdown: requireNonEmptyString(value.segmentDeltaMarkdown, "segmentDeltaMarkdown"),
 		carryForwardMarkdown: requireNonEmptyString(value.carryForwardMarkdown, "carryForwardMarkdown"),
 		generator: validateSummaryGenerator(value.generator),
+	};
+}
+
+function validateNonEmptyStringArray(value: unknown, field: string): string[] {
+	if (!Array.isArray(value)) throw new SessionChainValidationError(`${field} must be an array`);
+	return value.map((item, index) => requireNonEmptyString(item, `${field}[${index}]`));
+}
+
+function validateRollupContent(value: unknown): SessionChainRollupContentV1 {
+	if (!isRecord(value)) throw new SessionChainValidationError("rollup must be an object");
+	requireExactKeys(value, ["state", "decisions", "constraints", "completed", "unresolved", "nextActions"], "rollup");
+	return {
+		state: requireNonEmptyString(value.state, "rollup.state"),
+		decisions: validateNonEmptyStringArray(value.decisions, "rollup.decisions"),
+		constraints: validateNonEmptyStringArray(value.constraints, "rollup.constraints"),
+		completed: validateNonEmptyStringArray(value.completed, "rollup.completed"),
+		unresolved: validateNonEmptyStringArray(value.unresolved, "rollup.unresolved"),
+		nextActions: validateNonEmptyStringArray(value.nextActions, "rollup.nextActions"),
+	};
+}
+
+function validateRollupProvenance(value: unknown): SessionChainRollupProvenanceV1 {
+	if (!isRecord(value)) throw new SessionChainValidationError("rollup provenance must be an object");
+	requireExactKeys(value, ["generator", "model", "promptVersion", "generatedAt"], "rollup provenance");
+	return {
+		generator: requireNonEmptyString(value.generator, "provenance.generator"),
+		model: requireNonEmptyString(value.model, "provenance.model"),
+		promptVersion: requireNonEmptyString(value.promptVersion, "provenance.promptVersion"),
+		generatedAt: requireIsoTimestamp(value.generatedAt, "provenance.generatedAt"),
+	};
+}
+
+export function validateSessionChainRollupV1(value: unknown): SessionChainRollupV1 {
+	if (!isRecord(value)) throw new SessionChainValidationError("Session Chain Rollup must be an object");
+	requireExactKeys(
+		value,
+		[
+			"schema",
+			"chainId",
+			"branchId",
+			"windowIndex",
+			"startOrdinal",
+			"endOrdinal",
+			"segmentIds",
+			"summaryArtifactIds",
+			"sourceDigest",
+			"rollup",
+			"provenance",
+		],
+		"Session Chain Rollup",
+	);
+	if (value.schema !== CHAIN_ROLLUP_SCHEMA) {
+		throw new SessionChainValidationError("Session Chain Rollup schema is unsupported");
+	}
+	const chainId = requireNonEmptyString(value.chainId, "chainId");
+	const branchId = requireNonEmptyString(value.branchId, "branchId");
+	assertSessionChainId(chainId);
+	assertSessionBranchId(branchId);
+	const windowIndex = requirePositiveInteger(value.windowIndex, "windowIndex");
+	const startOrdinal = requirePositiveInteger(value.startOrdinal, "startOrdinal");
+	const endOrdinal = requirePositiveInteger(value.endOrdinal, "endOrdinal");
+	if (endOrdinal < startOrdinal) {
+		throw new SessionChainValidationError("Rollup ordinal range must be ordered");
+	}
+	const segmentIds = validateNonEmptyStringArray(value.segmentIds, "segmentIds");
+	for (const segmentId of segmentIds) assertSessionSegmentId(segmentId);
+	if (!Array.isArray(value.summaryArtifactIds)) {
+		throw new SessionChainValidationError("summaryArtifactIds must be an array");
+	}
+	const summaryArtifactIds = value.summaryArtifactIds.map((artifactId, index) =>
+		assertSessionChainArtifactId(artifactId, `summaryArtifactIds[${index}]`),
+	);
+	const expectedLength = endOrdinal - startOrdinal + 1;
+	if (
+		segmentIds.length !== expectedLength ||
+		summaryArtifactIds.length !== expectedLength ||
+		segmentIds.length !== summaryArtifactIds.length
+	) {
+		throw new SessionChainValidationError("Rollup source arrays must match its ordinal range");
+	}
+	if (
+		new Set(segmentIds).size !== segmentIds.length ||
+		new Set(summaryArtifactIds).size !== summaryArtifactIds.length
+	) {
+		throw new SessionChainValidationError("Rollup source arrays must not contain duplicates");
+	}
+	return {
+		schema: CHAIN_ROLLUP_SCHEMA,
+		chainId,
+		branchId,
+		windowIndex,
+		startOrdinal,
+		endOrdinal,
+		segmentIds,
+		summaryArtifactIds,
+		sourceDigest: assertSessionChainHash(value.sourceDigest, "sourceDigest"),
+		rollup: validateRollupContent(value.rollup),
+		provenance: validateRollupProvenance(value.provenance),
 	};
 }
 

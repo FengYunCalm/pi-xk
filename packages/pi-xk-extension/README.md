@@ -2,6 +2,18 @@
 
 Pi-XK adds durable Goal, single-child Task, and Session Chain workflows to Pi without changing Pi's agent loop, provider, or native message format. Pi keeps each physical JSONL transcript; Pi-XK keeps Goal/Task/chain events, checkpoint evidence, artifacts, derived read models, and child transcripts under the project `.pi-xk` directory.
 
+This package README is the command and installation reference. Start with the repository documentation for the complete behavior and risk model:
+
+- [Pi-XK overview](../../docs/pi-xk/README.md)
+- [Getting started](../../docs/pi-xk/getting-started.md)
+- [Design and boundaries](../../docs/pi-xk/design-and-boundaries.md)
+- [Operations and recovery](../../docs/pi-xk/operations-and-recovery.md)
+- [Compatibility and user impact](../../docs/pi-xk/compatibility-and-impact.md)
+- [Session Chain Rollups and model retrieval](../../docs/pi-xk/session-chain-rollups-and-model-retrieval.md)
+- [Host patch boundary](../../docs/pi-xk/host-patch-boundary.md)
+
+The package is currently private and installed from a built local checkout. Its supported baseline is a trusted, personal, interactive full-access profile. It does not provide a sandbox, per-tool permission policy, concurrent Tasks, worktree isolation, general long-term memory, or an unattended execution guarantee.
+
 ## Local Installation
 
 From a built Pi-XK checkout, install the package into the current user's Pi settings:
@@ -87,6 +99,12 @@ Task states are `pending -> running -> succeeded|failed|cancelled|orphaned`. Gra
 /chain status                       Show the current chain, branch, Segment, size, summary, and rollover gates.
 /chain history                      Show the Segment and branch topology.
 /chain summary [segmentId]          Show the Segment's summary-in, delta, and carry-forward summary.
+/chain rollups                      List published and failed L2 windows for the current branch.
+/chain rollup <window>              Show one L2 Rollup Markdown projection.
+/chain rollup backfill [limit]      Explicitly generate missing complete windows; default limit is one.
+/chain rollup config                Show the effective automatic Rollup configuration.
+/chain rollup config off            Stop future automatic L2 generation without deleting summaries.
+/chain rollup config <N>            Enable automatic L2 generation every N sealed Segments.
 /chain rollover [reason]            Request a safe manual physical rollover.
 /chain resume <chainId|prefix>      Switch to a logical chain head.
 /chain continue <segmentId> [entryId]  Create a successor branch from historical work.
@@ -95,7 +113,9 @@ Task states are `pending -> running -> succeeded|failed|cancelled|orphaned`. Gra
 
 A long logical conversation is a `SessionChain` composed of complete native Pi JSONL Segments. New empty sessions are placed in a project-local managed Segment; an existing Pi transcript is adopted once as an external root without copying it. At a settled boundary, Pi-XK automatically rolls over after 16 MiB or 4,000 entries; at 64 MiB or 16,000 entries it must roll over before the next provider turn. It never rolls over while a Task is running or awaiting delivery, a Goal draft is open, or a Goal lifecycle intent is unsettled.
 
-Rollover writes a provenance-bearing progressive summary, seals the previous Segment, and replaces only the runtime's physical session. Active Goals continue through this replacement without a pause, while normal quit/reload/new/resume/fork still preserve their conservative Goal-pause behavior. Compaction remains Pi-native and independent. Continuing after a historical Segment or tree position always creates a successor branch; sealed Segments are never rewritten. Pi-XK adds a compact `Chain <id> · S<n> · <size>` footer status alongside Pi's native footer.
+Rollover writes a provenance-bearing L1 Segment summary, seals the previous Segment, and replaces only the runtime's physical session. By default, every five sealed Segments on each branch produce one L2 Rollup from validated L1 artifacts only. A metadata-only manifest exposes available ranges to the model; `pi_xk_list_chain_summaries` and `pi_xk_read_chain_summary` let it read relevant L1/L2 evidence on demand. Summary bodies are never automatically injected into every request.
+
+Active Goals continue through physical replacement without a pause, while normal quit/reload/new/resume/fork still preserve their conservative Goal-pause behavior. Compaction remains Pi-native and independent. Continuing after a historical Segment or tree position always creates a successor branch; sealed Segments are never rewritten. Pi-XK adds a compact `Chain <id> · S<n> · <size>` footer status alongside Pi's native footer.
 
 ## Files And Recovery
 
@@ -121,7 +141,13 @@ Each confirmed Goal is stored below the current project root. Pi-XK does not cre
     events.jsonl
     chain-read-model.json
     locks/
-    branches/<branchId>/segments/<ordinal>_<session-id>.jsonl
+    branches/<branchId>/
+      segments/<ordinal>_<session-id>.jsonl
+      rollups/<window>.md
+      rollups/<window>.pending.json
+      rollups/state.json
+
+.pi-xk/session-chain.json          # Rollup enabled/interval configuration
 ```
 
 Project-scoped checkpoint and Task result artifacts are stored under `.pi-xk/artifacts/`. Before Goal confirmation, a draft exists only as a Pi native session custom entry and creates nothing under the project `.pi-xk` directory.
@@ -130,7 +156,7 @@ Each domain's `events.jsonl` is its fact source. Goal contract/read-model files 
 
 For Tasks, `events.jsonl` is the fact source, `task-read-model.json` is rebuildable, and parent-session `task_link` entries store only event references. Complete result envelopes remain in the project artifact store and child messages remain in the child transcript. A V2 Task started from a Session Chain records the parent `chainId/branchId/segmentId/entryId`; its `childChainId` points into `.pi-xk/sessions/chains/`. The `.pi-xk/tasks/<taskId>/session/` path is retained only for V1 Task facts, which remain readable without rewriting historical events or hashes.
 
-For Session Chains, `events.jsonl` is the topology fact source. `chain-read-model.json` and the project `catalog.json` are rebuildable indexes. A sealed Segment records its final file hash, leaf, and progressive-summary artifact; the `/chain doctor` command reports a changed sealed file as corruption instead of rewriting it. Prepared rollover recovery either commits the durable target, rebuilds the missing target from the recorded identity, or aborts back to the writable source Segment.
+For Session Chains, `events.jsonl`, native Segment JSONL, L1 artifacts, and L2 artifacts are facts. `chain-read-model.json`, `catalog.json`, Rollup Markdown, pending publication records, and runtime migration state are derived/recovery data. A sealed Segment records its final file hash, leaf, and L1 artifact. `/chain doctor` reports changed facts instead of rewriting them, recovers prepared rollover, and can rebuild missing or stale Rollup Markdown.
 
 ## Security Boundary
 

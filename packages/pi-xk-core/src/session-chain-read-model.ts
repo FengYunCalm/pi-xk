@@ -9,6 +9,8 @@ import {
 	SESSION_CHAIN_READ_MODEL_SCHEMA,
 	type SessionBranchProjectionV1,
 	type SessionChainReadModelV1,
+	type SessionChainRollupFailureProjectionV1,
+	type SessionChainRollupProjectionV1,
 	SessionChainValidationError,
 	type SessionSegmentProjectionV1,
 	validateSessionChainExactKeys,
@@ -39,6 +41,8 @@ function cloneBranch(branch: SessionBranchProjectionV1): SessionBranchProjection
 			location: { ...segment.location },
 			...(segment.seal ? { seal: { ...segment.seal } } : {}),
 		})),
+		rollups: branch.rollups.map((rollup) => ({ ...rollup })),
+		rollupFailures: branch.rollupFailures.map((failure) => ({ ...failure })),
 		...(branch.pendingRollover
 			? {
 					pendingRollover: {
@@ -137,13 +141,94 @@ function validatePendingRollover(value: unknown): PendingRolloverProjectionV1 {
 	};
 }
 
+function positiveInteger(value: unknown, field: string): number {
+	const number = validateSessionChainNonNegativeInteger(value, field);
+	if (number === 0) throw new SessionChainValidationError(`${field} must be positive`);
+	return number;
+}
+
+function validateRollupProjection(value: unknown): SessionChainRollupProjectionV1 {
+	if (!isSessionChainRecord(value)) throw new SessionChainValidationError("Rollup projection must be an object");
+	validateSessionChainExactKeys(
+		value,
+		["branchId", "windowIndex", "startOrdinal", "endOrdinal", "artifactId", "sourceDigest", "eventId", "publishedAt"],
+		"Rollup projection",
+	);
+	const branchId = validateSessionChainNonEmptyString(value.branchId, "Rollup branchId");
+	assertSessionBranchId(branchId);
+	return {
+		branchId,
+		windowIndex: positiveInteger(value.windowIndex, "Rollup windowIndex"),
+		startOrdinal: positiveInteger(value.startOrdinal, "Rollup startOrdinal"),
+		endOrdinal: positiveInteger(value.endOrdinal, "Rollup endOrdinal"),
+		artifactId: assertSessionChainArtifactId(value.artifactId, "Rollup artifactId"),
+		sourceDigest: assertSessionChainHash(value.sourceDigest, "Rollup sourceDigest"),
+		eventId: validateSessionChainNonEmptyString(value.eventId, "Rollup eventId"),
+		publishedAt: validateSessionChainTimestamp(value.publishedAt, "Rollup publishedAt"),
+	};
+}
+
+function validateRollupFailure(value: unknown): SessionChainRollupFailureProjectionV1 {
+	if (!isSessionChainRecord(value)) throw new SessionChainValidationError("Rollup failure must be an object");
+	validateSessionChainExactKeys(
+		value,
+		[
+			"branchId",
+			"windowIndex",
+			"startOrdinal",
+			"endOrdinal",
+			"stage",
+			"errorCode",
+			"retryable",
+			"attempt",
+			"eventId",
+			"failedAt",
+		],
+		"Rollup failure",
+	);
+	const branchId = validateSessionChainNonEmptyString(value.branchId, "Rollup failure branchId");
+	assertSessionBranchId(branchId);
+	if (typeof value.retryable !== "boolean") {
+		throw new SessionChainValidationError("Rollup failure retryable must be a boolean");
+	}
+	return {
+		branchId,
+		windowIndex: positiveInteger(value.windowIndex, "Rollup failure windowIndex"),
+		startOrdinal: positiveInteger(value.startOrdinal, "Rollup failure startOrdinal"),
+		endOrdinal: positiveInteger(value.endOrdinal, "Rollup failure endOrdinal"),
+		stage: validateSessionChainNonEmptyString(value.stage, "Rollup failure stage"),
+		errorCode: validateSessionChainNonEmptyString(value.errorCode, "Rollup failure errorCode"),
+		retryable: value.retryable,
+		attempt: positiveInteger(value.attempt, "Rollup failure attempt"),
+		eventId: validateSessionChainNonEmptyString(value.eventId, "Rollup failure eventId"),
+		failedAt: validateSessionChainTimestamp(value.failedAt, "Rollup failure failedAt"),
+	};
+}
+
 function validateBranch(value: unknown): SessionBranchProjectionV1 {
 	if (!isSessionChainRecord(value)) throw new SessionChainValidationError("branch projection must be an object");
-	const allowed = ["branchId", "createdAt", "forkedFrom", "headSegmentId", "segments", "pendingRollover"];
+	const allowed = [
+		"branchId",
+		"createdAt",
+		"forkedFrom",
+		"headSegmentId",
+		"segments",
+		"rollups",
+		"rollupFailures",
+		"pendingRollover",
+	];
 	for (const key of Object.keys(value)) {
 		if (!allowed.includes(key)) throw new SessionChainValidationError("branch projection has unknown fields");
 	}
-	for (const required of ["branchId", "createdAt", "forkedFrom", "headSegmentId", "segments"]) {
+	for (const required of [
+		"branchId",
+		"createdAt",
+		"forkedFrom",
+		"headSegmentId",
+		"segments",
+		"rollups",
+		"rollupFailures",
+	]) {
 		if (!(required in value)) throw new SessionChainValidationError("branch projection has missing fields");
 	}
 	const branchId = validateSessionChainNonEmptyString(value.branchId, "branchId");
@@ -170,6 +255,9 @@ function validateBranch(value: unknown): SessionBranchProjectionV1 {
 		throw new SessionChainValidationError("branch segments must be a non-empty array");
 	}
 	const segments = value.segments.map(validateSegmentProjection);
+	if (!Array.isArray(value.rollups) || !Array.isArray(value.rollupFailures)) {
+		throw new SessionChainValidationError("branch Rollup projections must be arrays");
+	}
 	if (!segments.some((segment) => segment.segmentId === headSegmentId)) {
 		throw new SessionChainValidationError("branch headSegmentId is not present in segments");
 	}
@@ -179,6 +267,8 @@ function validateBranch(value: unknown): SessionBranchProjectionV1 {
 		forkedFrom,
 		headSegmentId,
 		segments,
+		rollups: value.rollups.map(validateRollupProjection),
+		rollupFailures: value.rollupFailures.map(validateRollupFailure),
 		...(value.pendingRollover === undefined
 			? {}
 			: { pendingRollover: validatePendingRollover(value.pendingRollover) }),

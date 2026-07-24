@@ -28,6 +28,9 @@ const commands = [
 		"test/task-contract.test.ts",
 		"test/task-store.test.ts",
 		"test/task-read-model.test.ts",
+		"test/session-chain-contract.test.ts",
+		"test/session-chain-store.test.ts",
+		"test/session-chain-read-model.test.ts",
 	],
 	[
 		"--workspace",
@@ -40,6 +43,7 @@ const commands = [
 		"test/suite/pi-xk-goal-extension.test.ts",
 		"test/suite/pi-xk-session-chain-controller.test.ts",
 		"test/suite/pi-xk-session-chain-extension.test.ts",
+		"test/suite/agent-session-rollover.test.ts",
 		"test/suite/pi-xk-task-runner.test.ts",
 		"test/suite/pi-xk-task-extension.test.ts",
 		"test/suite/pi-xk-package-install.test.ts",

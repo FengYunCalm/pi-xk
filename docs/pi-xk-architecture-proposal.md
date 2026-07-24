@@ -1,14 +1,16 @@
 # Pi-XK 架构策划案
 
-> **状态**：In implementation（Phase 0、Phase 1.1–1.8 与 Task Run v1 已完成；当前个人本机无限权限 profile 仍延后 Policy/沙箱，完整 Phase 3 调度能力、通用 Context/memory、Proposal/反省闭环和其余能力按依赖顺序推进）
+> **状态**：In implementation（Phase 0、Phase 1.1–1.8、Task Run v1 与 Session Chain v1.1 / Rollup v1 已完成；当前个人本机无限权限 profile 仍延后 Policy/沙箱，完整 Phase 3 调度能力、通用 Context/memory、Proposal/反省闭环和其余能力按依赖顺序推进）
 >
-> **版本**：1.0.0
+> **版本**：1.1.0
 >
-> **日期**：2026-07-22
+> **日期**：2026-07-24
 >
 > **定位**：基于 Pi 的维护型 fork，加上可验证的领域层、任务编排层和安全边界。
 >
 > **读者**：项目维护者、贡献者、扩展作者和需要审查 Agent 行为的用户。
+
+> **文档角色**：本文是上位架构与未来路线，不是首次使用手册。当前已实现能力、安装、命令、恢复和实际使用影响以 [Pi-XK 文档](pi-xk/README.md) 为入口；具体已接受决策以 [ADR 索引](adr/README.md) 为准。本文未标记“已完成”的 Phase 不构成功能承诺。
 
 ## 0. 结论先行
 
@@ -405,6 +407,8 @@ checkpoint 的最终领域契约应能引用目标进度、验收状态、已验
 ## 8. Context、Compaction 与长期记忆
 
 ### 8.1 L0/L1/L2 是预算策略，不是新的会话格式
+
+Session Chain v1.1 已交付一个受限子集：sealed Segment 的 L1 artifact、固定窗口 L2 Rollup、metadata-only manifest 和当前 chain 内的只读按需查询。它不等于本节规划的通用跨域 budget controller、长期 memory、FTS/SQLite 索引或跨项目知识源。
 
 | 层 | 内容 | 生命周期 | 可信度处理 |
 | --- | --- | --- | --- |
@@ -850,7 +854,7 @@ pi_xk.artifact.*
 - 工具结果已持久化后的 `turn_end` 与 `session_before_compact` 的自动 checkpoint；
 - artifact store、redaction 和可重建 read model。
 
-**2026-07-23 实现状态：** Phase 1.1–1.8 和 Task Run v1 均已完成。Session Chain v1 进一步把长期逻辑会话拆为完整原生 Pi JSONL Segment：新空会话进入项目级 managed Segment，既有 Pi session 作为不复制的 external root 被采用，`events.jsonl` 是拓扑事实源，而 catalog/read model 可重建。soft（16 MiB/4,000 entries）只在 settled 后轮转，hard（64 MiB/16,000 entries）在下一次 provider turn 前强制轮转；Task 运行、Task 结果待交付、Goal 草案或 lifecycle intent 会阻止轮转。每次轮转以渐进 summary-in/delta/carry-forward artifact 封存旧段、创建新段并替换 runtime；active Goal 在 `reason: "rollover"` 下继续，不触发保守 pause，普通 quit/reload/new/resume/fork、agent abort 和 tree navigation 的暂停规则不变。Task V2 从普通会话或 Goal 记录父 `chainId/branchId/segmentId/entryId`，child 自身从 managed SessionChain 起步；Task V1 保持原 hash 并仅在读取时 upcast。Pi 原生 session、tree、compaction、provider 和消息 schema 均未替换；`/chain` 仅管理逻辑链，原生 `/resume` 仍管理单个物理 session。尚未实现的是通用 L0/L1/L2 Context controller、long-term memory、完整 TaskSupervisor（并发/DAG/retry/budget/deadline/RPC/worktree/sandbox）以及 Policy、artifact retention/GC。
+**2026-07-24 实现状态：** Phase 1.1–1.8 和 Task Run v1 均已完成。Session Chain v1.1 把长期逻辑会话拆为完整原生 Pi JSONL Segment：新空会话进入项目级 managed Segment，既有 Pi session 作为不复制的 external root 被采用，`events.jsonl` 是拓扑事实源，而 catalog/read model 可重建。soft（16 MiB/4,000 entries）只在 settled 后轮转，hard（64 MiB/16,000 entries）在下一次 provider turn 前强制轮转；Task 运行、Task 结果待交付、Goal 草案或 lifecycle intent 会阻止轮转。每次轮转生成并校验 L1 summary-in/delta/carry-forward artifact，默认每 5 个 sealed Segment 生成只读取 L1 的 L2 Rollup。系统提示词只注入 metadata manifest，模型通过统一只读工具按需读取当前 chain 的 L1/L2。Rollup 失败不回滚 rollover，历史窗口只显式有限额 backfill。active Goal 在 `reason: "rollover"` 下继续，不触发保守 pause。Task V2 记录父 chain ref，child 自身从 managed SessionChain 起步；Task V1 保持原 hash 并仅在读取时 upcast。Pi 原生 session、tree、compaction、provider 和消息 schema 均未替换。尚未实现的是通用跨域 Context controller、long-term memory、完整 TaskSupervisor（并发/DAG/retry/budget/deadline/RPC/worktree/sandbox）以及 Policy、artifact retention/GC。
 
 #### Phase 1.7：Goal 连续执行（已完成）
 
@@ -895,18 +899,20 @@ Policy/沙箱仍是 supervised、unattended 和不可信执行的前置条件，
 
 Task Run v1 之外的完整 Phase 3 能力仍未实现：多 Task 并发与 DAG 调度、retry、预算、deadline、RPC child、worktree/合并、sandbox、Policy 重新求值、跨 descendant 取消和进程组回收。不得用 v1 的单 in-process child 通过测试来宣称这些能力已经完成。
 
-### 已完成实施切片：Session Chain v1
+### 已完成实施切片：Session Chain v1.1 / Rollup v1
 
-Session Chain v1 独立于完整 Phase 3：它只解决一个长期逻辑会话如何由多个完整原生 Pi JSONL 物理文件承接，不把 SessionChain、Task、Compaction 或 Goal 互相替代。
+Session Chain v1.1 独立于完整 Phase 3 和通用 Phase 4：它解决一个长期逻辑会话如何由多个完整原生 Pi JSONL 物理文件承接，以及模型如何在需要时读取该 chain 的摘要证据，不把 SessionChain、Task、Compaction、Goal 或长期 memory 互相替代。
 
 - `.pi-xk/sessions/chains/<chainId>/events.jsonl` 记录 chain/branch/segment 拓扑；`catalog.json` 与 read model 可删除重建；
-- 每个 sealed Segment 固定拥有 summary-in、原生正文与含 delta/carry-forward 的 summary-out；摘要携带 source 范围/hash、base summary、模型和 token provenance，失败不 seal；
+- 每个 sealed Segment 固定拥有 summary-in、原生正文与含 delta/carry-forward 的 L1 summary-out；rollover 前重新读取 artifact 并验证 provenance，失败或篡改不 seal；
 - 两阶段 `rollover_prepared -> rollover_committed|rollover_aborted` 确保 source summary-out 与 target JSONL durable 后才提升 branch head；startup/`/chain doctor` 能按 marker 恢复 prepared 状态；
 - host 只新增非破坏性的 `summarizeSessionContext`、`rolloverSession`、`session_before_rollover` 和 lifecycle reason `rollover`。不设置 `SessionHeader.parentSession`，不改原生 entry schema；
-- `/chain` 提供 picker、status、history、summary、manual rollover、resume、history continue 和 doctor；footer 额外显示当前链与 Segment 体积；
+- 每个 branch 默认每 5 个 sealed Segment 产生一个 L2 Rollup；窗口连续、不重叠，输入只使用有序 L1 artifacts。`rollup_published/failed` 使用 v2 event，v1 hash 不重写；
+- 系统提示词只注入固定大小 manifest，模型通过 `pi_xk_list_chain_summaries` 和 `pi_xk_read_chain_summary` 按需读取；摘要正文和伪系统指令不自动注入；
+- `/chain` 提供 picker、status、history、summary、rollups、rollup view/config/backfill、manual rollover、resume、history continue 和 doctor；footer 额外显示当前链与 Segment 体积；
 - rollover 会原样迁移 Goal binding，Task V2 绑定父 chain ref；历史继续创建 successor branch，sealed 文件不重写。
 
-退出门槛：每个 Segment 单独可被 Pi 打开；summary 递进且与 artifact hash 对应；prepared 崩溃能明确 commit/rebuild/abort；硬阈值绝不把普通输入送入未轮转的 provider turn；Goal/Task gate 阻止不安全轮转；active Goal 在真实 rollover 后仍由 replacement runtime 继续。
+退出门槛：每个 Segment 单独可被 Pi 打开；L1 递进且与 artifact/marker 对应；十次默认 rollover 生成两个独立 L2；模型可从 manifest 发现并通过只读工具读取 L1/L2；关闭 Rollup 后不产生新 L2 调用但既有摘要可读；prepared 和 Rollup publication 崩溃能恢复；硬阈值绝不把普通输入送入未轮转的 provider turn；Goal/Task gate 阻止不安全轮转；active Goal 在真实 rollover 后仍由 replacement runtime 继续。
 
 ### 16.3 Phase 2：Policy 与沙箱
 
@@ -940,6 +946,8 @@ Session Chain v1 独立于完整 Phase 3：它只解决一个长期逻辑会话�
 - token、费用、wall time 和输出上限任一耗尽都会停止任务。
 
 ### 16.5 Phase 4：Context 与 memory
+
+Session Chain 专用 L1/L2 与按需读取已经完成；本 Phase 剩余范围是跨 Goal/Task/branch/source 的通用预算、检索、长期 memory、敏感信息和过期策略。
 
 交付：
 

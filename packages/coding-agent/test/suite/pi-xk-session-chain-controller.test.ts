@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
-import { appendFile, mkdir, readFile, rm } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, type UserMessage } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { SEGMENT_SUMMARY_SCHEMA } from "../../../pi-xk-core/src/index.ts";
+import { SEGMENT_SUMMARY_SCHEMA, SessionChainStore } from "../../../pi-xk-core/src/index.ts";
 import {
 	evaluateSessionChainThreshold,
 	isPiXkSessionChainBinding,
@@ -44,6 +44,7 @@ function createPersistedSession(projectRoot: string, name: string, withTurn = tr
 
 interface FakeHostOptions {
 	response?: string;
+	responses?: string[];
 	outputTokens?: number;
 	crashAfterSourceFinalize?: boolean;
 	cancelBeforeCallbacks?: boolean;
@@ -52,8 +53,10 @@ interface FakeHostOptions {
 
 function createHost(initialManager: SessionManager, options: FakeHostOptions = {}) {
 	let currentManager = initialManager;
+	let responseIndex = 0;
 	const summarizeSessionContext = vi.fn<SessionChainHost["summarizeSessionContext"]>(async () => ({
 		summary:
+			options.responses?.[responseIndex++] ??
 			options.response ??
 			"<segment-delta>## Delta\n\n- Finished the current segment.</segment-delta>\n<carry-forward>## Carry forward\n\nContinue from the verified state.</carry-forward>",
 		model: { provider: "faux", modelId: "faux-summary" },
@@ -298,6 +301,339 @@ describe("SessionChainController rollover", () => {
 		expect(replay.branches[0]?.segments.map((segment) => segment.status)).toEqual(["sealed", "sealed", "active"]);
 	});
 
+	it("rejects a self-consistent summary-in marker whose content no longer matches its artifact", async () => {
+		const projectRoot = await createTempDir();
+		const source = createPersistedSession(projectRoot, "summary-provenance-source");
+		const controller = new SessionChainController({ projectRoot });
+		await controller.adoptExternalRoot(source);
+		appendTurn(source, "segment one work", "segment one result");
+		const firstHost = createHost(source);
+		await controller.rollover(firstHost.host, { reason: "create summary provenance fixture" });
+
+		const active = firstHost.getCurrentManager();
+		appendTurn(active, "segment two work", "segment two result");
+		active.flushDurable();
+		const activePath = active.getSessionFile();
+		if (!activePath) throw new Error("active Segment must be persisted");
+		const tampered = "Tampered carry-forward that is internally hash-consistent.";
+		const lines = (await readFile(activePath, "utf8"))
+			.trimEnd()
+			.split("\n")
+			.map((line) => {
+				const entry = JSON.parse(line) as Record<string, unknown>;
+				if (entry.type !== "custom_message" || entry.customType !== PI_XK_SESSION_CHAIN_SUMMARY_IN_CUSTOM_TYPE) {
+					return line;
+				}
+				const details = entry.details as Record<string, unknown>;
+				entry.content = tampered;
+				details.carryForwardHash = `sha256:${createHash("sha256").update(tampered, "utf8").digest("hex")}`;
+				return JSON.stringify(entry);
+			});
+		await writeFile(activePath, `${lines.join("\n")}\n`);
+
+		const reopened = SessionManager.open(activePath);
+		const secondHost = createHost(reopened);
+		await expect(controller.rollover(secondHost.host, { reason: "reject forged summary-in" })).rejects.toThrow(
+			"summary-in content does not match its summary artifact",
+		);
+		expect(secondHost.summarizeSessionContext).not.toHaveBeenCalled();
+	});
+
+	it("publishes one L2 Rollup after the configured number of sealed Segments", async () => {
+		const projectRoot = await createTempDir();
+		const source = createPersistedSession(projectRoot, "rollup-source");
+		const controller = new SessionChainController({ projectRoot });
+		await controller.setRollupConfig({ enabled: true, interval: 2 });
+		const binding = await controller.adoptExternalRoot(source);
+		appendTurn(source, "segment one work", "segment one result");
+		const { host, getCurrentManager, summarizeSessionContext } = createHost(source, {
+			responses: [
+				"<segment-delta>Segment one delta.</segment-delta><carry-forward>Segment one carry-forward.</carry-forward>",
+				"<segment-delta>Segment two delta.</segment-delta><carry-forward>Segment two carry-forward.</carry-forward>",
+				'<chain-rollup>{"state":"Two Segments are sealed.","decisions":["Use L2 rollups."],"constraints":["Read L1 artifacts only."],"completed":["Window one."],"unresolved":[],"nextActions":["Continue the chain."]}</chain-rollup>',
+			],
+		});
+
+		await controller.rollover(host, { reason: "first rollup Segment" });
+		appendTurn(getCurrentManager(), "segment two work", "segment two result");
+		await controller.rollover(host, { reason: "second rollup Segment" });
+
+		const summaries = await controller.listSummaries(binding.chainId, binding.branchId, {
+			level: "all",
+			limit: 20,
+		});
+		expect(summarizeSessionContext).toHaveBeenCalledTimes(3);
+		expect(summaries.items.filter((item) => item.level === "l1")).toHaveLength(2);
+		expect(summaries.items.filter((item) => item.level === "l2")).toEqual([
+			expect.objectContaining({ level: "l2", windowIndex: 1, startOrdinal: 1, endOrdinal: 2 }),
+		]);
+		const rollup = await controller.readSummary(binding.chainId, binding.branchId, {
+			level: "l2",
+			windowIndex: 1,
+		});
+		expect(rollup).toMatchObject({
+			level: "l2",
+			rollup: { rollup: { state: "Two Segments are sealed." } },
+		});
+	});
+
+	it("uses the default five-Segment interval and publishes two non-overlapping windows after ten rollovers", async () => {
+		const projectRoot = await createTempDir();
+		const controller = new SessionChainController({
+			projectRoot,
+			createSessionManagerAt: (cwd, sessionFile, options) => SessionManager.createAt(cwd, sessionFile, options),
+		});
+		const root = await controller.createManagedRoot({ title: "Default Rollup chain" });
+		const source = root.sessionManager;
+		const binding = root.binding;
+		const responses: string[] = [];
+		for (let ordinal = 1; ordinal <= 10; ordinal++) {
+			responses.push(
+				`<segment-delta>Segment ${ordinal} delta.</segment-delta><carry-forward>Segment ${ordinal} carry-forward.</carry-forward>`,
+			);
+			if (ordinal % 5 === 0) {
+				responses.push(
+					`<chain-rollup>{"state":"Segments ${ordinal - 4}-${ordinal} are sealed.","decisions":[],"constraints":[],"completed":["Window ${ordinal / 5}."],"unresolved":[],"nextActions":[]}</chain-rollup>`,
+				);
+			}
+		}
+		appendTurn(source, "segment 1 work", "segment 1 result");
+		const { host, getCurrentManager, summarizeSessionContext } = createHost(source, { responses });
+
+		for (let ordinal = 1; ordinal <= 10; ordinal++) {
+			await controller.rollover(host, { reason: `default window S${ordinal}` });
+			const rollups = (await controller.getStore().replayChain(binding.chainId)).branches[0]?.rollups ?? [];
+			if (ordinal === 4) expect(rollups).toEqual([]);
+			if (ordinal === 5) {
+				expect(rollups).toEqual([expect.objectContaining({ windowIndex: 1, startOrdinal: 1, endOrdinal: 5 })]);
+			}
+			if (ordinal < 10)
+				appendTurn(getCurrentManager(), `segment ${ordinal + 1} work`, `segment ${ordinal + 1} result`);
+		}
+
+		const replay = await controller.getStore().replayChain(binding.chainId);
+		expect(replay.branches[0]?.segments.filter((segment) => segment.status === "sealed")).toHaveLength(10);
+		expect(replay.branches[0]?.rollups).toEqual([
+			expect.objectContaining({ windowIndex: 1, startOrdinal: 1, endOrdinal: 5 }),
+			expect.objectContaining({ windowIndex: 2, startOrdinal: 6, endOrdinal: 10 }),
+		]);
+		expect(summarizeSessionContext).toHaveBeenCalledTimes(12);
+		const firstPage = await controller.listSummaries(binding.chainId, binding.branchId, { limit: 3 });
+		expect(firstPage.items).toHaveLength(3);
+		expect(firstPage.nextCursor).toBe("3");
+		expect(
+			await controller.listSummaries(binding.chainId, binding.branchId, {
+				level: "l2",
+				cursor: "1",
+				limit: 1,
+			}),
+		).toMatchObject({
+			items: [expect.objectContaining({ level: "l2", windowIndex: 2, integrity: "verified" })],
+			nextCursor: null,
+		});
+		expect(
+			await controller.readSummary(binding.chainId, binding.branchId, { level: "l2", latest: true }),
+		).toMatchObject({
+			level: "l2",
+			integrity: "verified",
+			windowIndex: 2,
+		});
+	});
+
+	it("keeps a committed rollover usable when L2 generation fails and records a retryable diagnostic", async () => {
+		const projectRoot = await createTempDir();
+		const source = createPersistedSession(projectRoot, "rollup-failure-source");
+		const controller = new SessionChainController({ projectRoot });
+		await controller.setRollupConfig({ enabled: true, interval: 1 });
+		const binding = await controller.adoptExternalRoot(source);
+		appendTurn(source, "commit despite L2 failure", "L1 is still valid");
+		const { host, getCurrentManager } = createHost(source, {
+			responses: [
+				"<segment-delta>L1 delta.</segment-delta><carry-forward>L1 carry-forward.</carry-forward>",
+				"not a rollup envelope",
+			],
+		});
+
+		const result = await controller.rollover(host, { reason: "non-blocking Rollup failure" });
+
+		expect(result.cancelled).toBe(false);
+		expect(controller.getCurrentBinding(getCurrentManager())?.ordinal).toBe(2);
+		const replay = await controller.getStore().replayChain(binding.chainId);
+		expect(replay.branches[0]?.segments.map((segment) => segment.status)).toEqual(["sealed", "active"]);
+		expect(replay.branches[0]?.rollups).toEqual([]);
+		expect(replay.branches[0]?.rollupFailures).toEqual([
+			expect.objectContaining({
+				windowIndex: 1,
+				stage: "artifact_generation",
+				errorCode: "rollup_artifact_generation_failed",
+				retryable: true,
+			}),
+		]);
+	});
+
+	it("reuses a pending Rollup artifact when event publication is retried", async () => {
+		const projectRoot = await createTempDir();
+		const source = createPersistedSession(projectRoot, "rollup-pending-source");
+		const store = new SessionChainStore(projectRoot);
+		const publish = vi
+			.spyOn(store, "appendRollupPublished")
+			.mockRejectedValueOnce(new Error("simulated event outage"));
+		const controller = new SessionChainController({ projectRoot, store });
+		await controller.setRollupConfig({ enabled: true, interval: 1 });
+		const binding = await controller.adoptExternalRoot(source);
+		appendTurn(source, "pending artifact source", "pending artifact result");
+		const { host, summarizeSessionContext } = createHost(source, {
+			responses: [
+				"<segment-delta>Pending delta.</segment-delta><carry-forward>Pending carry-forward.</carry-forward>",
+				'<chain-rollup>{"state":"Pending publication.","decisions":[],"constraints":[],"completed":[],"unresolved":["Publish event."],"nextActions":["Retry without another model call."]}</chain-rollup>',
+			],
+		});
+
+		await controller.rollover(host, { reason: "create pending Rollup" });
+		expect(summarizeSessionContext).toHaveBeenCalledTimes(2);
+		expect((await controller.getStore().replayChain(binding.chainId)).branches[0]?.rollups).toEqual([]);
+		expect((await controller.doctor(binding.chainId)).diagnostics).toContainEqual(
+			expect.objectContaining({ code: "rollup_publication_pending", severity: "warning" }),
+		);
+		await controller.setRollupConfig({ enabled: true, interval: 2 });
+
+		expect(await controller.backfillRollups(host, binding.chainId, binding.branchId)).toBe(1);
+		expect(summarizeSessionContext).toHaveBeenCalledTimes(2);
+		expect(publish).toHaveBeenCalledTimes(2);
+		expect((await controller.getStore().replayChain(binding.chainId)).branches[0]?.rollups).toEqual([
+			expect.objectContaining({ windowIndex: 1, startOrdinal: 1, endOrdinal: 1 }),
+		]);
+		expect((await controller.doctor(binding.chainId)).diagnostics).not.toContainEqual(
+			expect.objectContaining({ code: "rollup_publication_pending" }),
+		);
+	});
+
+	it("discovers an orphaned Rollup artifact after a crash before pending state is written", async () => {
+		const projectRoot = await createTempDir();
+		const source = createPersistedSession(projectRoot, "rollup-orphan-source");
+		const store = new SessionChainStore(projectRoot);
+		const publish = vi
+			.spyOn(store, "appendRollupPublished")
+			.mockRejectedValueOnce(new Error("simulated event outage"));
+		const controller = new SessionChainController({ projectRoot, store });
+		await controller.setRollupConfig({ enabled: true, interval: 1 });
+		const binding = await controller.adoptExternalRoot(source);
+		appendTurn(source, "orphan artifact source", "orphan artifact result");
+		const { host, summarizeSessionContext } = createHost(source, {
+			responses: [
+				"<segment-delta>Orphan delta.</segment-delta><carry-forward>Orphan carry-forward.</carry-forward>",
+				'<chain-rollup>{"state":"Orphan publication.","decisions":[],"constraints":[],"completed":[],"unresolved":["Publish event."],"nextActions":["Discover the artifact."]}</chain-rollup>',
+			],
+		});
+
+		await controller.rollover(host, { reason: "create orphaned Rollup" });
+		await rm(
+			join(
+				projectRoot,
+				".pi-xk",
+				"sessions",
+				"chains",
+				binding.chainId,
+				"branches",
+				binding.branchId,
+				"rollups",
+				"000001.pending.json",
+			),
+		);
+		await controller.setRollupConfig({ enabled: true, interval: 2 });
+
+		expect((await controller.doctor(binding.chainId)).diagnostics).toContainEqual(
+			expect.objectContaining({ code: "rollup_artifact_orphaned", severity: "warning" }),
+		);
+		expect(await controller.backfillRollups(host, binding.chainId, binding.branchId)).toBe(1);
+		expect(summarizeSessionContext).toHaveBeenCalledTimes(2);
+		expect(publish).toHaveBeenCalledTimes(2);
+		expect((await controller.getStore().replayChain(binding.chainId)).branches[0]?.rollups).toEqual([
+			expect.objectContaining({ windowIndex: 1, startOrdinal: 1, endOrdinal: 1 }),
+		]);
+	});
+
+	it("diagnoses and rebuilds a missing derived Rollup Markdown projection", async () => {
+		const projectRoot = await createTempDir();
+		const source = createPersistedSession(projectRoot, "rollup-projection-source");
+		const controller = new SessionChainController({ projectRoot });
+		await controller.setRollupConfig({ enabled: true, interval: 1 });
+		const binding = await controller.adoptExternalRoot(source);
+		appendTurn(source, "projection source", "projection result");
+		const { host } = createHost(source, {
+			responses: [
+				"<segment-delta>Projection delta.</segment-delta><carry-forward>Projection carry-forward.</carry-forward>",
+				'<chain-rollup>{"state":"Projection state.","decisions":[],"constraints":[],"completed":["Published."],"unresolved":[],"nextActions":[]}</chain-rollup>',
+			],
+		});
+		await controller.rollover(host, { reason: "projection fixture" });
+		const markdownPath = join(
+			projectRoot,
+			".pi-xk",
+			"sessions",
+			"chains",
+			binding.chainId,
+			"branches",
+			binding.branchId,
+			"rollups",
+			"000001.md",
+		);
+		await rm(markdownPath);
+
+		expect((await controller.doctor(binding.chainId)).diagnostics).toContainEqual(
+			expect.objectContaining({ code: "rollup_markdown_missing", severity: "warning" }),
+		);
+		expect(await controller.repairRollupProjections(binding.chainId)).toEqual([
+			`${binding.branchId}/W1: rebuilt Markdown projection`,
+		]);
+		expect(await readFile(markdownPath, "utf8")).toContain("# Session Chain Rollup W1");
+		expect((await controller.doctor(binding.chainId)).diagnostics).not.toContainEqual(
+			expect.objectContaining({ code: "rollup_markdown_missing" }),
+		);
+	});
+
+	it("does not automatically backfill complete historical windows after an upgrade", async () => {
+		const projectRoot = await createTempDir();
+		const source = createPersistedSession(projectRoot, "rollup-migration-source");
+		const controller = new SessionChainController({ projectRoot });
+		await controller.setRollupConfig({ enabled: false, interval: 2 });
+		const binding = await controller.adoptExternalRoot(source);
+		appendTurn(source, "historical one", "historical one result");
+		const { host, getCurrentManager, summarizeSessionContext } = createHost(source, {
+			responses: [
+				"<segment-delta>Historical one.</segment-delta><carry-forward>Historical one carry.</carry-forward>",
+				"<segment-delta>Historical two.</segment-delta><carry-forward>Historical two carry.</carry-forward>",
+				"<segment-delta>Post-upgrade three.</segment-delta><carry-forward>Post-upgrade three carry.</carry-forward>",
+				'<chain-rollup>{"state":"Historical window backfilled.","decisions":[],"constraints":[],"completed":["Backfill."],"unresolved":[],"nextActions":[]}</chain-rollup>',
+			],
+		});
+		await controller.rollover(host, { reason: "historical one" });
+		appendTurn(getCurrentManager(), "historical two", "historical two result");
+		await controller.rollover(host, { reason: "historical two" });
+		await rm(
+			join(
+				projectRoot,
+				".pi-xk",
+				"sessions",
+				"chains",
+				binding.chainId,
+				"branches",
+				binding.branchId,
+				"rollups",
+				"state.json",
+			),
+		);
+		await controller.setRollupConfig({ enabled: true, interval: 2 });
+		appendTurn(getCurrentManager(), "post-upgrade three", "post-upgrade three result");
+		await controller.rollover(host, { reason: "post-upgrade three" });
+
+		expect(summarizeSessionContext).toHaveBeenCalledTimes(3);
+		expect((await controller.getStore().replayChain(binding.chainId)).branches[0]?.rollups).toEqual([]);
+		expect(await controller.backfillRollups(host, binding.chainId, binding.branchId)).toBe(1);
+		expect(summarizeSessionContext).toHaveBeenCalledTimes(4);
+		expect((await controller.getStore().replayChain(binding.chainId)).branches[0]?.rollups).toHaveLength(1);
+	});
+
 	it("aborts a prepared rollover when the Host cancels before callbacks", async () => {
 		const projectRoot = await createTempDir();
 		const source = createPersistedSession(projectRoot, "cancel-source");
@@ -497,9 +833,65 @@ describe("SessionChainController rollover", () => {
 			expect.objectContaining({ severity: "error", code: "summary_artifact_invalid" }),
 		);
 	});
+
+	it("reports a read-model mismatch that would make the model manifest untrustworthy", async () => {
+		const projectRoot = await createTempDir();
+		const source = createPersistedSession(projectRoot, "manifest-read-model-source");
+		const controller = new SessionChainController({ projectRoot });
+		const binding = await controller.adoptExternalRoot(source);
+		const readModelPath = join(projectRoot, ".pi-xk", "sessions", "chains", binding.chainId, "chain-read-model.json");
+		const readModel = JSON.parse(await readFile(readModelPath, "utf8")) as Record<string, unknown>;
+		readModel.title = "tampered manifest projection";
+		await writeFile(readModelPath, `${JSON.stringify(readModel)}\n`);
+
+		expect((await controller.doctor(binding.chainId)).diagnostics).toContainEqual(
+			expect.objectContaining({ severity: "error", code: "manifest_read_model_inconsistent" }),
+		);
+	});
 });
 
 describe("SessionChainController branching", () => {
+	it("numbers Rollup windows independently on parent and successor branches", async () => {
+		const projectRoot = await createTempDir();
+		const source = createPersistedSession(projectRoot, "branch-rollup-source");
+		const controller = new SessionChainController({ projectRoot });
+		await controller.setRollupConfig({ enabled: true, interval: 1 });
+		const sourceBinding = await controller.adoptExternalRoot(source);
+		appendTurn(source, "parent S1", "parent S1 result");
+		const { host, getCurrentManager, summarizeSessionContext } = createHost(source, {
+			responses: [
+				"<segment-delta>Parent S1 delta.</segment-delta><carry-forward>Parent carry-forward.</carry-forward>",
+				'<chain-rollup>{"state":"Parent W1.","decisions":[],"constraints":[],"completed":["Parent window."],"unresolved":[],"nextActions":[]}</chain-rollup>',
+				"<segment-delta>Branch point delta.</segment-delta><carry-forward>Successor carry-forward.</carry-forward>",
+				"<segment-delta>Successor S1 delta.</segment-delta><carry-forward>Successor S1 carry-forward.</carry-forward>",
+				'<chain-rollup>{"state":"Successor W1.","decisions":[],"constraints":[],"completed":["Successor window."],"unresolved":[],"nextActions":[]}</chain-rollup>',
+			],
+		});
+		await controller.rollover(host, { reason: "publish parent W1" });
+		appendTurn(getCurrentManager(), "branch point", "branch point result");
+		const sourceEntryId = getCurrentManager().getLeafId();
+		if (!sourceEntryId) throw new Error("branch Rollup fixture requires a source leaf");
+		const successor = await controller.continueBranch(host, {
+			reason: "start successor Rollup branch",
+			sourceEntryId,
+		});
+		appendTurn(getCurrentManager(), "successor S1", "successor S1 result");
+		await controller.rollover(host, { reason: "publish successor W1" });
+
+		const replay = await controller.getStore().replayChain(sourceBinding.chainId);
+		const parent = replay.branches.find((branch) => branch.branchId === sourceBinding.branchId);
+		const child = replay.branches.find((branch) => branch.branchId === successor.branchId);
+		expect(parent?.rollups).toEqual([expect.objectContaining({ windowIndex: 1, startOrdinal: 1, endOrdinal: 1 })]);
+		expect(child?.rollups).toEqual([expect.objectContaining({ windowIndex: 1, startOrdinal: 1, endOrdinal: 1 })]);
+		expect(parent?.rollups[0]?.artifactId).not.toBe(child?.rollups[0]?.artifactId);
+		expect(summarizeSessionContext).toHaveBeenCalledTimes(5);
+		await expect(
+			controller.readSummary(sourceBinding.chainId, successor.branchId, {
+				artifactId: parent?.rollups[0]?.artifactId ?? "missing",
+			}),
+		).rejects.toThrow("not available in the selected branch");
+	});
+
 	it("creates a successor branch without sealing or rewriting the source branch", async () => {
 		const projectRoot = await createTempDir();
 		const source = createPersistedSession(projectRoot, "branch-source");

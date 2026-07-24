@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+	CHAIN_ROLLUP_SCHEMA,
 	SEGMENT_SUMMARY_SCHEMA,
 	SESSION_CHAIN_SPEC_SCHEMA,
 	type SegmentSummaryV1,
+	type SessionChainRollupV1,
 	type SessionChainSpecV1,
 	SessionChainValidationError,
 	validateSegmentSummaryV1,
+	validateSessionChainRollupV1,
 	validateSessionChainSpecV1,
 } from "../src/session-chain-contract.ts";
 
@@ -56,6 +59,34 @@ function createSummary(): SegmentSummaryV1 {
 	};
 }
 
+function createRollup(): SessionChainRollupV1 {
+	return {
+		schema: CHAIN_ROLLUP_SCHEMA,
+		chainId: "chain_contract",
+		branchId: "branch_main",
+		windowIndex: 1,
+		startOrdinal: 1,
+		endOrdinal: 5,
+		segmentIds: ["segment-1", "segment-2", "segment-3", "segment-4", "segment-5"],
+		summaryArtifactIds: Array.from({ length: 5 }, (_, index) => `sha256:${String(index + 1).padStart(64, "0")}`),
+		sourceDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		rollup: {
+			state: "The chain is ready for the next implementation unit.",
+			decisions: ["Keep Session and Goal state separate."],
+			constraints: ["Do not scan historical transcripts."],
+			completed: ["Five Segment summaries were published."],
+			unresolved: ["Verify recovery after restart."],
+			nextActions: ["Run the recovery suite."],
+		},
+		provenance: {
+			generator: "pi-xk",
+			model: "faux/faux-model",
+			promptVersion: "session-chain-rollup-v1",
+			generatedAt: "2026-07-22T00:05:00.000Z",
+		},
+	};
+}
+
 describe("Session Chain contracts", () => {
 	it("strictly validates a managed root Segment", () => {
 		expect(validateSessionChainSpecV1(createSpec())).toEqual(createSpec());
@@ -100,5 +131,27 @@ describe("Session Chain contracts", () => {
 				carryForwardMarkdown: "",
 			}),
 		).toThrow("carryForwardMarkdown");
+	});
+
+	it("strictly validates an ordered L2 Rollup without embedding its content-addressed ID", () => {
+		expect(validateSessionChainRollupV1(createRollup())).toEqual(createRollup());
+		expect(() =>
+			validateSessionChainRollupV1({
+				...createRollup(),
+				artifactId: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			}),
+		).toThrow("unknown or missing fields");
+		expect(() =>
+			validateSessionChainRollupV1({
+				...createRollup(),
+				endOrdinal: 6,
+			}),
+		).toThrow("ordinal range");
+		expect(() =>
+			validateSessionChainRollupV1({
+				...createRollup(),
+				summaryArtifactIds: createRollup().summaryArtifactIds.slice(1),
+			}),
+		).toThrow("source arrays");
 	});
 });
