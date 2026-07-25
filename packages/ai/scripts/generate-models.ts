@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { mkdirSync, readdirSync, rmSync, writeFileSync } from "fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "fs";
 import { dirname, join, resolve } from "path";
 import { fileURLToPath } from "url";
 import {
@@ -21,17 +21,27 @@ import type {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const packageRoot = join(__dirname, "..");
+const defaultPackageRoot = join(__dirname, "..");
 
-function readGeneratorOptions(args: string[]): {
+interface ModelGeneratorOptions {
 	strict: boolean;
 	jsonOnly: boolean;
 	jsonOutputDir: string | undefined;
+	packageRoot: string | undefined;
 	pretty: boolean;
-} {
+}
+
+interface ModelGeneratorContext {
+	fetch: typeof globalThis.fetch;
+	options: ModelGeneratorOptions;
+	packageRoot: string;
+}
+
+function readGeneratorOptions(args: string[]): ModelGeneratorOptions {
 	let strict = false;
 	let jsonOnly = false;
 	let jsonOutputDir: string | undefined;
+	let packageRoot: string | undefined;
 	let pretty = false;
 
 	for (let index = 0; index < args.length; index++) {
@@ -54,14 +64,18 @@ function readGeneratorOptions(args: string[]): {
 			jsonOutputDir = resolve(value);
 			continue;
 		}
+		if (arg === "--package-root") {
+			const value = args[++index];
+			if (!value) throw new Error("--package-root requires a directory");
+			packageRoot = resolve(value);
+			continue;
+		}
 		throw new Error(`Unknown argument: ${arg}`);
 	}
 
 	if (jsonOnly && !jsonOutputDir) throw new Error("--json-only requires --json-output");
-	return { strict, jsonOnly, jsonOutputDir, pretty };
+	return { strict, jsonOnly, jsonOutputDir, packageRoot, pretty };
 }
-
-const generatorOptions = readGeneratorOptions(process.argv.slice(2));
 
 interface ModelsDevModel {
 	id: string;
@@ -794,34 +808,40 @@ function getModelsDevCost(cost: ModelsDevModel["cost"]): ModelCost {
 	};
 }
 
-async function fetchNvidiaNimModelIds(): Promise<Map<string, string>> {
+async function fetchNvidiaNimModelIds(context: ModelGeneratorContext): Promise<Map<string, string>> {
 	try {
 		console.log("Fetching models from NVIDIA NIM API...");
-		const response = await fetch(`${NVIDIA_BASE_URL}/models`);
+		const response = await context.fetch(`${NVIDIA_BASE_URL}/models`);
 		if (!response.ok) throw new Error(`NVIDIA NIM API returned ${response.status}`);
 		const data = (await response.json()) as { data?: NvidiaNimModelListItem[] };
+		if (!Array.isArray(data.data) || data.data.length === 0) {
+			throw new Error("NVIDIA NIM API returned an empty or invalid model catalog");
+		}
 		const modelIds = new Map<string, string>();
 
-		for (const model of data.data ?? []) {
+		for (const model of data.data) {
 			modelIds.set(model.id, model.id);
 			modelIds.set(normalizeNvidiaModelId(model.id), model.id);
 		}
 
-		console.log(`Fetched ${data.data?.length ?? 0} model IDs from NVIDIA NIM`);
+		console.log(`Fetched ${data.data.length} model IDs from NVIDIA NIM`);
 		return modelIds;
 	} catch (error) {
 		console.error("Failed to fetch NVIDIA NIM models:", error);
-		if (generatorOptions.strict) throw error;
+		if (context.options.strict) throw error;
 		return new Map();
 	}
 }
 
-async function fetchOpenRouterModels(): Promise<Model<any>[]> {
+async function fetchOpenRouterModels(context: ModelGeneratorContext): Promise<Model<any>[]> {
 	try {
 		console.log("Fetching models from OpenRouter API...");
-		const response = await fetch("https://openrouter.ai/api/v1/models");
+		const response = await context.fetch("https://openrouter.ai/api/v1/models");
 		if (!response.ok) throw new Error(`OpenRouter API returned ${response.status}`);
 		const data = await response.json();
+		if (!Array.isArray(data.data) || data.data.length === 0) {
+			throw new Error("OpenRouter API returned an empty or invalid model catalog");
+		}
 
 		const models: Model<any>[] = [];
 
@@ -868,20 +888,21 @@ async function fetchOpenRouterModels(): Promise<Model<any>[]> {
 			};
 			models.push(normalizedModel);
 		}
+		if (models.length === 0) throw new Error("OpenRouter API returned no tool-capable models");
 
 		console.log(`Fetched ${models.length} tool-capable models from OpenRouter`);
 		return models;
 	} catch (error) {
 		console.error("Failed to fetch OpenRouter models:", error);
-		if (generatorOptions.strict) throw error;
+		if (context.options.strict) throw error;
 		return [];
 	}
 }
 
-async function fetchAiGatewayModels(): Promise<Model<any>[]> {
+async function fetchAiGatewayModels(context: ModelGeneratorContext): Promise<Model<any>[]> {
 	try {
 		console.log("Fetching models from Vercel AI Gateway API...");
-		const response = await fetch(`${AI_GATEWAY_MODELS_URL}/models`);
+		const response = await context.fetch(`${AI_GATEWAY_MODELS_URL}/models`);
 		if (!response.ok) throw new Error(`Vercel AI Gateway API returned ${response.status}`);
 		const data = await response.json();
 		const models: Model<any>[] = [];
@@ -894,7 +915,10 @@ async function fetchAiGatewayModels(): Promise<Model<any>[]> {
 			return Number.isFinite(parsed) ? parsed : 0;
 		};
 
-		const items = Array.isArray(data.data) ? (data.data as AiGatewayModel[]) : [];
+		if (!Array.isArray(data.data) || data.data.length === 0) {
+			throw new Error("Vercel AI Gateway API returned an empty or invalid model catalog");
+		}
+		const items = data.data as AiGatewayModel[];
 		for (const model of items) {
 			const tags = Array.isArray(model.tags) ? model.tags : [];
 			// Only include models that support tools
@@ -928,25 +952,29 @@ async function fetchAiGatewayModels(): Promise<Model<any>[]> {
 				maxTokens: model.max_tokens || 4096,
 			});
 		}
+		if (models.length === 0) throw new Error("Vercel AI Gateway API returned no tool-capable models");
 
 		console.log(`Fetched ${models.length} tool-capable models from Vercel AI Gateway`);
 		return models;
 	} catch (error) {
 		console.error("Failed to fetch Vercel AI Gateway models:", error);
-		if (generatorOptions.strict) throw error;
+		if (context.options.strict) throw error;
 		return [];
 	}
 }
 
-async function loadModelsDevData(): Promise<Model<any>[]> {
+async function loadModelsDevData(context: ModelGeneratorContext): Promise<Model<any>[]> {
 	try {
 		console.log("Fetching models from models.dev API...");
-		const response = await fetch("https://models.dev/api.json");
+		const response = await context.fetch("https://models.dev/api.json");
 		if (!response.ok) throw new Error(`models.dev API returned ${response.status}`);
 		const data = await response.json();
+		if (!data || typeof data !== "object" || Array.isArray(data)) {
+			throw new Error("models.dev API returned an invalid model catalog");
+		}
 
 		const models: Model<any>[] = [];
-		const nvidiaNimModelIds = data.nvidia?.models ? await fetchNvidiaNimModelIds() : new Map<string, string>();
+		const nvidiaNimModelIds = data.nvidia?.models ? await fetchNvidiaNimModelIds(context) : new Map<string, string>();
 
 		// Process Amazon Bedrock models
 		if (data["amazon-bedrock"]?.models) {
@@ -1826,6 +1854,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 			}
 		}
 
+		if (models.length === 0) throw new Error("models.dev API returned no tool-capable models");
 		console.log(`Loaded ${models.length} tool-capable models from models.dev`);
 		return models;
 	} catch (error) {
@@ -1834,14 +1863,84 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 	}
 }
 
-async function generateModels() {
+function removeGeneratedCatalog(packageRoot: string): void {
+	const providersDir = join(packageRoot, "src", "providers");
+	if (existsSync(providersDir)) {
+		for (const entry of readdirSync(providersDir)) {
+			if (entry.endsWith(".models.ts")) rmSync(join(providersDir, entry));
+		}
+		rmSync(join(providersDir, "data"), { recursive: true, force: true });
+	}
+	rmSync(join(packageRoot, "src", "models.generated.ts"), { force: true });
+}
+
+function copyGeneratedCatalog(sourceRoot: string, targetRoot: string): void {
+	const sourceProvidersDir = join(sourceRoot, "src", "providers");
+	const targetProvidersDir = join(targetRoot, "src", "providers");
+	mkdirSync(targetProvidersDir, { recursive: true });
+	if (existsSync(sourceProvidersDir)) {
+		for (const entry of readdirSync(sourceProvidersDir)) {
+			if (entry.endsWith(".models.ts")) {
+				cpSync(join(sourceProvidersDir, entry), join(targetProvidersDir, entry));
+			}
+		}
+		const sourceDataDir = join(sourceProvidersDir, "data");
+		if (existsSync(sourceDataDir)) {
+			cpSync(sourceDataDir, join(targetProvidersDir, "data"), { recursive: true });
+		}
+	}
+	const sourceAggregator = join(sourceRoot, "src", "models.generated.ts");
+	if (existsSync(sourceAggregator)) {
+		mkdirSync(join(targetRoot, "src"), { recursive: true });
+		cpSync(sourceAggregator, join(targetRoot, "src", "models.generated.ts"));
+	}
+}
+
+function publishGeneratedCatalog(stagedRoot: string, packageRoot: string): void {
+	const backupRoot = mkdtempSync(join(packageRoot, ".pi-model-catalog-backup-"));
+	try {
+		copyGeneratedCatalog(packageRoot, backupRoot);
+		removeGeneratedCatalog(packageRoot);
+		try {
+			copyGeneratedCatalog(stagedRoot, packageRoot);
+		} catch (error) {
+			removeGeneratedCatalog(packageRoot);
+			copyGeneratedCatalog(backupRoot, packageRoot);
+			throw error;
+		}
+	} finally {
+		rmSync(backupRoot, { recursive: true, force: true });
+	}
+}
+
+function publishDirectory(stagedDirectory: string, targetDirectory: string): void {
+	const targetParent = dirname(targetDirectory);
+	mkdirSync(targetParent, { recursive: true });
+	const backupRoot = mkdtempSync(join(targetParent, ".pi-model-catalog-json-backup-"));
+	const backupDirectory = join(backupRoot, "catalog");
+	try {
+		if (existsSync(targetDirectory)) cpSync(targetDirectory, backupDirectory, { recursive: true });
+		rmSync(targetDirectory, { recursive: true, force: true });
+		try {
+			cpSync(stagedDirectory, targetDirectory, { recursive: true });
+		} catch (error) {
+			rmSync(targetDirectory, { recursive: true, force: true });
+			if (existsSync(backupDirectory)) cpSync(backupDirectory, targetDirectory, { recursive: true });
+			throw error;
+		}
+	} finally {
+		rmSync(backupRoot, { recursive: true, force: true });
+	}
+}
+
+async function generateModels(context: ModelGeneratorContext) {
 	// Fetch models from both sources
 	// models.dev: Anthropic, Google, OpenAI, Groq, Cerebras
 	// OpenRouter: xAI and other providers (excluding Anthropic, Google, OpenAI)
 	// AI Gateway: OpenAI-compatible catalog with tool-capable models
-	const modelsDevModels = await loadModelsDevData();
-	const openRouterModels = await fetchOpenRouterModels();
-	const aiGatewayModels = await fetchAiGatewayModels();
+	const modelsDevModels = await loadModelsDevData(context);
+	const openRouterModels = await fetchOpenRouterModels(context);
+	const aiGatewayModels = await fetchAiGatewayModels(context);
 
 	// Combine models (models.dev has priority)
 	const allModels = [...modelsDevModels, ...openRouterModels, ...aiGatewayModels].filter(
@@ -2330,9 +2429,9 @@ async function generateModels() {
 		}
 	}
 	const writeJson = (path: string, value: unknown) =>
-		writeFileSync(path, `${JSON.stringify(value, null, generatorOptions.pretty ? 2 : undefined)}\n`);
+		writeFileSync(path, `${JSON.stringify(value, null, context.options.pretty ? 2 : undefined)}\n`);
 
-	if (!generatorOptions.jsonOnly) {
+	if (!context.options.jsonOnly) {
 		// Generate TypeScript structural catalogs and adjacent JSON values.
 		const generatedHeader = `// This file is auto-generated by scripts/generate-models.ts
 // Do not edit manually - run 'npm run generate-models' to update
@@ -2340,64 +2439,72 @@ async function generateModels() {
 `;
 		const catalogConstName = (providerId: string) =>
 			`${providerId.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_MODELS`;
-		const providersDir = join(packageRoot, "src/providers");
+		const stagingRoot = mkdtempSync(join(context.packageRoot, ".pi-model-catalog-stage-"));
+		const stagedPackageRoot = join(stagingRoot, "package");
+		const providersDir = join(stagedPackageRoot, "src/providers");
 		const dataDir = join(providersDir, "data");
 
 		function emitModelShape(model: Model<any>, indent: string): string {
 			return `${indent}${JSON.stringify(model.id)}: Model<${JSON.stringify(model.api)}> & {\n${indent}\tid: ${JSON.stringify(model.id)};\n${indent}\tprovider: ${JSON.stringify(model.provider)};\n${indent}};\n`;
 		}
 
-		// Remove stale per-provider catalogs and their generated values.
-		for (const entry of readdirSync(providersDir)) {
-			if (entry.endsWith(".models.ts")) {
-				rmSync(join(providersDir, entry));
-			}
-		}
-		rmSync(dataDir, { recursive: true, force: true });
-		mkdirSync(dataDir, { recursive: true });
+		try {
+			mkdirSync(dataDir, { recursive: true });
 
-		// Per-provider catalog structure and values (sorted for deterministic output).
-		for (const providerId of sortedProviderIds) {
-			const models = providers[providerId];
-			const sortedModelIds = Object.keys(models).sort();
+			// Per-provider catalog structure and values (sorted for deterministic output).
+			for (const providerId of sortedProviderIds) {
+				const models = providers[providerId];
+				const sortedModelIds = Object.keys(models).sort();
+				let output = generatedHeader;
+				output += `import values from "./data/${providerId}.json" with { type: "json" };\n`;
+				output += `import type { Model } from "../types.ts";\n\n`;
+				output += `export const ${catalogConstName(providerId)} = values as {\n`;
+				for (const modelId of sortedModelIds) {
+					output += emitModelShape(models[modelId], "\t");
+				}
+				output += `};\n`;
+				writeFileSync(join(providersDir, `${providerId}.models.ts`), output);
+				writeJson(join(dataDir, `${providerId}.json`), jsonProviders[providerId]);
+			}
+			console.log(`Generated ${sortedProviderIds.length} catalog structures under src/providers/`);
+			console.log("Generated JSON model values under src/providers/data/");
+
+			// Aggregator
 			let output = generatedHeader;
-			output += `import values from "./data/${providerId}.json" with { type: "json" };\n`;
-			output += `import type { Model } from "../types.ts";\n\n`;
-			output += `export const ${catalogConstName(providerId)} = values as {\n`;
-			for (const modelId of sortedModelIds) {
-				output += emitModelShape(models[modelId], "\t");
+			for (const providerId of sortedProviderIds) {
+				output += `import { ${catalogConstName(providerId)} } from "./providers/${providerId}.models.ts";\n`;
 			}
-			output += `};\n`;
-			writeFileSync(join(providersDir, `${providerId}.models.ts`), output);
-			writeJson(join(dataDir, `${providerId}.json`), jsonProviders[providerId]);
+			output += `\nexport const MODELS = {\n`;
+			for (const providerId of sortedProviderIds) {
+				output += `\t${JSON.stringify(providerId)}: ${catalogConstName(providerId)},\n`;
+			}
+			output += `} as const;\n`;
+			writeFileSync(join(stagedPackageRoot, "src/models.generated.ts"), output);
+			publishGeneratedCatalog(stagedPackageRoot, context.packageRoot);
+			console.log("Generated src/models.generated.ts");
+		} finally {
+			rmSync(stagingRoot, { recursive: true, force: true });
 		}
-		console.log(`Generated ${sortedProviderIds.length} catalog structures under src/providers/`);
-		console.log("Generated JSON model values under src/providers/data/");
-
-		// Aggregator
-		let output = generatedHeader;
-		for (const providerId of sortedProviderIds) {
-			output += `import { ${catalogConstName(providerId)} } from "./providers/${providerId}.models.ts";\n`;
-		}
-		output += `\nexport const MODELS = {\n`;
-		for (const providerId of sortedProviderIds) {
-			output += `\t${JSON.stringify(providerId)}: ${catalogConstName(providerId)},\n`;
-		}
-		output += `} as const;\n`;
-		writeFileSync(join(packageRoot, "src/models.generated.ts"), output);
-		console.log("Generated src/models.generated.ts");
 	}
 
-	if (generatorOptions.jsonOutputDir) {
-		const providerOutputDir = join(generatorOptions.jsonOutputDir, "providers");
-		rmSync(generatorOptions.jsonOutputDir, { recursive: true, force: true });
-		mkdirSync(providerOutputDir, { recursive: true });
-		writeJson(join(generatorOptions.jsonOutputDir, "models.json"), jsonProviders);
-		writeJson(join(generatorOptions.jsonOutputDir, "providers.json"), sortedProviderIds);
-		for (const providerId of sortedProviderIds) {
-			writeJson(join(providerOutputDir, `${providerId}.json`), jsonProviders[providerId]);
+	if (context.options.jsonOutputDir) {
+		const outputParent = dirname(context.options.jsonOutputDir);
+		mkdirSync(outputParent, { recursive: true });
+		const stagingRoot = mkdtempSync(join(outputParent, ".pi-model-catalog-json-stage-"));
+		const stagedOutputDir = join(stagingRoot, "catalog");
+		const providerOutputDir = join(stagedOutputDir, "providers");
+		try {
+			mkdirSync(providerOutputDir, { recursive: true });
+			writeJson(join(stagedOutputDir, "models.json"), jsonProviders);
+			writeJson(join(stagedOutputDir, "providers.json"), sortedProviderIds);
+			for (const providerId of sortedProviderIds) {
+				writeJson(join(providerOutputDir, `${providerId}.json`), jsonProviders[providerId]);
+			}
+			publishDirectory(stagedOutputDir, context.options.jsonOutputDir);
+		} finally {
+			rmSync(stagingRoot, { recursive: true, force: true });
 		}
-		console.log(`Generated JSON model catalog under ${generatorOptions.jsonOutputDir}`);
+		console.log(`Generated JSON model catalog under ${context.options.jsonOutputDir}`);
 	}
 
 	// Print statistics
@@ -2413,8 +2520,18 @@ async function generateModels() {
 	}
 }
 
-// Run the generator
-generateModels().catch((error) => {
-	console.error(error);
-	process.exitCode = 1;
-});
+async function runModelGenerator(context: ModelGeneratorContext): Promise<void> {
+	await generateModels(context);
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === __filename) {
+	const options = readGeneratorOptions(process.argv.slice(2));
+	runModelGenerator({
+		fetch: globalThis.fetch,
+		options,
+		packageRoot: options.packageRoot ?? defaultPackageRoot,
+	}).catch((error) => {
+		console.error(error);
+		process.exitCode = 1;
+	});
+}

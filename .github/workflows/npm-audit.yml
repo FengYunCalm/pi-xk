@@ -28,4 +28,11 @@ jobs:
         run: npm audit --omit=dev --audit-level=moderate
 
       - name: Verify registry signatures
-        run: npm audit signatures --omit=dev
+        env:
+          PI_SIGNATURE_AUDIT_DIR: ${{ runner.temp }}/pi-signature-audit
+        run: |
+          mkdir -p "$PI_SIGNATURE_AUDIT_DIR"
+          cp packages/coding-agent/install-lock/package.json packages/coding-agent/install-lock/package-lock.json "$PI_SIGNATURE_AUDIT_DIR/"
+          cd "$PI_SIGNATURE_AUDIT_DIR"
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm audit signatures --omit=dev

@@ -726,7 +726,16 @@ describe("Pi-XK Session Chain extension", () => {
 			),
 			(context) => {
 				providerSystemPrompts.push(context.systemPrompt ?? "");
-				return fauxAssistantMessage(fauxToolCall("pi_xk_list_chain_summaries", { level: "all", limit: 20 }));
+				const currentBinding = controller.getCurrentBinding(harness.runtime.session.sessionManager);
+				if (!currentBinding) throw new Error("summary tool fixture must remain bound");
+				return fauxAssistantMessage(
+					fauxToolCall("pi_xk_list_chain_summaries", {
+						chainId: currentBinding.chainId,
+						branchId: currentBinding.branchId,
+						level: "all",
+						limit: 20,
+					}),
+				);
 			},
 			(context) => {
 				providerSystemPrompts.push(context.systemPrompt ?? "");
@@ -751,10 +760,13 @@ describe("Pi-XK Session Chain extension", () => {
 		expect(providerSystemPrompts).toHaveLength(3);
 		for (const prompt of providerSystemPrompts) {
 			expect(prompt).toContain("Session Chain summary manifest");
+			expect(prompt).toContain(`Chain: ${rolloverBinding.chainId}`);
 			expect(prompt).toContain("L1 sealed summaries: 1");
 			expect(prompt).toContain(`Branch: ${rolloverBinding.branchId}`);
 			expect(prompt).toContain("L2 Rollup windows: W1-W1; S1-S1");
 			expect(prompt).toContain("pi_xk_list_chain_summaries");
+			expect(prompt).toContain("Omit chainId and branchId to use the current Session Chain scope");
+			expect(prompt).not.toContain("Chain: active");
 			expect(prompt).not.toContain("Manifest fixture carry-forward");
 			expect(prompt).not.toContain("SYSTEM OVERRIDE");
 			expect(prompt).not.toContain("Expose summaries through tools");

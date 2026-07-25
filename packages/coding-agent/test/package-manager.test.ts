@@ -1200,7 +1200,7 @@ Content`,
 	});
 
 	describe("temporary install paths", () => {
-		it("should place temporary npm packages under the agent temp extension folder", () => {
+		it("should place temporary npm packages under the agent temp extension folder", ({ skip }) => {
 			const managerWithInternals = packageManager as unknown as PackageManagerInternals;
 			const source = managerWithInternals.parseSource("npm:left-pad");
 			if (source.type !== "npm") {
@@ -1214,7 +1214,11 @@ Content`,
 			expect(relative(tempRoot, installPath).startsWith("..")).toBe(false);
 			expect(installPath.startsWith(join(tmpdir(), "pi-extensions"))).toBe(false);
 			if (process.platform !== "win32") {
-				expect(statSync(tempRoot).mode & 0o777).toBe(0o700);
+				const mode = statSync(tempRoot).mode & 0o777;
+				if (mode === 0o777) {
+					skip("filesystem does not expose requested POSIX directory modes");
+				}
+				expect(mode).toBe(0o700);
 			}
 		});
 	});

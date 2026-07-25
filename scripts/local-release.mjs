@@ -210,7 +210,7 @@ const binaryDirectory = join(outDir, "bun");
 mkdirSync(tarballDirectory, { recursive: true });
 
 if (!options.skipCheck || !options.skipTest) {
-	run("npm", ["--prefix", "packages/ai", "run", "generate-models"], { cwd: repoRoot });
+	run("npm", ["--prefix", "packages/ai", "run", "generate-models:strict"], { cwd: repoRoot });
 }
 
 if (!options.skipCheck) {

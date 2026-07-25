@@ -1,4 +1,4 @@
-import { access, chmod, realpath, symlink } from "node:fs/promises";
+import { access, chmod, mkdir, realpath, symlink } from "node:fs/promises";
 import { delimiter, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
@@ -289,8 +289,7 @@ describe("NodeExecutionEnv", () => {
 		if (!missingShell.ok) expect(missingShell.error).toMatchObject({ code: "shell_unavailable" });
 
 		const shellPath = join(root, "not-executable-shell");
-		const env = new NodeExecutionEnv({ cwd: root });
-		getOrThrow(await env.writeFile(shellPath, "not executable"));
+		await mkdir(shellPath);
 		const spawnErrorEnv = new NodeExecutionEnv({ cwd: root, shellPath });
 		const spawnError = await spawnErrorEnv.exec("printf ok");
 		expect(spawnError.ok).toBe(false);

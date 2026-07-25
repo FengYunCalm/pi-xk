@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { accessSync, chmodSync, constants, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { delimiter, join } from "path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -20,6 +20,15 @@ function setExecPath(value: string): void {
 		value,
 		configurable: true,
 	});
+}
+
+function isPathWritable(path: string): boolean {
+	try {
+		accessSync(path, constants.W_OK);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 afterEach(() => {
@@ -425,9 +434,12 @@ describe("detectInstallMethod", () => {
 		});
 	});
 
-	test("does not self-update when npm install path is not writable", () => {
+	test("does not self-update when npm install path is not writable", ({ skip }) => {
 		const { packageDir } = createNpmPrefixInstall();
 		chmodSync(packageDir, 0o500);
+		if (isPathWritable(packageDir)) {
+			skip("filesystem does not enforce chmod write restrictions");
+		}
 
 		expect(getSelfUpdateCommand("@earendil-works/pi-coding-agent")).toBeUndefined();
 		expect(getSelfUpdateUnavailableInstruction("@earendil-works/pi-coding-agent")).toContain(

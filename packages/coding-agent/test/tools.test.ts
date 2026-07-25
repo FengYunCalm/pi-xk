@@ -460,10 +460,20 @@ describe("Coding Agent Tools", () => {
 			expect(result).toEqual({ error: `Could not edit file: ${missingFile}. Error code: ENOENT.` });
 		});
 
-		it("should include EACCES in diff preview for unreadable files", async () => {
+		it("should include EACCES in diff preview for unreadable files", async ({ skip }) => {
 			const unreadableFile = join(testDir, "unreadable-preview.txt");
 			writeFileSync(unreadableFile, "hello\n");
 			chmodSync(unreadableFile, 0o222);
+			let remainsReadable = false;
+			try {
+				readFileSync(unreadableFile);
+				remainsReadable = true;
+			} catch {
+				// Expected when the filesystem enforces the requested mode.
+			}
+			if (remainsReadable) {
+				skip("filesystem does not enforce chmod read restrictions");
+			}
 
 			const result = await computeEditsDiff(unreadableFile, [{ oldText: "hello", newText: "world" }], testDir);
 

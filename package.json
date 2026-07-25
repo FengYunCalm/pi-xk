@@ -22,7 +22,7 @@
 		"check:pi-xk-runtime": "node scripts/check-pi-xk-runtime.mjs",
 		"test:pi-xk": "node scripts/run-pi-xk-tests.mjs",
 		"benchmark:session-chain": "node scripts/benchmark-session-chain.mjs",
-		"generate:models": "npm --prefix packages/ai run generate-models && npm --prefix packages/ai run generate-image-models",
+		"generate:models": "npm --prefix packages/ai run generate-models:strict && npm --prefix packages/ai run generate-image-models",
 		"generate:model-catalog": "npm --prefix packages/ai run generate-model-catalog",
 		"diff:model-catalog": "node scripts/diff-model-catalog.mjs",
 		"check:model-catalog": "node scripts/publish-model-catalog.mjs --input .artifacts/model-catalog --dry-run",
