@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Refreshed generated provider catalogs to add Claude Opus 5 for GitHub Copilot and remove four model aliases no longer returned by Vercel AI Gateway.
+
 ### Fixed
 
 - Fixed model catalog generation to preserve the last complete catalog when any required remote source is unavailable or returns an empty/invalid catalog, stage complete outputs before replacement, and require strict generation for build and release paths while allowing dynamic lookup of provider-specific model IDs.
