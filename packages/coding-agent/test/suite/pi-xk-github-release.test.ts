@@ -12,6 +12,8 @@ const buildScriptPath = join(workspaceRoot, "scripts", "build-pi-xk-binaries.sh"
 const packagerPath = join(workspaceRoot, "scripts", "package-pi-xk-release.mjs");
 const releaseNotesPath = join(workspaceRoot, "scripts", "release-notes.mjs");
 const releaseWorkflowPath = join(workspaceRoot, ".github", "workflows", "build-pi-xk-release.yml");
+const modelCatalogWorkflowPath = join(workspaceRoot, ".github", "workflows", "publish-model-catalog.yml");
+const binaryReleaseWorkflowPath = join(workspaceRoot, ".github", "workflows", "build-binaries.yml");
 const temporaryDirectories: string[] = [];
 const sourceCommit = "0123456789abcdef0123456789abcdef01234567";
 
@@ -134,6 +136,19 @@ describe("Pi-XK GitHub release packaging", () => {
 
 		expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
 		expect(result.stdout).toContain("https://github.com/FengYunCalm/pi-xk/blob/pi-xk-v0.1.0/docs/pi-xk/README.md");
+	});
+
+	it("pins artifact transfer actions to resolvable Node 24 revisions", async () => {
+		const workflows = await Promise.all(
+			[releaseWorkflowPath, modelCatalogWorkflowPath, binaryReleaseWorkflowPath].map((path) =>
+				readFile(path, "utf8"),
+			),
+		);
+
+		for (const workflow of workflows) {
+			expect(workflow).toContain("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1");
+			expect(workflow).toContain("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1");
+		}
 	});
 
 	it("rejects a mismatched local release tag before replacing existing output", async () => {
