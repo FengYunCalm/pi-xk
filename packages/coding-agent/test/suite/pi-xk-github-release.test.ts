@@ -86,8 +86,12 @@ afterEach(async () => {
 describe("Pi-XK GitHub release packaging", () => {
 	it("uses a dedicated GitHub-only workflow without npm publication", async () => {
 		const workflow = await readFile(releaseWorkflowPath, "utf8");
+		const buildStepIndex = workflow.indexOf("- name: Build\n");
+		const testStepIndex = workflow.indexOf("- name: Test\n");
 
 		expect(workflow).toContain("pi-xk-v*");
+		expect(buildStepIndex).toBeGreaterThan(-1);
+		expect(testStepIndex).toBeGreaterThan(buildStepIndex);
 		for (const platform of [
 			"darwin-arm64",
 			"darwin-x64",
