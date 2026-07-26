@@ -48,6 +48,7 @@ const commands = [
 		"test/suite/pi-xk-task-runner.test.ts",
 		"test/suite/pi-xk-task-extension.test.ts",
 		"test/suite/pi-xk-package-install.test.ts",
+		"test/suite/pi-xk-github-release.test.ts",
 		"test/suite/pi-xk-session-chain-summary-quality.test.ts",
 	],
 ];

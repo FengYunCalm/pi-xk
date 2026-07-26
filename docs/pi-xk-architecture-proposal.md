@@ -1,10 +1,10 @@
 # Pi-XK 架构策划案
 
-> **状态**：Implemented baseline, stabilization pending release validation（Phase 0、Phase 1.1–1.8、Task Run v1、Session Chain v1.1 / Rollup v1 及其正确性、恢复、长链性能和本地产品化稳定化已在当前分支实现；仍需完整本地与真实 smoke 验收。Policy/沙箱、完整 TaskSupervisor、通用 Context/memory 与 Proposal/反省闭环不在当前范围）
+> **状态**：Implemented and locally release-validated（Phase 0、Phase 1.1–1.8、Task Run v1、Session Chain v1.1 / Rollup v1、正确性、恢复、长链性能、本地产品化和 GitHub-only 发行链均已实现并完成本地 smoke；正式 `pi-xk-v*` tag 与 GitHub Release 仍需独立授权和目标 `main` CI 证据。Policy/沙箱、完整 TaskSupervisor、通用 Context/memory 与 Proposal/反省闭环不在当前范围）
 >
-> **版本**：1.1.0
+> **版本**：1.1.1
 >
-> **日期**：2026-07-25
+> **日期**：2026-07-26
 >
 > **定位**：基于 Pi 的维护型 fork，加上可验证的领域层、任务编排层和安全边界。
 >

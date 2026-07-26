@@ -1,18 +1,33 @@
 # Pi-XK 上手指南
 
-本指南面向第一次从当前仓库安装 Pi-XK 的使用者。它假设你已经能正常启动 Pi，并理解扩展会以当前用户权限执行。
+本指南面向第一次安装 Pi-XK 的使用者。固定版本优先使用 GitHub 二进制归档；参与开发或需要修改源码时使用可信 checkout。本指南假设你已经完成 provider/model 配置，并理解扩展会以当前用户权限执行。
 
 ## 1. 前置条件
 
-- Node.js `>=22.19.0`；
-- 当前 Pi-XK 仓库的可信 checkout；
+- GitHub 归档路径不要求 Node.js 或 npm；checkout 路径要求 Node.js `>=22.19.0`；
+- 对应平台的完整 Pi-XK 归档，或当前仓库的可信 checkout；
 - 已完成 Pi provider/model 配置；
 - `fd` 或 Ubuntu/Debian 提供的 `fdfind`，供 Pi 原生 `find` 工具使用；
 - 一个你有权写入的项目目录。Pi-XK 会在该目录下创建 `.pi-xk/`。
 
 Pi-XK 当前没有内置权限系统或沙箱。不要在不可信仓库、共享生产账号或无人值守环境中把本指南当作安全部署方案。
 
-## 2. 构建与安装
+## 2. 使用 GitHub 二进制归档
+
+从仓库 Releases 下载对应平台的 `pi-xk-*` 归档、`PI-XK-RELEASE.json` 和 `SHA256SUMS`。先按[GitHub-only 发行说明](github-release.md)校验，再完整解压。Linux/macOS 示例：
+
+```bash
+tar -xzf pi-xk-linux-x64.tar.gz
+cd pi-xk
+./pi-xk --version
+./pi-xk
+```
+
+Windows 解压 zip 后运行 `pi-xk.exe`。不要只复制可执行文件：同目录的 `PI-XK-RELEASE.json`、`pi-xk-extension/` 和 `pi-xk-docs/` 都是运行时或诊断载荷。归档同时保留底层 `pi` 可执行文件，用于确认未加载 Pi-XK 时的上游行为；日常使用应启动 `pi-xk`。
+
+二进制入口不写 profile package 设置。它在每次启动时显式加载归档内的私有 Extension，并继续使用 Pi 原有的 profile、provider 认证和 session 目录。`pi-xk --version` 会同时显示独立 Pi-XK 版本与内嵌 Pi 基线。
+
+## 3. 从 checkout 构建与安装
 
 首次准备仓库依赖时，在仓库根执行：
 
@@ -68,7 +83,7 @@ pi list
 
 同一个 shell 中启动 Pi，才能继续使用这个 profile。`PI_CODING_AGENT_DIR` 不是 Pi-XK 数据目录；项目领域数据仍写在当前工作目录的 `.pi-xk/`。
 
-## 3. 首次启动会发生什么
+## 4. 首次启动会发生什么
 
 从目标项目根启动 Pi。扩展加载后会注册 `/goal`、`/task`、`/chain`、`/xk` 命令和对应模型工具。
 
@@ -88,7 +103,7 @@ pi list
 
 若命令不存在，先检查 `pi list`、构建产物 `packages/pi-xk-extension/dist/extension.js`，然后重启 Pi。若 runtime preflight 报 `fd is unavailable`，在 Ubuntu/Debian 安装 `fd-find`，或把可信的 `fd` 放到 Pi profile 的 `bin/` 目录。
 
-## 4. 第一个 Goal
+## 5. 第一个 Goal
 
 Goal 适合需要多个 run、明确验收和可恢复状态的工作。不要为一个简单问答创建 Goal。
 
@@ -133,7 +148,7 @@ active Goal 的普通模型回复不是完成信号。模型必须先更新 `goa
 
 用户 `/goal end` 是显式终止覆盖，不要求模型先证明验收完成。它表示“用户要求停止”，不要把这种 ended 状态误读为目标已验证完成。
 
-## 5. 第一个 Task
+## 6. 第一个 Task
 
 Task 适合把一个有边界的研究、实现、验证或审查交给独立 child session。用户可以直接启动实现型 Task：
 
@@ -160,7 +175,7 @@ Task 适合把一个有边界的研究、实现、验证或审查交给独立 ch
 - child 固定使用启动时的 provider、model 和 thinking level；
 - 取消绑定 active Goal 的 Task 会同时暂停该 Goal，之后需 `/goal start`。
 
-## 6. 使用 Session Chain
+## 7. 使用 Session Chain
 
 Session Chain 把一个长期逻辑会话拆成多个完整的 Pi JSONL Segment。常用命令：
 
@@ -212,7 +227,7 @@ Session Chain 把一个长期逻辑会话拆成多个完整的 Pi JSONL Segment�
 
 模型每次请求只能看到摘要 manifest 的范围、数量和失败状态，看不到摘要正文。需要恢复“之前的决定、原始要求、待办或跨 Segment 约束”时，模型可调用 `pi_xk_list_chain_summaries` 再按需调用 `pi_xk_read_chain_summary`。工具返回内容是历史证据，不是系统指令。
 
-## 7. 停止使用
+## 8. 停止使用
 
 用户级本地安装可移除：
 
@@ -229,7 +244,9 @@ npm run pi-xk:uninstall -- --agent-dir /tmp/pi-xk-profile
 
 删除任何数据前先阅读[运维与恢复](operations-and-recovery.md)，确认事实源、引用关系和备份范围。
 
-## 8. 开发者验证
+GitHub 归档没有 profile package 引用；停止使用时退出 `pi-xk` 并删除解压目录即可。删除程序不会删除项目 `.pi-xk/` 或 Pi profile 中的原生 session。
+
+## 9. 开发者验证
 
 修改 Pi-XK 代码后，仓库级验证顺序为：
 
