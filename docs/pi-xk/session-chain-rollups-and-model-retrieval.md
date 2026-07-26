@@ -25,6 +25,8 @@ Session Chain 的历史信息采用两层摘要：
 
 rollover 前，Controller 从当前 Segment 的 `summary-in` marker 找到前序 artifact，并重新读取、校验 schema 与来源。marker 的 artifact ID、正文 hash、当前 Segment binding 和 artifact 的 carry-forward 必须一致。任一项不一致都会中止 rollover；Pi-XK 不自动改写 marker、正文或 artifact。
 
+新摘要写入 Artifact Store 后也会立即按返回的 artifact ID read-back。后续 summary-out marker、source seal、successor summary-in 与 hash 全部使用这个 canonical 内容。如果存储前脱敏或序列化改变了 JSON schema、正文 hash 或 provenance，rollover 在提交 branch head 前失败，不留下半 sealed Segment。
+
 Pi compaction 与 L1 递进摘要独立：存在 compaction 时，以最新 compaction summary 为 base，只总结保留边界后的尾部；否则以 `summary-in` 为 base。
 
 ## 3. L2 窗口和配置
@@ -97,18 +99,21 @@ Artifact Store 的 artifact ID 是完整正文的 SHA-256，因此正文不能�
 ```mermaid
 flowchart TD
     A["rollover_committed"] --> B["形成完整 branch 窗口"]
-    B --> C["验证有序 L1 artifacts"]
-    C --> D["生成并写入 L2 artifact"]
-    D --> E["写 pending publication"]
-    E --> F["追加 rollup_published v2 event"]
-    F --> G["更新 read model"]
-    G --> H["生成 Markdown 投影"]
+    B --> C["持久化 scheduled publication job"]
+    C --> D["rollover 立即返回 successor Segment"]
+    C --> E["branch 后台串行队列"]
+    E --> F["generation lock 与有序 L1 验证"]
+    F --> G["生成或复用 L2 artifact"]
+    G --> H["追加 rollup_published v2 event"]
+    H --> I["更新 read model 与 Markdown"]
 ```
 
 失败语义：
 
 - L2 失败不回滚已经成功的 rollover；新 Segment 仍可继续使用。
-- 失败尽量追加 `rollup_failed` v2 诊断，包含窗口、阶段、错误分类、retryable 和 attempt，不保存 provider 原始响应或凭据。
+- 第 N 次 rollover 的同步等待不包含 L2 provider latency；每个 branch 的 publication job 串行执行。
+- branch/window generation lock 防止多进程重复付费调用；`generating` 进程退出后恢复为可重试 scheduled。
+- 失败追加 `rollup_failed` v2 诊断，按 provider timeout/rate limit、临时 I/O、L1 provenance/schema/sourceDigest、配置、event conflict 和 Markdown projection 分类，包含 stage、errorCode、retryable 和 attempt，不保存 provider 原始响应或凭据。
 - artifact 已写且 pending publication 已落盘时，事件重试复用同一 artifact 和原始窗口范围，不再次调用模型；其间修改 interval 只影响该窗口之后的窗口。
 - 如果进程在 artifact 发布后、pending 文件写入前退出，Controller 会按 chain、branch、window 和 artifact 内的 sourceDigest 发现孤儿 L2，验证其有序 L1 来源后继续发布，不再次调用模型。
 - event 已发布但 read model 缺失或陈旧时，Store 的 replay/rebuild 路径从混合 v1/v2 日志恢复。
@@ -130,7 +135,7 @@ flowchart TD
 - 未解决的 Rollup failure 数量；
 - 两个只读工具的名称和读取条件。
 
-manifest 从 `chain-read-model.json` 加载，并先与 event facts 重建结果做一致性校验。read model 缺失、陈旧或被篡改时，本次请求不注入 manifest，运行时给出 warning，`/chain doctor` 报 `manifest_read_model_inconsistent`。
+manifest 从 checkpointed `chain-read-model.json` 加载。投影记录已消费 event 的字节 offset、sequence 和 head hash；event 文件未缩短且 head 连续时只读取新增 tail。offset 异常、文件缩短或 head 不匹配时退回完整 replay；无法建立可信投影时本次请求不注入 manifest，并报告 `manifest_read_model_inconsistent`。
 
 manifest 不包含：
 
@@ -146,7 +151,7 @@ manifest 不包含：
 
 ### `pi_xk_list_chain_summaries`
 
-列出当前 chain/branch 的 L1/L2 元数据，不返回正文。默认 `limit=20`，最大 50，支持 cursor。结果包含 artifact ID、level、Segment/window 范围、创建时间和 `verified|invalid` 完整性状态。
+列出当前 chain/branch 的 L1/L2 元数据，不返回正文。默认 `limit=20`，最大 50，支持 cursor；只读取当前页 artifact。结果包含 artifact ID、level、Segment/window 范围、创建时间和 `unchecked|invalid` 完整性状态。`unchecked` 表示索引/schema 可定位但尚未做完整 provenance 验证，不能被解释为可信正文。
 
 ### `pi_xk_read_chain_summary`
 
@@ -172,13 +177,15 @@ manifest 不包含：
 /chain rollup config off
 /chain rollup config <N>
 /chain doctor
+/chain doctor deep
+/chain doctor repair-projections
 ```
 
 `backfill` 默认只尝试最早缺失的一个完整窗口；`limit` 是本次最多发布数量。关闭自动 Rollup 后，既有 L1/L2 仍可通过命令和模型工具读取。
 
 ## 9. Doctor 检查
 
-`/chain doctor` 同时检查：
+`/chain doctor` 是快速检查，只读取 event/read-model head、拓扑、写锁、pending publication 和 Markdown metadata。`/chain doctor deep` 从事实源完整 replay，并检查：
 
 - L1 artifact、summary-in/out marker、binding 和 carry-forward 一致性；
 - sealed Segment 文件大小、hash 和 leaf；
@@ -187,9 +194,19 @@ manifest 不包含：
 - pending/failure 状态；
 - Markdown 缺失或陈旧。
 
-doctor 可以恢复 prepared rollover、重建缺失 target 和重建 L2 Markdown；它不会接受新的 sealed hash，也不会重写损坏 artifact 或 event。
+`/chain doctor repair-projections` 只重建 read model、catalog 和 L2 Markdown。prepared rollover 在 chain startup 恢复；doctor 负责报告仍需恢复的状态。任何命令都不会接受新的 sealed hash，也不会重写损坏 artifact 或 event。
 
-## 10. 明确边界
+## 10. 摘要语义质量
+
+仓库提供确定性的多 Segment golden fixture，分别检查遗漏、事实反转、过期信息残留和把未决事项错误升级为已完成：
+
+```bash
+npm run evaluate:session-chain-summaries
+```
+
+该评估验证 fixture 中关键事实能在连续 L1 carry-forward 和 L2 分类字段中保持一致，并有故障注入测试证明四类漂移都能被检出。它是回归门槛，不代表任意真实模型摘要都达到语义完美；如果未来真实评估显示不可接受漂移，再单独设计不可变 correction/supersede 契约。
+
+## 11. 明确边界
 
 已实现的是 Session Chain 专用的 L1/L2 历史摘要和模型按需读取，不是：
 

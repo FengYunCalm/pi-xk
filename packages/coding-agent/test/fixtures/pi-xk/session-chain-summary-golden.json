@@ -1,0 +1,79 @@
+{
+  "schema": "pi-xk.session-chain-summary-golden.v1",
+  "facts": [
+    {
+      "id": "interval-default",
+      "introducedAt": 1,
+      "canonical": "Rollup interval defaults to five sealed Segments.",
+      "acceptedPatterns": ["interval defaults to 5", "default rollup interval is 5"],
+      "reversalPatterns": ["interval defaults to 10", "default rollup interval is 10"]
+    },
+    {
+      "id": "no-policy-layer",
+      "introducedAt": 1,
+      "canonical": "A Policy layer is explicitly out of scope.",
+      "acceptedPatterns": ["policy layer remains out of scope", "do not add a policy layer"],
+      "reversalPatterns": ["policy layer is approved", "policy layer is required"]
+    },
+    {
+      "id": "task-supervisor-rejected",
+      "introducedAt": 3,
+      "canonical": "TaskSupervisor was rejected.",
+      "acceptedPatterns": ["tasksupervisor remains rejected", "do not add tasksupervisor"],
+      "reversalPatterns": ["implement tasksupervisor", "tasksupervisor is approved"]
+    },
+    {
+      "id": "manifest-metadata-only",
+      "introducedAt": 4,
+      "canonical": "The manifest contains metadata only; summary bodies are read on demand.",
+      "acceptedPatterns": ["manifest stays metadata-only", "manifest contains metadata only"],
+      "reversalPatterns": ["manifest includes summary bodies", "inject all summary bodies"]
+    },
+    {
+      "id": "release-smoke-open",
+      "introducedAt": 5,
+      "canonical": "Release smoke remains unresolved.",
+      "acceptedPatterns": ["release smoke remains unresolved", "release smoke is still open"],
+      "reversalPatterns": ["release smoke passed", "release smoke is complete"],
+      "mustRemainUnresolved": true
+    },
+    {
+      "id": "temporary-provider-retry",
+      "introducedAt": 2,
+      "expiresAfter": 2,
+      "canonical": "A temporary provider retry was pending until Segment 3.",
+      "acceptedPatterns": ["temporary provider retry is pending"],
+      "reversalPatterns": []
+    }
+  ],
+  "l1": [
+    {
+      "ordinal": 1,
+      "carryForward": "The default Rollup interval is 5. Do not add a Policy layer."
+    },
+    {
+      "ordinal": 2,
+      "carryForward": "The default Rollup interval is 5. The Policy layer remains out of scope. A temporary provider retry is pending."
+    },
+    {
+      "ordinal": 3,
+      "carryForward": "The default Rollup interval is 5. The Policy layer remains out of scope. TaskSupervisor remains rejected."
+    },
+    {
+      "ordinal": 4,
+      "carryForward": "The default Rollup interval is 5. The Policy layer remains out of scope. TaskSupervisor remains rejected. The manifest stays metadata-only."
+    },
+    {
+      "ordinal": 5,
+      "carryForward": "The default Rollup interval is 5. The Policy layer remains out of scope. TaskSupervisor remains rejected. The manifest contains metadata only. Release smoke remains unresolved."
+    }
+  ],
+  "l2": {
+    "state": "The default Rollup interval is 5 and the manifest stays metadata-only.",
+    "decisions": ["The default Rollup interval is 5.", "The manifest contains metadata only."],
+    "constraints": ["The Policy layer remains out of scope.", "TaskSupervisor remains rejected."],
+    "completed": ["The background Rollup queue is implemented."],
+    "unresolved": ["Release smoke remains unresolved."],
+    "nextActions": ["Run the isolated release smoke."]
+  }
+}

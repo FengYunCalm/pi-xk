@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { createPiXkGoalExtension, getPiXkSessionChainGateState, type PiXkGoalExtensionOptions } from "./index.ts";
+import { renderPiXkRuntimeStatus } from "./runtime-status.ts";
 import { SessionChainController } from "./session-chain-controller.ts";
 import { createPiXkSessionChainExtension, type PiXkSessionChainExtensionOptions } from "./session-chain-extension.ts";
 
@@ -37,6 +38,16 @@ export function createPiXkRuntimeExtension(options: PiXkRuntimeExtensionOptions 
 		// Goal/Task input and settled gates run before physical chain replacement.
 		goalExtension(pi);
 		chainExtension(pi);
+		pi.registerCommand("xk", {
+			description: "Inspect the current Pi-XK Chain, Goal, Task, Rollup, and recovery state",
+			handler: async (args, ctx) => {
+				if (args.trim() !== "status") {
+					ctx.ui.notify("Pi-XK: usage: /xk status", "error");
+					return;
+				}
+				ctx.ui.notify(await renderPiXkRuntimeStatus(ctx, controllerFor(ctx.cwd)), "info");
+			},
+		});
 	};
 }
 

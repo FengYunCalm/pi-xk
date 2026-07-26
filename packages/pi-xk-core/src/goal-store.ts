@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { type FileHandle, mkdir, open, readFile, rename, rm, unlink } from "node:fs/promises";
+import { open, readFile, rename, rm } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { ArtifactStore, type ArtifactWriteInput } from "./artifact-store.ts";
 import {
@@ -46,9 +46,15 @@ import {
 	validateGoalReadModel,
 } from "./goal-read-model.ts";
 import { stableJsonStringify } from "./stable-json.ts";
-
-const LOCK_RETRY_LIMIT = 100;
-const LOCK_RETRY_DELAY_MS = 10;
+import {
+	type FileWriteLockOptions,
+	inspectFileWriteLock,
+	repairAbandonedFileWriteLock,
+	type WriteLockDiagnostic,
+	type WriteLockFailure,
+	type WriteLockOwnerState,
+	withFileWriteLock,
+} from "./write-lock.ts";
 
 export class GoalStoreError extends Error {
 	constructor(message: string) {
@@ -138,21 +144,9 @@ interface GoalPaths {
 	recoveryLockPath: string;
 }
 
-interface StoredLock {
-	pid: number;
-	nonce: string;
-	createdAt: string;
-}
+export type GoalLockOwnerState = WriteLockOwnerState;
 
-export type GoalLockOwnerState = "alive" | "missing" | "unknown";
-
-export interface GoalWriteLockDiagnostic {
-	pid?: number;
-	nonce?: string;
-	createdAt?: string;
-	ownerState: GoalLockOwnerState;
-	malformed: boolean;
-}
+export type GoalWriteLockDiagnostic = WriteLockDiagnostic;
 
 export interface GoalTailDiagnostic {
 	discardedBytes: number;
@@ -243,23 +237,6 @@ function assertIsoTimestamp(value: string, field: string): void {
 function assertActor(value: GoalActor): void {
 	if (value !== "user" && value !== "runtime" && value !== "model" && value !== "child-task" && value !== "system") {
 		throw new GoalValidationError("actor is invalid");
-	}
-}
-
-function parseStoredLock(value: unknown): StoredLock | undefined {
-	if (!isRecord(value)) return undefined;
-	if (typeof value.pid !== "number" || !Number.isInteger(value.pid) || value.pid <= 0) return undefined;
-	if (typeof value.nonce !== "string" || value.nonce.trim().length === 0) return undefined;
-	if (typeof value.createdAt !== "string" || Number.isNaN(Date.parse(value.createdAt))) return undefined;
-	return { pid: value.pid, nonce: value.nonce, createdAt: value.createdAt };
-}
-
-function getLockOwnerState(pid: number): GoalLockOwnerState {
-	try {
-		process.kill(pid, 0);
-		return "alive";
-	} catch (error) {
-		return isErrno(error, "ESRCH") ? "missing" : "unknown";
 	}
 }
 
@@ -829,10 +806,6 @@ function replayEvents(goalId: string, raw: string, now = new Date().toISOString(
 	};
 }
 
-function wait(ms: number): Promise<void> {
-	return new Promise((resolveWait) => setTimeout(resolveWait, ms));
-}
-
 export class GoalStore {
 	private readonly goalsDirectory: string;
 	private readonly artifactStore: ArtifactStore;
@@ -870,56 +843,21 @@ export class GoalStore {
 		return replayEvents(goalId, raw, options.now);
 	}
 
-	private async readWriteLockDiagnostic(paths: GoalPaths): Promise<GoalWriteLockDiagnostic | undefined> {
-		let raw: string;
-		try {
-			raw = await readFile(paths.lockPath, "utf8");
-		} catch (error) {
-			if (isErrno(error, "ENOENT")) return undefined;
-			throw error;
-		}
-		let stored: StoredLock | undefined;
-		try {
-			stored = parseStoredLock(JSON.parse(raw) as unknown);
-		} catch {
-			stored = undefined;
-		}
-		if (!stored) {
-			return { ownerState: "unknown", malformed: true };
-		}
+	private lockOptions(paths: GoalPaths, goalId: string): FileWriteLockOptions {
 		return {
-			pid: stored.pid,
-			nonce: stored.nonce,
-			createdAt: stored.createdAt,
-			ownerState: getLockOwnerState(stored.pid),
-			malformed: false,
+			directory: paths.goalDirectory,
+			lockPath: paths.lockPath,
+			recoveryLockPath: paths.recoveryLockPath,
+			error: (failure: WriteLockFailure) => {
+				if (failure.kind === "locked") return new GoalLockedError(goalId);
+				if (failure.kind === "recovery-locked") return new GoalLockedError(goalId, "recovering its write lock");
+				if (failure.kind === "conflict") return new GoalLockRecoveryConflictError(goalId);
+				if (failure.kind === "malformed") {
+					return new GoalLockRecoveryError(goalId, "the lock metadata is malformed");
+				}
+				return new GoalLockRecoveryError(goalId, `the owner is ${failure.ownerState}`);
+			},
 		};
-	}
-
-	private async withRecoveryLock<TResult>(
-		paths: GoalPaths,
-		goalId: string,
-		action: () => Promise<TResult>,
-	): Promise<TResult> {
-		await mkdir(paths.goalDirectory, { recursive: true });
-		const recoveryLock: StoredLock = { pid: process.pid, nonce: randomUUID(), createdAt: new Date().toISOString() };
-		let handle: FileHandle | undefined;
-		let ownsRecoveryLock = false;
-		try {
-			try {
-				handle = await open(paths.recoveryLockPath, "wx", 0o600);
-				ownsRecoveryLock = true;
-			} catch (error) {
-				if (isErrno(error, "EEXIST")) throw new GoalLockedError(goalId, "recovering its write lock");
-				throw error;
-			}
-			await handle.writeFile(`${JSON.stringify(recoveryLock)}\n`, "utf8");
-			await handle.sync();
-			return await action();
-		} finally {
-			await handle?.close().catch(() => {});
-			if (ownsRecoveryLock) await unlink(paths.recoveryLockPath).catch(() => {});
-		}
 	}
 
 	private async withGoalLock<TResult>(
@@ -927,30 +865,7 @@ export class GoalStore {
 		goalId: string,
 		action: () => Promise<TResult>,
 	): Promise<TResult> {
-		await mkdir(paths.goalDirectory, { recursive: true });
-		const lock: StoredLock = { pid: process.pid, nonce: randomUUID(), createdAt: new Date().toISOString() };
-		for (let attempt = 0; attempt < LOCK_RETRY_LIMIT; attempt++) {
-			let handle: FileHandle;
-			try {
-				handle = await open(paths.lockPath, "wx", 0o600);
-			} catch (error) {
-				if (!isErrno(error, "EEXIST")) throw error;
-				await wait(LOCK_RETRY_DELAY_MS);
-				continue;
-			}
-			try {
-				try {
-					await handle.writeFile(`${JSON.stringify(lock)}\n`, "utf8");
-					await handle.sync();
-				} finally {
-					await handle.close();
-				}
-				return await action();
-			} finally {
-				await unlink(paths.lockPath).catch(() => {});
-			}
-		}
-		throw new GoalLockedError(goalId);
+		return await withFileWriteLock(this.lockOptions(paths, goalId), action);
 	}
 
 	private async syncDirectory(directory: string): Promise<void> {
@@ -1237,28 +1152,14 @@ export class GoalStore {
 
 	async inspectWriteLock(goalId: string): Promise<GoalWriteLockDiagnostic | undefined> {
 		const paths = this.paths(goalId);
-		return await this.readWriteLockDiagnostic(paths);
+		return await inspectFileWriteLock(paths.lockPath);
 	}
 
 	async repairAbandonedWriteLock(goalId: string, expectedNonce: string): Promise<boolean> {
 		assertGoalId(goalId);
 		assertNonEmptyString(expectedNonce, "expectedNonce");
 		const paths = this.paths(goalId);
-		return await this.withRecoveryLock(paths, goalId, async () => {
-			const diagnostic = await this.readWriteLockDiagnostic(paths);
-			if (!diagnostic) return false;
-			if (diagnostic.malformed || !diagnostic.nonce) {
-				throw new GoalLockRecoveryError(goalId, "the lock metadata is malformed");
-			}
-			if (diagnostic.nonce !== expectedNonce) {
-				throw new GoalLockRecoveryConflictError(goalId);
-			}
-			if (diagnostic.ownerState !== "missing") {
-				throw new GoalLockRecoveryError(goalId, `the owner is ${diagnostic.ownerState}`);
-			}
-			await unlink(paths.lockPath);
-			return true;
-		});
+		return await repairAbandonedFileWriteLock(this.lockOptions(paths, goalId), expectedNonce);
 	}
 
 	async updateGoalContract(

@@ -1,0 +1,137 @@
+import { readFile } from "node:fs/promises";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { GoalStore, TaskStore } from "pi-xk-core";
+import { readGoalStateSection } from "./goal-status.ts";
+import { isPiXkSessionLink, isPiXkTaskLink, PI_XK_SESSION_LINK_CUSTOM_TYPE } from "./index.ts";
+import type { SessionChainController } from "./session-chain-controller.ts";
+
+function currentGoalId(ctx: ExtensionContext): string | undefined {
+	for (const entry of [...ctx.sessionManager.getBranch()].reverse()) {
+		if (
+			entry.type === "custom" &&
+			entry.customType === PI_XK_SESSION_LINK_CUSTOM_TYPE &&
+			isPiXkSessionLink(entry.data)
+		) {
+			return entry.data.goalId;
+		}
+	}
+	return undefined;
+}
+
+function currentTaskId(ctx: ExtensionContext): string | undefined {
+	for (const entry of [...ctx.sessionManager.getBranch()].reverse()) {
+		if (
+			entry.type === "custom" &&
+			entry.customType === PI_XK_SESSION_LINK_CUSTOM_TYPE &&
+			isPiXkTaskLink(entry.data)
+		) {
+			return entry.data.taskId;
+		}
+	}
+	return undefined;
+}
+
+function lockDiagnostic(entity: string, diagnostic: { ownerState: string; malformed: boolean } | undefined): string[] {
+	if (!diagnostic) return [];
+	return [`${entity}_write_lock_${diagnostic.malformed ? "malformed" : diagnostic.ownerState}`];
+}
+
+async function goalStatus(ctx: ExtensionContext): Promise<{ line: string; diagnostics: string[] }> {
+	const goalId = currentGoalId(ctx);
+	if (!goalId) return { line: "Goal: none", diagnostics: [] };
+	try {
+		const store = new GoalStore(ctx.cwd);
+		const replay = await store.replayGoal(goalId);
+		const files = await store.inspectGoalFiles(goalId);
+		const required = replay.contract.acceptance.filter((item) => item.required).map((item) => item.id);
+		const verified = new Set(replay.lifecycle.end?.verifiedAcceptanceIds ?? []);
+		const verifiedRequired = required.filter((id) => verified.has(id)).length;
+		let nextAction = "unavailable";
+		if (files.state.status === "valid") {
+			nextAction = readGoalStateSection(
+				await readFile(files.state.path, "utf8"),
+				"next_best_action",
+				"not recorded",
+			);
+		}
+		const diagnostics = [
+			...(replay.tailDiagnostic ? ["goal_event_log_partial_tail"] : []),
+			...(files.objective.status === "valid" ? [] : [`goal_objective_${files.objective.status}`]),
+			...(files.state.status === "valid" ? [] : [`goal_state_${files.state.status}`]),
+			...lockDiagnostic("goal", await store.inspectWriteLock(goalId)),
+		];
+		return {
+			line: `Goal: ${replay.contract.title} · ${replay.lifecycle.status} · acceptance ${verifiedRequired}/${required.length} · next ${nextAction}`,
+			diagnostics,
+		};
+	} catch (error) {
+		return {
+			line: `Goal: ${goalId} unavailable`,
+			diagnostics: [`goal_status_failed:${error instanceof Error ? error.message : String(error)}`],
+		};
+	}
+}
+
+async function taskStatus(ctx: ExtensionContext): Promise<{ line: string; diagnostics: string[] }> {
+	const taskId = currentTaskId(ctx);
+	if (!taskId) return { line: "Task: none", diagnostics: [] };
+	try {
+		const store = new TaskStore(ctx.cwd);
+		const replay = await store.replayTask(taskId);
+		return {
+			line: `Task: ${taskId} · ${replay.status} · ${replay.spec.role}`,
+			diagnostics: [
+				...(replay.tailDiagnostic ? ["task_event_log_partial_tail"] : []),
+				...lockDiagnostic("task", await store.inspectWriteLock(taskId)),
+			],
+		};
+	} catch (error) {
+		return {
+			line: `Task: ${taskId} unavailable`,
+			diagnostics: [`task_status_failed:${error instanceof Error ? error.message : String(error)}`],
+		};
+	}
+}
+
+async function chainStatus(
+	ctx: ExtensionContext,
+	controller: SessionChainController,
+): Promise<{ lines: string[]; diagnostics: string[] }> {
+	const binding = controller.getCurrentBinding(ctx.sessionManager);
+	if (!binding) return { lines: ["Chain: none", "Rollup: none"], diagnostics: [] };
+	try {
+		const status = await controller.getCurrentStatus(ctx.sessionManager);
+		if (!status) return { lines: ["Chain: none", "Rollup: none"], diagnostics: [] };
+		const readModel = await controller.getStore().loadChainReadModel(status.chainId);
+		const branch = readModel.branches.find((candidate) => candidate.branchId === status.branchId);
+		if (!branch) throw new Error(`branch not found: ${status.branchId}`);
+		const nextWindow = (branch.rollups.at(-1)?.windowIndex ?? 0) + 1;
+		const publication = await controller.getRollupPublication(status.chainId, status.branchId, nextWindow);
+		const doctor = await controller.doctor(status.chainId, "quick");
+		return {
+			lines: [
+				`Chain: ${status.title ?? status.chainId} · ${status.branchId} · S${status.ordinal} ${status.segmentStatus}${status.archived ? " · archived" : ""}`,
+				`Rollup: ${branch.rollups.length} published · ${publication ? `W${publication.windowIndex} ${publication.status}` : "idle"}`,
+			],
+			diagnostics: doctor.diagnostics.map((diagnostic) => `chain_${diagnostic.code}`),
+		};
+	} catch (error) {
+		return {
+			lines: [`Chain: ${binding.chainId} unavailable`, "Rollup: unavailable"],
+			diagnostics: [`chain_status_failed:${error instanceof Error ? error.message : String(error)}`],
+		};
+	}
+}
+
+export async function renderPiXkRuntimeStatus(
+	ctx: ExtensionContext,
+	controller: SessionChainController,
+): Promise<string> {
+	const [chain, goal, task] = await Promise.all([chainStatus(ctx, controller), goalStatus(ctx), taskStatus(ctx)]);
+	const diagnostics = [...chain.diagnostics, ...goal.diagnostics, ...task.diagnostics];
+	const recovery =
+		diagnostics.length === 0
+			? "Recovery: clear"
+			: `Recovery: ${diagnostics.length} diagnostic(s) · ${diagnostics.slice(0, 3).join(", ")}${diagnostics.length > 3 ? ", ..." : ""}`;
+	return ["Pi-XK status", ...chain.lines, goal.line, task.line, recovery].join("\n");
+}

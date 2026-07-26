@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { type FileHandle, mkdir, open, readdir, readFile, rename, rm, unlink } from "node:fs/promises";
+import { open, readdir, readFile, rename, rm } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { ArtifactCorruptionError, ArtifactNotFoundError, ArtifactStore } from "./artifact-store.ts";
 import { stableJsonStringify } from "./stable-json.ts";
@@ -25,9 +25,14 @@ import {
 	validateTaskSpec,
 } from "./task-contract.ts";
 import { buildTaskReadModel, sameTaskReadModel, TaskReadModelStaleError } from "./task-read-model.ts";
-
-const LOCK_RETRY_LIMIT = 100;
-const LOCK_RETRY_DELAY_MS = 10;
+import {
+	type FileWriteLockOptions,
+	inspectFileWriteLock,
+	repairAbandonedFileWriteLock,
+	type WriteLockDiagnostic,
+	type WriteLockFailure,
+	withFileWriteLock,
+} from "./write-lock.ts";
 
 export class TaskStoreError extends Error {
 	constructor(message: string) {
@@ -88,9 +93,23 @@ export class TaskCorruptionError extends TaskStoreError {
 }
 
 export class TaskLockedError extends TaskStoreError {
-	constructor(taskId: string) {
-		super(`Task is locked while writing: ${taskId}`);
+	constructor(taskId: string, operation = "writing") {
+		super(`Task is locked while ${operation}: ${taskId}`);
 		this.name = "TaskLockedError";
+	}
+}
+
+export class TaskLockRecoveryError extends TaskStoreError {
+	constructor(taskId: string, message: string) {
+		super(`Task write-lock recovery failed for ${taskId}: ${message}`);
+		this.name = "TaskLockRecoveryError";
+	}
+}
+
+export class TaskLockRecoveryConflictError extends TaskStoreError {
+	constructor(taskId: string) {
+		super(`Task write-lock recovery conflicted with a different lock owner: ${taskId}`);
+		this.name = "TaskLockRecoveryConflictError";
 	}
 }
 
@@ -99,7 +118,10 @@ interface TaskPaths {
 	eventsPath: string;
 	readModelPath: string;
 	lockPath: string;
+	recoveryLockPath: string;
 }
+
+export type TaskWriteLockDiagnostic = WriteLockDiagnostic;
 
 export interface TaskTailDiagnostic {
 	discardedBytes: number;
@@ -375,10 +397,6 @@ function sameIdempotentContent(existing: TaskEvent, proposed: TaskEvent): boolea
 	);
 }
 
-function wait(ms: number): Promise<void> {
-	return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
-}
-
 export class TaskStore {
 	private readonly tasksDirectory: string;
 	private readonly artifacts: ArtifactStore;
@@ -399,6 +417,24 @@ export class TaskStore {
 			eventsPath: join(taskDirectory, "events.jsonl"),
 			readModelPath: join(taskDirectory, "task-read-model.json"),
 			lockPath: join(taskDirectory, ".write.lock"),
+			recoveryLockPath: join(taskDirectory, ".write.recovery.lock"),
+		};
+	}
+
+	private lockOptions(paths: TaskPaths, taskId: string): FileWriteLockOptions {
+		return {
+			directory: paths.taskDirectory,
+			lockPath: paths.lockPath,
+			recoveryLockPath: paths.recoveryLockPath,
+			error: (failure: WriteLockFailure) => {
+				if (failure.kind === "locked") return new TaskLockedError(taskId);
+				if (failure.kind === "recovery-locked") return new TaskLockedError(taskId, "recovering its write lock");
+				if (failure.kind === "conflict") return new TaskLockRecoveryConflictError(taskId);
+				if (failure.kind === "malformed") {
+					return new TaskLockRecoveryError(taskId, "the lock metadata is malformed");
+				}
+				return new TaskLockRecoveryError(taskId, `the owner is ${failure.ownerState}`);
+			},
 		};
 	}
 
@@ -412,29 +448,7 @@ export class TaskStore {
 	}
 
 	private async withLock<TResult>(paths: TaskPaths, taskId: string, action: () => Promise<TResult>): Promise<TResult> {
-		await mkdir(paths.taskDirectory, { recursive: true });
-		for (let attempt = 0; attempt < LOCK_RETRY_LIMIT; attempt++) {
-			let handle: FileHandle;
-			try {
-				handle = await open(paths.lockPath, "wx", 0o600);
-			} catch (error) {
-				if (!isErrno(error, "EEXIST")) throw error;
-				await wait(LOCK_RETRY_DELAY_MS);
-				continue;
-			}
-			try {
-				await handle.writeFile(
-					`${JSON.stringify({ pid: process.pid, nonce: randomUUID(), createdAt: new Date().toISOString() })}\n`,
-				);
-				await handle.sync();
-				await handle.close();
-				return await action();
-			} finally {
-				await handle.close().catch(() => {});
-				await unlink(paths.lockPath).catch(() => {});
-			}
-		}
-		throw new TaskLockedError(taskId);
+		return await withFileWriteLock(this.lockOptions(paths, taskId), action);
 	}
 
 	private async syncDirectory(directory: string): Promise<void> {
@@ -697,6 +711,18 @@ export class TaskStore {
 
 	async replayTask(taskId: string): Promise<TaskReplay> {
 		return await this.readReplay(this.paths(taskId), taskId);
+	}
+
+	async inspectWriteLock(taskId: string): Promise<TaskWriteLockDiagnostic | undefined> {
+		const paths = this.paths(taskId);
+		return await inspectFileWriteLock(paths.lockPath);
+	}
+
+	async repairAbandonedWriteLock(taskId: string, expectedNonce: string): Promise<boolean> {
+		assertTaskId(taskId);
+		if (expectedNonce.trim().length === 0) throw new TaskValidationError("expectedNonce must be non-empty");
+		const paths = this.paths(taskId);
+		return await repairAbandonedFileWriteLock(this.lockOptions(paths, taskId), expectedNonce);
 	}
 
 	async loadTaskReadModel(taskId: string): Promise<TaskReadModel> {

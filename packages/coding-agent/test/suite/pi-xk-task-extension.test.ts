@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -212,6 +212,43 @@ function taskSpec(taskId: string, parentSessionId: string): TaskSpecV1 {
 }
 
 describe("Pi-XK Task extension", () => {
+	it("reports and explicitly repairs an abandoned Task write lock", async () => {
+		let harness: Harness;
+		const notifications: string[] = [];
+		harness = await createHarness({
+			extensionFactories: [taskExtension(() => harness)],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({ uiContext: testUi(notifications) });
+		const store = new TaskStore(harness.tempDir);
+		const spec = taskSpec("task_doctor_abandoned_lock", harness.sessionManager.getSessionId());
+		const created = await store.createTask(spec, {
+			eventId: "task_doctor_abandoned_lock:created",
+			idempotencyKey: "task_doctor_abandoned_lock:created",
+			actor: "user",
+		});
+		harness.sessionManager.appendCustomEntry(
+			PI_XK_SESSION_LINK_CUSTOM_TYPE,
+			createPiXkTaskLink(spec.taskId, null, created.event.eventId, 0),
+		);
+		writeFileSync(
+			join(harness.tempDir, ".pi-xk", "tasks", spec.taskId, ".write.lock"),
+			`${JSON.stringify({
+				pid: 999_999_999,
+				nonce: "abandoned-task-command",
+				createdAt: "2026-07-25T00:00:00.000Z",
+			})}\n`,
+		);
+
+		await harness.session.prompt(`/task doctor ${spec.taskId}`);
+		expect(notifications.at(-1)).toContain("write lock owner PID 999999999 is missing");
+		expect(notifications.at(-1)).toContain(`/task doctor ${spec.taskId} repair-lock abandoned-task-command`);
+
+		await harness.session.prompt(`/task doctor ${spec.taskId} repair-lock abandoned-task-command`);
+		expect(notifications.at(-1)).toContain("repaired abandoned write lock");
+		expect(await store.inspectWriteLock(spec.taskId)).toBeUndefined();
+	});
+
 	it("uses TaskSpecV2 and an independent child chain in a normal chained session", async () => {
 		let harness: Harness;
 		harness = await createHarness({
@@ -404,16 +441,33 @@ describe("Pi-XK Task extension", () => {
 		expect(readFileSync(join(harness.tempDir, "task-output.txt"), "utf8")).toBe("written by child\n");
 	});
 
-	it("blocks ordinary parent input and pauses an active Goal when the user cancels", async () => {
+	it("queues ordinary parent input and pauses an active Goal when the user cancels", async () => {
 		let harness: Harness;
 		const notifications: string[] = [];
+		const parentUserInputs: string[] = [];
 		harness = await createHarness({
 			extensionFactories: [taskExtension(() => harness)],
 		});
 		harnesses.push(harness);
 		harness.setResponses([
 			abortResponse(),
-			fauxAssistantMessage("This lookalike command must not reach the parent."),
+			fauxAssistantMessage("Task cancellation delivered."),
+			(context) => {
+				parentUserInputs.push(
+					...context.messages
+						.filter((message) => message.role === "user")
+						.map((message) => getMessageText(message)),
+				);
+				return fauxAssistantMessage("First queued input handled.");
+			},
+			(context) => {
+				parentUserInputs.push(
+					...context.messages
+						.filter((message) => message.role === "user")
+						.map((message) => getMessageText(message)),
+				);
+				return fauxAssistantMessage("Second queued input handled.");
+			},
 		]);
 		await harness.session.bindExtensions({ uiContext: testUi(notifications) });
 		const goalStore = await createActiveGoal(harness, "goal_user_task_cancel");
@@ -423,13 +477,18 @@ describe("Pi-XK Task extension", () => {
 		await waitFor("the user Task to run", async () =>
 			(await taskStore.listTasks()).some((task) => task.status === "running"),
 		);
+		await harness.session.prompt("/goal pause must remain blocked during the Task");
+		expect(notifications.at(-1)).toContain("Goal changes are blocked while Task");
+		expect((await goalStore.replayGoal("goal_user_task_cancel")).lifecycle.status).toBe("active");
 		const callsBeforeInput = harness.faux.state.callCount;
-		await harness.session.prompt("This input must not reach the parent model.");
+		await harness.session.prompt("Process this after the Task.");
 		expect(harness.faux.state.callCount).toBe(callsBeforeInput);
-		expect(notifications.at(-1)).toContain("Use /task status or /task cancel");
+		expect(harness.session.pendingMessageCount).toBe(1);
+		expect(notifications.at(-1)).toContain("queued until it settles");
 		await harness.session.prompt("/taskish This is ordinary input, not a Task command.");
 		expect(harness.faux.state.callCount).toBe(callsBeforeInput);
-		expect(notifications.at(-1)).toContain("Use /task status or /task cancel");
+		expect(harness.session.pendingMessageCount).toBe(2);
+		expect(notifications.at(-1)).toContain("queued until it settles");
 		await harness.session.prompt("/task start A second concurrent Task must be rejected.");
 		expect(notifications.at(-1)).toContain("already running");
 		expect(await taskStore.listTasks()).toHaveLength(1);
@@ -437,13 +496,17 @@ describe("Pi-XK Task extension", () => {
 		await harness.session.prompt("/task status");
 		expect(notifications.at(-1)).toContain("status=running");
 		await harness.session.prompt("/task cancel user requested cancellation");
+		await harness.session.waitForIdle();
 		const task = (await taskStore.listTasks())[0];
 		expect(task?.status).toBe("cancelled");
 		expect((await goalStore.replayGoal("goal_user_task_cancel")).lifecycle).toMatchObject({
 			status: "paused",
 			lastPause: { actor: "runtime", audit: { unmetRequiredAcceptanceIds: ["A-1"] } },
 		});
-		expect(taskResultEntries(harness)).toHaveLength(0);
+		expect(taskResultEntries(harness)).toHaveLength(1);
+		expect(harness.session.pendingMessageCount).toBe(0);
+		expect(parentUserInputs.at(-2)).toBe("Process this after the Task.");
+		expect(parentUserInputs.at(-1)).toBe("/taskish This is ordinary input, not a Task command.");
 	});
 
 	it("rejects Task starts during a Goal draft and after a Goal is paused or ended", async () => {

@@ -20,22 +20,23 @@ Pi-XK 当前没有内置权限系统或沙箱。不要在不可信仓库、共�
 npm ci --ignore-scripts
 ```
 
-构建 Pi-XK Core 与 Extension，并运行无网络 runtime preflight：
+推荐使用仓库提供的本地管理脚本。它会构建 Core/Extension、运行无网络 runtime preflight，并以原子写入更新指定 Pi profile 的 `settings.json`：
 
 ```bash
-npm --workspace pi-xk-core run build
-npm --workspace pi-xk-extension run build
-npm run check:pi-xk-runtime
+npm run pi-xk:install
+npm run pi-xk:upgrade
 ```
 
-把本地 package 安装到当前用户的 Pi profile：
+先预览而不构建、不写设置：
 
 ```bash
-pi install /home/mechrevo/projects/pi-xk/packages/pi-xk-extension
-pi list
+npm run pi-xk:install -- --dry-run
+npm run pi-xk:install -- --agent-dir /tmp/pi-xk-profile --dry-run
 ```
 
-本地路径安装只在 Pi 设置中保存引用，不复制 package。修改 Pi-XK 源码后需要重新 build，并完全重启 Pi 才能加载新产物。
+脚本只管理当前 checkout 的本地 package 引用，不复制 package，也不删除任何项目 `.pi-xk/`。修改源码或执行 upgrade 后必须完全重启 Pi。`upgrade` 要求目标 profile 已安装；不会把拼写错误的 profile 静默变成新安装。
+
+需要手工检查时，等价流程仍是构建、preflight 后运行 `pi install /absolute/path/to/packages/pi-xk-extension`。项目级 `pi install -l ...` 仍由 Pi 原生命令管理，不由本地脚本修改。
 
 只试运行一次、不修改 settings 时，可使用 Pi 的临时 package 参数：
 
@@ -61,8 +62,7 @@ pi install -l /home/mechrevo/projects/pi-xk/packages/pi-xk-extension
 
 ```bash
 export PI_CODING_AGENT_DIR=/tmp/pi-xk-profile
-npm run check:pi-xk-runtime
-pi install /home/mechrevo/projects/pi-xk/packages/pi-xk-extension
+npm run pi-xk:install
 pi list
 ```
 
@@ -70,7 +70,7 @@ pi list
 
 ## 3. 首次启动会发生什么
 
-从目标项目根启动 Pi。扩展加载后会注册 `/goal`、`/task`、`/chain` 命令和对应模型工具。
+从目标项目根启动 Pi。扩展加载后会注册 `/goal`、`/task`、`/chain`、`/xk` 命令和对应模型工具。
 
 - 空的新 session 会被替换为 Session Chain 的 managed root Segment。
 - 已有正文的 Pi session 会被采用为 external root，不复制原文件。
@@ -83,6 +83,7 @@ pi list
 
 ```text
 /chain status
+/xk status
 ```
 
 若命令不存在，先检查 `pi list`、构建产物 `packages/pi-xk-extension/dist/extension.js`，然后重启 Pi。若 runtime preflight 报 `fd is unavailable`，在 Ubuntu/Debian 安装 `fd-find`，或把可信的 `fd` 放到 Pi profile 的 `bin/` 目录。
@@ -152,7 +153,8 @@ Task 适合把一个有边界的研究、实现、验证或审查交给独立 ch
 当前约束：
 
 - 一个 parent 同时只能有一个 Task；
-- Task 运行时，除 `/task ...` 外的普通输入会被拦截；
+- Task 运行时，普通输入进入 Pi 原生 follow-up 队列，Task 终态和结果交付后按输入顺序处理；
+- `/task status`、`/task cancel` 和只读 doctor 命令立即执行；Goal/Chain 写命令仍被拒绝；
 - child 与 parent 使用同一 workspace 和同一用户权限；
 - child 不加载 extension，不能再创建 Goal 或 nested Task；
 - child 固定使用启动时的 provider、model 和 thinking level；
@@ -164,12 +166,18 @@ Session Chain 把一个长期逻辑会话拆成多个完整的 Pi JSONL Segment�
 
 ```text
 /chain status
+/chain list
+/chain rename 登录回归
+/chain archive
+/chain list all
 /chain history
 /chain summary
 /chain rollups
 /chain rollup config
 /chain rollover 阶段性收束
 /chain doctor
+/chain doctor deep
+/chain doctor repair-projections
 ```
 
 达到 soft 阈值（16 MiB 或 4,000 entries）后，Pi-XK 会在 settled 且 gate 清空时自动 rollover。达到 hard 阈值（64 MiB 或 16,000 entries）后，下一条普通输入必须先成功 rollover 才会送给 provider。
@@ -206,13 +214,14 @@ Session Chain 把一个长期逻辑会话拆成多个完整的 Pi JSONL Segment�
 
 ## 7. 停止使用
 
-用户级安装可移除：
+用户级本地安装可移除：
 
 ```bash
-pi remove /home/mechrevo/projects/pi-xk/packages/pi-xk-extension
+npm run pi-xk:uninstall
+npm run pi-xk:uninstall -- --agent-dir /tmp/pi-xk-profile
 ```
 
-项目级安装需在对应项目中带 `-l` 移除。移除 package 不会删除：
+可先加 `--dry-run` 查看目标。项目级手工安装仍需在对应项目中用 Pi 的 `remove -l` 移除。移除 package 不会删除：
 
 - 项目 `.pi-xk/` 中的 Goal、Task、Chain 和 artifact；
 - Pi profile 中既有原生 session；
@@ -226,8 +235,11 @@ pi remove /home/mechrevo/projects/pi-xk/packages/pi-xk-extension
 
 ```bash
 npm run test:pi-xk
-npm run benchmark:session-chain -- --sizes 1,8,32,128 --runs 3
 npm run check
+./test.sh
+npm run evaluate:session-chain-summaries
+npm run benchmark:session-chain -- --sizes 1,8,32,128 --runs 3 --json
+npm run benchmark:session-chain-events -- --counts 100,1000 --runs 3 --json
 git diff --check
 ```
 

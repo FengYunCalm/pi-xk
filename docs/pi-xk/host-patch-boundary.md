@@ -1,6 +1,6 @@
 # Pi-XK Host Patch 边界与升级检查
 
-Session Chain 需要在同一个 Pi runtime 内安全生成摘要并替换物理 session。普通 Extension API 无法原子完成这两件事，因此本 fork 对 `@earendil-works/pi-coding-agent` 保留一个小型通用 Host patch。本文记录其边界、原因、验证和升级检查项。
+Session Chain 需要在同一个 Pi runtime 内安全生成摘要并替换物理 session，Task 运行期间还需要延迟普通用户输入而不并发启动 parent turn。普通 Extension API 原本没有这三个边界，因此本 fork 对 `@earendil-works/pi-coding-agent` 保留一个小型通用 Host patch。本文记录其边界、原因、验证和升级检查项。
 
 ## 1. Patch 只提供什么
 
@@ -38,6 +38,16 @@ Session Chain 需要在同一个 Pi runtime 内安全生成摘要并替换物理
 - shutdown/start reason 增加 `rollover`；
 - `reason: "rollover"` 表示同一逻辑会话内部物理替换，不等同于 `/new`、`/resume`、fork、reload 或 quit。
 
+### `queueUserMessage`
+
+位置：
+
+- `packages/coding-agent/src/core/agent-session.ts`
+- `packages/coding-agent/src/core/extensions/types.ts`
+- `packages/coding-agent/src/core/extensions/runner.ts`
+
+能力：extension 把 text/image 用户消息加入 Pi 原生 follow-up 队列，不立即启动 agent turn。消息仍由 Pi 的 session/runtime 队列拥有并按顺序处理；rollover pending 时拒绝写入只读 source transcript。Pi-XK 用它在 Task 运行期间保存普通输入，Task 终态交付后再让 parent 处理。
+
 ## 2. Patch 不做什么
 
 - 不改变 provider transport、Agent loop 或 tool call 协议；
@@ -46,6 +56,7 @@ Session Chain 需要在同一个 Pi runtime 内安全生成摘要并替换物理
 - 不解析 Pi-XK chain、Goal、Task 或 artifact；
 - 不决定 rollover 阈值、窗口、摘要格式或 recovery；
 - 不提供后台 session、多写者、远程 RPC 或 sandbox。
+- 不绕过 input hook、命令解析、Task gate 或 rollover read-only 边界，也不允许 parent/child 并发模型调用。
 
 Pi-XK 的所有领域判断仍在 `packages/pi-xk-extension/src/session-chain-controller.ts`；Core 事实源仍在 `pi-xk-core`。
 
@@ -62,6 +73,7 @@ rollover 的语义是“同一逻辑会话更换物理承载文件”。它需�
 ```bash
 cd packages/coding-agent
 node node_modules/vitest/dist/cli.js --run test/suite/agent-session-rollover.test.ts
+node node_modules/vitest/dist/cli.js --run test/suite/agent-session-queue.test.ts
 ```
 
 完整 Pi-XK 验收：
@@ -71,20 +83,21 @@ npm run test:pi-xk
 npm run check
 ```
 
-`agent-session-rollover.test.ts` 必须覆盖摘要不改 transcript、成功 replacement、取消、callback/commit 失败、busy/queue gate、事件顺序和 runtime identity。
+`agent-session-rollover.test.ts` 必须覆盖摘要不改 transcript、成功 replacement、取消、callback/commit 失败、busy/queue gate、事件顺序和 runtime identity。`agent-session-queue.test.ts` 必须覆盖 text/image、顺序、无即时 turn 和 rollover pending 拒绝。
 
 ## 5. 上游同步检查单
 
 每次同步 upstream Pi 后逐项检查：
 
 1. `AgentSession` 的 summarizer、model/auth 访问和 compaction API 是否变化。
-2. `AgentSessionRuntime` 的 replacement、queue、abort、dispose 和 extension rebind 顺序是否变化。
+2. `AgentSessionRuntime` 的 replacement、follow-up queue、abort、dispose 和 extension rebind 顺序是否变化。
 3. Extension event 类型、runner dispatch、context actions 和 lifecycle reason 是否新增冲突。
 4. `SessionManager.createAt/open/flushDurable` 是否仍能保证指定 path/identity 和 durable marker。
 5. 新 upstream `/new`、resume 或 runtime replacement 能力是否可以等价替代本 patch。
 6. Goal extension 对 `session_shutdown` 的判断是否仍明确排除 `reason: "rollover"`。
 7. 运行 Host 定向测试、Session Chain Controller/Extension 测试、`npm run test:pi-xk` 和 `npm run check`。
 8. 若删除或缩小 patch，先证明 source/target/event 的崩溃恢复语义没有退化。
+9. 确认 `queueUserMessage` 仍只排队、不触发 turn，并且不会跳过正常 follow-up 的 transcript 持久化顺序。
 
 ## 6. 升级失败的停止条件
 
@@ -95,5 +108,6 @@ npm run check
 - commit 失败后 runtime 已切到未发布 target；
 - rollover 被 Goal 当作真实 session 离开而暂停；
 - summary helper 写入 transcript 或改变 compaction/tree；
+- queued user message 立即启动 parent、乱序、丢失 image，或能在 rollover pending 时写 source；
 - extension 无法区分取消、失败和成功 commit；
 - Host 定向测试或 Pi-XK 完整测试未通过。

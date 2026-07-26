@@ -12,6 +12,7 @@ export default defineConfig({
 	test: {
 		globals: true,
 		environment: "node",
+		maxWorkers: 8,
 		testTimeout: 30000,
 		reporters: process.env.GITHUB_ACTIONS ? ["dot", "github-actions"] : ["dot"],
 		silent: "passed-only",

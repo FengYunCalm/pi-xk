@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { type FauxResponseFactory, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
@@ -251,6 +251,35 @@ afterEach(() => {
 });
 
 describe("Pi-XK Goal extension", () => {
+	it("reports and explicitly repairs an abandoned Goal write lock", async () => {
+		const notifications: string[] = [];
+		const harness = await createHarness({
+			extensionFactories: [createPiXkGoalExtension()],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({
+			uiContext: createUiContext({ notify: (message) => notifications.push(message) }),
+		});
+		const goalId = "goal_doctor_abandoned_lock";
+		const store = await createActiveGoal(harness, goalId);
+		await writeFile(
+			join(harness.tempDir, ".pi-xk", "goals", goalId, ".write.lock"),
+			`${JSON.stringify({
+				pid: 999_999_999,
+				nonce: "abandoned-goal-command",
+				createdAt: "2026-07-25T00:00:00.000Z",
+			})}\n`,
+		);
+
+		await harness.session.prompt("/goal doctor");
+		expect(notifications.at(-1)).toContain("write lock owner PID 999999999 is missing");
+		expect(notifications.at(-1)).toContain("/goal doctor repair-lock abandoned-goal-command");
+
+		await harness.session.prompt("/goal doctor repair-lock abandoned-goal-command");
+		expect(notifications.at(-1)).toContain("repaired abandoned write lock");
+		expect(await store.inspectWriteLock(goalId)).toBeUndefined();
+	});
+
 	it("pauses an active Goal recovered at session startup instead of continuing it", async () => {
 		const harness = await createHarness({
 			extensionFactories: [createPiXkGoalExtension()],
@@ -603,7 +632,12 @@ describe("Pi-XK Goal extension", () => {
 		expect(statuses).toHaveLength(statusCount);
 
 		await harness.session.prompt("/goal status");
-		expect(notifications.at(-1)).toContain("wall 3m 0s, active 2m 0s, busy 0s");
+		const statusNotification = notifications.at(-1) ?? "";
+		expect(statusNotification).toContain("Pi-XK Goal Show live Goal time");
+		expect(statusNotification).toContain("wall 3m 0s, active 2m 0s, busy 0s");
+		expect(statusNotification).toContain("A-1=missing");
+		expect(statusNotification).toContain("goal-state.md:");
+		expect(statusNotification).toContain("Next action:");
 	});
 
 	it("keeps a submitted Goal draft in the session until the user confirms it", async () => {
