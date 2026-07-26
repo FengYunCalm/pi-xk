@@ -71,6 +71,9 @@ jobs:
           fi
           git rev-parse HEAD > /tmp/pi-xk-source-sha
 
+      - name: Build
+        run: npm run build
+
       - name: Check
         run: |
           npm run check
