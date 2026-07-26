@@ -2,15 +2,25 @@
 
 ## [Unreleased]
 
+### New Features
+
+- **Pi-XK durable agent workflows** - Use reviewable Goal V2 contracts, automatic Goal continuation, and one isolated Task V1 child run with explicit status, cancellation, shutdown recovery, and native queued follow-up input. See [Pi-XK Getting Started](../../docs/pi-xk/getting-started.md).
+- **Segmented Session Chains** - Continue long-running work across complete native Pi JSONL Segments with safe rollover, successor branches, Goal and Task continuity, chain titles and archive controls, and tiered recovery diagnostics. See [Pi-XK Design and Boundaries](../../docs/pi-xk/design-and-boundaries.md).
+- **Verified L1/L2 history retrieval** - Preserve canonical per-Segment L1 summaries, publish non-blocking branch Rollups, expose only a bounded memory manifest, and let models read fully verified historical evidence on demand. See [Session Chain Rollups and Model Retrieval](../../docs/pi-xk/session-chain-rollups-and-model-retrieval.md).
+
 ### Added
 
 - Added built-in llama.cpp router support with `/login` connection setup and `/llama` Hugging Face model search and downloads, explicit loading, unloading, and live progress. See [llama.cpp](docs/llama-cpp.md).
 - Added extension registration for complete pi-ai providers, including native authentication, model refresh, filtering, and streaming behavior.
 - Added extension APIs for durable session flushing, context summarization, and settled physical-session rollover with replacement lifecycle events.
 - Added `queueUserMessage` for extensions to enqueue a native follow-up without immediately starting an agent turn.
+- Added the private Pi-XK Core and Extension packages with event-backed Goal V2 and Task V1 state, review and lifecycle commands, explicit abandoned-lock repair, and conservative restart behavior.
+- Added Session Chain v1.1 with manual and threshold rollover, resumable prepared commits, successor branches, verified L1 summaries, asynchronous L2 Rollups, model summary tools, incremental read models, and fast/deep doctor paths.
+- Added managed local Pi-XK install, upgrade, uninstall, and dry-run commands plus `/xk status` for a combined Chain, Goal, Task, Rollup, and recovery view.
 
 ### Fixed
 
+- Fixed OpenCode Zen Go models configured for the OpenAI Responses API to dispatch through the Responses endpoint.
 - Fixed explicit clipboard environment overrides from inheriting host WSL detection.
 - Fixed prompt-template defaults for all arguments (`${@:-default}` and `${ARGUMENTS:-default}`) ([#6695](https://github.com/earendil-works/pi/issues/6695)).
 - Fixed obsolete custom UI, custom tool, and custom editor examples in the extension documentation ([#6735](https://github.com/earendil-works/pi/issues/6735)).
