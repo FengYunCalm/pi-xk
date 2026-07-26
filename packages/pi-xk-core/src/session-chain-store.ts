@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Dirent } from "node:fs";
-import { type FileHandle, mkdir, open, readdir, readFile, rename, rm, unlink } from "node:fs/promises";
+import { mkdir, open, readdir, readFile, rename, rm, stat } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { ArtifactStore, validateArtifactMetadata } from "./artifact-store.ts";
 import {
@@ -11,6 +11,7 @@ import {
 	assertSessionSegmentId,
 	type BranchCreatedPayloadV1,
 	CHAIN_ROLLUP_SCHEMA,
+	type ChainArchiveUpdatedPayloadV1,
 	type ChainMetadataUpdatedPayloadV1,
 	isSessionChainRecord,
 	type RolloverAbortedPayloadV1,
@@ -22,6 +23,7 @@ import {
 	SESSION_CHAIN_CATALOG_SCHEMA,
 	SESSION_CHAIN_EVENT_SCHEMA,
 	SESSION_CHAIN_EVENT_V2_SCHEMA,
+	SESSION_CHAIN_EVENT_V3_SCHEMA,
 	type SegmentSummaryV1,
 	type SessionBranchProjectionV1,
 	type SessionChainActor,
@@ -54,9 +56,14 @@ import {
 	validateSessionChainReadModel,
 } from "./session-chain-read-model.ts";
 import { stableJsonStringify } from "./stable-json.ts";
-
-const LOCK_RETRY_LIMIT = 100;
-const LOCK_RETRY_DELAY_MS = 10;
+import {
+	type FileWriteLockOptions,
+	inspectFileWriteLock,
+	repairAbandonedFileWriteLock,
+	type WriteLockDiagnostic,
+	type WriteLockFailure,
+	withFileWriteLock,
+} from "./write-lock.ts";
 
 export class SessionChainStoreError extends Error {
 	constructor(message: string) {
@@ -117,9 +124,23 @@ export class SessionChainCorruptionError extends SessionChainStoreError {
 }
 
 export class SessionChainLockedError extends SessionChainStoreError {
-	constructor(chainId: string) {
-		super(`Session Chain is locked while writing: ${chainId}`);
+	constructor(chainId: string, operation = "writing") {
+		super(`Session Chain is locked while ${operation}: ${chainId}`);
 		this.name = "SessionChainLockedError";
+	}
+}
+
+export class SessionChainLockRecoveryError extends SessionChainStoreError {
+	constructor(chainId: string, message: string) {
+		super(`Session Chain write-lock recovery failed for ${chainId}: ${message}`);
+		this.name = "SessionChainLockRecoveryError";
+	}
+}
+
+export class SessionChainLockRecoveryConflictError extends SessionChainStoreError {
+	constructor(chainId: string) {
+		super(`Session Chain write-lock recovery conflicted with a different lock owner: ${chainId}`);
+		this.name = "SessionChainLockRecoveryConflictError";
 	}
 }
 
@@ -127,13 +148,35 @@ interface SessionChainPaths {
 	chainDirectory: string;
 	eventsPath: string;
 	readModelPath: string;
+	readModelCheckpointPath: string;
 	locksDirectory: string;
 	lockPath: string;
+}
+
+interface SessionChainReadModelCheckpointV1 {
+	schema: "pi-xk.session-chain-read-model-checkpoint.v1";
+	headEventOffset: number;
+	byteOffset: number;
+	sequence: number;
+	headHash: string;
+	readModelDigest: string;
+}
+
+export interface SessionChainReadModelLoadDiagnostic {
+	mode: "fast" | "tail" | "full";
+	bytesRead: number;
+}
+
+export interface SessionChainReadModelLoadResult {
+	readModel: SessionChainReadModelV1;
+	diagnostic: SessionChainReadModelLoadDiagnostic;
 }
 
 export interface SessionChainTailDiagnostic {
 	discardedBytes: number;
 }
+
+export type SessionChainWriteLockDiagnostic = WriteLockDiagnostic;
 
 export interface SessionChainReplay {
 	chainId: string;
@@ -141,6 +184,7 @@ export interface SessionChainReplay {
 	head: SessionChainHead;
 	events: SessionChainEvent[];
 	title: string | null;
+	archived: boolean;
 	branches: SessionBranchProjectionV1[];
 	tailDiagnostic?: SessionChainTailDiagnostic;
 }
@@ -162,7 +206,10 @@ export interface SessionChainWriteResult {
 }
 
 interface SessionChainEventWithoutHash {
-	schema: typeof SESSION_CHAIN_EVENT_SCHEMA | typeof SESSION_CHAIN_EVENT_V2_SCHEMA;
+	schema:
+		| typeof SESSION_CHAIN_EVENT_SCHEMA
+		| typeof SESSION_CHAIN_EVENT_V2_SCHEMA
+		| typeof SESSION_CHAIN_EVENT_V3_SCHEMA;
 	eventId: string;
 	chainId: string;
 	sequence: number;
@@ -171,7 +218,7 @@ interface SessionChainEventWithoutHash {
 	timestamp: string;
 	prevHash: string | null;
 	payload: SessionChainEvent["payload"];
-	schemaVersion: 1 | 2;
+	schemaVersion: 1 | 2 | 3;
 	idempotencyKey: string;
 }
 
@@ -181,6 +228,108 @@ function isErrno(error: unknown, code: string): boolean {
 
 function calculateHash(event: SessionChainEventWithoutHash): string {
 	return `sha256:${createHash("sha256").update(stableJsonStringify(event)).digest("hex")}`;
+}
+
+function contentHash(value: string): string {
+	return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function readModelDigest(readModel: SessionChainReadModelV1): string {
+	return contentHash(stableJsonStringify(readModel));
+}
+
+function validateReadModelCheckpoint(value: unknown): SessionChainReadModelCheckpointV1 {
+	if (!isSessionChainRecord(value)) throw new SessionChainValidationError("Read model checkpoint must be an object");
+	validateSessionChainExactKeys(
+		value,
+		["schema", "headEventOffset", "byteOffset", "sequence", "headHash", "readModelDigest"],
+		"Read model checkpoint",
+	);
+	if (value.schema !== "pi-xk.session-chain-read-model-checkpoint.v1") {
+		throw new SessionChainValidationError("Read model checkpoint schema is unsupported");
+	}
+	const headEventOffset = validateSessionChainNonNegativeInteger(
+		value.headEventOffset,
+		"Read model checkpoint headEventOffset",
+	);
+	const byteOffset = validateSessionChainNonNegativeInteger(value.byteOffset, "Read model checkpoint byteOffset");
+	if (headEventOffset >= byteOffset) {
+		throw new SessionChainValidationError("Read model checkpoint head event range is invalid");
+	}
+	return {
+		schema: "pi-xk.session-chain-read-model-checkpoint.v1",
+		headEventOffset,
+		byteOffset,
+		sequence: validateSessionChainNonNegativeInteger(value.sequence, "Read model checkpoint sequence"),
+		headHash: assertSessionChainHash(value.headHash, "Read model checkpoint headHash"),
+		readModelDigest: assertSessionChainHash(value.readModelDigest, "Read model checkpoint readModelDigest"),
+	};
+}
+
+function validateCatalogEntry(value: unknown): SessionChainCatalogEntryV1 {
+	if (!isSessionChainRecord(value)) throw new SessionChainValidationError("Catalog entry must be an object");
+	const keys = ["chainId", "title", "cwd", "sequence", "baseHash", "createdAt", "updatedAt", "branchHeads"];
+	if ("archived" in value) keys.push("archived");
+	validateSessionChainExactKeys(value, keys, "Catalog entry");
+	const chainId = validateSessionChainNonEmptyString(value.chainId, "Catalog chainId");
+	assertSessionChainId(chainId);
+	const sequence = validateSessionChainNonNegativeInteger(value.sequence, "Catalog sequence");
+	if (sequence === 0) throw new SessionChainValidationError("Catalog sequence must be positive");
+	if (!Array.isArray(value.branchHeads) || value.branchHeads.length === 0) {
+		throw new SessionChainValidationError("Catalog branchHeads must be a non-empty array");
+	}
+	if (value.archived !== undefined && typeof value.archived !== "boolean") {
+		throw new SessionChainValidationError("Catalog archived must be a boolean");
+	}
+	return {
+		chainId,
+		title: validateSessionChainTitle(value.title),
+		cwd: validateSessionChainNonEmptyString(value.cwd, "Catalog cwd"),
+		sequence,
+		baseHash: assertSessionChainHash(value.baseHash, "Catalog baseHash"),
+		createdAt: validateSessionChainTimestamp(value.createdAt, "Catalog createdAt"),
+		updatedAt: validateSessionChainTimestamp(value.updatedAt, "Catalog updatedAt"),
+		archived: value.archived ?? false,
+		branchHeads: value.branchHeads.map((head) => {
+			if (!isSessionChainRecord(head))
+				throw new SessionChainValidationError("Catalog branch head must be an object");
+			validateSessionChainExactKeys(head, ["branchId", "segmentId"], "Catalog branch head");
+			const branchId = validateSessionChainNonEmptyString(head.branchId, "Catalog branchId");
+			const segmentId = validateSessionChainNonEmptyString(head.segmentId, "Catalog segmentId");
+			assertSessionBranchId(branchId);
+			assertSessionSegmentId(segmentId);
+			return { branchId, segmentId };
+		}),
+	};
+}
+
+function validateCatalog(value: unknown): SessionChainCatalogV1 {
+	if (!isSessionChainRecord(value)) throw new SessionChainValidationError("Catalog must be an object");
+	validateSessionChainExactKeys(value, ["schema", "updatedAt", "chains"], "Catalog");
+	if (value.schema !== SESSION_CHAIN_CATALOG_SCHEMA || !Array.isArray(value.chains)) {
+		throw new SessionChainValidationError("Catalog schema or chains are invalid");
+	}
+	return {
+		schema: SESSION_CHAIN_CATALOG_SCHEMA,
+		updatedAt: value.updatedAt === null ? null : validateSessionChainTimestamp(value.updatedAt, "Catalog updatedAt"),
+		chains: value.chains.map(validateCatalogEntry),
+	};
+}
+
+function catalogEntryFromReadModel(readModel: SessionChainReadModelV1): SessionChainCatalogEntryV1 {
+	return {
+		chainId: readModel.chainId,
+		title: readModel.title,
+		cwd: readModel.cwd,
+		sequence: readModel.sequence,
+		baseHash: readModel.baseHash,
+		createdAt: readModel.createdAt,
+		updatedAt: readModel.updatedAt,
+		archived: readModel.archived,
+		branchHeads: readModel.branches
+			.map((branch) => ({ branchId: branch.branchId, segmentId: branch.headSegmentId }))
+			.sort((left, right) => left.branchId.localeCompare(right.branchId)),
+	};
 }
 
 function createEvent(input: SessionChainEventWithoutHash): SessionChainEvent {
@@ -347,6 +496,17 @@ function validateMetadataPayload(value: unknown): ChainMetadataUpdatedPayloadV1 
 	return { title: validateSessionChainTitle(value.title) };
 }
 
+function validateArchivePayload(value: unknown): ChainArchiveUpdatedPayloadV1 {
+	if (!isSessionChainRecord(value)) {
+		throw new SessionChainValidationError("chain_archive_updated payload must be an object");
+	}
+	validateSessionChainExactKeys(value, ["archived"], "chain_archive_updated payload");
+	if (typeof value.archived !== "boolean") {
+		throw new SessionChainValidationError("chain_archive_updated archived must be a boolean");
+	}
+	return { archived: value.archived };
+}
+
 function requirePositiveInteger(value: unknown, field: string): number {
 	const number = validateSessionChainNonNegativeInteger(value, field);
 	if (number === 0) throw new SessionChainValidationError(`${field} must be positive`);
@@ -419,6 +579,7 @@ function parsePayload(eventType: SessionChainEventType, value: unknown): Session
 	if (eventType === "branch_created") return validateBranchPayload(value);
 	if (eventType === "rollup_published") return validateRollupPublishedPayload(value);
 	if (eventType === "rollup_failed") return validateRollupFailedPayload(value);
+	if (eventType === "chain_archive_updated") return validateArchivePayload(value);
 	return validateMetadataPayload(value);
 }
 
@@ -444,7 +605,8 @@ function parseEvent(value: unknown, lineNumber: number): SessionChainEvent {
 		validateSessionChainExactKeys(value, required, `Session Chain event ${lineNumber}`);
 		const isV1 = value.schema === SESSION_CHAIN_EVENT_SCHEMA && value.schemaVersion === 1;
 		const isV2 = value.schema === SESSION_CHAIN_EVENT_V2_SCHEMA && value.schemaVersion === 2;
-		if (!isV1 && !isV2) {
+		const isV3 = value.schema === SESSION_CHAIN_EVENT_V3_SCHEMA && value.schemaVersion === 3;
+		if (!isV1 && !isV2 && !isV3) {
 			throw new SessionChainValidationError("event schema is unsupported");
 		}
 		const chainId = validateSessionChainNonEmptyString(value.chainId, "chainId");
@@ -460,20 +622,31 @@ function parseEvent(value: unknown, lineNumber: number): SessionChainEvent {
 				"rollover_aborted",
 				"branch_created",
 				"chain_metadata_updated",
+				"chain_archive_updated",
 				"rollup_published",
 				"rollup_failed",
 			].includes(eventType)
 		) {
 			throw new SessionChainValidationError("eventType is invalid");
 		}
-		if (isV1 && (eventType === "rollup_published" || eventType === "rollup_failed")) {
-			throw new SessionChainValidationError("Rollup events require event schema v2");
+		if (
+			isV1 &&
+			(eventType === "rollup_published" || eventType === "rollup_failed" || eventType === "chain_archive_updated")
+		) {
+			throw new SessionChainValidationError("Event type requires a newer event schema");
 		}
 		if (isV2 && eventType !== "rollup_published" && eventType !== "rollup_failed") {
 			throw new SessionChainValidationError("event schema v2 is reserved for Rollup events");
 		}
+		if (isV3 && eventType !== "chain_archive_updated") {
+			throw new SessionChainValidationError("event schema v3 is reserved for archive events");
+		}
 		const withoutHash: SessionChainEventWithoutHash = {
-			schema: isV2 ? SESSION_CHAIN_EVENT_V2_SCHEMA : SESSION_CHAIN_EVENT_SCHEMA,
+			schema: isV3
+				? SESSION_CHAIN_EVENT_V3_SCHEMA
+				: isV2
+					? SESSION_CHAIN_EVENT_V2_SCHEMA
+					: SESSION_CHAIN_EVENT_SCHEMA,
 			eventId: validateSessionChainNonEmptyString(value.eventId, "eventId"),
 			chainId,
 			sequence,
@@ -482,7 +655,7 @@ function parseEvent(value: unknown, lineNumber: number): SessionChainEvent {
 			timestamp: validateSessionChainTimestamp(value.timestamp, "timestamp"),
 			prevHash: value.prevHash === null ? null : assertSessionChainHash(value.prevHash, "prevHash"),
 			payload: parsePayload(eventType, value.payload),
-			schemaVersion: isV2 ? 2 : 1,
+			schemaVersion: isV3 ? 3 : isV2 ? 2 : 1,
 			idempotencyKey: validateSessionChainNonEmptyString(value.idempotencyKey, "idempotencyKey"),
 		};
 		const hash = assertSessionChainHash(value.hash, "hash");
@@ -662,12 +835,14 @@ function applyEvent(
 		return title;
 	}
 	if (event.eventType === "chain_metadata_updated") return event.payload.title;
+	if (event.eventType === "chain_archive_updated") return title;
 	throw new SessionChainLifecycleTransitionError("chain_created may only be the first event");
 }
 
 function project(events: readonly SessionChainEvent[]): {
 	spec: SessionChainSpecV1;
 	title: string | null;
+	archived: boolean;
 	branches: SessionBranchProjectionV1[];
 } {
 	const created = events[0];
@@ -687,8 +862,12 @@ function project(events: readonly SessionChainEvent[]): {
 		},
 	];
 	let title = spec.title;
-	for (const event of events.slice(1)) title = applyEvent(branches, title, event);
-	return { spec, title, branches };
+	let archived = false;
+	for (const event of events.slice(1)) {
+		title = applyEvent(branches, title, event);
+		if (event.eventType === "chain_archive_updated") archived = event.payload.archived;
+	}
+	return { spec, title, archived, branches };
 }
 
 function replayRaw(chainId: string, raw: string): SessionChainReplay {
@@ -723,8 +902,51 @@ function replayRaw(chainId: string, raw: string): SessionChainReplay {
 		head: headFor(events[events.length - 1] as SessionChainEvent),
 		events,
 		title: projected.title,
+		archived: projected.archived,
 		branches: projected.branches.map(cloneBranch),
 		...(hasPartial ? { tailDiagnostic: { discardedBytes: Buffer.byteLength(raw.slice(validRaw.length)) } } : {}),
+	};
+}
+
+function applyEventTail(chainId: string, readModel: SessionChainReadModelV1, raw: string): SessionChainReadModelV1 {
+	if (raw.length === 0) return readModel;
+	if (!raw.endsWith("\n")) {
+		throw new SessionChainCorruptionError("Session Chain event tail is incomplete");
+	}
+	const lines = raw.split("\n").filter((line) => line.length > 0);
+	const branches = readModel.branches.map(cloneBranch);
+	let title = readModel.title;
+	let archived = readModel.archived;
+	let previousHash = readModel.baseHash;
+	let sequence = readModel.sequence;
+	let updatedAt = readModel.updatedAt;
+	for (const line of lines) {
+		let event: SessionChainEvent;
+		try {
+			event = parseEvent(JSON.parse(line) as unknown, sequence + 1);
+		} catch (error) {
+			if (error instanceof SyntaxError) {
+				throw new SessionChainCorruptionError(`Session Chain event ${sequence + 1} is not valid JSON`);
+			}
+			throw error;
+		}
+		if (event.chainId !== chainId || event.sequence !== sequence + 1 || event.prevHash !== previousHash) {
+			throw new SessionChainCorruptionError(`Session Chain event ${sequence + 1} breaks the incremental tail`);
+		}
+		title = applyEvent(branches, title, event);
+		if (event.eventType === "chain_archive_updated") archived = event.payload.archived;
+		sequence = event.sequence;
+		previousHash = event.hash;
+		updatedAt = event.timestamp;
+	}
+	return {
+		...readModel,
+		sequence,
+		baseHash: previousHash,
+		title,
+		archived,
+		updatedAt,
+		branches,
 	};
 }
 
@@ -734,10 +956,6 @@ function sameIdempotentContent(existing: SessionChainEvent, proposed: SessionCha
 		existing.eventType === proposed.eventType &&
 		stableJsonStringify(existing.payload) === stableJsonStringify(proposed.payload)
 	);
-}
-
-function wait(ms: number): Promise<void> {
-	return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 }
 
 export class SessionChainStore {
@@ -768,8 +986,46 @@ export class SessionChainStore {
 			chainDirectory,
 			eventsPath: join(chainDirectory, "events.jsonl"),
 			readModelPath: join(chainDirectory, "chain-read-model.json"),
+			readModelCheckpointPath: join(chainDirectory, "chain-read-model.checkpoint.json"),
 			locksDirectory,
 			lockPath: join(locksDirectory, "write.lock"),
+		};
+	}
+
+	private rollupGenerationLockPaths(
+		chainId: string,
+		branchId: string,
+		windowIndex: number,
+	): { directory: string; lockPath: string; label: string } {
+		const paths = this.paths(chainId);
+		assertSessionBranchId(branchId);
+		if (!Number.isInteger(windowIndex) || windowIndex <= 0) {
+			throw new SessionChainValidationError("Rollup windowIndex must be a positive integer");
+		}
+		const directory = join(paths.chainDirectory, "branches", branchId, "rollups");
+		return {
+			directory,
+			lockPath: join(directory, `${String(windowIndex).padStart(6, "0")}.generation.lock`),
+			label: `${chainId}/${branchId}/W${windowIndex}`,
+		};
+	}
+
+	private fileLockOptions(lockPath: string, lockDirectory: string, label: string): FileWriteLockOptions {
+		return {
+			directory: lockDirectory,
+			lockPath,
+			recoveryLockPath: join(lockDirectory, `${basename(lockPath, ".lock")}.recovery.lock`),
+			error: (failure: WriteLockFailure) => {
+				if (failure.kind === "locked") return new SessionChainLockedError(label);
+				if (failure.kind === "recovery-locked") {
+					return new SessionChainLockedError(label, "recovering its write lock");
+				}
+				if (failure.kind === "conflict") return new SessionChainLockRecoveryConflictError(label);
+				if (failure.kind === "malformed") {
+					return new SessionChainLockRecoveryError(label, "the lock metadata is malformed");
+				}
+				return new SessionChainLockRecoveryError(label, `the owner is ${failure.ownerState}`);
+			},
 		};
 	}
 
@@ -779,29 +1035,7 @@ export class SessionChainStore {
 		label: string,
 		action: () => Promise<TResult>,
 	): Promise<TResult> {
-		await mkdir(lockDirectory, { recursive: true });
-		for (let attempt = 0; attempt < LOCK_RETRY_LIMIT; attempt++) {
-			let handle: FileHandle;
-			try {
-				handle = await open(lockPath, "wx", 0o600);
-			} catch (error) {
-				if (!isErrno(error, "EEXIST")) throw error;
-				await wait(LOCK_RETRY_DELAY_MS);
-				continue;
-			}
-			try {
-				await handle.writeFile(
-					`${JSON.stringify({ pid: process.pid, nonce: randomUUID(), createdAt: new Date().toISOString() })}\n`,
-				);
-				await handle.sync();
-				await handle.close();
-				return await action();
-			} finally {
-				await handle.close().catch(() => {});
-				await unlink(lockPath).catch(() => {});
-			}
-		}
-		throw new SessionChainLockedError(label);
+		return await withFileWriteLock(this.fileLockOptions(lockPath, lockDirectory, label), action);
 	}
 
 	private async syncDirectory(directory: string): Promise<void> {
@@ -855,8 +1089,167 @@ export class SessionChainStore {
 		replay: SessionChainReplay,
 	): Promise<SessionChainReadModelV1> {
 		const readModel = buildSessionChainReadModel(replay);
-		await this.replaceFile(paths.readModelPath, paths.chainDirectory, `${JSON.stringify(readModel, null, "\t")}\n`);
+		await this.writeReadModelProjection(paths, readModel, (await stat(paths.eventsPath)).size);
 		return readModel;
+	}
+
+	private async writeReadModelProjection(
+		paths: SessionChainPaths,
+		readModel: SessionChainReadModelV1,
+		byteOffset: number,
+	): Promise<void> {
+		await this.replaceFile(paths.readModelPath, paths.chainDirectory, `${JSON.stringify(readModel, null, "\t")}\n`);
+		await this.writeReadModelCheckpoint(paths, readModel, byteOffset);
+	}
+
+	private async writeReadModelCheckpoint(
+		paths: SessionChainPaths,
+		readModel: SessionChainReadModelV1,
+		byteOffset: number,
+	): Promise<void> {
+		const headEventOffset = await this.findHeadEventOffset(paths, byteOffset);
+		const checkpoint: SessionChainReadModelCheckpointV1 = {
+			schema: "pi-xk.session-chain-read-model-checkpoint.v1",
+			headEventOffset,
+			byteOffset,
+			sequence: readModel.sequence,
+			headHash: readModel.baseHash,
+			readModelDigest: readModelDigest(readModel),
+		};
+		await this.replaceFile(
+			paths.readModelCheckpointPath,
+			paths.chainDirectory,
+			`${JSON.stringify(checkpoint, null, "\t")}\n`,
+		);
+	}
+
+	private async findHeadEventOffset(paths: SessionChainPaths, byteOffset: number): Promise<number> {
+		if (byteOffset <= 0) throw new SessionChainCorruptionError("Session Chain event log has no checkpoint head");
+		const handle = await open(paths.eventsPath, "r");
+		try {
+			const fileSize = (await handle.stat()).size;
+			if (fileSize < byteOffset) {
+				throw new SessionChainCorruptionError("Session Chain event log is shorter than its read model");
+			}
+			const terminator = Buffer.alloc(1);
+			if ((await handle.read(terminator, 0, 1, byteOffset - 1)).bytesRead !== 1 || terminator[0] !== 0x0a) {
+				throw new SessionChainCorruptionError("Session Chain checkpoint head event is incomplete");
+			}
+			let cursor = byteOffset - 1;
+			while (cursor > 0) {
+				const length = Math.min(4_096, cursor);
+				const start = cursor - length;
+				const buffer = Buffer.alloc(length);
+				const read = await handle.read(buffer, 0, length, start);
+				const newline = buffer.subarray(0, read.bytesRead).lastIndexOf(0x0a);
+				if (newline >= 0) return start + newline + 1;
+				cursor = start;
+			}
+			return 0;
+		} finally {
+			await handle.close();
+		}
+	}
+
+	private async readStoredReadModel(paths: SessionChainPaths, chainId: string): Promise<SessionChainReadModelV1> {
+		try {
+			const stored = validateSessionChainReadModel(
+				JSON.parse(await readFile(paths.readModelPath, "utf8")) as unknown,
+			);
+			if (stored.chainId !== chainId) throw new SessionChainReadModelStaleError(chainId);
+			return stored;
+		} catch (error) {
+			if (error instanceof SessionChainReadModelStaleError) throw error;
+			throw new SessionChainReadModelStaleError(chainId);
+		}
+	}
+
+	private async readStoredReadModelCheckpoint(
+		paths: SessionChainPaths,
+	): Promise<SessionChainReadModelCheckpointV1 | undefined> {
+		try {
+			return validateReadModelCheckpoint(
+				JSON.parse(await readFile(paths.readModelCheckpointPath, "utf8")) as unknown,
+			);
+		} catch {
+			return undefined;
+		}
+	}
+
+	private async readEventBytesFrom(
+		paths: SessionChainPaths,
+		byteOffset: number,
+	): Promise<{ bytes: Buffer; fileSize: number }> {
+		const handle = await open(paths.eventsPath, "r");
+		try {
+			const fileSize = (await handle.stat()).size;
+			if (fileSize < byteOffset) return { bytes: Buffer.alloc(0), fileSize };
+			const length = fileSize - byteOffset;
+			if (length === 0) return { bytes: Buffer.alloc(0), fileSize };
+			const buffer = Buffer.alloc(length);
+			let consumed = 0;
+			while (consumed < length) {
+				const read = await handle.read(buffer, consumed, length - consumed, byteOffset + consumed);
+				if (read.bytesRead === 0) break;
+				consumed += read.bytesRead;
+			}
+			return { bytes: buffer.subarray(0, consumed), fileSize: byteOffset + consumed };
+		} finally {
+			await handle.close();
+		}
+	}
+
+	private verifyCheckpointHead(chainId: string, checkpoint: SessionChainReadModelCheckpointV1, raw: string): boolean {
+		if (!raw.endsWith("\n")) return false;
+		const lines = raw.split("\n").filter((line) => line.length > 0);
+		if (lines.length !== 1 || !lines[0]) return false;
+		try {
+			const event = parseEvent(JSON.parse(lines[0]) as unknown, checkpoint.sequence);
+			return (
+				event.chainId === chainId && event.sequence === checkpoint.sequence && event.hash === checkpoint.headHash
+			);
+		} catch {
+			return false;
+		}
+	}
+
+	private async inspectReadModelFastPath(
+		paths: SessionChainPaths,
+		chainId: string,
+	): Promise<(SessionChainReadModelLoadResult & { byteOffset: number }) | undefined> {
+		const readModel = await this.readStoredReadModel(paths, chainId);
+		const checkpoint = await this.readStoredReadModelCheckpoint(paths);
+		if (
+			!checkpoint ||
+			checkpoint.sequence !== readModel.sequence ||
+			checkpoint.headHash !== readModel.baseHash ||
+			checkpoint.readModelDigest !== readModelDigest(readModel)
+		) {
+			return undefined;
+		}
+		const eventBytes = await this.readEventBytesFrom(paths, checkpoint.headEventOffset);
+		if (eventBytes.fileSize < checkpoint.byteOffset) return undefined;
+		const proofLength = checkpoint.byteOffset - checkpoint.headEventOffset;
+		if (eventBytes.bytes.length < proofLength) return undefined;
+		const headRaw = eventBytes.bytes.subarray(0, proofLength).toString("utf8");
+		if (!this.verifyCheckpointHead(chainId, checkpoint, headRaw)) return undefined;
+		const tailRaw = eventBytes.bytes.subarray(proofLength).toString("utf8");
+		if (tailRaw.length === 0) {
+			return {
+				readModel,
+				diagnostic: { mode: "fast", bytesRead: proofLength },
+				byteOffset: checkpoint.byteOffset,
+			};
+		}
+		try {
+			return {
+				readModel: applyEventTail(chainId, readModel, tailRaw),
+				diagnostic: { mode: "tail", bytesRead: eventBytes.bytes.length },
+				byteOffset: eventBytes.fileSize,
+			};
+		} catch {
+			return undefined;
+		}
 	}
 
 	private mutationMeta(
@@ -888,8 +1281,8 @@ export class SessionChainStore {
 	}
 
 	private async writeProjections(paths: SessionChainPaths, replay: SessionChainReplay): Promise<void> {
-		await this.writeReadModel(paths, replay);
-		await this.refreshCatalog();
+		const readModel = await this.writeReadModel(paths, replay);
+		await this.updateCatalogEntry(readModel);
 	}
 
 	async putSegmentSummary(summaryInput: SegmentSummaryV1): Promise<string> {
@@ -1089,6 +1482,14 @@ export class SessionChainStore {
 		return await this.append(chainId, "chain_metadata_updated", validateMetadataPayload(payloadInput), options);
 	}
 
+	async appendArchiveUpdated(
+		chainId: string,
+		payloadInput: ChainArchiveUpdatedPayloadV1,
+		options: SessionChainAppendOptions,
+	): Promise<SessionChainWriteResult> {
+		return await this.append(chainId, "chain_archive_updated", validateArchivePayload(payloadInput), options, 3);
+	}
+
 	async appendRollupPublished(
 		chainId: string,
 		payloadInput: RollupPublishedPayloadV1,
@@ -1122,14 +1523,19 @@ export class SessionChainStore {
 		eventType: Exclude<SessionChainEventType, "chain_created">,
 		payload: SessionChainEvent["payload"],
 		options: SessionChainAppendOptions,
-		schemaVersion: 1 | 2 = 1,
+		schemaVersion: 1 | 2 | 3 = 1,
 	): Promise<SessionChainWriteResult> {
 		const paths = this.paths(chainId);
 		return await this.withFileLock(paths.lockPath, paths.locksDirectory, chainId, async () => {
 			const replay = await this.readReplay(paths, chainId);
 			if (replay.tailDiagnostic) throw new SessionChainRecoveryRequiredError(chainId);
 			const event = createEvent({
-				schema: schemaVersion === 2 ? SESSION_CHAIN_EVENT_V2_SCHEMA : SESSION_CHAIN_EVENT_SCHEMA,
+				schema:
+					schemaVersion === 3
+						? SESSION_CHAIN_EVENT_V3_SCHEMA
+						: schemaVersion === 2
+							? SESSION_CHAIN_EVENT_V2_SCHEMA
+							: SESSION_CHAIN_EVENT_SCHEMA,
 				...this.mutationMeta(chainId, options),
 				sequence: replay.head.sequence + 1,
 				eventType,
@@ -1152,6 +1558,7 @@ export class SessionChainStore {
 				head: headFor(event),
 				events: nextEvents,
 				title: projected.title,
+				archived: projected.archived,
 				branches: projected.branches.map(cloneBranch),
 			};
 			await this.writeProjections(paths, next);
@@ -1163,19 +1570,104 @@ export class SessionChainStore {
 		return await this.readReplay(this.paths(chainId), chainId);
 	}
 
-	async loadChainReadModel(chainId: string): Promise<SessionChainReadModelV1> {
+	async inspectWriteLock(chainId: string): Promise<SessionChainWriteLockDiagnostic | undefined> {
 		const paths = this.paths(chainId);
-		const replay = await this.readReplay(paths, chainId);
-		if (replay.tailDiagnostic) throw new SessionChainRecoveryRequiredError(chainId);
-		let stored: SessionChainReadModelV1;
-		try {
-			stored = validateSessionChainReadModel(JSON.parse(await readFile(paths.readModelPath, "utf8")) as unknown);
-		} catch {
-			throw new SessionChainReadModelStaleError(chainId);
+		return await inspectFileWriteLock(paths.lockPath);
+	}
+
+	async repairAbandonedWriteLock(chainId: string, expectedNonce: string): Promise<boolean> {
+		assertSessionChainId(chainId);
+		if (expectedNonce.trim().length === 0) {
+			throw new SessionChainValidationError("expectedNonce must be non-empty");
 		}
-		const rebuilt = buildSessionChainReadModel(replay);
-		if (!sameSessionChainReadModel(stored, rebuilt)) throw new SessionChainReadModelStaleError(chainId);
-		return stored;
+		const paths = this.paths(chainId);
+		return await repairAbandonedFileWriteLock(
+			this.fileLockOptions(paths.lockPath, paths.locksDirectory, chainId),
+			expectedNonce,
+		);
+	}
+
+	async withRollupGenerationLock<TResult>(
+		chainId: string,
+		branchId: string,
+		windowIndex: number,
+		action: () => Promise<TResult>,
+	): Promise<TResult> {
+		const paths = this.rollupGenerationLockPaths(chainId, branchId, windowIndex);
+		return await this.withFileLock(paths.lockPath, paths.directory, paths.label, action);
+	}
+
+	async inspectRollupGenerationLock(
+		chainId: string,
+		branchId: string,
+		windowIndex: number,
+	): Promise<SessionChainWriteLockDiagnostic | undefined> {
+		return await inspectFileWriteLock(this.rollupGenerationLockPaths(chainId, branchId, windowIndex).lockPath);
+	}
+
+	async repairAbandonedRollupGenerationLock(
+		chainId: string,
+		branchId: string,
+		windowIndex: number,
+		expectedNonce: string,
+	): Promise<boolean> {
+		if (expectedNonce.trim().length === 0) {
+			throw new SessionChainValidationError("expectedNonce must be non-empty");
+		}
+		const paths = this.rollupGenerationLockPaths(chainId, branchId, windowIndex);
+		return await repairAbandonedFileWriteLock(
+			this.fileLockOptions(paths.lockPath, paths.directory, paths.label),
+			expectedNonce,
+		);
+	}
+
+	async loadChainReadModelSnapshot(chainId: string): Promise<SessionChainReadModelLoadResult> {
+		const paths = this.paths(chainId);
+		const initial = await this.inspectReadModelFastPath(paths, chainId);
+		if (initial?.diagnostic.mode === "fast") {
+			return { readModel: initial.readModel, diagnostic: initial.diagnostic };
+		}
+		return await this.withFileLock(paths.lockPath, paths.locksDirectory, chainId, async () => {
+			const current = await this.inspectReadModelFastPath(paths, chainId);
+			if (current) {
+				if (current.diagnostic.mode === "tail") {
+					await this.writeReadModelProjection(paths, current.readModel, current.byteOffset);
+					await this.updateCatalogEntry(current.readModel);
+				}
+				return { readModel: current.readModel, diagnostic: current.diagnostic };
+			}
+			const stored = await this.readStoredReadModel(paths, chainId);
+			const checkpoint = await this.readStoredReadModelCheckpoint(paths);
+			let raw: string;
+			try {
+				raw = await readFile(paths.eventsPath, "utf8");
+			} catch (error) {
+				if (isErrno(error, "ENOENT")) throw new SessionChainNotFoundError(chainId);
+				throw error;
+			}
+			const replay = replayRaw(chainId, raw);
+			if (replay.tailDiagnostic) throw new SessionChainRecoveryRequiredError(chainId);
+			const rebuilt = buildSessionChainReadModel(replay);
+			const checkpointMatchesStored =
+				checkpoint !== undefined &&
+				checkpoint.sequence === stored.sequence &&
+				checkpoint.headHash === stored.baseHash &&
+				checkpoint.readModelDigest === readModelDigest(stored);
+			const storedHeadStillExists = replay.events[stored.sequence - 1]?.hash === stored.baseHash;
+			if (
+				!sameSessionChainReadModel(stored, rebuilt) &&
+				!(checkpointMatchesStored && storedHeadStillExists && rebuilt.sequence >= stored.sequence)
+			) {
+				throw new SessionChainReadModelStaleError(chainId);
+			}
+			await this.writeReadModelProjection(paths, rebuilt, Buffer.byteLength(raw));
+			await this.updateCatalogEntry(rebuilt);
+			return { readModel: rebuilt, diagnostic: { mode: "full", bytesRead: Buffer.byteLength(raw) } };
+		});
+	}
+
+	async loadChainReadModel(chainId: string): Promise<SessionChainReadModelV1> {
+		return (await this.loadChainReadModelSnapshot(chainId)).readModel;
 	}
 
 	async rebuildChainReadModel(chainId: string): Promise<SessionChainReadModelV1> {
@@ -1213,6 +1705,7 @@ export class SessionChainStore {
 			chains.push({
 				chainId,
 				title: replay.title,
+				archived: replay.archived,
 				cwd: replay.spec.cwd,
 				sequence: replay.head.sequence,
 				baseHash: replay.head.hash,
@@ -1233,6 +1726,39 @@ export class SessionChainStore {
 		};
 	}
 
+	private async updateCatalogEntry(readModel: SessionChainReadModelV1): Promise<SessionChainCatalogV1> {
+		const lockPath = join(this.catalogLocksDirectory, "catalog.write.lock");
+		return await this.withFileLock(lockPath, this.catalogLocksDirectory, "catalog", async () => {
+			let catalog: SessionChainCatalogV1;
+			try {
+				catalog = validateCatalog(JSON.parse(await readFile(this.catalogPath, "utf8")) as unknown);
+			} catch (error) {
+				if (!isErrno(error, "ENOENT")) throw new SessionChainReadModelStaleError("catalog");
+				const chainDirectories = (await readdir(this.chainsDirectory, { withFileTypes: true })).filter(
+					(entry) => entry.isDirectory() && entry.name.startsWith("chain_"),
+				);
+				if (chainDirectories.some((entry) => entry.name !== readModel.chainId)) {
+					throw new SessionChainReadModelStaleError("catalog");
+				}
+				catalog = { schema: SESSION_CHAIN_CATALOG_SCHEMA, updatedAt: null, chains: [] };
+			}
+			const entry = catalogEntryFromReadModel(readModel);
+			const chains = [...catalog.chains.filter((candidate) => candidate.chainId !== entry.chainId), entry].sort(
+				(left, right) => left.chainId.localeCompare(right.chainId),
+			);
+			const next: SessionChainCatalogV1 = {
+				schema: SESSION_CHAIN_CATALOG_SCHEMA,
+				updatedAt: chains.reduce<string | null>(
+					(latest, candidate) => (latest === null || candidate.updatedAt > latest ? candidate.updatedAt : latest),
+					null,
+				),
+				chains,
+			};
+			await this.replaceFile(this.catalogPath, this.sessionsDirectory, `${JSON.stringify(next, null, "\t")}\n`);
+			return next;
+		});
+	}
+
 	private async refreshCatalog(): Promise<SessionChainCatalogV1> {
 		const lockPath = join(this.catalogLocksDirectory, "catalog.write.lock");
 		return await this.withFileLock(lockPath, this.catalogLocksDirectory, "catalog", async () => {
@@ -1247,21 +1773,15 @@ export class SessionChainStore {
 	}
 
 	async loadCatalog(): Promise<SessionChainCatalogV1> {
-		let stored: SessionChainCatalogV1;
 		try {
-			stored = JSON.parse(await readFile(this.catalogPath, "utf8")) as SessionChainCatalogV1;
+			return validateCatalog(JSON.parse(await readFile(this.catalogPath, "utf8")) as unknown);
 		} catch {
 			throw new SessionChainReadModelStaleError("catalog");
 		}
-		const rebuilt = await this.buildCatalog();
-		if (stableJsonStringify(stored) !== stableJsonStringify(rebuilt)) {
-			throw new SessionChainReadModelStaleError("catalog");
-		}
-		return stored;
 	}
 
 	async listChains(): Promise<SessionChainCatalogEntryV1[]> {
-		return (await this.buildCatalog()).chains;
+		return (await this.loadCatalog()).chains;
 	}
 
 	async repairTrailingPartialEvent(chainId: string): Promise<SessionChainReplay> {

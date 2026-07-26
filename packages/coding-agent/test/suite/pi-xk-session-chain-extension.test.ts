@@ -1,11 +1,15 @@
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it } from "vitest";
-import { type GoalContractV2, GoalStore } from "../../../pi-xk-core/src/index.ts";
+import { type GoalContractV2, GoalStore, type TaskSpecV1, TaskStore } from "../../../pi-xk-core/src/index.ts";
 import { createPiXkRuntimeExtension } from "../../../pi-xk-extension/src/extension.ts";
-import { createPiXkGoalBinding, PI_XK_SESSION_LINK_CUSTOM_TYPE } from "../../../pi-xk-extension/src/index.ts";
+import {
+	createPiXkGoalBinding,
+	createPiXkTaskLink,
+	PI_XK_SESSION_LINK_CUSTOM_TYPE,
+} from "../../../pi-xk-extension/src/index.ts";
 import type { SessionChainHost, SessionChainThreshold } from "../../../pi-xk-extension/src/session-chain-controller.ts";
 import { SessionChainController } from "../../../pi-xk-extension/src/session-chain-controller.ts";
 import { createPiXkSessionChainExtension } from "../../../pi-xk-extension/src/session-chain-extension.ts";
@@ -263,6 +267,7 @@ describe("Pi-XK Session Chain extension", () => {
 		expect((await controller.getStore().replayChain(binding!.chainId)).branches[0]?.headSegmentId).toBe(
 			binding?.segmentId,
 		);
+		expect((await controller.getStore().replayChain(binding!.chainId)).title).toBe("first managed request");
 	});
 
 	it("adopts an existing persisted Pi transcript as an external root without copying it", async () => {
@@ -564,8 +569,144 @@ describe("Pi-XK Session Chain extension", () => {
 
 		expect(harness.providerCalls()).toBe(0);
 		expect(notifications.at(-1)).toMatch(
-			/^Session Chain chain_[A-Za-z0-9_-]+ · branch_[A-Za-z0-9_-]+ · S1 active · [\d.]+ (?:B|KiB|MiB) · \d+ entries · threshold none · writable yes · summary root · gates clear$/,
+			/^Session Chain chain_[A-Za-z0-9_-]+ · archived no · branch_[A-Za-z0-9_-]+ · S1 active · [\d.]+ (?:B|KiB|MiB) · \d+ entries · threshold none · writable yes · summary root · rollup idle · gates clear$/,
 		);
+	});
+
+	it("allows read-only Chain commands and blocks Chain changes while a Task is running", async () => {
+		const notifications: string[] = [];
+		const harness = await createChainRuntime(
+			createPiXkSessionChainExtension({ getGateState: () => ({ taskRunning: true }) }),
+			{
+				uiContext: chainTestUi({ notifications }),
+				initializeSession: (sessionManager) => {
+					sessionManager.appendMessage({
+						role: "user",
+						content: [{ type: "text", text: "running Task gate fixture" }],
+						timestamp: Date.now(),
+					});
+					sessionManager.appendMessage(fauxAssistantMessage("running Task gate response"));
+					sessionManager.flushDurable();
+				},
+			},
+		);
+		harnesses.push(harness);
+		const controller = new SessionChainController({ projectRoot: harness.projectRoot });
+		const initial = await controller.getCurrentStatus(harness.runtime.session.sessionManager);
+
+		await harness.runtime.session.prompt("/chain status");
+		expect(notifications.at(-1)).toContain("gates running Task");
+
+		await harness.runtime.session.prompt("/chain rename must stay unchanged");
+		expect(notifications.at(-1)).toContain("Session Chain changes are blocked while a Task is running");
+		await harness.runtime.session.prompt("/chain rollover must stay blocked");
+		expect(notifications.at(-1)).toContain("Session Chain changes are blocked while a Task is running");
+
+		const after = await controller.getCurrentStatus(harness.runtime.session.sessionManager);
+		expect(after?.title).toBe(initial?.title);
+		expect(after?.ordinal).toBe(initial?.ordinal);
+		expect(harness.providerCalls()).toBe(0);
+	});
+
+	it("aggregates Chain, Goal, Task, Rollup, and recovery state through /xk status", async () => {
+		const notifications: string[] = [];
+		const harness = await createChainRuntime(createPiXkRuntimeExtension(), {
+			uiContext: chainTestUi({ notifications }),
+		});
+		harnesses.push(harness);
+		const sessionId = harness.runtime.session.sessionManager.getSessionId();
+		const goalId = "goal_runtime_status";
+		const goalStore = new GoalStore(harness.projectRoot);
+		const created = await goalStore.createGoal(
+			{
+				schema: "pi-xk.goal.contract.v2",
+				goalId,
+				title: "Inspect runtime status",
+				objective: "Show the combined Pi-XK operating state.",
+				constraints: [],
+				acceptance: [
+					{ id: "A-1", kind: "artifact", description: "Status is visible.", required: true },
+					{ id: "A-2", kind: "artifact", description: "Optional detail is visible.", required: false },
+				],
+				capabilities: { filesystem: "unrestricted", network: "unrestricted", spawn: "unrestricted" },
+				budgets: { tokens: 0, costCents: 0, wallSeconds: 0 },
+				ownerSessionId: sessionId,
+				createdAt: "2026-07-25T00:00:00.000Z",
+				schemaVersion: 2,
+				nonGoals: [],
+				doneCondition: "The status is verified.",
+				pauseCondition: "A blocker requires user input.",
+				finalReport: "Report the status evidence.",
+				executionAuthorization: "Read-only status inspection is authorized.",
+			},
+			{ eventId: "goal_runtime_status:created", idempotencyKey: "goal_runtime_status:created", actor: "user" },
+		);
+		const activated = await goalStore.appendLifecycleEvent(
+			goalId,
+			{ eventType: "goal_activated", payload: { sessionId } },
+			{
+				eventId: "goal_runtime_status:activated",
+				idempotencyKey: "goal_runtime_status:activated",
+				actor: "user",
+				expectedHead: created.head,
+			},
+		);
+		await goalStore.appendLifecycleEvent(
+			goalId,
+			{
+				eventType: "goal_ended",
+				payload: {
+					outcome: "verified",
+					reason: "Status aggregation fixture completed.",
+					verifiedAcceptanceIds: ["A-1", "A-2"],
+					finalEvidence: "Required and optional evidence were both verified.",
+					finalSummary: "The status fixture is complete.",
+				},
+			},
+			{
+				eventId: "goal_runtime_status:ended",
+				idempotencyKey: "goal_runtime_status:ended",
+				actor: "user",
+				expectedHead: activated.head,
+			},
+		);
+		harness.runtime.session.sessionManager.appendCustomEntry(
+			PI_XK_SESSION_LINK_CUSTOM_TYPE,
+			createPiXkGoalBinding(goalId, 0),
+		);
+		const taskSpec: TaskSpecV1 = {
+			schema: "pi-xk.task.spec.v1",
+			taskId: "task_runtime_status",
+			parentSessionId: sessionId,
+			parentEntryId: harness.runtime.session.sessionManager.getLeafId() ?? sessionId,
+			parentGoalId: goalId,
+			role: "verification",
+			prompt: "Inspect status.",
+			expectedResult: "A combined status report.",
+			workspaceMode: "same-workspace",
+			allowNestedSpawn: false,
+			createdAt: "2026-07-25T00:01:00.000Z",
+		};
+		const task = await new TaskStore(harness.projectRoot).createTask(taskSpec, {
+			eventId: "task_runtime_status:created",
+			idempotencyKey: "task_runtime_status:created",
+			actor: "user",
+		});
+		harness.runtime.session.sessionManager.appendCustomEntry(
+			PI_XK_SESSION_LINK_CUSTOM_TYPE,
+			createPiXkTaskLink(taskSpec.taskId, goalId, task.event.eventId, 0),
+		);
+
+		await harness.runtime.session.prompt("/xk status");
+
+		const status = notifications.at(-1) ?? "";
+		expect(status).toContain("Pi-XK status");
+		expect(status).toMatch(/Chain: .+ · branch_.+ · S1 active/);
+		expect(status).toContain("Rollup: 0 published · idle");
+		expect(status).toContain("Goal: Inspect runtime status · ended · acceptance 1/1");
+		expect(status).toContain("Task: task_runtime_status · pending · verification");
+		expect(status).toContain("Recovery: clear");
+		expect(harness.providerCalls()).toBe(0);
 	});
 
 	it("manually rolls over the current Segment and reports success from the replacement context", async () => {
@@ -637,6 +778,38 @@ describe("Pi-XK Session Chain extension", () => {
 		await harness.runtime.session.prompt("/chain doctor");
 		expect(notifications.at(-1)).toBe(`Session Chain doctor ${sourceBinding.chainId}: no diagnostics`);
 		expect(harness.providerCalls()).toBe(1);
+	});
+
+	it("diagnoses and explicitly repairs an abandoned Session Chain write lock", async () => {
+		const notifications: string[] = [];
+		const harness = await createChainRuntime(createPiXkSessionChainExtension(), {
+			uiContext: chainTestUi({ notifications }),
+		});
+		harnesses.push(harness);
+		const controller = new SessionChainController({ projectRoot: harness.projectRoot });
+		const binding = controller.getCurrentBinding(harness.runtime.session.sessionManager)!;
+		const lockPath = join(
+			harness.projectRoot,
+			".pi-xk",
+			"sessions",
+			"chains",
+			binding.chainId,
+			"locks",
+			"write.lock",
+		);
+		writeFileSync(
+			lockPath,
+			`${JSON.stringify({ pid: 999_999_999, nonce: "abandoned-chain-command", createdAt: "2026-07-22T00:01:00.000Z" })}\n`,
+		);
+
+		await harness.runtime.session.prompt("/chain doctor");
+		expect(notifications.at(-1)).toContain("write_lock_abandoned");
+		expect(notifications.at(-1)).toContain("/chain doctor repair-lock abandoned-chain-command");
+
+		await harness.runtime.session.prompt("/chain doctor repair-lock abandoned-chain-command");
+		expect(notifications.at(-1)).toContain("repaired abandoned write lock");
+		await harness.runtime.session.prompt("/chain doctor");
+		expect(notifications.at(-1)).toBe(`Session Chain doctor ${binding.chainId}: no diagnostics`);
 	});
 
 	it("controls Rollup configuration, explicit backfill, listing, and viewing without hidden generation", async () => {
@@ -750,6 +923,7 @@ describe("Pi-XK Session Chain extension", () => {
 		await harness.runtime.session.prompt("/chain rollover manifest fixture");
 		const rolloverBinding = controller.getCurrentBinding(harness.runtime.session.sessionManager);
 		if (!rolloverBinding) throw new Error("manifest fixture must remain bound");
+		await controller.waitForRollupPublications(rolloverBinding.chainId, rolloverBinding.branchId);
 		const rolloverReplay = await controller.getStore().replayChain(rolloverBinding.chainId);
 		expect(rolloverReplay.branches[0]?.rollupFailures).toEqual([]);
 		expect(rolloverReplay.branches[0]?.rollups).toHaveLength(1);
@@ -815,6 +989,7 @@ describe("Pi-XK Session Chain extension", () => {
 		const targetFile = first.runtime.session.sessionFile;
 		const binding = firstController.getCurrentBinding(first.runtime.session.sessionManager);
 		if (!targetFile || !binding) throw new Error("restart fixture must have a bound target Segment");
+		await firstController.waitForRollupPublications(binding.chainId, binding.branchId);
 		await first.dispose();
 
 		const restartedController = createTestSessionChainController(projectRoot);
@@ -878,6 +1053,48 @@ describe("Pi-XK Session Chain extension", () => {
 		expect(controller.getCurrentBinding(harness.runtime.session.sessionManager)?.chainId).toBe(first.binding.chainId);
 		expect(notifications.at(-1)).toContain(`Session Chain resumed ${first.binding.chainId}`);
 		expect(harness.providerCalls()).toBe(0);
+	});
+
+	it("renames and archives chains while hiding archived heads from the default picker", async () => {
+		const projectRoot = join(tmpdir(), `pi-xk-chain-archive-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(projectRoot, { recursive: true });
+		const controller = createTestSessionChainController(projectRoot);
+		const first = await controller.createManagedRoot({ title: "First Chain" });
+		const second = await controller.createManagedRoot({ title: "Second Chain" });
+		const notifications: string[] = [];
+		const pickerChoices: string[][] = [];
+		const harness = await createChainRuntime(
+			createPiXkSessionChainExtension({ createController: () => controller }),
+			{
+				projectRoot,
+				sessionManager: first.sessionManager,
+				uiContext: chainTestUi({
+					notifications,
+					select: (_title, choices) => {
+						pickerChoices.push(choices);
+						return choices[0];
+					},
+				}),
+			},
+		);
+		harnesses.push(harness);
+
+		await harness.runtime.session.prompt("/chain rename Archived Work");
+		expect((await controller.getStore().loadChainReadModel(first.binding.chainId)).title).toBe("Archived Work");
+		await harness.runtime.session.prompt("/chain archive");
+		expect((await controller.getStore().loadChainReadModel(first.binding.chainId)).archived).toBe(true);
+
+		await harness.runtime.session.prompt("/chain list");
+		expect(notifications.at(-1)).toContain("Second Chain");
+		expect(notifications.at(-1)).not.toContain("Archived Work");
+		await harness.runtime.session.prompt("/chain list all");
+		expect(notifications.at(-1)).toContain("ARCHIVED Archived Work");
+
+		await harness.runtime.session.prompt("/chain");
+		expect(pickerChoices).toEqual([]);
+		expect(controller.getCurrentBinding(harness.runtime.session.sessionManager)?.chainId).toBe(
+			second.binding.chainId,
+		);
 	});
 
 	it("continues a historical Segment as a new branch without modifying the source transcript", async () => {

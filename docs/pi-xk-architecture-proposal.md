@@ -1,10 +1,10 @@
 # Pi-XK 架构策划案
 
-> **状态**：In implementation（Phase 0、Phase 1.1–1.8、Task Run v1 与 Session Chain v1.1 / Rollup v1 已完成；当前个人本机无限权限 profile 仍延后 Policy/沙箱，完整 Phase 3 调度能力、通用 Context/memory、Proposal/反省闭环和其余能力按依赖顺序推进）
+> **状态**：Implemented baseline, stabilization pending release validation（Phase 0、Phase 1.1–1.8、Task Run v1、Session Chain v1.1 / Rollup v1 及其正确性、恢复、长链性能和本地产品化稳定化已在当前分支实现；仍需完整本地与真实 smoke 验收。Policy/沙箱、完整 TaskSupervisor、通用 Context/memory 与 Proposal/反省闭环不在当前范围）
 >
 > **版本**：1.1.0
 >
-> **日期**：2026-07-24
+> **日期**：2026-07-25
 >
 > **定位**：基于 Pi 的维护型 fork，加上可验证的领域层、任务编排层和安全边界。
 >
@@ -854,7 +854,7 @@ pi_xk.artifact.*
 - 工具结果已持久化后的 `turn_end` 与 `session_before_compact` 的自动 checkpoint；
 - artifact store、redaction 和可重建 read model。
 
-**2026-07-24 实现状态：** Phase 1.1–1.8 和 Task Run v1 均已完成。Session Chain v1.1 把长期逻辑会话拆为完整原生 Pi JSONL Segment：新空会话进入项目级 managed Segment，既有 Pi session 作为不复制的 external root 被采用，`events.jsonl` 是拓扑事实源，而 catalog/read model 可重建。soft（16 MiB/4,000 entries）只在 settled 后轮转，hard（64 MiB/16,000 entries）在下一次 provider turn 前强制轮转；Task 运行、Task 结果待交付、Goal 草案或 lifecycle intent 会阻止轮转。每次轮转生成并校验 L1 summary-in/delta/carry-forward artifact，默认每 5 个 sealed Segment 生成只读取 L1 的 L2 Rollup。系统提示词只注入 metadata manifest，模型通过统一只读工具按需读取当前 chain 的 L1/L2。Rollup 失败不回滚 rollover，历史窗口只显式有限额 backfill。active Goal 在 `reason: "rollover"` 下继续，不触发保守 pause。Task V2 记录父 chain ref，child 自身从 managed SessionChain 起步；Task V1 保持原 hash 并仅在读取时 upcast。Pi 原生 session、tree、compaction、provider 和消息 schema 均未替换。尚未实现的是通用跨域 Context controller、long-term memory、完整 TaskSupervisor（并发/DAG/retry/budget/deadline/RPC/worktree/sandbox）以及 Policy、artifact retention/GC。
+**2026-07-25 实现状态：** Phase 1.1–1.8 和 Task Run v1 均已完成。Session Chain v1.1 把长期逻辑会话拆为完整原生 Pi JSONL Segment：新空会话进入项目级 managed Segment，既有 Pi session 作为不复制的 external root 被采用，`events.jsonl` 是拓扑事实源，而 catalog/read model 可重建。soft（16 MiB/4,000 entries）只在 settled 后轮转，hard（64 MiB/16,000 entries）在下一次 provider turn 前强制轮转；Task 运行、Task 结果待交付、Goal 草案或 lifecycle intent 会阻止轮转。L1 以 Artifact Store read-back 内容为 canonical，并由统一验证器核对 marker/seal/successor provenance。默认每 5 个 sealed Segment 登记只读取 L1 的后台 L2 publication；branch 串行队列与 generation lock 避免重复付费调用。checkpointed read model 通过 event tail 快速更新，普通 status/manifest/picker 不再完整 replay。系统提示词只注入 metadata manifest，模型读取正文前完成完整 provenance 验证。active Goal 在 `reason: "rollover"` 下继续。Task 普通输入使用 Pi follow-up 队列延迟处理，仍保持单 child 与父屏障。Chain 标题/归档、分级 doctor、统一锁恢复、`/xk status` 与本地安装脚本已经落地。尚未实现的是通用跨域 Context controller、long-term memory、完整 TaskSupervisor（并发/DAG/retry/budget/deadline/RPC/worktree/sandbox）以及 Policy、artifact retention/GC。
 
 #### Phase 1.7：Goal 连续执行（已完成）
 
@@ -890,6 +890,7 @@ Policy/沙箱仍是 supervised、unattended 和不可信执行的前置条件，
 - 只支持一个 in-process child `AgentSession`，并发固定为 1、禁止 nested spawn，不引入第三方 subagent runtime；
 - `pending -> running -> succeeded|failed|cancelled|orphaned` 生命周期和结构化 result envelope；
 - 父 session/Goal 的 start、status、cancel、reload recovery 与结果 artifact 引用；
+- Task 运行期间普通输入进入 Pi 原生 follow-up 队列，终态交付后按序处理；Goal/Chain 写命令和第二个 Task 仍被 gate；
 - child transcript 独立，父 session 只接收 task link 和最终 envelope，不复制整段对话；
 - 本切片不实现 Policy/沙箱，也不收紧现有 Pi 工具权限；child 明确继承启动 Pi 的用户权限。它只交付可追溯的单 Task 运行，不同时承诺 unattended、worktree 自动合并或后台修改 Resource。
 
@@ -905,11 +906,12 @@ Session Chain v1.1 独立于完整 Phase 3 和通用 Phase 4：它解决一个�
 
 - `.pi-xk/sessions/chains/<chainId>/events.jsonl` 记录 chain/branch/segment 拓扑；`catalog.json` 与 read model 可删除重建；
 - 每个 sealed Segment 固定拥有 summary-in、原生正文与含 delta/carry-forward 的 L1 summary-out；rollover 前重新读取 artifact 并验证 provenance，失败或篡改不 seal；
-- 两阶段 `rollover_prepared -> rollover_committed|rollover_aborted` 确保 source summary-out 与 target JSONL durable 后才提升 branch head；startup/`/chain doctor` 能按 marker 恢复 prepared 状态；
+- 两阶段 `rollover_prepared -> rollover_committed|rollover_aborted` 确保 source summary-out 与 target JSONL durable 后才提升 branch head；startup 能按 marker 恢复 prepared 状态，quick/deep doctor 负责报告未完成恢复；
 - host 只新增非破坏性的 `summarizeSessionContext`、`rolloverSession`、`session_before_rollover` 和 lifecycle reason `rollover`。不设置 `SessionHeader.parentSession`，不改原生 entry schema；
 - 每个 branch 默认每 5 个 sealed Segment 产生一个 L2 Rollup；窗口连续、不重叠，输入只使用有序 L1 artifacts。`rollup_published/failed` 使用 v2 event，v1 hash 不重写；
+- rollover 只登记后台 publication job，branch 串行队列与跨进程 generation lock 保证 successor 立即可用并避免重复模型调用；
 - 系统提示词只注入固定大小 manifest，模型通过 `pi_xk_list_chain_summaries` 和 `pi_xk_read_chain_summary` 按需读取；摘要正文和伪系统指令不自动注入；
-- `/chain` 提供 picker、status、history、summary、rollups、rollup view/config/backfill、manual rollover、resume、history continue 和 doctor；footer 额外显示当前链与 Segment 体积；
+- `/chain` 提供 picker/list、确定性标题、rename/archive、status、history、summary、rollups、rollup view/config/backfill、manual rollover、resume、history continue 和 quick/deep/repair doctor；`/xk status` 聚合 Chain/Goal/Task/恢复视图；
 - rollover 会原样迁移 Goal binding，Task V2 绑定父 chain ref；历史继续创建 successor branch，sealed 文件不重写。
 
 退出门槛：每个 Segment 单独可被 Pi 打开；L1 递进且与 artifact/marker 对应；十次默认 rollover 生成两个独立 L2；模型可从 manifest 发现并通过只读工具读取 L1/L2；关闭 Rollup 后不产生新 L2 调用但既有摘要可读；prepared 和 Rollup publication 崩溃能恢复；硬阈值绝不把普通输入送入未轮转的 provider turn；Goal/Task gate 阻止不安全轮转；active Goal 在真实 rollover 后仍由 replacement runtime 继续。
@@ -994,6 +996,9 @@ Session Chain 专用 L1/L2 与按需读取已经完成；本 Phase 剩余范围�
 | Policy | symlink、shell wrapper、sudo、网络、凭据 | hard deny/ask/allow 与 effective policy 一致 |
 | Sandbox | backend 缺失、启动失败、超时、清理 | supervised/unattended fail closed，无残留挂载/进程 |
 | Task V1 | 单 child 成功、失败、取消、reload、取消超时、重启、model switch、compaction | 状态与结果 envelope 可追溯；正常取消与 runtime 丢失可区分；父子 transcript 分离；终态不自动重跑 |
+| Task 输入 | Task running 时连续普通输入、status/cancel、Goal/Chain 写命令 | 普通输入按序延迟；status/cancel 即时；状态变更拒绝；parent/child 不并发调用模型 |
+| Session Chain 长链 | 100/1000 events、tail append、read-model 损坏、summary 分页 | 正常 manifest/status 只读有效 event tail；异常回退 replay；首页成本随 page size 而非全库增长 |
+| Summary 语义 | 多 Segment 约束、决策、完成项、否决项、未决项 | golden fixture 对 omission、reversal、stale、false completion 均可检测 |
 | Task Phase 3 | 并发、DAG、retry、deadline、RPC、worktree、sandbox | 预算与策略生效；父取消回收所有 descendant 和进程组；未经验证不合并 diff |
 | Resource | untrusted project、冲突 Skill、reload 竞态 | trust gate、generation 原子切换、旧版本可恢复 |
 | MCP | lazy connect、OAuth、超大输出、server 崩溃 | token 不入日志，输出 guard、取消和错误 schema 生效 |

@@ -12,6 +12,7 @@ Pi-XK 是 Pi 的维护型 fork 与扩展层。它在保留 Pi provider、Agent l
 | Goal 连续执行 | 已实现 | active Goal 会自动继续，直到模型提交合格的 pause/end intent 或用户显式控制 |
 | Task Run v1 | 已实现 | 同一 parent 只运行一个 in-process child；无并发、DAG、retry、deadline 或 worktree 隔离 |
 | Session Chain v1.1 | 已实现 | 物理 Segment、L1 递进摘要、默认每 5 段 L2 Rollup、模型按需检索、恢复和 successor branch |
+| 日常状态与管理 | 已实现 | `/xk status` 聚合 Chain/Goal/Task/恢复诊断；Chain 支持标题、归档和默认隐藏归档项 |
 | Artifact store | 已实现 | 项目级、内容寻址、单 artifact 最大 64 KiB；不是任意大文件仓库 |
 | Policy 与沙箱 | 未实现 | 扩展继承启动 Pi 的用户权限，不提供逐工具授权或无人值守隔离 |
 | 通用 Context controller 与长期记忆 | 未实现 | 已有 Chain 专用 L1/L2 检索，但没有跨域/跨项目 memory 或通用 token policy controller |
@@ -64,8 +65,8 @@ flowchart LR
 1. **没有沙箱。** Pi-XK 与 Pi 进程拥有相同的文件、进程、网络和凭据访问能力。只在受信任的代码与项目中安装。
 2. **会产生额外模型调用。** Goal 草案、active Goal 连续运行、Task child 和 Session Chain 摘要都可能调用当前 provider，增加 token、费用和耗时。
 3. **会写入项目目录。** 启用后，Session Chain 会在项目根创建 `.pi-xk/sessions/`；确认 Goal 或启动 Task 后还会创建对应领域数据。
-4. **会改变部分交互流程。** Task 运行时普通输入被拦截；hard rollover 失败时输入不会送给 provider；历史位置继续输入会创建 successor branch。
-5. **不要手工改事件日志。** `events.jsonl` 是事实源。投影通过 Core rebuild API 恢复；prepared rollover 与 sealed integrity 通过 `/chain doctor` 处理。
+4. **会改变部分交互流程。** Task 运行时普通输入进入 Pi follow-up 队列，待 Task 结束后按序处理；Goal/Chain 写命令仍会拒绝。hard rollover 失败时输入不会送给 provider；历史位置继续输入会创建 successor branch。
+5. **不要手工改事件日志或锁。** `events.jsonl` 是事实源。投影用 `/chain doctor repair-projections` 恢复；事实完整性用 `/chain doctor deep` 检查；遗留写锁只能按 doctor 给出的 nonce 显式修复。
 6. **Pi 原生能力仍然存在。** `/resume`、`/tree`、`/compact` 和 provider/model 配置仍由 Pi 管理；`/chain` 只管理逻辑链和物理 Segment。
 
 ## 文档职责
@@ -81,4 +82,4 @@ flowchart LR
 
 ## 版本基线
 
-当前文档对应 Session Chain v1.1 / Rollup v1 实现。2026-07-24 本工作区的修正后入口 `npm run test:pi-xk` 已通过 Core 55/55、Pi/Host 集成 119/119；旧的 Core 42 / Pi 集成 97 不再是完整验收证据。发布前还必须运行 `npm run check`、`git diff --check` 和完整 Session Chain benchmark。
+当前文档对应 2026-07-25 的 Pi-XK 稳定化实现。修正后的 `npm run test:pi-xk` 已覆盖 Core `62/62`、Pi/Host 集成 `150/150`，包括 Task 输入队列和摘要语义质量套件；旧的 `42/97`、`55/119` 都不再是完整验收证据。发布前还必须运行 `npm run check`、`./test.sh`、两组 Session Chain benchmark、摘要质量评估和 `git diff --check`。

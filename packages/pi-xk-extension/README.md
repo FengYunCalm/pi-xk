@@ -16,21 +16,17 @@ The package is currently private and installed from a built local checkout. Its 
 
 ## Local Installation
 
-From a built Pi-XK checkout, install the package into the current user's Pi settings:
+Use the repository-managed local install commands. They build Core and Extension, run the runtime preflight, and atomically update the selected Pi profile:
 
 ```bash
-npm --workspace pi-xk-core run build
-npm --workspace pi-xk-extension run build
-npm run check:pi-xk-runtime
-pi install /absolute/path/to/pi-xk/packages/pi-xk-extension
-pi list
+npm run pi-xk:install
+npm run pi-xk:upgrade
+npm run pi-xk:uninstall
+npm run pi-xk:install -- --dry-run
+npm run pi-xk:install -- --agent-dir /tmp/pi-xk-profile
 ```
 
-`pi install` stores a reference to the local package. It does not copy the package, so rebuild the checkout and restart Pi after changing Pi-XK source. Remove the local package with:
-
-```bash
-pi remove /absolute/path/to/pi-xk/packages/pi-xk-extension
-```
+Each command accepts `--agent-dir` and `--dry-run`. The script stores a reference to this checkout; it never copies the package or removes project `.pi-xk` data. Restart Pi after install or upgrade. Project-local package scope remains available through Pi's native `pi install -l` command.
 
 For an isolated test profile, set `PI_CODING_AGENT_DIR` before both commands. This keeps package settings, Pi-managed binaries, and sessions out of the normal user profile.
 
@@ -50,6 +46,8 @@ Pi's native `find` tool needs `fd`. On Ubuntu or Debian, install `fd-find`; Pi r
 /goal pause [reason]       Pause the active Goal and interrupt a busy run.
 /goal start                Resume a paused Goal; active and ended Goals are rejected.
 /goal status               Show Goal state, diagnostics, and timing.
+/goal doctor               Inspect the Goal write lock.
+/goal doctor repair-lock <nonce>  Remove only a confirmed abandoned lock with the exact nonce.
 /goal end [reason]         Immediately end the active or paused Goal by explicit user request.
 /goal -- <objective>       Draft an objective beginning with a reserved subcommand.
 ```
@@ -84,11 +82,13 @@ In TUI mode, Pi-XK adds a composable native footer status such as `Goal active �
 /task status [taskId]             Show status, elapsed time, role, child session, summary, and artifacts.
 /task cancel [reason]             Cancel the current running Task.
 /task cancel <taskId> [reason]    Cancel a linked running Task by ID.
+/task doctor [taskId]              Inspect the Task write lock.
+/task doctor [taskId] repair-lock <nonce>  Repair a confirmed abandoned lock.
 ```
 
 The parent model can call `pi_xk_start_task(role, prompt, expectedResult)` for one bounded research, implementation, verification, or review child. That tool terminates the current parent run. The child runs in an independent Pi `AgentSession` and must call its child-only `pi_xk_finish_task` tool exactly once; a normal text reply is treated as a failed result. The parent never sees `pi_xk_finish_task`, and the child loads with `noExtensions: true`, so it cannot call Goal tools or create a nested Task.
 
-Only one Task can run at a time. While it is running, ordinary user input is rejected and the parent Goal cannot auto-continue. A model-started Task delivers a structured result and resumes the settled parent exactly once. A user-started Task only notifies the user. Cancelling a Task bound to an active Goal also pauses that Goal; resume it explicitly with `/goal start`.
+Only one Task can run at a time. While it is running, ordinary user input is queued in Pi's native follow-up queue and processed in order after the Task settles and its result is delivered. `/task status` and `/task cancel` remain immediate; Goal/Chain mutations and starting a second Task remain blocked. Queuing does not allow the parent model and child model to run concurrently. A model-started Task delivers a structured result and resumes the settled parent exactly once. A user-started Task only notifies the user. Cancelling a Task bound to an active Goal also pauses that Goal; resume it explicitly with `/goal start`.
 
 Task states are `pending -> running -> succeeded|failed|cancelled|orphaned`. Graceful shutdown, extension reload, and tree navigation request child cancellation; confirmed cancellation records `cancelled`, while a child that does not settle within the five-second shutdown window records `orphaned` and is detached. A failed tree-navigation cancellation rejects the navigation. Startup marks a leftover `pending` Task cancelled and a leftover `running` Task orphaned, then backfills a missing terminal result message without starting the parent model. Terminal Tasks never restart. Model switching and parent compaction do not change Task state; the child keeps its launch-time provider/model and thinking-level snapshot.
 
@@ -96,7 +96,11 @@ Task states are `pending -> running -> succeeded|failed|cancelled|orphaned`. Gra
 
 ```text
 /chain                              Select a logical Session Chain head.
+/chain list                         List non-archived chains.
+/chain list all                     Include archived chains.
 /chain status                       Show the current chain, branch, Segment, size, summary, and rollover gates.
+/chain rename <title>               Set a human-readable Chain title.
+/chain archive                      Hide the current Chain from default discovery without deleting data.
 /chain history                      Show the Segment and branch topology.
 /chain summary [segmentId]          Show the Segment's summary-in, delta, and carry-forward summary.
 /chain rollups                      List published and failed L2 windows for the current branch.
@@ -108,12 +112,16 @@ Task states are `pending -> running -> succeeded|failed|cancelled|orphaned`. Gra
 /chain rollover [reason]            Request a safe manual physical rollover.
 /chain resume <chainId|prefix>      Switch to a logical chain head.
 /chain continue <segmentId> [entryId]  Create a successor branch from historical work.
-/chain doctor                       Replay the chain, recover a prepared rollover, and report diagnostics.
+/chain doctor                       Run the fast head, topology, lock, publication, and projection check.
+/chain doctor deep                  Fully replay and hash all Segment/L1/L2 facts.
+/chain doctor repair-projections    Rebuild read model, catalog, and Rollup Markdown only.
+/chain doctor repair-lock <nonce>   Repair a confirmed abandoned Chain write lock.
+/xk status                          Aggregate current Chain, Rollup, Goal, Task, and recovery state.
 ```
 
 A long logical conversation is a `SessionChain` composed of complete native Pi JSONL Segments. New empty sessions are placed in a project-local managed Segment; an existing Pi transcript is adopted once as an external root without copying it. At a settled boundary, Pi-XK automatically rolls over after 16 MiB or 4,000 entries; at 64 MiB or 16,000 entries it must roll over before the next provider turn. It never rolls over while a Task is running or awaiting delivery, a Goal draft is open, or a Goal lifecycle intent is unsettled.
 
-Rollover writes a provenance-bearing L1 Segment summary, seals the previous Segment, and replaces only the runtime's physical session. By default, every five sealed Segments on each branch produce one L2 Rollup from validated L1 artifacts only. A metadata-only manifest exposes available ranges to the model; `pi_xk_list_chain_summaries` and `pi_xk_read_chain_summary` let it read relevant L1/L2 evidence on demand. Summary bodies are never automatically injected into every request.
+Rollover writes a provenance-bearing L1 Segment summary, reads its canonical Artifact Store content back, seals the previous Segment, and replaces only the runtime's physical session. By default, every five sealed Segments schedule one branch-serial L2 publication job from validated L1 artifacts only; L2 provider latency does not block entering the successor Segment. Cross-process generation locks prevent duplicate paid calls. A metadata-only manifest exposes available ranges to the model; `pi_xk_list_chain_summaries` and `pi_xk_read_chain_summary` let it read relevant L1/L2 evidence on demand. Summary bodies are never automatically injected into every request, and a read returns content only after full provenance verification.
 
 Active Goals continue through physical replacement without a pause, while normal quit/reload/new/resume/fork still preserve their conservative Goal-pause behavior. Compaction remains Pi-native and independent. Continuing after a historical Segment or tree position always creates a successor branch; sealed Segments are never rewritten. Pi-XK adds a compact `Chain <id> · S<n> · <size>` footer status alongside Pi's native footer.
 
@@ -156,7 +164,7 @@ Each domain's `events.jsonl` is its fact source. Goal contract/read-model files 
 
 For Tasks, `events.jsonl` is the fact source, `task-read-model.json` is rebuildable, and parent-session `task_link` entries store only event references. Complete result envelopes remain in the project artifact store and child messages remain in the child transcript. A V2 Task started from a Session Chain records the parent `chainId/branchId/segmentId/entryId`; its `childChainId` points into `.pi-xk/sessions/chains/`. The `.pi-xk/tasks/<taskId>/session/` path is retained only for V1 Task facts, which remain readable without rewriting historical events or hashes.
 
-For Session Chains, `events.jsonl`, native Segment JSONL, L1 artifacts, and L2 artifacts are facts. `chain-read-model.json`, `catalog.json`, Rollup Markdown, pending publication records, and runtime migration state are derived/recovery data. A sealed Segment records its final file hash, leaf, and L1 artifact. `/chain doctor` reports changed facts instead of rewriting them, recovers prepared rollover, and can rebuild missing or stale Rollup Markdown.
+For Session Chains, `events.jsonl`, native Segment JSONL, L1 artifacts, and L2 artifacts are facts. `chain-read-model.json`, `catalog.json`, Rollup Markdown, pending publication records, and runtime migration state are derived/recovery data. The read model checkpoints event byte offset, sequence, and head hash so normal status/manifest queries consume only a valid event tail. A sealed Segment records its final file hash, leaf, and L1 artifact. `/chain doctor deep` reports changed facts instead of rewriting them; `/chain doctor repair-projections` rebuilds only derived read model, catalog, and Markdown files.
 
 ## Security Boundary
 

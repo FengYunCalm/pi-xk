@@ -13,12 +13,14 @@
       <content-hash>.data
       <content-hash>.json
   goals/<goalId>/
+    .write.lock                      # 仅写入期间存在；PID/nonce/createdAt
     events.jsonl
     contract.json
     goal-objective.md
     goal-state.md
     goal-read-model.json
   tasks/<taskId>/
+    .write.lock                      # 仅写入期间存在；PID/nonce/createdAt
     events.jsonl
     task-read-model.json
     session/                         # 仅 Task V1 历史兼容
@@ -33,6 +35,7 @@
         segments/<ordinal>_<session-id>.jsonl
         rollups/<window>.md
         rollups/<window>.pending.json
+        rollups/<window>.job.json
         rollups/state.json
   session-chain.json
 ```
@@ -60,6 +63,7 @@ Pi-XK 不创建项目级 `.pi` 目录来保存自己的领域状态。项目 `.p
 | `chain-read-model.json` / `catalog.json` | 投影 | 通过 Core rebuild API 重建 | 包含已发布 Rollup 和失败投影 |
 | Rollup Markdown | 投影 | 由 repair 路径重建 | doctor 检测缺失或陈旧；不是 L2 事实源 |
 | Rollup pending/state | 恢复数据 | 由 Controller 管理 | 复用已生成 artifact，并标记历史自动 backfill 边界 |
+| Goal/Task/Chain write lock | 并发协调 | 只能按 doctor 给出的 nonce 显式修复 | metadata 为 PID、nonce、createdAt；不是业务完成证据 |
 
 “可重建”不等于建议直接删除。优先使用对应 Core rebuild API；Session Chain prepared rollover 和 sealed integrity 使用 `/chain doctor`。保留操作前备份，并先确认损坏的是投影而不是事实源。
 
@@ -88,11 +92,14 @@ Pi-XK 不创建项目级 `.pi` 目录来保存自己的领域状态。项目 `.p
 
 重点检查：
 
+- Goal 标题与 objective 是否仍匹配当前工作；
 - lifecycle 是 active、paused 还是 ended；
+- run 总数、当前 run 和累计 wall/active/busy 时间；
 - 当前 branch 是否仍绑定预期 Goal；
-- required acceptance 是否有对应证据；
+- required acceptance 是 verified、missing 还是 unverified；
 - wall、active 和 busy 时间的含义是否被正确区分；
-- pause audit 记录的 blocker 和 next best action 是否仍成立。
+- 最近 checkpoint、pause audit、blocker 和 next best action 是否仍成立；
+- `goal-state.md` 路径、状态及其中的 `next_best_action`、`blocked_on`、`acceptance_gaps`。
 
 重启后看到 paused 通常是保守恢复，不是数据丢失。先读状态，再显式 `/goal start`。
 
@@ -122,9 +129,17 @@ Pi-XK 不创建项目级 `.pi` 目录来保存自己的领域状态。项目 `.p
 /chain rollup <window>
 /chain rollup config
 /chain doctor
+/chain doctor deep
+/chain doctor repair-projections
 ```
 
-`status` 用于看 writable head、size、entry 数、threshold 和 gate；`history` 用于看 branch/segment 拓扑；`summary` 用于核对 L1；`rollups/rollup` 用于检查 L2；`doctor` 用于 replay、prepared rollover recovery、L1/L2 provenance、sealed hash 和 Markdown 诊断。
+`status` 集中显示标题、归档、writable head、size、entry 数、threshold、gate 和后台 Rollup 状态；`history` 查看 branch/segment 拓扑；`summary` 核对 L1；`rollups/rollup` 检查 L2。普通 `doctor` 走 read-model 快速路径；`doctor deep` 才完整 replay、hash Segment 并验证全部 L1/L2；`repair-projections` 只重建 read model、catalog 和 Markdown。
+
+需要同时查看 Chain、Goal、Task 与恢复诊断时使用：
+
+```text
+/xk status
+```
 
 ## 5. 正常生命周期
 
@@ -163,7 +178,7 @@ Pi-XK 不创建项目级 `.pi` 目录来保存自己的领域状态。项目 `.p
 | hard rollover 失败 | 输入不送给 provider，显示错误 |
 | 从历史 tree 位置继续输入 | 创建 successor branch，再转发输入 |
 | `/chain continue` | 从指定 Segment/entry 创建 successor branch |
-| 达到完整 Rollup 窗口 | rollover commit 后尝试生成 L2；失败不阻塞会话 |
+| 达到完整 Rollup 窗口 | rollover commit 后登记后台 publication job，立即进入 successor Segment |
 | `/chain rollup config off` | 停止新的自动 L2；既有摘要保持可读 |
 | `/chain rollup backfill [limit]` | 显式、有限额补齐历史窗口 |
 | sealed Segment hash 变化 | doctor 报 corruption，不自动重写 |
@@ -172,13 +187,15 @@ Pi-XK 不创建项目级 `.pi` 目录来保存自己的领域状态。项目 `.p
 
 Rollup 发布的故障边界与 rollover 分开：
 
-1. L2 生成失败：rollover 已成功，写 `rollup_failed` 诊断并继续新 Segment。
+1. L2 生成失败：rollover 已成功，后台 job 写 `rollup_failed` 诊断并继续新 Segment。
 2. artifact 已生成但 event 失败：保留 pending publication；重试复用 artifact，不再次调用模型。
 3. event 已写但 read model 缺失/陈旧：从 v1/v2 混合 event log rebuild。
 4. Markdown 缺失或陈旧：doctor 报 warning，可从 L2 artifact 重建。
 5. artifact、sourceDigest 或 event identity 损坏：doctor 报 error，不自动重写事实源。
 
-`/chain doctor` 在命令路径上会先恢复 prepared rollover，再报告诊断。关闭自动 Rollup 不会禁用 doctor 或只读摘要工具。
+后台 publication 每个 branch 串行执行，并由 branch/window generation lock 防止多个进程重复调用模型。状态依次为 `scheduled`、`generating`、`artifact_ready`、`published`，失败为 `failed`。进程退出后，下次启动根据 job/pending/artifact 恢复；非重试型 provenance/schema/config 错误必须先修来源。
+
+关闭自动 Rollup 不会禁用 doctor 或只读摘要工具。
 
 ## 7. Rollover 恢复
 
@@ -189,13 +206,13 @@ Rollup 发布的故障边界与 rollover 分开：
 3. target 不可安全使用，source 仍是 writable：写 `rollover_aborted`，继续 source。
 4. sealed source 的最终 hash 不匹配：报告 corruption，停止自动修复。
 
-运行：
+启动同一 chain 时会尝试恢复 prepared rollover。检查结果使用：
 
 ```text
-/chain doctor
+/chain doctor deep
 ```
 
-doctor 可能恢复 prepared rollover，也会输出诊断。执行后再次检查：
+doctor 只报告事实和恢复需求，不改写 sealed Segment。启动恢复后再次检查：
 
 ```text
 /chain status
@@ -251,7 +268,7 @@ Ubuntu/Debian 可安装 `fd-find`；Pi 能识别 `fdfind`。也可以把可信�
 
 ### Task 运行时输入无响应
 
-普通输入被有意拦截。使用 `/task status` 或 `/task cancel`。Pi-XK 不支持在同一 parent 同时继续对话并让 Task 后台运行。
+普通输入不会丢弃，而是进入 Pi 原生 follow-up 队列，待 Task terminal 和结果交付后按顺序处理。`/task status` 与 `/task cancel` 立即执行；会修改 Goal、Chain 或启动另一个 Task 的命令仍被拒绝。父模型与 child 仍不会并发调用模型或同时修改工作区。
 
 ### hard threshold 后输入未发送
 
@@ -265,16 +282,32 @@ Pi-XK 在 provider 调用前尝试 rollover。失败时输入被明确保留在�
 
 先运行 `/chain rollups` 和 `/chain doctor`。确认 L1 artifact 完整、当前 model 可用、配置 interval 未改变来源预期，并检查 `.pi-xk/sessions/chains/<chain>/branches/<branch>/rollups/` 是否存在 pending publication。不要删除 artifact 或修改 event；可使用 `/chain rollup backfill` 重试最早缺失窗口。
 
-## 10. 更新与移除
+### doctor 报 abandoned write lock
 
-本地 package 引用不会自动更新构建产物。更新仓库后：
+Goal、Task、Chain 使用相同的 PID/nonce 锁协议。只有 owner PID 明确不存在且 nonce 与检查结果完全一致时，才允许显式修复：
 
-```bash
-npm --workspace pi-xk-core run build
-npm --workspace pi-xk-extension run build
-npm run check:pi-xk-runtime
+```text
+/goal doctor
+/goal doctor repair-lock <nonce>
+/task doctor [taskId]
+/task doctor [taskId] repair-lock <nonce>
+/chain doctor
+/chain doctor repair-lock <nonce>
 ```
 
-然后正常退出并重启 Pi。不要在 active Goal 或 running Task 中热切换不兼容代码；reload 会触发保守暂停/取消语义。
+owner 仍存活、PID 状态无法确认、metadata malformed 或 nonce 已变化时都会拒绝删除。不要按锁年龄猜测，也不要手工删 `.write.lock`。
+
+## 10. 更新与移除
+
+受支持的本地管理入口为：
+
+```bash
+npm run pi-xk:install -- --dry-run
+npm run pi-xk:install
+npm run pi-xk:upgrade
+npm run pi-xk:uninstall
+```
+
+可用 `--agent-dir <path>` 指定隔离 profile；`--dry-run` 不构建也不写 settings。install/upgrade 会构建并运行 runtime preflight，uninstall 只删除该 checkout 的 package 引用。然后正常退出并重启 Pi。不要在 active Goal 或 running Task 中热切换不兼容代码；reload 会触发保守暂停/取消语义。
 
 移除扩展只删除 Pi settings 中的 package 引用，不删除项目数据。若需要归档项目，优先保留 `.pi-xk/` 和原生 session；确认不再需要且备份可用后，才单独处理这些目录。

@@ -3,6 +3,7 @@ import { isAbsolute } from "node:path";
 export const SESSION_CHAIN_SPEC_SCHEMA = "pi-xk.session-chain.spec.v1";
 export const SESSION_CHAIN_EVENT_SCHEMA = "pi-xk.session-chain-event.v1";
 export const SESSION_CHAIN_EVENT_V2_SCHEMA = "pi-xk.session-chain-event.v2";
+export const SESSION_CHAIN_EVENT_V3_SCHEMA = "pi-xk.session-chain-event.v3";
 export const SESSION_CHAIN_READ_MODEL_SCHEMA = "pi-xk.session-chain-read-model.v1";
 export const SESSION_CHAIN_CATALOG_SCHEMA = "pi-xk.session-chain-catalog.v1";
 export const SEGMENT_SUMMARY_SCHEMA = "pi-xk.segment-summary.v1";
@@ -147,6 +148,10 @@ export interface ChainMetadataUpdatedPayloadV1 {
 	title: string | null;
 }
 
+export interface ChainArchiveUpdatedPayloadV1 {
+	archived: boolean;
+}
+
 export interface RollupPublishedPayloadV1 {
 	branchId: string;
 	windowIndex: number;
@@ -174,6 +179,7 @@ export type SessionChainEventType =
 	| "rollover_aborted"
 	| "branch_created"
 	| "chain_metadata_updated"
+	| "chain_archive_updated"
 	| "rollup_published"
 	| "rollup_failed";
 
@@ -182,7 +188,10 @@ export interface ChainCreatedEventPayloadV1 {
 }
 
 interface SessionChainEventBase<TEventType extends SessionChainEventType, TPayload> {
-	schema: typeof SESSION_CHAIN_EVENT_SCHEMA | typeof SESSION_CHAIN_EVENT_V2_SCHEMA;
+	schema:
+		| typeof SESSION_CHAIN_EVENT_SCHEMA
+		| typeof SESSION_CHAIN_EVENT_V2_SCHEMA
+		| typeof SESSION_CHAIN_EVENT_V3_SCHEMA;
 	eventId: string;
 	chainId: string;
 	sequence: number;
@@ -191,7 +200,7 @@ interface SessionChainEventBase<TEventType extends SessionChainEventType, TPaylo
 	timestamp: string;
 	prevHash: string | null;
 	payload: TPayload;
-	schemaVersion: 1 | 2;
+	schemaVersion: 1 | 2 | 3;
 	idempotencyKey: string;
 	hash: string;
 }
@@ -203,6 +212,7 @@ export type SessionChainEvent =
 	| SessionChainEventBase<"rollover_aborted", RolloverAbortedPayloadV1>
 	| SessionChainEventBase<"branch_created", BranchCreatedPayloadV1>
 	| SessionChainEventBase<"chain_metadata_updated", ChainMetadataUpdatedPayloadV1>
+	| SessionChainEventBase<"chain_archive_updated", ChainArchiveUpdatedPayloadV1>
 	| SessionChainEventBase<"rollup_published", RollupPublishedPayloadV1>
 	| SessionChainEventBase<"rollup_failed", RollupFailedPayloadV1>;
 
@@ -257,6 +267,7 @@ export interface SessionChainReadModelV1 {
 	sequence: number;
 	baseHash: string;
 	title: string | null;
+	archived: boolean;
 	cwd: string;
 	createdAt: string;
 	updatedAt: string;
@@ -271,6 +282,7 @@ export interface SessionChainCatalogEntryV1 {
 	baseHash: string;
 	createdAt: string;
 	updatedAt: string;
+	archived: boolean;
 	branchHeads: Array<{ branchId: string; segmentId: string }>;
 }
 

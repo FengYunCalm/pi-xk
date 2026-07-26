@@ -1,11 +1,13 @@
-import { appendFile, mkdir, readFile, rm } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+	type TaskChildInfoV1,
 	TaskHeadConflictError,
 	TaskIdempotencyConflictError,
 	TaskLifecycleTransitionError,
+	TaskLockedError,
 	TaskRecoveryRequiredError,
 	type TaskResultEnvelopeV1,
 	type TaskSpecV1,
@@ -212,6 +214,48 @@ describe("TaskStore", () => {
 		const repaired = await store.repairTrailingPartialEvent(spec.taskId);
 		expect(repaired.tailDiagnostic).toBeUndefined();
 		expect(await readFile(eventsPath, "utf8")).toMatch(/\n$/);
+	});
+
+	it("fails closed and explicitly repairs an abandoned Task write lock", async () => {
+		const { store, projectRoot } = await createStore();
+		const spec = createSpec("task_abandoned_lock");
+		const created = await store.createTask(spec, { eventId: "evt-created", idempotencyKey: "create:lock" });
+		const lockPath = join(projectRoot, ".pi-xk", "tasks", spec.taskId, ".write.lock");
+		await writeFile(
+			lockPath,
+			`${JSON.stringify({ pid: 999_999_999, nonce: "abandoned-task", createdAt: "2026-07-22T00:01:00.000Z" })}\n`,
+		);
+
+		const startedPayload: TaskChildInfoV1 = {
+			childSessionId: "child-lock",
+			childSessionFile: "child-lock.jsonl",
+			provider: "faux",
+			modelId: "faux",
+			thinkingLevel: "medium",
+			builtinTools: [],
+			attempt: 1,
+		};
+		await expect(
+			store.appendTaskStarted(spec.taskId, startedPayload, {
+				eventId: "evt-start-locked",
+				idempotencyKey: "start:locked",
+				expectedHead: created.head,
+			}),
+		).rejects.toBeInstanceOf(TaskLockedError);
+		expect(await store.inspectWriteLock(spec.taskId)).toMatchObject({
+			nonce: "abandoned-task",
+			ownerState: "missing",
+			malformed: false,
+		});
+		await expect(store.repairAbandonedWriteLock(spec.taskId, "wrong-owner")).rejects.toThrow("conflicted");
+		await expect(store.repairAbandonedWriteLock(spec.taskId, "abandoned-task")).resolves.toBe(true);
+		await expect(
+			store.appendTaskStarted(spec.taskId, startedPayload, {
+				eventId: "evt-start-recovered",
+				idempotencyKey: "start:recovered",
+				expectedHead: created.head,
+			}),
+		).resolves.toMatchObject({ head: { sequence: 2 } });
 	});
 
 	it("recovers pending and running Tasks without inventing success", async () => {

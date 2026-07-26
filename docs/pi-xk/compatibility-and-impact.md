@@ -1,6 +1,6 @@
 # Pi-XK 兼容性与使用影响
 
-本文回答安装 Pi-XK 后，现有 Pi 工作流会发生什么变化。结论是：Pi 的核心协议和原生命令仍保留，但 extension 会主动管理 session、增加模型调用、写入项目状态，并在部分边界拦截输入或暂停 Goal。它不是“只增加三个命令、其余完全无感”的被动插件。
+本文回答安装 Pi-XK 后，现有 Pi 工作流会发生什么变化。结论是：Pi 的核心协议和原生命令仍保留，但 extension 会主动管理 session、增加模型调用、写入项目状态，并在部分边界排队输入、拒绝状态变更或暂停 Goal。它不是“只增加几个命令、其余完全无感”的被动插件。
 
 ## 1. 支持基线
 
@@ -28,7 +28,7 @@
 
 ## 2. 安装作用域
 
-`pi install /absolute/path/to/pi-xk-extension` 默认写用户级 settings，因此会在该 profile 的所有项目中加载。安装后第一次进入任意项目，都可能创建 `.pi-xk/sessions/` 并管理 Session Chain。
+`npm run pi-xk:install` 默认原子更新 `PI_CODING_AGENT_DIR` 或 `~/.pi/agent` 的用户级 settings，因此会在该 profile 的所有项目中加载。安装后第一次进入任意项目，都可能创建 `.pi-xk/sessions/` 并管理 Session Chain。`--dry-run` 只显示将要使用的 profile、extension 和 settings，不构建也不写入。
 
 只希望影响一个项目时使用项目级 `pi install -l ...`。但项目 settings 中的绝对路径可能不适合提交或跨机器共享。
 
@@ -54,7 +54,7 @@
 
 扩展加载后增加：
 
-- `/goal`、`/task`、`/chain` 命令；
+- `/goal`、`/task`、`/chain`、`/xk status` 命令；
 - 模型可见的 Goal lifecycle、Goal draft、Task start/finish 工具；
 - `Goal active · 12m 34s` 一类 footer status；
 - `Chain <id> · S<n> · <size>` 一类 footer status；
@@ -70,12 +70,13 @@ Pi-XK 会在以下情况消费、延迟或拒绝用户输入：
 | 条件 | 输入行为 | 用户下一步 |
 | --- | --- | --- |
 | `/goal` 多行捕获处于 open | 下一条输入作为 Goal objective，不作为普通聊天 | 等待草案，随后 review/confirm/revise/cancel |
-| Task 正在 running | 除 `/task ...` 外的输入被拦截 | `/task status` 或 `/task cancel` |
+| Task 正在 running | 普通输入进入 follow-up 队列；Task 终态后按序处理 | 可继续排队，或立即执行 `/task status`、`/task cancel` |
+| Task 正在 running 且输入为 Goal/Chain 写命令 | 拒绝状态变更 | 等待 Task 结束或先取消 Task |
 | 当前 Segment 达 hard threshold | 先生成摘要并 rollover，成功后转发输入 | 等待；失败则诊断后重新提交 |
 | 当前位于历史 tree/Segment | 创建 successor branch，切换后转发输入 | 在新 branch 继续 |
 | hard rollover 失败 | 输入不送给 provider | `/chain doctor`，处理错误后再次输入 |
 
-这些行为用于避免把输入送入错误的 parent、sealed Segment 或不安全状态。调用方若通过 RPC/自动化发送输入，必须能识别“handled 但未交付 provider”的错误路径，不能只依据发送 API 返回来判定模型已收到。
+这些行为用于避免把输入送入错误的 parent、sealed Segment 或不一致状态。Task 队列不会让 parent 与 child 并发调用模型；它只延后处理。调用方若通过 RPC/自动化发送输入，仍必须区分“已排队”“handled 但未交付 provider”和“已进入模型 turn”，不能只依据发送 API 返回判定模型已收到。
 
 ## 6. 模型调用、费用和时延
 
@@ -88,14 +89,14 @@ Pi-XK 会在以下情况消费、延迟或拒绝用户输入：
 | provider 失败后的 active Goal | 按指数退避重新尝试 |
 | Task start | child 使用启动时的 provider/model/thinking snapshot 执行 |
 | Session Chain rollover | 生成 segment delta 与 cumulative carry-forward summary |
-| 每 N 个 sealed Segment | 默认生成一个 L2 Rollup；失败不回滚 rollover |
+| 每 N 个 sealed Segment | rollover 提交后登记后台 L2 Rollup；失败不回滚 rollover |
 | `/chain rollup backfill` | 显式生成历史完整窗口，受 limit 控制 |
 
 因此：
 
 - “没有继续输入”不代表 active Goal 不会继续消耗 token；
 - manual rollover 也可能产生摘要调用；
-- 默认每五次成功 rollover 还可能增加一次 L2 调用；
+- 默认每五次成功 rollover 会登记一次 L2 调用；它按 branch 串行后台执行，不增加第 5 次 rollover 的同步等待；
 - `rollup config off` 停止新的自动 L2，但不影响 L1 rollover 摘要；
 - backfill 是显式付费操作，不会在升级时自动批量执行；
 - Task child 的消耗独立于 parent 当前 turn；
@@ -188,6 +189,8 @@ peak RSS 包含 Node 进程和已加载 runtime 的基线，不是纯 session �
 - `/chain doctor` replay 时间；
 - 长期 branch/Segment 数量与磁盘增长。
 
+另有 `npm run benchmark:session-chain-events -- --counts 100,1000 --runs 3 --json` 专门验证 checkpointed read model。它要求已消费完整 event log 后的重复 manifest/status 加载走 `fast` 模式，读取并验证 checkpoint 对应的最后一条 event，且读取量小于完整日志的 10%；该 benchmark 不替代 deep doctor 的线性事实校验。
+
 ## 13. 第三方扩展兼容
 
 高风险组合：
@@ -195,10 +198,12 @@ peak RSS 包含 Node 进程和已加载 runtime 的基线，不是纯 session �
 - 同时改写 context/compaction 的 memory 扩展；
 - 另一套 Goal 或 subagent runtime；
 - 会写同一 session JSONL 的 GUI/daemon；
-- 替换 footer、输入拦截或 session lifecycle 的大型 extension；
+- 替换 footer、input/follow-up 队列或 session lifecycle 的大型 extension；
 - 自动修改 `models.json` 或重载 provider 的 gateway 管理器。
 
 当前规则是一次只在隔离 profile 实验一个 context/memory 主机制。`pi-mcp-adapter`、`pi-subagents`、`pi-observational-memory` 等不属于核心依赖，采用前需要契约测试和供应链复核。
+
+Pi-XK 为此增加的 Host API 还包括 `queueUserMessage`：extension 可以把用户消息加入 Pi 原生 follow-up 队列而不立即启动 turn。它不是通用后台调度器，不允许绕过 rollover read-only 状态，也不改变正常 `prompt()` 的 input hook 顺序。
 
 普通只读工具、独立 UI status、不会改写 session/context 的小型 extension 风险较低，但仍需检查事件顺序和命令/工具重名。Pi-XK 依赖 Goal/Task 输入 gate 先于 Session Chain replacement 执行；改变 extension 加载顺序可能影响组合行为。
 

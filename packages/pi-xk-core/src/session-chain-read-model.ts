@@ -64,6 +64,7 @@ export function buildSessionChainReadModel(replay: SessionChainReplay): SessionC
 		sequence: replay.head.sequence,
 		baseHash: replay.head.hash,
 		title: replay.title,
+		archived: replay.archived,
 		cwd: replay.spec.cwd,
 		createdAt: replay.spec.createdAt,
 		updatedAt: replay.events.at(-1)?.timestamp ?? replay.spec.createdAt,
@@ -278,11 +279,9 @@ function validateBranch(value: unknown): SessionBranchProjectionV1 {
 export function validateSessionChainReadModel(value: unknown): SessionChainReadModelV1 {
 	if (!isSessionChainRecord(value))
 		throw new SessionChainValidationError("Session Chain read model must be an object");
-	validateSessionChainExactKeys(
-		value,
-		["schema", "chainId", "sequence", "baseHash", "title", "cwd", "createdAt", "updatedAt", "branches"],
-		"Session Chain read model",
-	);
+	const keys = ["schema", "chainId", "sequence", "baseHash", "title", "cwd", "createdAt", "updatedAt", "branches"];
+	if ("archived" in value) keys.push("archived");
+	validateSessionChainExactKeys(value, keys, "Session Chain read model");
 	if (value.schema !== SESSION_CHAIN_READ_MODEL_SCHEMA) {
 		throw new SessionChainValidationError("Session Chain read model schema is unsupported");
 	}
@@ -293,12 +292,16 @@ export function validateSessionChainReadModel(value: unknown): SessionChainReadM
 	if (!Array.isArray(value.branches) || value.branches.length === 0) {
 		throw new SessionChainValidationError("branches must be a non-empty array");
 	}
+	if (value.archived !== undefined && typeof value.archived !== "boolean") {
+		throw new SessionChainValidationError("archived must be a boolean");
+	}
 	return {
 		schema: SESSION_CHAIN_READ_MODEL_SCHEMA,
 		chainId,
 		sequence,
 		baseHash: assertSessionChainHash(value.baseHash, "baseHash"),
 		title: validateSessionChainTitle(value.title),
+		archived: value.archived ?? false,
 		cwd: validateSessionChainNonEmptyString(value.cwd, "cwd"),
 		createdAt: validateSessionChainTimestamp(value.createdAt, "createdAt"),
 		updatedAt: validateSessionChainTimestamp(value.updatedAt, "updatedAt"),

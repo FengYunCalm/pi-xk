@@ -27,7 +27,7 @@ Pi-XK 解决的是长期 Agent 工作中的可验证状态问题：目标如何�
 | Goal | Pi-XK | 保存稳定 objective、约束、验收、生命周期和执行状态 | 不是 prompt、摘要或 Task 列表 |
 | Task | Pi-XK | 执行一个有边界的 child 工作并返回结构化结果 | 不是并发调度框架或 Goal 的物理分段 |
 | Artifact | Pi-XK | 保存内容寻址、带 provenance 的不可变小型结果 | 不是 transcript、memory 或通用 blob store |
-| Read model/catalog | Pi-XK | 加速状态和拓扑查询 | 不是事实源，删除后应可重建 |
+| Read model/catalog | Pi-XK | 以 event offset、sequence 和 head hash 加速状态和拓扑查询 | 不是事实源，删除后应可重建 |
 
 ### 2.1 关系
 
@@ -67,6 +67,7 @@ Pi-XK 主要通过 Extension API 集成，并只为 Session Chain 增加了小�
 - `summarizeSessionContext`：生成带来源范围和 usage provenance 的 rollover 摘要；
 - `rolloverSession`：在同一 runtime 中安全替换物理 session；
 - `session_before_rollover` 与 `reason: "rollover"`：让扩展区分物理轮转和普通 session 切换。
+- `queueUserMessage`：把 extension-origin 用户消息加入 Pi 原生 follow-up 队列，但不立即启动 agent turn。
 
 明确保持不变的 Pi 能力：
 
@@ -114,6 +115,7 @@ Session Chain marker 使用 Pi 支持的 custom entry/custom message，不向原
 - 独立 child transcript/SessionChain 与 parent result envelope；
 - parent Goal barrier、取消、reload/startup recovery 和 terminal backfill；
 - Task V1 只读兼容与 Task V2 chain reference。
+- Task 运行期间的普通用户输入按序进入 Pi follow-up 队列，终态交付后才由 parent 处理；status/cancel 保持即时。
 
 ### 明确限制
 
@@ -121,6 +123,7 @@ Session Chain marker 使用 Pi 支持的 custom entry/custom message，不向原
 - `workspaceMode` 当前是 `same-workspace`；
 - 不加载 extension 和 theme，不允许 nested spawn；
 - 没有 worktree、merge、sandbox、RPC child、DAG、retry、deadline 或预算硬限制；
+- Goal/Chain 写命令与第二个 Task 在 child 运行期间仍被阻止；消息排队不等于父子并发；
 - child 与 parent 共享进程权限和工作目录，因此不能被视为安全隔离；
 - graceful shutdown 最多等待五秒；无法确认停止时记录 `orphaned` 并 detach，不声称进程已被可靠回收。
 
@@ -139,6 +142,8 @@ Session Chain marker 使用 Pi 支持的 custom entry/custom message，不向原
 已有正文的 Pi session 作为 external root 被采用一次，不复制到 `.pi-xk`。其 successor 才是 Pi-XK managed Segment。
 
 rollover 前会重新读取前序 L1 artifact，并验证当前 `summary-in` 的 artifact ID、carry-forward 正文/hash、chain、branch、source/target Segment provenance。任一不一致会中止 rollover，不自动修复被篡改事实。
+
+新 L1 写入 Artifact Store 后会立即按 artifact ID read-back。marker、source seal、successor `summary-in` 和相关 hash 只使用 read-back 的 canonical 内容；若 Artifact Store 的脱敏或序列化使 schema/provenance 不再成立，rollover 在 branch head 改变前失败。
 
 ### Rollover 协议
 
@@ -175,9 +180,13 @@ startup 或 `/chain doctor` 会检查 prepared marker：目标完整时 commit�
 
 默认每个 branch 每 5 个 sealed Segment 生成一个 L2 Rollup。窗口连续、不重叠，successor branch 从自己的 `S1/W1` 开始。L2 输入只使用窗口内有序、校验通过的 L1 artifacts，不扫描 transcript。
 
-L2 artifact 是结构化事实源；Markdown 是可重建投影。发布使用 `rollup_published` v2 event，失败尽量记录 `rollup_failed` v2 event。v1/v2 event 可混合 replay，不修改旧 hash。Rollup 失败不阻塞已提交 rollover；pending publication 允许 event 重试复用已生成 artifact。
+L2 artifact 是结构化事实源；Markdown 是可重建投影。rollover commit 只登记 branch 串行的后台 publication job，不等待 provider。跨进程 generation lock 保证同一 branch/window 最多一个生成者；已有 artifact 时只重试 event 或 Markdown，不再次付费生成。发布使用 `rollup_published` v2 event，失败按 provider、I/O、provenance、schema、digest、event conflict 或 projection 分类记录 `rollup_failed` v2 event。
 
-每次模型请求只追加固定大小的 metadata manifest。模型通过 `pi_xk_list_chain_summaries` 和 `pi_xk_read_chain_summary` 按需读取当前 chain/read-model 关联 branch 的证据，不能借 artifact ID 任意读取 Artifact Store。摘要正文和其中的伪系统指令不会进入系统提示词。
+每次模型请求只追加固定大小的 metadata manifest。模型通过 `pi_xk_list_chain_summaries` 和 `pi_xk_read_chain_summary` 按需读取当前 chain/read-model 关联 branch 的证据，不能借 artifact ID 任意读取 Artifact Store。列表区分 `unchecked`、`verified`、`invalid`；读取正文前必须经过统一 L1/L2 provenance 验证。摘要正文和其中的伪系统指令不会进入系统提示词。
+
+常规 manifest、status、picker 和分页摘要查询走 checkpointed read-model/catalog 快速路径，只读取新增 event tail 或当前页。event 文件缩短、offset 异常或 head 不匹配时退回完整 replay。`/chain doctor deep` 始终从事实源完整验证；全 Artifact Store orphan 扫描不在普通请求路径。
+
+Chain 的确定性首条用户输入标题、`/chain rename`、archive 与 `/chain list all` 属于发现层。archive 通过 v3 event 持久化，只从默认 picker/list 隐藏，不删除 chain、Segment 或 artifact。
 
 完整契约见[Session Chain Rollup 与模型检索](session-chain-rollups-and-model-retrieval.md)。
 
@@ -224,7 +233,7 @@ Artifact store 保存 checkpoint provenance、Task result、Session Chain summar
 
 - Goal V1 可读，并按 V2 投影视图使用，不重写历史 hash；
 - Task V1 facts 可读，runtime upcast 为当前视图，不迁移原始事件；
-- Session Chain v1 marker、v1/v2 event 和 L1/L2 artifact schema 需严格校验；
+- Session Chain v1 marker、v1/v2/v3 event 和 L1/L2 artifact schema 需严格校验；
 - unknown、损坏或 hash 不一致时失败并给出诊断，不猜测修复；
 - read model 缺失可重建，但事实源损坏不能靠删除投影解决。
 

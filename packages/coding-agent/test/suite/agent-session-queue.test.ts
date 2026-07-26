@@ -89,6 +89,32 @@ describe("AgentSession queue characterization", () => {
 		expect(harness.session.messages).toEqual([]);
 	});
 
+	it("queues extension-origin user messages while idle until another turn starts", async () => {
+		let extensionApi: ExtensionAPI | undefined;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					extensionApi = pi;
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("trigger handled"), fauxAssistantMessage("queued input handled")]);
+
+		extensionApi?.queueUserMessage("wait for the trigger");
+
+		expect(harness.session.pendingMessageCount).toBe(1);
+		expect(harness.faux.state.callCount).toBe(0);
+		extensionApi?.sendMessage(
+			{ customType: "queue-trigger", content: "release queued input", display: false, details: {} },
+			{ triggerTurn: true },
+		);
+		await harness.session.waitForIdle();
+
+		expect(getUserTexts(harness)).toEqual(["wait for the trigger"]);
+		expect(getAssistantTexts(harness)).toEqual(["trigger handled", "queued input handled"]);
+	});
+
 	it("delivers extension-origin steering messages before the next LLM call", async () => {
 		let extensionApi: ExtensionAPI | undefined;
 		const waiting = await createWaitingHarness({

@@ -49,7 +49,9 @@ pending -> running -> succeeded | failed | cancelled | orphaned
 
 ### 运行与父 Agent 屏障
 
-同一父 session 最多运行一个 child。child 在后台执行，但父 Agent 当前 run 在启动 Task 后立即终止；child 终态提交前，Goal 自动续跑被 gate 阻止，普通用户输入也不会进入父 Agent。
+同一父 session 最多运行一个 child。child 在后台执行，但父 Agent 当前 run 在启动 Task 后立即终止；child 终态提交前，Goal 自动续跑被 gate 阻止。普通用户输入通过 Host `queueUserMessage` 进入 Pi 原生 follow-up 队列，等 Task 终态与结果交付后按顺序处理；这不会启动并发 parent turn。
+
+`/task status`、`/task cancel` 和 lock doctor 保持即时；会修改 Goal、Chain 或启动第二个 Task 的命令继续被阻止。输入队列不是第二套任务状态或 transcript，消息仍由 Pi session/runtime 队列拥有。
 
 模型启动的 Task 完成后，Pi-XK 向父 session 注入结构化结果引用，并在父 run settled 后触发隐藏恢复 turn。用户通过命令启动的 Task 只通知用户，不自动触发模型 turn。
 
@@ -74,6 +76,10 @@ child 使用 Pi 公共 `createAgentSession`、`DefaultResourceLoader` 和 `Sessi
 - unclean crash 由下次 `session_start` 恢复为 `orphaned`。
 - model select 与 compaction 不改变 Task 状态；child transcript 不参与父 transcript compaction。
 - 所有异步回调携带 runtime nonce 和 parent session ID；旧 runtime 不得写入新 session。
+
+### 写锁恢复补充
+
+Task 写锁统一记录 PID、nonce 与 createdAt。`inspectWriteLock` 只诊断；`repairAbandonedWriteLock` 只有在 owner PID 明确不存在且用户提供的 nonce 与锁完全一致时才删除。活进程、PID 状态未知、malformed metadata、nonce 冲突和恢复者竞争均拒绝修复。恢复必须由 `/task doctor [taskId] repair-lock <nonce>` 显式触发，不按年龄自动删除。
 
 ## V1 明确不做
 
@@ -111,5 +117,5 @@ Task Run v1 不实现：
 代价：
 
 - 同一时间只能执行一个 Task。
-- Task 运行期间用户不能向父 Agent追加普通消息。
+- Task 运行期间普通消息会延迟，不能立即与 child 并发处理。
 - `orphaned` Task 需要创建新 Task 才能重新执行。

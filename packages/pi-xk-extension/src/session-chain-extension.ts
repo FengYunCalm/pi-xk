@@ -17,7 +17,9 @@ import {
 	SessionChainController,
 	type SessionChainGateState,
 	type SessionChainHost,
+	sessionChainTitleFromInput,
 } from "./session-chain-controller.ts";
+import { renderRollupMarkdown } from "./session-chain-summary.ts";
 
 type InputImage = NonNullable<InputEvent["images"]>[number];
 type ReplacementUserContent = string | Array<{ type: "text"; text: string } | InputImage>;
@@ -60,6 +62,22 @@ function sessionChainGateLabels(gates: Partial<SessionChainGateState> | undefine
 	].filter((label): label is string => label !== null);
 }
 
+function isReadOnlySessionChainCommand(command: string): boolean {
+	return (
+		command === "list" ||
+		command === "list all" ||
+		command === "status" ||
+		command === "history" ||
+		command === "summary" ||
+		command.startsWith("summary ") ||
+		command === "rollups" ||
+		command === "rollup config" ||
+		/^rollup [1-9]\d*$/.test(command) ||
+		command === "doctor" ||
+		command === "doctor deep"
+	);
+}
+
 interface SessionChainHeadChoice {
 	chainId: string;
 	branchId: string;
@@ -72,16 +90,21 @@ function shortChainId(value: string): string {
 	return separator >= 0 ? value.slice(separator + 1, separator + 9) : value.slice(0, 8);
 }
 
-async function listSessionChainHeads(controller: SessionChainController): Promise<SessionChainHeadChoice[]> {
+async function listSessionChainHeads(
+	controller: SessionChainController,
+	includeArchived = false,
+): Promise<SessionChainHeadChoice[]> {
 	const catalog = await controller.getStore().listChains();
-	return catalog.flatMap((chain) =>
-		chain.branchHeads.map((head) => ({
-			chainId: chain.chainId,
-			branchId: head.branchId,
-			segmentId: head.segmentId,
-			label: `${chain.title ?? "Untitled Chain"} · ${shortChainId(chain.chainId)} · ${shortChainId(head.branchId)} · ${shortChainId(head.segmentId)}`,
-		})),
-	);
+	return catalog
+		.filter((chain) => includeArchived || !chain.archived)
+		.flatMap((chain) =>
+			chain.branchHeads.map((head) => ({
+				chainId: chain.chainId,
+				branchId: head.branchId,
+				segmentId: head.segmentId,
+				label: `${chain.title ?? "Untitled Chain"} · ${shortChainId(chain.chainId)} · ${shortChainId(head.branchId)} · ${shortChainId(head.segmentId)}`,
+			})),
+		);
 }
 
 async function selectSessionChainHead(
@@ -89,7 +112,7 @@ async function selectSessionChainHead(
 	controller: SessionChainController,
 	query?: string,
 ): Promise<SessionChainHeadChoice | null> {
-	const choices = await listSessionChainHeads(controller);
+	const choices = await listSessionChainHeads(controller, query !== undefined);
 	const candidates = query
 		? choices.filter((choice) => choice.chainId === query || choice.chainId.startsWith(query))
 		: choices;
@@ -160,10 +183,13 @@ function formatSessionChainHistory(replay: SessionChainReplay): string {
 	return lines.join("\n");
 }
 
-function formatSessionChainRollups(replay: SessionChainReplay, branchId: string): string {
-	const branch = replay.branches.find((candidate) => candidate.branchId === branchId);
+function formatSessionChainRollups(
+	projection: Pick<SessionChainReplay, "chainId" | "branches">,
+	branchId: string,
+): string {
+	const branch = projection.branches.find((candidate) => candidate.branchId === branchId);
 	if (!branch) throw new Error(`Session Chain branch not found: ${branchId}`);
-	const lines = [`Session Chain Rollups ${replay.chainId} · ${branchId}`];
+	const lines = [`Session Chain Rollups ${projection.chainId} · ${branchId}`];
 	if (branch.rollups.length === 0) lines.push("No published L2 Rollups.");
 	for (const rollup of branch.rollups) {
 		lines.push(
@@ -181,10 +207,10 @@ function formatSessionChainRollups(replay: SessionChainReplay, branchId: string)
 
 async function formatSessionChainSummary(
 	controller: SessionChainController,
-	replay: SessionChainReplay,
+	projection: Pick<SessionChainReplay, "branches">,
 	segmentId: string,
 ): Promise<string> {
-	const matches = replay.branches.flatMap((branch) =>
+	const matches = projection.branches.flatMap((branch) =>
 		branch.segments.filter((segment) => segment.segmentId === segmentId).map((segment) => ({ branch, segment })),
 	);
 	if (matches.length === 0) throw new Error(`Session Chain Segment not found: ${segmentId}`);
@@ -216,27 +242,15 @@ function formatSessionChainDoctor(
 			? `Session Chain doctor ${chainId}: no diagnostics`
 			: `Session Chain doctor ${chainId}: ${report.diagnostics.length} diagnostic(s)`;
 	return [
-		headline,
+		report.mode === "deep"
+			? `${headline} · deep ${report.durationMs}ms · ${report.filesChecked} files · ${report.bytesRead} bytes`
+			: headline,
 		...recoveries.map((recovery) => `RECOVERY ${recovery}`),
 		...report.diagnostics.map(
 			(diagnostic) =>
 				`${diagnostic.severity.toUpperCase()} ${diagnostic.code}${diagnostic.branchId ? ` ${diagnostic.branchId}` : ""}${diagnostic.segmentId ? `/${diagnostic.segmentId}` : ""}: ${diagnostic.message}`,
 		),
 	].join("\n");
-}
-
-async function recoverSessionChain(controller: SessionChainController, chainId: string): Promise<string[]> {
-	const replay = await controller.getStore().replayChain(chainId);
-	const recoveries: string[] = [];
-	for (const branch of replay.branches) {
-		if (!branch.pendingRollover) continue;
-		const recovery = await controller.recoverPending(chainId, branch.branchId);
-		recoveries.push(
-			`${branch.branchId}: ${recovery.action}${recovery.targetSegmentId ? ` ${recovery.targetSegmentId}` : ""}`,
-		);
-	}
-	recoveries.push(...(await controller.repairRollupProjections(chainId)));
-	return recoveries;
 }
 
 async function refreshSessionChainFooter(ctx: ExtensionContext, controller: SessionChainController): Promise<void> {
@@ -305,13 +319,13 @@ function sessionChainHost(ctx: ExtensionContext): SessionChainHost {
 async function resumeCommittedHead(ctx: ExtensionContext, controller: SessionChainController): Promise<boolean> {
 	const binding = controller.getCurrentBinding(ctx.sessionManager);
 	if (!binding) return false;
-	let replay = await controller.getStore().replayChain(binding.chainId);
-	let branch = replay.branches.find((candidate) => candidate.branchId === binding.branchId);
+	let readModel = await controller.getStore().loadChainReadModel(binding.chainId);
+	let branch = readModel.branches.find((candidate) => candidate.branchId === binding.branchId);
 	if (!branch) throw new Error(`Session Chain branch not found: ${binding.branchId}`);
 	if (branch.pendingRollover) {
 		await controller.recoverPending(binding.chainId, binding.branchId);
-		replay = await controller.getStore().replayChain(binding.chainId);
-		branch = replay.branches.find((candidate) => candidate.branchId === binding.branchId);
+		readModel = await controller.getStore().loadChainReadModel(binding.chainId);
+		branch = readModel.branches.find((candidate) => candidate.branchId === binding.branchId);
 		if (!branch) throw new Error(`Session Chain branch not found after recovery: ${binding.branchId}`);
 	}
 	if (branch.headSegmentId === binding.segmentId) return false;
@@ -399,6 +413,8 @@ async function buildSessionChainSummaryManifest(
 	const unresolvedFailures = branch.rollupFailures.filter(
 		(failure) => !branch.rollups.some((rollup) => rollup.windowIndex === failure.windowIndex),
 	);
+	const nextWindowIndex = (latestRollup?.windowIndex ?? 0) + 1;
+	const publication = await controller.getRollupPublication(binding.chainId, binding.branchId, nextWindowIndex);
 	const config = await controller.getRollupConfig();
 	const nextStart = (latestRollup?.endOrdinal ?? 0) + 1;
 	const nextEnd = nextStart + config.interval - 1;
@@ -411,6 +427,7 @@ async function buildSessionChainSummaryManifest(
 		`- L1 sealed summaries: ${sealed.length}${latestL1 > 0 ? `; latest S${latestL1}` : ""}`,
 		`- L2 Rollup windows: ${firstRollup && latestRollup ? `W${firstRollup.windowIndex}-W${latestRollup.windowIndex}; S${firstRollup.startOrdinal}-S${latestRollup.endOrdinal}` : "none"}`,
 		`- Complete Rollup window pending: ${completeWindowPending ? `yes (S${nextStart}-S${nextEnd})` : "no"}`,
+		`- Rollup publication: ${publication ? `W${publication.windowIndex} ${publication.status}${publication.errorCode ? ` (${publication.errorCode})` : ""}` : "idle"}`,
 		`- Unresolved Rollup failures: ${unresolvedFailures.length}`,
 		"Use pi_xk_list_chain_summaries to discover L1/L2 metadata and pi_xk_read_chain_summary to read only relevant artifacts.",
 		"Omit chainId and branchId to use the current Session Chain scope; only pass exact IDs from this manifest when an explicit scope is required.",
@@ -548,19 +565,52 @@ export function createPiXkSessionChainExtension(options: PiXkSessionChainExtensi
 				const trimmed = args.trim();
 				let replacementContext: ReplacedSessionContext | undefined;
 				try {
+					const gates = await options.getGateState?.(ctx);
+					if (gates?.taskRunning && !isReadOnlySessionChainCommand(trimmed)) {
+						throw new Error("Session Chain changes are blocked while a Task is running");
+					}
 					if (trimmed.length === 0) {
 						const choice = await selectSessionChainHead(ctx, controller);
 						if (choice) await switchToSessionChainHead(ctx, controller, choice);
 						return;
 					}
+					if (trimmed === "list" || trimmed === "list all") {
+						const includeArchived = trimmed === "list all";
+						const chains = (await controller.getStore().listChains()).filter(
+							(chain) => includeArchived || !chain.archived,
+						);
+						ctx.ui.notify(
+							chains.length === 0
+								? "No Session Chains."
+								: chains
+										.map(
+											(chain) =>
+												`${chain.archived ? "ARCHIVED " : ""}${chain.title ?? "Untitled Chain"} · ${chain.chainId} · ${chain.branchHeads.length} branch head(s)`,
+										)
+										.join("\n"),
+							"info",
+						);
+						return;
+					}
 					if (trimmed === "status") {
 						const status = await controller.getCurrentStatus(ctx.sessionManager);
 						if (!status) throw new Error("current Pi session is not bound to a Session Chain");
+						const readModel = await controller.getStore().loadChainReadModel(status.chainId);
+						const branch = readModel.branches.find((candidate) => candidate.branchId === status.branchId);
+						if (!branch) throw new Error(`Session Chain branch not found: ${status.branchId}`);
+						const nextWindowIndex = (branch.rollups.at(-1)?.windowIndex ?? 0) + 1;
+						const publication = await controller.getRollupPublication(
+							status.chainId,
+							status.branchId,
+							nextWindowIndex,
+						);
 						const gates = await options.getGateState?.(ctx);
 						const gateLabels = sessionChainGateLabels(gates);
 						ctx.ui.notify(
 							[
 								`Session Chain ${status.chainId}`,
+								...(status.title ? [`title ${status.title}`] : []),
+								`archived ${status.archived ? "yes" : "no"}`,
 								status.branchId,
 								`S${status.ordinal} ${status.segmentStatus}`,
 								formatSessionChainBytes(status.bytes),
@@ -568,10 +618,27 @@ export function createPiXkSessionChainExtension(options: PiXkSessionChainExtensi
 								`threshold ${status.threshold}`,
 								`writable ${status.writableHead ? "yes" : "no"}`,
 								`summary ${status.summaryInArtifactId ? status.summaryInArtifactId.slice(0, 15) : "root"}`,
+								`rollup ${publication ? `W${publication.windowIndex} ${publication.status}` : "idle"}`,
 								`gates ${gateLabels.length > 0 ? gateLabels.join(", ") : "clear"}`,
 							].join(" · "),
 							"info",
 						);
+						return;
+					}
+					if (trimmed.startsWith("rename ")) {
+						const binding = controller.getCurrentBinding(ctx.sessionManager);
+						if (!binding) throw new Error("current Pi session is not bound to a Session Chain");
+						const title = trimmed.slice("rename".length).trim();
+						if (!title) throw new Error("usage: /chain rename <title>");
+						await controller.renameChain(binding.chainId, title);
+						ctx.ui.notify(`Session Chain renamed to ${title.replace(/\s+/g, " ").trim()}`, "info");
+						return;
+					}
+					if (trimmed === "archive") {
+						const binding = controller.getCurrentBinding(ctx.sessionManager);
+						if (!binding) throw new Error("current Pi session is not bound to a Session Chain");
+						await controller.archiveChain(binding.chainId);
+						ctx.ui.notify(`Session Chain archived ${binding.chainId}`, "info");
 						return;
 					}
 					if (trimmed === "history") {
@@ -587,8 +654,8 @@ export function createPiXkSessionChainExtension(options: PiXkSessionChainExtensi
 						const binding = controller.getCurrentBinding(ctx.sessionManager);
 						if (!binding) throw new Error("current Pi session is not bound to a Session Chain");
 						const segmentId = trimmed.slice("summary".length).trim() || binding.segmentId;
-						const replay = await controller.getStore().replayChain(binding.chainId);
-						ctx.ui.notify(await formatSessionChainSummary(controller, replay, segmentId), "info");
+						const readModel = await controller.getStore().loadChainReadModel(binding.chainId);
+						ctx.ui.notify(await formatSessionChainSummary(controller, readModel, segmentId), "info");
 						return;
 					}
 					if (trimmed === "rollups") {
@@ -596,7 +663,7 @@ export function createPiXkSessionChainExtension(options: PiXkSessionChainExtensi
 						if (!binding) throw new Error("current Pi session is not bound to a Session Chain");
 						ctx.ui.notify(
 							formatSessionChainRollups(
-								await controller.getStore().replayChain(binding.chainId),
+								await controller.getStore().loadChainReadModel(binding.chainId),
 								binding.branchId,
 							),
 							"info",
@@ -660,7 +727,7 @@ export function createPiXkSessionChainExtension(options: PiXkSessionChainExtensi
 							windowIndex,
 						});
 						if (result.level !== "l2") throw new Error(`Session Chain Rollup W${windowIndex} is invalid`);
-						ctx.ui.notify(result.markdown, "info");
+						ctx.ui.notify(result.markdown ?? renderRollupMarkdown(result.artifactId, result.rollup), "info");
 						return;
 					}
 					if (trimmed === "rollover" || trimmed.startsWith("rollover ")) {
@@ -701,8 +768,8 @@ export function createPiXkSessionChainExtension(options: PiXkSessionChainExtensi
 						}
 						const binding = controller.getCurrentBinding(ctx.sessionManager);
 						if (!binding) throw new Error("current Pi session is not bound to a Session Chain");
-						const replay = await controller.getStore().replayChain(binding.chainId);
-						const sources = replay.branches.filter((branch) =>
+						const readModel = await controller.getStore().loadChainReadModel(binding.chainId);
+						const sources = readModel.branches.filter((branch) =>
 							branch.segments.some((segment) => segment.segmentId === segmentId),
 						);
 						if (sources.length !== 1 || !sources[0]) {
@@ -742,18 +809,42 @@ export function createPiXkSessionChainExtension(options: PiXkSessionChainExtensi
 						}
 						return;
 					}
-					if (trimmed === "doctor") {
+					if (trimmed === "doctor" || trimmed.startsWith("doctor ")) {
 						const binding = controller.getCurrentBinding(ctx.sessionManager);
 						if (!binding) throw new Error("current Pi session is not bound to a Session Chain");
-						const recoveries = await recoverSessionChain(controller, binding.chainId);
+						const doctorArgs = trimmed.slice("doctor".length).trim();
+						if (doctorArgs.startsWith("repair-lock ")) {
+							const nonce = doctorArgs.slice("repair-lock".length).trim();
+							if (!nonce || /\s/.test(nonce)) throw new Error("usage: /chain doctor repair-lock <nonce>");
+							const repaired = await controller.getStore().repairAbandonedWriteLock(binding.chainId, nonce);
+							ctx.ui.notify(
+								repaired
+									? `Session Chain repaired abandoned write lock for ${binding.chainId}`
+									: `Session Chain write lock is already absent for ${binding.chainId}`,
+								"info",
+							);
+							return;
+						}
+						if (doctorArgs === "repair-projections") {
+							const repaired = await controller.repairProjections(binding.chainId);
+							ctx.ui.notify(`Session Chain projections repaired: ${repaired.join("; ")}`, "info");
+							return;
+						}
+						if (doctorArgs !== "" && doctorArgs !== "deep") {
+							throw new Error("usage: /chain doctor [deep|repair-projections|repair-lock <nonce>]");
+						}
 						ctx.ui.notify(
-							formatSessionChainDoctor(binding.chainId, recoveries, await controller.doctor(binding.chainId)),
+							formatSessionChainDoctor(
+								binding.chainId,
+								[],
+								await controller.doctor(binding.chainId, doctorArgs === "deep" ? "deep" : "quick"),
+							),
 							"info",
 						);
 						return;
 					}
 					throw new Error(
-						"usage: /chain [status|history|summary [segmentId]|rollups|rollup <window>|rollup backfill [limit]|rollup config [off|N]|rollover [reason]|resume <chainId|prefix>|continue <segmentId> [entryId]|doctor]",
+						"usage: /chain [list [all]|status|rename <title>|archive|history|summary [segmentId]|rollups|rollup <window>|rollup backfill [limit]|rollup config [off|N]|rollover [reason]|resume <chainId|prefix>|continue <segmentId> [entryId]|doctor [deep|repair-projections|repair-lock <nonce>]]",
 					);
 				} catch (error) {
 					reportSessionChainError(replacementContext ?? ctx, options, "Pi-XK Session Chain command failed", error);
@@ -800,6 +891,20 @@ export function createPiXkSessionChainExtension(options: PiXkSessionChainExtensi
 					}
 				}
 				await refreshSessionChainFooter(ctx, controller);
+				const binding = controller.getCurrentBinding(ctx.sessionManager);
+				if (binding) {
+					void controller
+						.resumeRollupPublications(sessionChainHost(ctx), binding.chainId, binding.branchId)
+						.catch((error) =>
+							reportSessionChainError(
+								ctx,
+								options,
+								"Pi-XK Session Chain Rollup recovery failed",
+								error,
+								"warning",
+							),
+						);
+				}
 			} catch (error) {
 				reportSessionChainError(ctx, options, "Pi-XK Session Chain adoption failed", error);
 			}
@@ -812,6 +917,7 @@ export function createPiXkSessionChainExtension(options: PiXkSessionChainExtensi
 				if (event.source === "extension" && forwardedInputSegments.delete(binding.segmentId)) {
 					return { action: "continue" };
 				}
+				await controller.ensureDefaultTitle(binding.chainId, event.text);
 				let replacementContext: ReplacedSessionContext | undefined;
 				forwardingRolloverProjects.add(projectRoot);
 				try {
@@ -914,6 +1020,7 @@ export function createPiXkSessionChainExtension(options: PiXkSessionChainExtensi
 			forwardingRolloverProjects.add(projectRoot);
 			try {
 				await controller.bootstrapManagedChain(sessionChainHost(ctx), {
+					title: sessionChainTitleFromInput(event.text),
 					withSession: async (nextContext) => {
 						replacementContext = nextContext as ReplacedSessionContext;
 						await refreshSessionChainFooter(replacementContext, controller);

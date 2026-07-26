@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import type {
 	AgentEndEvent,
 	AgentSettledEvent,
@@ -25,6 +26,7 @@ import {
 	validateGoalLifecycleEventForContract,
 } from "pi-xk-core";
 import { Type } from "typebox";
+import { formatDuration, formatGoalFooterStatus, type GoalStatusSnapshot, renderGoalStatus } from "./goal-status.ts";
 import { createGoalDraftReviewComponent, type GoalDraftReviewAction } from "./goal-ui.ts";
 import {
 	isPiXkSessionChainBinding,
@@ -783,6 +785,31 @@ function notifyTaskError(ctx: ExtensionContext, options: PiXkGoalExtensionOption
 	}
 }
 
+interface ExtensionWriteLockDiagnostic {
+	pid?: number;
+	nonce?: string;
+	createdAt?: string;
+	ownerState: "alive" | "missing" | "unknown";
+	malformed: boolean;
+}
+
+function formatWriteLockDiagnostic(
+	entity: "Goal" | "Task",
+	entityId: string,
+	diagnostic: ExtensionWriteLockDiagnostic | undefined,
+	repairCommand: string,
+): string {
+	if (!diagnostic) return `Pi-XK ${entity} ${entityId}: write lock clear`;
+	if (diagnostic.malformed) {
+		return `Pi-XK ${entity} ${entityId}: write lock is malformed; explicit recovery is refused`;
+	}
+	const owner = `write lock owner PID ${diagnostic.pid ?? "unknown"} is ${diagnostic.ownerState}`;
+	if (diagnostic.ownerState === "missing" && diagnostic.nonce) {
+		return `Pi-XK ${entity} ${entityId}: ${owner}; run ${repairCommand} ${diagnostic.nonce}`;
+	}
+	return `Pi-XK ${entity} ${entityId}: ${owner}; recovery is not allowed`;
+}
+
 function goalRuntimePrompt(objectivePath: string, statePath: string): string {
 	return [
 		`An active Pi-XK Goal is bound to this session. Read ${objectivePath} and ${statePath} before substantive work.`,
@@ -894,31 +921,6 @@ function rejectGoalLifecycleIntent(
 ): never {
 	appendRejectedGoalLifecycleIntent(pi, intent, timestamp);
 	throw new Error(message);
-}
-
-function formatDuration(milliseconds: number): string {
-	const seconds = Math.max(0, Math.floor(milliseconds / 1000));
-	const days = Math.floor(seconds / 86_400);
-	const hours = Math.floor((seconds % 86_400) / 3_600);
-	const minutes = Math.floor((seconds % 3_600) / 60);
-	if (days > 0) return `${days}d ${hours}h ${minutes}m`;
-	if (hours > 0) return `${hours}h ${minutes}m`;
-	return minutes > 0 ? `${minutes}m ${seconds % 60}s` : `${seconds}s`;
-}
-
-interface GoalStatusSnapshot {
-	status: GoalLifecycleStatus;
-	activeElapsed: number;
-	observedAt: number;
-}
-
-function activeElapsedForStatus(snapshot: GoalStatusSnapshot, now: number): number {
-	if (snapshot.status !== "active") return snapshot.activeElapsed;
-	return snapshot.activeElapsed + Math.max(0, now - snapshot.observedAt);
-}
-
-function formatGoalFooterStatus(snapshot: GoalStatusSnapshot, now: number): string {
-	return `Goal ${snapshot.status} · ${formatDuration(activeElapsedForStatus(snapshot, now))}`;
 }
 
 function appendTaskEventLink(pi: ExtensionAPI, ctx: ExtensionContext, replay: TaskReplay, eventId: string): void {
@@ -1821,10 +1823,8 @@ async function showGoalStatus(
 	const store = storeFor(ctx.cwd);
 	const replay = await store.replayGoal(binding.goalId, { now: goalNow(options) });
 	const files = await store.inspectGoalFiles(binding.goalId);
-	ctx.ui.notify(
-		`Pi-XK Goal ${binding.goalId}: ${replay.lifecycle.status}; wall ${formatDuration(replay.lifecycle.wallElapsed)}, active ${formatDuration(replay.lifecycle.activeElapsed)}, busy ${formatDuration(replay.lifecycle.busyElapsed)}; objective ${files.objective.status}, state ${files.state.status}`,
-		"info",
-	);
+	const state = files.state.status === "valid" ? await readFile(files.state.path, "utf8") : undefined;
+	ctx.ui.notify(renderGoalStatus(binding.goalId, replay, files, state), "info");
 }
 
 interface TaskParentState {
@@ -1835,6 +1835,7 @@ interface TaskParentState {
 	parentSettled: boolean;
 	delivered: boolean;
 	autoResume: boolean;
+	settlementDeferred: boolean;
 }
 
 export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}): ExtensionFactory {
@@ -1890,10 +1891,15 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 				return;
 			}
 			appendTaskEventLink(pi, parent.context, replay, terminal.eventId);
+			if (parent.settlementDeferred) return;
 			if (parent.delivered) return;
 			if (parent.launchActor === "user" || !parent.autoResume) {
 				parent.delivered = true;
 				parent.context.ui.notify(`Pi-XK ${formatTaskStatus(replay, Date.now())}`, "info");
+				if (parent.launchActor === "user" && parent.context.hasPendingMessages()) {
+					const inspection = await runner.getStore().inspectTask(taskId);
+					deliverTaskResult(pi, parent.context, taskResultMessage(replay, inspection), true);
+				}
 				return;
 			}
 			if (!parent.parentSettled || !parent.context.isIdle()) return;
@@ -1962,6 +1968,7 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 				parentSettled: launchActor === "user",
 				delivered: false,
 				autoResume: launchActor === "model",
+				settlementDeferred: false,
 			});
 			void handle.completion.catch((error) => notifyTaskError(ctx, options, error));
 			const replay = await runner.getStore().replayTask(handle.taskId);
@@ -2012,7 +2019,10 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 			if (!replay) throw new Error(`Task ${taskId} does not belong to the current session branch`);
 			if (replay.status !== "running") throw new Error(`Task ${taskId} is ${replay.status}, not running`);
 			const parent = taskParents.get(taskId);
-			if (parent) parent.autoResume = false;
+			if (parent) {
+				parent.autoResume = false;
+				parent.settlementDeferred = true;
+			}
 			const runner = runnerFor(ctx.cwd);
 			if (runner.getActiveTaskId() === taskId) {
 				await runner.cancel(taskId, reason);
@@ -2029,6 +2039,10 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 			if (terminal) appendTaskEventLink(pi, ctx, terminalReplay, terminal.eventId);
 			if (pauseGoal && replay.spec.parentGoalId) {
 				await pauseActiveGoalForRuntime(ctx, storeFor, options, `Task ${taskId} was cancelled by the user.`);
+			}
+			if (parent) {
+				parent.settlementDeferred = false;
+				await handleTaskSettled(taskId, terminalReplay.status);
 			}
 		};
 
@@ -2716,7 +2730,12 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 			try {
 				const task = await currentTaskReplay(ctx);
 				if (task?.status === "running" && !/^\/task(?:\s|$)/.test(event.text.trimStart())) {
-					ctx.ui.notify(`Pi-XK Task ${task.taskId} is running. Use /task status or /task cancel.`, "warning");
+					pi.queueUserMessage(
+						event.images && event.images.length > 0
+							? [{ type: "text", text: event.text }, ...event.images]
+							: event.text,
+					);
+					ctx.ui.notify(`Pi-XK Task ${task.taskId} is running; input queued until it settles.`, "info");
 					return { action: "handled" };
 				}
 			} catch (error) {
@@ -2737,6 +2756,43 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 			handler: async (args, ctx) => {
 				const trimmed = args.trim();
 				try {
+					if (trimmed === "doctor" || trimmed.startsWith("doctor ")) {
+						const doctorArgs = trimmed.slice("doctor".length).trim().split(/\s+/).filter(Boolean);
+						const repairIndex = doctorArgs.indexOf("repair-lock");
+						if (repairIndex > 1 || (repairIndex >= 0 && doctorArgs.length !== repairIndex + 2)) {
+							throw new Error("usage: /task doctor [taskId] [repair-lock <nonce>]");
+						}
+						const taskId = repairIndex === 0 ? undefined : doctorArgs[0];
+						if (repairIndex === -1 && doctorArgs.length > 1) {
+							throw new Error("usage: /task doctor [taskId] [repair-lock <nonce>]");
+						}
+						const replay = await currentTaskReplay(ctx, taskId);
+						if (!replay) throw new Error("no Task is linked to the current session branch");
+						const store = runnerFor(ctx.cwd).getStore();
+						if (repairIndex >= 0) {
+							const nonce = doctorArgs[repairIndex + 1];
+							if (!nonce) throw new Error("usage: /task doctor [taskId] repair-lock <nonce>");
+							const repaired = await store.repairAbandonedWriteLock(replay.taskId, nonce);
+							ctx.ui.notify(
+								repaired
+									? `Pi-XK Task ${replay.taskId}: repaired abandoned write lock`
+									: `Pi-XK Task ${replay.taskId}: no write lock was present`,
+								"info",
+							);
+							return;
+						}
+						const diagnostic = await store.inspectWriteLock(replay.taskId);
+						ctx.ui.notify(
+							formatWriteLockDiagnostic(
+								"Task",
+								replay.taskId,
+								diagnostic,
+								`/task doctor ${replay.taskId} repair-lock`,
+							),
+							diagnostic ? "warning" : "info",
+						);
+						return;
+					}
 					if (trimmed === "status" || trimmed.startsWith("status ")) {
 						const taskId = trimmed.slice("status".length).trim() || undefined;
 						const replay = await currentTaskReplay(ctx, taskId);
@@ -2771,7 +2827,9 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 						ctx.ui.notify(`Pi-XK Task ${replay.taskId} cancelled`, "info");
 						return;
 					}
-					throw new Error("usage: /task start <prompt> | /task status [taskId] | /task cancel [taskId] [reason]");
+					throw new Error(
+						"usage: /task start <prompt> | /task status [taskId] | /task cancel [taskId] [reason] | /task doctor [taskId] [repair-lock <nonce>]",
+					);
 				} catch (error) {
 					notifyTaskError(ctx, options, error);
 				}
@@ -2782,6 +2840,40 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 			handler: async (args, ctx) => {
 				const trimmed = args.trim();
 				try {
+					const task = await currentTaskReplay(ctx);
+					if (
+						task?.status === "running" &&
+						trimmed !== "status" &&
+						trimmed !== "doctor" &&
+						!trimmed.startsWith("doctor ")
+					) {
+						throw new Error(`Goal changes are blocked while Task ${task.taskId} is running`);
+					}
+					if (trimmed === "doctor" || trimmed.startsWith("doctor ")) {
+						const binding = findCurrentGoalBinding(ctx);
+						if (!binding) throw new Error("no Goal is bound to the current session branch");
+						const store = storeFor(ctx.cwd);
+						const doctorArgs = trimmed.slice("doctor".length).trim();
+						if (doctorArgs.startsWith("repair-lock ")) {
+							const nonce = doctorArgs.slice("repair-lock".length).trim();
+							if (!nonce || /\s/.test(nonce)) throw new Error("usage: /goal doctor repair-lock <nonce>");
+							const repaired = await store.repairAbandonedWriteLock(binding.goalId, nonce);
+							ctx.ui.notify(
+								repaired
+									? `Pi-XK Goal ${binding.goalId}: repaired abandoned write lock`
+									: `Pi-XK Goal ${binding.goalId}: no write lock was present`,
+								"info",
+							);
+							return;
+						}
+						if (doctorArgs.length > 0) throw new Error("usage: /goal doctor [repair-lock <nonce>]");
+						const diagnostic = await store.inspectWriteLock(binding.goalId);
+						ctx.ui.notify(
+							formatWriteLockDiagnostic("Goal", binding.goalId, diagnostic, "/goal doctor repair-lock"),
+							diagnostic ? "warning" : "info",
+						);
+						return;
+					}
 					if (trimmed.length === 0) {
 						const capture = findCurrentGoalCapture(ctx);
 						const timestamp = goalNow(options);

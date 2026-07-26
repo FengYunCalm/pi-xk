@@ -1475,25 +1475,7 @@ export class AgentSession {
 		content: string | (TextContent | ImageContent)[],
 		options?: { deliverAs?: "steer" | "followUp" },
 	): Promise<void> {
-		// Normalize content to text string + optional images
-		let text: string;
-		let images: ImageContent[] | undefined;
-
-		if (typeof content === "string") {
-			text = content;
-		} else {
-			const textParts: string[] = [];
-			images = [];
-			for (const part of content) {
-				if (part.type === "text") {
-					textParts.push(part.text);
-				} else {
-					images.push(part);
-				}
-			}
-			text = textParts.join("\n");
-			if (images.length === 0) images = undefined;
-		}
+		const { text, images } = this._normalizeUserMessageContent(content);
 
 		// Use prompt() with expandPromptTemplates: false to skip command handling and template expansion
 		await this.prompt(text, {
@@ -1502,6 +1484,29 @@ export class AgentSession {
 			images,
 			source: "extension",
 		});
+	}
+
+	/** Queue an extension-origin user message without starting an agent turn. */
+	async queueUserMessage(content: string | (TextContent | ImageContent)[]): Promise<void> {
+		if (this._isRolloverPending) {
+			throw new Error("Session rollover is in progress; the source transcript is read-only");
+		}
+		const { text, images } = this._normalizeUserMessageContent(content);
+		await this._queueFollowUp(text, images);
+	}
+
+	private _normalizeUserMessageContent(content: string | (TextContent | ImageContent)[]): {
+		text: string;
+		images: ImageContent[] | undefined;
+	} {
+		if (typeof content === "string") return { text: content, images: undefined };
+		const textParts: string[] = [];
+		const images: ImageContent[] = [];
+		for (const part of content) {
+			if (part.type === "text") textParts.push(part.text);
+			else images.push(part);
+		}
+		return { text: textParts.join("\n"), images: images.length > 0 ? images : undefined };
 	}
 
 	/**
@@ -2424,6 +2429,15 @@ export class AgentSession {
 						runner.emitError({
 							extensionPath: "<runtime>",
 							event: "send_user_message",
+							error: err instanceof Error ? err.message : String(err),
+						});
+					});
+				},
+				queueUserMessage: (content) => {
+					this.queueUserMessage(content).catch((err) => {
+						runner.emitError({
+							extensionPath: "<runtime>",
+							event: "queue_user_message",
 							error: err instanceof Error ? err.message : String(err),
 						});
 					});

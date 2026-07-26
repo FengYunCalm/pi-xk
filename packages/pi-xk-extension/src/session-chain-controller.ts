@@ -19,14 +19,31 @@ import {
 	type SegmentSummaryV1,
 	type SessionBranchProjectionV1,
 	type SessionChainActor,
+	SessionChainLockedError,
 	type SessionChainReplay,
-	type SessionChainRollupContentV1,
 	type SessionChainRollupV1,
 	SessionChainStore,
 	type SessionSegmentDescriptorV1,
 	type SessionSegmentProjectionV1,
 } from "pi-xk-core";
+import {
+	runQuickSessionChainDoctor,
+	type SessionChainDiagnostic,
+	type SessionChainDoctorReport,
+} from "./session-chain-doctor.ts";
+import { SessionChainControllerError } from "./session-chain-errors.ts";
+import {
+	classifyRollupFailure,
+	parseRollupEnvelope,
+	parseSummaryEnvelope,
+	renderRollupMarkdown,
+	rollupSourceDigest,
+	summaryBudget,
+} from "./session-chain-summary.ts";
 import { isPiXkSessionLink } from "./session-link.ts";
+
+export type { SessionChainDiagnostic, SessionChainDoctorReport } from "./session-chain-doctor.ts";
+export { SessionChainControllerError } from "./session-chain-errors.ts";
 
 export const PI_XK_SESSION_CHAIN_LINK_CUSTOM_TYPE = "pi-xk.session-chain-link";
 export const PI_XK_SESSION_CHAIN_SUMMARY_IN_CUSTOM_TYPE = "pi-xk.session-chain-summary-in";
@@ -43,6 +60,15 @@ export const SESSION_CHAIN_SOFT_ENTRIES = 4_000;
 export const SESSION_CHAIN_HARD_BYTES = 64 * 1024 * 1024;
 export const SESSION_CHAIN_HARD_ENTRIES = 16_000;
 
+export function sessionChainTitleFromInput(input: string, maxLength = 80): string | null {
+	const normalized = input.replace(/\s+/g, " ").trim();
+	if (normalized.length === 0) return null;
+	const characters = [...normalized];
+	return characters.length <= maxLength
+		? normalized
+		: `${characters.slice(0, Math.max(1, maxLength - 3)).join("")}...`;
+}
+
 const GOAL_SESSION_LINK_CUSTOM_TYPE = "pi-xk.session-link";
 const SESSION_CHAIN_CONFIG_SCHEMA = "pi-xk.session-chain-config.v1";
 
@@ -58,6 +84,26 @@ interface PendingRollupPublicationV1 {
 	windowIndex: number;
 	sourceDigest: string;
 	artifactId: string;
+}
+
+export type SessionChainRollupPublicationState = "scheduled" | "generating" | "artifact_ready" | "failed" | "published";
+
+export interface SessionChainRollupPublicationV1 {
+	schema: "pi-xk.session-chain-rollup-publication.v1";
+	chainId: string;
+	branchId: string;
+	windowIndex: number;
+	startOrdinal: number;
+	endOrdinal: number;
+	segmentIds: string[];
+	summaryArtifactIds: string[];
+	sourceDigest: string;
+	status: SessionChainRollupPublicationState;
+	artifactId: string | null;
+	attempt: number;
+	errorCode: string | null;
+	retryable: boolean | null;
+	updatedAt: string;
 }
 
 interface SessionChainRollupRuntimeStateV1 {
@@ -180,7 +226,7 @@ export interface SessionChainSummaryListItem {
 	level: "l1" | "l2";
 	artifactId: string;
 	createdAt: string;
-	integrity: "verified" | "invalid";
+	integrity: "unchecked" | "verified" | "invalid";
 	segmentId?: string;
 	segmentOrdinal?: number;
 	windowIndex?: number;
@@ -216,7 +262,7 @@ export type SessionChainSummaryReadResult =
 			startOrdinal: number;
 			endOrdinal: number;
 			rollup: SessionChainRollupV1;
-			markdown: string;
+			markdown?: string;
 	  };
 
 export interface SessionChainRootOptions {
@@ -315,22 +361,10 @@ export interface SessionChainRecoveryResult {
 	targetSegmentId: string | null;
 }
 
-export interface SessionChainDiagnostic {
-	severity: "warning" | "error";
-	code: string;
-	message: string;
-	branchId?: string;
-	segmentId?: string;
-}
-
-export interface SessionChainDoctorReport {
-	chainId: string;
-	diagnostics: SessionChainDiagnostic[];
-}
-
 export interface SessionChainCurrentStatus {
 	chainId: string;
 	title: string | null;
+	archived: boolean;
 	branchId: string;
 	segmentId: string;
 	ordinal: number;
@@ -354,11 +388,6 @@ interface SummarySelection {
 	entriesHash: string;
 }
 
-interface ParsedSummaryEnvelope {
-	segmentDeltaMarkdown: string;
-	carryForwardMarkdown: string;
-}
-
 interface SessionChainRollupWindow {
 	chainId: string;
 	branchId: string;
@@ -369,13 +398,6 @@ interface SessionChainRollupWindow {
 	summaries: SegmentSummaryV1[];
 	summaryArtifactIds: string[];
 	sourceDigest: string;
-}
-
-export class SessionChainControllerError extends Error {
-	constructor(message: string) {
-		super(message);
-		this.name = "SessionChainControllerError";
-	}
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -493,31 +515,6 @@ function hashText(value: string): string {
 	return `sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
 }
 
-function rollupSourceDigest(input: {
-	chainId: string;
-	branchId: string;
-	windowIndex: number;
-	startOrdinal: number;
-	endOrdinal: number;
-	segmentIds: readonly string[];
-	summaryArtifactIds: readonly string[];
-}): string {
-	return hashText(
-		JSON.stringify({
-			schema: CHAIN_ROLLUP_SCHEMA,
-			chainId: input.chainId,
-			branchId: input.branchId,
-			windowIndex: input.windowIndex,
-			startOrdinal: input.startOrdinal,
-			endOrdinal: input.endOrdinal,
-			segments: input.segmentIds.map((segmentId, index) => ({
-				segmentId,
-				summaryArtifactId: input.summaryArtifactIds[index],
-			})),
-		}),
-	);
-}
-
 function flushSessionDurably(manager: SessionManager): void {
 	const compatible = manager as SessionManager & { flushDurable?: () => void };
 	if (!compatible.flushDurable) {
@@ -536,103 +533,6 @@ async function hashFile(path: string): Promise<string> {
 	return `sha256:${createHash("sha256")
 		.update(await readFile(path))
 		.digest("hex")}`;
-}
-
-function parseSummaryEnvelope(summary: string): ParsedSummaryEnvelope {
-	const match =
-		/^\s*<segment-delta>\s*([\s\S]*?)\s*<\/segment-delta>\s*<carry-forward>\s*([\s\S]*?)\s*<\/carry-forward>\s*$/.exec(
-			summary,
-		);
-	const segmentDeltaMarkdown = match?.[1]?.trim();
-	const carryForwardMarkdown = match?.[2]?.trim();
-	if (!segmentDeltaMarkdown || !carryForwardMarkdown) {
-		throw new SessionChainControllerError(
-			"Session Chain summarizer returned an invalid summary envelope; expected segment-delta and carry-forward blocks",
-		);
-	}
-	return { segmentDeltaMarkdown, carryForwardMarkdown };
-}
-
-function parseRollupEnvelope(summary: string): SessionChainRollupContentV1 {
-	const match = /^\s*<chain-rollup>([\s\S]*?)<\/chain-rollup>\s*$/.exec(summary);
-	if (!match?.[1]) throw new SessionChainControllerError("Session Chain Rollup response has an invalid envelope");
-	let value: unknown;
-	try {
-		value = JSON.parse(match[1]);
-	} catch {
-		throw new SessionChainControllerError("Session Chain Rollup response is not valid JSON");
-	}
-	if (
-		!isRecord(value) ||
-		!hasExactKeys(value, ["state", "decisions", "constraints", "completed", "unresolved", "nextActions"])
-	) {
-		throw new SessionChainControllerError("Session Chain Rollup response has invalid fields");
-	}
-	if (!isNonEmptyString(value.state)) {
-		throw new SessionChainControllerError("Session Chain Rollup state must be non-empty");
-	}
-	const readList = (field: string): string[] => {
-		const list = value[field];
-		if (!Array.isArray(list) || list.some((item) => !isNonEmptyString(item))) {
-			throw new SessionChainControllerError(`Session Chain Rollup ${field} must be a string array`);
-		}
-		return [...list];
-	};
-	return {
-		state: value.state,
-		decisions: readList("decisions"),
-		constraints: readList("constraints"),
-		completed: readList("completed"),
-		unresolved: readList("unresolved"),
-		nextActions: readList("nextActions"),
-	};
-}
-
-function renderRollupMarkdown(artifactId: string, rollup: SessionChainRollupV1): string {
-	const section = (title: string, items: readonly string[]): string =>
-		[`## ${title}`, "", ...(items.length > 0 ? items.map((item) => `- ${item}`) : ["- None."])].join("\n");
-	return [
-		`# Session Chain Rollup W${rollup.windowIndex}`,
-		"",
-		`- Chain: ${rollup.chainId}`,
-		`- Branch: ${rollup.branchId}`,
-		`- Segments: S${rollup.startOrdinal}–S${rollup.endOrdinal}`,
-		`- Artifact: ${artifactId}`,
-		`- Source digest: ${rollup.sourceDigest}`,
-		`- Generator: ${rollup.provenance.generator}`,
-		`- Model: ${rollup.provenance.model}`,
-		`- Prompt: ${rollup.provenance.promptVersion}`,
-		`- Generated: ${rollup.provenance.generatedAt}`,
-		"",
-		"## State",
-		"",
-		rollup.rollup.state,
-		"",
-		section("Decisions", rollup.rollup.decisions),
-		"",
-		section("Constraints", rollup.rollup.constraints),
-		"",
-		section("Completed", rollup.rollup.completed),
-		"",
-		section("Unresolved", rollup.rollup.unresolved),
-		"",
-		section("Next actions", rollup.rollup.nextActions),
-		"",
-		"## Sources",
-		"",
-		...rollup.segmentIds.map(
-			(segmentId, index) =>
-				`- S${rollup.startOrdinal + index}: ${segmentId} · ${rollup.summaryArtifactIds[index] ?? "missing"}`,
-		),
-		"",
-	].join("\n");
-}
-
-function summaryBudget(contextWindow: number): number {
-	if (!Number.isFinite(contextWindow) || contextWindow <= 0) {
-		throw new SessionChainControllerError("Session Chain summary requires a positive model context window");
-	}
-	return Math.min(8_192, Math.max(2_048, Math.floor(contextWindow * 0.05)));
 }
 
 export function evaluateSessionChainThreshold(input: SessionChainThresholdInput): SessionChainThreshold {
@@ -671,8 +571,8 @@ function bindingFor(chainId: string, branchId: string, segment: SessionSegmentDe
 	};
 }
 
-function findBranch(replay: SessionChainReplay, branchId: string): SessionBranchProjectionV1 {
-	const branch = replay.branches.find((candidate) => candidate.branchId === branchId);
+function findBranch(projection: Pick<SessionChainReplay, "branches">, branchId: string): SessionBranchProjectionV1 {
+	const branch = projection.branches.find((candidate) => candidate.branchId === branchId);
 	if (!branch) throw new SessionChainControllerError(`Session Chain branch not found: ${branchId}`);
 	return branch;
 }
@@ -791,6 +691,8 @@ export class SessionChainController {
 	private readonly store: SessionChainStore;
 	private readonly now: () => string;
 	private readonly createSessionManagerAt: CreateSessionManagerAt;
+	private readonly rollupPublicationQueues = new Map<string, Promise<void>>();
+	private readonly rollupPublicationErrors = new Map<string, unknown>();
 
 	constructor(options: SessionChainControllerOptions) {
 		this.projectRoot = resolve(options.projectRoot);
@@ -813,6 +715,114 @@ export class SessionChainController {
 
 	getStore(): SessionChainStore {
 		return this.store;
+	}
+
+	async renameChain(chainId: string, title: string, actor: SessionChainActor = "user"): Promise<void> {
+		const normalized = title.replace(/\s+/g, " ").trim();
+		if (normalized.length === 0) throw new SessionChainControllerError("Session Chain title must be non-empty");
+		const replay = await this.store.replayChain(chainId);
+		if (replay.title === normalized) return;
+		const sequence = replay.head.sequence + 1;
+		await this.store.appendMetadataUpdated(
+			chainId,
+			{ title: normalized },
+			{
+				eventId: `${chainId}:metadata:${sequence}`,
+				idempotencyKey: `${chainId}:metadata:${sequence}`,
+				expectedHead: replay.head,
+				actor,
+				timestamp: this.now(),
+			},
+		);
+	}
+
+	async ensureDefaultTitle(chainId: string, input: string): Promise<string | null> {
+		const readModel = await this.store.loadChainReadModel(chainId);
+		if (readModel.title !== null) return readModel.title;
+		const title = sessionChainTitleFromInput(input);
+		if (title === null) return null;
+		await this.renameChain(chainId, title, "runtime");
+		return title;
+	}
+
+	async archiveChain(chainId: string, actor: SessionChainActor = "user"): Promise<void> {
+		const replay = await this.store.replayChain(chainId);
+		if (replay.archived) return;
+		const sequence = replay.head.sequence + 1;
+		await this.store.appendArchiveUpdated(
+			chainId,
+			{ archived: true },
+			{
+				eventId: `${chainId}:archive:${sequence}`,
+				idempotencyKey: `${chainId}:archive:${sequence}`,
+				expectedHead: replay.head,
+				actor,
+				timestamp: this.now(),
+			},
+		);
+	}
+
+	private rollupQueueKey(chainId: string, branchId: string): string {
+		return `${chainId}/${branchId}`;
+	}
+
+	private enqueueRollupPublication(host: SessionChainHost, job: SessionChainRollupPublicationV1): void {
+		const key = this.rollupQueueKey(job.chainId, job.branchId);
+		const previous = this.rollupPublicationQueues.get(key) ?? Promise.resolve();
+		const publication = previous
+			.then(async () => {
+				let current = job;
+				for (;;) {
+					await this.processRollupPublication(host, current);
+					const completed = await this.getRollupPublication(
+						current.chainId,
+						current.branchId,
+						current.windowIndex,
+					);
+					if (completed?.status !== "published") return;
+					const next = await this.ensureScheduledRollupPublication(current.chainId, current.branchId);
+					if (!next || next.windowIndex <= current.windowIndex || next.status === "failed") return;
+					current = next;
+				}
+			})
+			.catch((error: unknown) => {
+				this.rollupPublicationErrors.set(key, error);
+			});
+		this.rollupPublicationQueues.set(key, publication);
+		void publication.finally(() => {
+			if (this.rollupPublicationQueues.get(key) === publication) this.rollupPublicationQueues.delete(key);
+		});
+	}
+
+	private async scheduleRollupPublication(host: SessionChainHost, chainId: string, branchId: string): Promise<void> {
+		const job = await this.ensureScheduledRollupPublication(chainId, branchId);
+		if (!job || job.status === "published" || (job.status === "failed" && job.retryable === false)) return;
+		this.enqueueRollupPublication(host, job);
+	}
+
+	async resumeRollupPublications(host: SessionChainHost, chainId: string, branchId: string): Promise<void> {
+		await this.scheduleRollupPublication(host, chainId, branchId);
+	}
+
+	async waitForRollupPublications(chainId?: string, branchId?: string): Promise<void> {
+		for (;;) {
+			const matchesKey = (key: string): boolean => {
+				if (!chainId) return true;
+				if (branchId) return key === this.rollupQueueKey(chainId, branchId);
+				return key.startsWith(`${chainId}/`);
+			};
+			const publications = [...this.rollupPublicationQueues.entries()]
+				.filter(([key]) => matchesKey(key))
+				.map(([, publication]) => publication);
+			if (publications.length > 0) {
+				await Promise.all(publications);
+				continue;
+			}
+			const failure = [...this.rollupPublicationErrors.entries()].find(([key]) => matchesKey(key));
+			if (!failure) return;
+			this.rollupPublicationErrors.delete(failure[0]);
+			throw failure[1];
+		}
 	}
 
 	private configPath(): string {
@@ -881,6 +891,10 @@ export class SessionChainController {
 		return join(this.rollupDirectory(chainId, branchId), `${String(windowIndex).padStart(6, "0")}.pending.json`);
 	}
 
+	private rollupPublicationPath(chainId: string, branchId: string, windowIndex: number): string {
+		return join(this.rollupDirectory(chainId, branchId), `${String(windowIndex).padStart(6, "0")}.job.json`);
+	}
+
 	private rollupStatePath(chainId: string, branchId: string): string {
 		return join(this.rollupDirectory(chainId, branchId), "state.json");
 	}
@@ -895,6 +909,80 @@ export class SessionChainController {
 		} finally {
 			await rm(temporary, { force: true });
 		}
+	}
+
+	private async writeRollupPublication(publication: SessionChainRollupPublicationV1): Promise<void> {
+		await this.replaceDerivedFile(
+			this.rollupPublicationPath(publication.chainId, publication.branchId, publication.windowIndex),
+			`${JSON.stringify(publication, null, "\t")}\n`,
+		);
+	}
+
+	async getRollupPublication(
+		chainId: string,
+		branchId: string,
+		windowIndex: number,
+	): Promise<SessionChainRollupPublicationV1 | null> {
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(
+				await readFile(this.rollupPublicationPath(chainId, branchId, windowIndex), "utf8"),
+			) as unknown;
+		} catch (error) {
+			if (isRecord(error) && error.code === "ENOENT") return null;
+			throw error;
+		}
+		if (
+			!isRecord(parsed) ||
+			!hasExactKeys(parsed, [
+				"schema",
+				"chainId",
+				"branchId",
+				"windowIndex",
+				"startOrdinal",
+				"endOrdinal",
+				"segmentIds",
+				"summaryArtifactIds",
+				"sourceDigest",
+				"status",
+				"artifactId",
+				"attempt",
+				"errorCode",
+				"retryable",
+				"updatedAt",
+			]) ||
+			parsed.schema !== "pi-xk.session-chain-rollup-publication.v1" ||
+			parsed.chainId !== chainId ||
+			parsed.branchId !== branchId ||
+			parsed.windowIndex !== windowIndex ||
+			typeof parsed.startOrdinal !== "number" ||
+			!Number.isInteger(parsed.startOrdinal) ||
+			parsed.startOrdinal <= 0 ||
+			typeof parsed.endOrdinal !== "number" ||
+			!Number.isInteger(parsed.endOrdinal) ||
+			parsed.endOrdinal < parsed.startOrdinal ||
+			!Array.isArray(parsed.segmentIds) ||
+			!parsed.segmentIds.every(isNonEmptyString) ||
+			!Array.isArray(parsed.summaryArtifactIds) ||
+			!parsed.summaryArtifactIds.every(isHash) ||
+			parsed.segmentIds.length !== parsed.summaryArtifactIds.length ||
+			!isHash(parsed.sourceDigest) ||
+			!(["scheduled", "generating", "artifact_ready", "failed", "published"] as const).includes(
+				parsed.status as SessionChainRollupPublicationState,
+			) ||
+			(parsed.artifactId !== null && !isHash(parsed.artifactId)) ||
+			typeof parsed.attempt !== "number" ||
+			!Number.isInteger(parsed.attempt) ||
+			parsed.attempt < 0 ||
+			(parsed.errorCode !== null && !isNonEmptyString(parsed.errorCode)) ||
+			(parsed.retryable !== null && typeof parsed.retryable !== "boolean") ||
+			!isNonEmptyString(parsed.updatedAt) ||
+			Number.isNaN(Date.parse(parsed.updatedAt))
+		) {
+			throw new SessionChainControllerError("Session Chain Rollup publication state is invalid");
+		}
+		for (const segmentId of parsed.segmentIds) assertSessionSegmentId(segmentId);
+		return parsed as unknown as SessionChainRollupPublicationV1;
 	}
 
 	private async initializeRollupState(
@@ -946,13 +1034,222 @@ export class SessionChainController {
 		};
 	}
 
+	private async ensureScheduledRollupPublication(
+		chainId: string,
+		branchId: string,
+	): Promise<SessionChainRollupPublicationV1 | null> {
+		const config = await this.getRollupConfig();
+		if (!config.enabled) return null;
+		const readModel = await this.store.loadChainReadModel(chainId);
+		const branch = findBranch(readModel, branchId);
+		const sealedThroughOrdinal = branch.segments.reduce(
+			(highest, segment) => (segment.status === "sealed" ? Math.max(highest, segment.ordinal) : highest),
+			0,
+		);
+		const state = await this.loadRollupState(chainId, branchId, sealedThroughOrdinal, config.interval);
+		const previous = branch.rollups.at(-1);
+		if ((previous?.endOrdinal ?? 0) < state.migrationBackfillEndOrdinal) return null;
+		const windowIndex = (previous?.windowIndex ?? 0) + 1;
+		const startOrdinal = (previous?.endOrdinal ?? 0) + 1;
+		const endOrdinal = startOrdinal + config.interval - 1;
+		const segments: Array<SessionSegmentProjectionV1 & { seal: NonNullable<SessionSegmentProjectionV1["seal"]> }> =
+			[];
+		for (let ordinal = startOrdinal; ordinal <= endOrdinal; ordinal++) {
+			const segment = branch.segments.find((candidate) => candidate.ordinal === ordinal);
+			if (!segment || segment.status !== "sealed" || !segment.seal) return null;
+			segments.push({ ...segment, seal: segment.seal });
+		}
+		const segmentIds = segments.map((segment) => segment.segmentId);
+		const summaryArtifactIds = segments.map((segment) => segment.seal.summaryArtifactId);
+		const sourceDigest = rollupSourceDigest({
+			chainId,
+			branchId,
+			windowIndex,
+			startOrdinal,
+			endOrdinal,
+			segmentIds,
+			summaryArtifactIds,
+		});
+		const existing = await this.getRollupPublication(chainId, branchId, windowIndex);
+		if (existing) {
+			if (
+				existing.startOrdinal !== startOrdinal ||
+				existing.endOrdinal !== endOrdinal ||
+				existing.sourceDigest !== sourceDigest ||
+				existing.segmentIds.some((segmentId, index) => segmentId !== segmentIds[index]) ||
+				existing.summaryArtifactIds.some((artifactId, index) => artifactId !== summaryArtifactIds[index])
+			) {
+				throw new SessionChainControllerError("Session Chain Rollup publication sources changed");
+			}
+			return existing;
+		}
+		const publication: SessionChainRollupPublicationV1 = {
+			schema: "pi-xk.session-chain-rollup-publication.v1",
+			chainId,
+			branchId,
+			windowIndex,
+			startOrdinal,
+			endOrdinal,
+			segmentIds,
+			summaryArtifactIds,
+			sourceDigest,
+			status: "scheduled",
+			artifactId: null,
+			attempt: 0,
+			errorCode: null,
+			retryable: null,
+			updatedAt: this.now(),
+		};
+		await this.writeRollupPublication(publication);
+		return publication;
+	}
+
+	private async verifyL1SummaryEvidence(
+		chainId: string,
+		branch: SessionBranchProjectionV1,
+		segment: SessionSegmentProjectionV1,
+	): Promise<SegmentSummaryV1> {
+		if (segment.status !== "sealed" || !segment.seal) {
+			throw new SessionChainControllerError("Session Chain L1 summary requires a sealed Segment");
+		}
+		const sourcePath = this.segmentPath(chainId, branch.branchId, segment);
+		const sourceStat = await stat(sourcePath);
+		if (sourceStat.size !== segment.seal.bytes || (await hashFile(sourcePath)) !== segment.seal.fileHash) {
+			throw new SessionChainControllerError("sealed Segment bytes or hash changed");
+		}
+		const sourceManager = PiSessionManager.open(sourcePath);
+		const sourceBinding = this.getCurrentBinding(sourceManager);
+		if (
+			!sourceBinding ||
+			sourceBinding.chainId !== chainId ||
+			sourceBinding.branchId !== branch.branchId ||
+			sourceBinding.segmentId !== segment.segmentId ||
+			sourceBinding.summaryInArtifactId !== segment.summaryInArtifactId
+		) {
+			throw new SessionChainControllerError("source Segment binding does not match chain topology");
+		}
+		if (sourceManager.getLeafId() !== segment.seal.leafId) {
+			throw new SessionChainControllerError("sealed Segment leaf changed");
+		}
+		await this.assertSummaryInProvenance(sourceManager, sourceBinding);
+		const summary = await this.store.readSegmentSummary(segment.seal.summaryArtifactId);
+		if (
+			summary.chainId !== chainId ||
+			summary.branchId !== branch.branchId ||
+			summary.sourceSegmentId !== segment.segmentId ||
+			summary.sourceLeafId !== summary.sourceRange.lastEntryId ||
+			summary.baseSummaryArtifactId !== segment.summaryInArtifactId
+		) {
+			throw new SessionChainControllerError("L1 summary provenance does not match chain topology");
+		}
+		const sourceBranch = sourceManager.getBranch();
+		const firstIndex =
+			summary.sourceRange.firstEntryId === null
+				? -1
+				: sourceBranch.findIndex((entry) => entry.id === summary.sourceRange.firstEntryId);
+		const lastIndex = sourceBranch.findIndex((entry) => entry.id === summary.sourceRange.lastEntryId);
+		const sourceRange =
+			firstIndex >= 0 && lastIndex >= firstIndex ? sourceBranch.slice(firstIndex, lastIndex + 1) : [];
+		if (
+			firstIndex < 0 ||
+			lastIndex < firstIndex ||
+			sourceRange.length !== summary.sourceRange.entryCount ||
+			hashEntries(sourceRange) !== summary.sourceRange.entriesHash
+		) {
+			throw new SessionChainControllerError("L1 summary source range does not match the source transcript");
+		}
+		const sourceOut = sourceManager.getEntry(segment.seal.summaryOutEntryId);
+		if (
+			!sourceOut ||
+			sourceOut.type !== "custom" ||
+			sourceOut.customType !== PI_XK_SESSION_CHAIN_SUMMARY_OUT_CUSTOM_TYPE ||
+			!isSummaryOutMarker(sourceOut.data)
+		) {
+			throw new SessionChainControllerError("L1 summary-out marker is missing or invalid");
+		}
+		this.validateSummaryMarker(summary, sourceOut.data);
+		if (
+			sourceOut.data.artifactId !== segment.seal.summaryArtifactId ||
+			sourceOut.data.targetSegmentId !== summary.targetSegmentId ||
+			sourceOut.parentId !== summary.sourceLeafId
+		) {
+			throw new SessionChainControllerError("L1 summary-out marker identity does not match its artifact");
+		}
+		const target = branch.segments.find((candidate) => candidate.segmentId === summary.targetSegmentId);
+		if (
+			!target ||
+			target.predecessorSegmentId !== segment.segmentId ||
+			target.summaryInArtifactId !== segment.seal.summaryArtifactId
+		) {
+			throw new SessionChainControllerError("L1 summary target does not match its successor Segment");
+		}
+		const targetManager = PiSessionManager.open(this.segmentPath(chainId, branch.branchId, target));
+		const targetBinding = this.getCurrentBinding(targetManager);
+		if (
+			!targetBinding ||
+			targetBinding.chainId !== chainId ||
+			targetBinding.branchId !== branch.branchId ||
+			targetBinding.segmentId !== target.segmentId ||
+			targetBinding.summaryInArtifactId !== segment.seal.summaryArtifactId
+		) {
+			throw new SessionChainControllerError("successor Segment binding does not match the L1 summary");
+		}
+		const summaryIn = findSummaryInEntry(targetManager, targetBinding);
+		if (summaryIn.content !== summary.carryForwardMarkdown) {
+			throw new SessionChainControllerError("successor summary-in does not match the L1 carry-forward");
+		}
+		return summary;
+	}
+
+	private async verifyL2SummaryEvidence(
+		chainId: string,
+		branch: SessionBranchProjectionV1,
+		projection: SessionBranchProjectionV1["rollups"][number],
+	): Promise<SessionChainRollupV1> {
+		const rollup = await this.store.readChainRollup(projection.artifactId);
+		const segments = branch.segments.filter(
+			(segment) => segment.ordinal >= projection.startOrdinal && segment.ordinal <= projection.endOrdinal,
+		);
+		if (
+			segments.length !== projection.endOrdinal - projection.startOrdinal + 1 ||
+			segments.some((segment) => segment.status !== "sealed" || !segment.seal)
+		) {
+			throw new SessionChainControllerError("L2 Rollup source window is incomplete");
+		}
+		for (const segment of segments) await this.verifyL1SummaryEvidence(chainId, branch, segment);
+		const summaryArtifactIds = segments.map((segment) => segment.seal?.summaryArtifactId ?? "");
+		const expectedDigest = rollupSourceDigest({
+			chainId,
+			branchId: branch.branchId,
+			windowIndex: projection.windowIndex,
+			startOrdinal: projection.startOrdinal,
+			endOrdinal: projection.endOrdinal,
+			segmentIds: segments.map((segment) => segment.segmentId),
+			summaryArtifactIds,
+		});
+		if (
+			rollup.chainId !== chainId ||
+			rollup.branchId !== branch.branchId ||
+			rollup.windowIndex !== projection.windowIndex ||
+			rollup.startOrdinal !== projection.startOrdinal ||
+			rollup.endOrdinal !== projection.endOrdinal ||
+			rollup.segmentIds.some((segmentId, index) => segmentId !== segments[index]?.segmentId) ||
+			rollup.summaryArtifactIds.some((artifactId, index) => artifactId !== summaryArtifactIds[index]) ||
+			rollup.sourceDigest !== projection.sourceDigest ||
+			rollup.sourceDigest !== expectedDigest
+		) {
+			throw new SessionChainControllerError("L2 Rollup provenance does not match its ordered L1 sources");
+		}
+		return rollup;
+	}
+
 	async listSummaries(
 		chainId: string,
 		branchId: string,
 		options: { level?: SessionChainSummaryLevel; cursor?: string; limit?: number } = {},
 	): Promise<SessionChainSummaryListResult> {
-		const replay = await this.store.replayChain(chainId);
-		const branch = findBranch(replay, branchId);
+		const readModel = await this.store.loadChainReadModel(chainId);
+		const branch = findBranch(readModel, branchId);
 		const level = options.level ?? "all";
 		const limit = options.limit ?? 20;
 		if (!Number.isInteger(limit) || limit <= 0 || limit > 50) {
@@ -966,18 +1263,11 @@ export class SessionChainController {
 		if (level === "l1" || level === "all") {
 			for (const segment of branch.segments) {
 				if (segment.status !== "sealed" || !segment.seal) continue;
-				let createdAt = segment.createdAt;
-				let integrity: SessionChainSummaryListItem["integrity"] = "verified";
-				try {
-					createdAt = (await this.store.readSegmentSummary(segment.seal.summaryArtifactId)).generator.generatedAt;
-				} catch {
-					integrity = "invalid";
-				}
 				items.push({
 					level: "l1",
 					artifactId: segment.seal.summaryArtifactId,
-					createdAt,
-					integrity,
+					createdAt: segment.createdAt,
+					integrity: "unchecked",
 					segmentId: segment.segmentId,
 					segmentOrdinal: segment.ordinal,
 				});
@@ -985,24 +1275,31 @@ export class SessionChainController {
 		}
 		if (level === "l2" || level === "all") {
 			for (const projection of branch.rollups) {
-				let integrity: SessionChainSummaryListItem["integrity"] = "verified";
-				try {
-					await this.store.readChainRollup(projection.artifactId);
-				} catch {
-					integrity = "invalid";
-				}
 				items.push({
 					level: "l2",
 					artifactId: projection.artifactId,
 					createdAt: projection.publishedAt,
-					integrity,
+					integrity: "unchecked",
 					windowIndex: projection.windowIndex,
 					startOrdinal: projection.startOrdinal,
 					endOrdinal: projection.endOrdinal,
 				});
 			}
 		}
-		const page = items.slice(offset, offset + limit);
+		const page = await Promise.all(
+			items.slice(offset, offset + limit).map(async (item): Promise<SessionChainSummaryListItem> => {
+				try {
+					if (item.level === "l1") {
+						const summary = await this.store.readSegmentSummary(item.artifactId);
+						return { ...item, createdAt: summary.generator.generatedAt };
+					}
+					await this.store.readChainRollup(item.artifactId);
+					return item;
+				} catch {
+					return { ...item, integrity: "invalid" };
+				}
+			}),
+		);
 		return { items: page, nextCursor: offset + page.length < items.length ? String(offset + page.length) : null };
 	}
 
@@ -1011,8 +1308,8 @@ export class SessionChainController {
 		branchId: string,
 		selector: SessionChainSummarySelector,
 	): Promise<SessionChainSummaryReadResult> {
-		const replay = await this.store.replayChain(chainId);
-		const branch = findBranch(replay, branchId);
+		const readModel = await this.store.loadChainReadModel(chainId);
+		const branch = findBranch(readModel, branchId);
 		const artifactId = "artifactId" in selector ? selector.artifactId : undefined;
 		const l1Ordinal = "level" in selector && selector.level === "l1" ? selector.segmentOrdinal : undefined;
 		const l1 = branch.segments.find(
@@ -1022,14 +1319,20 @@ export class SessionChainController {
 				(artifactId ? segment.seal.summaryArtifactId === artifactId : segment.ordinal === l1Ordinal),
 		);
 		if (l1?.seal) {
-			return {
-				level: "l1",
-				artifactId: l1.seal.summaryArtifactId,
-				integrity: "verified",
-				segmentId: l1.segmentId,
-				segmentOrdinal: l1.ordinal,
-				summary: await this.store.readSegmentSummary(l1.seal.summaryArtifactId),
-			};
+			try {
+				return {
+					level: "l1",
+					artifactId: l1.seal.summaryArtifactId,
+					integrity: "verified",
+					segmentId: l1.segmentId,
+					segmentOrdinal: l1.ordinal,
+					summary: await this.verifyL1SummaryEvidence(chainId, branch, l1),
+				};
+			} catch (error) {
+				throw new SessionChainControllerError(
+					`Session Chain L1 summary integrity verification failed: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
 		}
 		const l2Window =
 			"level" in selector && selector.level === "l2" && "windowIndex" in selector ? selector.windowIndex : undefined;
@@ -1040,7 +1343,26 @@ export class SessionChainController {
 			return rollup.windowIndex === l2Window;
 		});
 		if (!l2) throw new SessionChainControllerError("Session Chain summary is not available in the selected branch");
-		const rollup = await this.store.readChainRollup(l2.artifactId);
+		let rollup: SessionChainRollupV1;
+		try {
+			rollup = await this.verifyL2SummaryEvidence(chainId, branch, l2);
+		} catch (error) {
+			throw new SessionChainControllerError(
+				`Session Chain L2 summary integrity verification failed: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+		const expectedMarkdown = renderRollupMarkdown(l2.artifactId, rollup);
+		let markdown: string | undefined;
+		try {
+			if (
+				(await readFile(this.rollupMarkdownPath(chainId, branch.branchId, l2.windowIndex), "utf8")) ===
+				expectedMarkdown
+			) {
+				markdown = expectedMarkdown;
+			}
+		} catch {
+			// Markdown is a rebuildable projection; the verified structured artifact remains readable.
+		}
 		return {
 			level: "l2",
 			artifactId: l2.artifactId,
@@ -1049,20 +1371,20 @@ export class SessionChainController {
 			startOrdinal: l2.startOrdinal,
 			endOrdinal: l2.endOrdinal,
 			rollup,
-			markdown: renderRollupMarkdown(l2.artifactId, rollup),
+			...(markdown === undefined ? {} : { markdown }),
 		};
 	}
 
 	async getSegmentFile(chainId: string, branchId: string, segmentId: string): Promise<string> {
-		const replay = await this.store.replayChain(chainId);
-		const branch = findBranch(replay, branchId);
+		const readModel = await this.store.loadChainReadModel(chainId);
+		const branch = findBranch(readModel, branchId);
 		const segment = findSegment(branch, segmentId);
 		return this.segmentPath(chainId, branchId, segment);
 	}
 
 	async getBranchHeadFile(chainId: string, branchId: string): Promise<string> {
-		const replay = await this.store.replayChain(chainId);
-		const branch = findBranch(replay, branchId);
+		const readModel = await this.store.loadChainReadModel(chainId);
+		const branch = findBranch(readModel, branchId);
 		return this.segmentPath(chainId, branchId, findSegment(branch, branch.headSegmentId));
 	}
 
@@ -1515,6 +1837,13 @@ export class SessionChainController {
 		};
 	}
 
+	private async storeCanonicalSegmentSummary(
+		summary: SegmentSummaryV1,
+	): Promise<{ artifactId: string; summary: SegmentSummaryV1 }> {
+		const artifactId = await this.store.putSegmentSummary(summary);
+		return { artifactId, summary: await this.store.readSegmentSummary(artifactId) };
+	}
+
 	private async nextRollupWindow(
 		chainId: string,
 		branchId: string,
@@ -1737,8 +2066,10 @@ export class SessionChainController {
 	private async recordRollupFailure(
 		window: Pick<SessionChainRollupWindow, "chainId" | "branchId" | "windowIndex" | "startOrdinal" | "endOrdinal">,
 		stage: string,
+		error: unknown,
 	): Promise<void> {
 		try {
+			const classification = classifyRollupFailure(stage, error);
 			const replay = await this.store.replayChain(window.chainId);
 			const branch = findBranch(replay, window.branchId);
 			const attempt =
@@ -1751,8 +2082,8 @@ export class SessionChainController {
 					startOrdinal: window.startOrdinal,
 					endOrdinal: window.endOrdinal,
 					stage,
-					errorCode: `rollup_${stage}_failed`,
-					retryable: true,
+					errorCode: classification.errorCode,
+					retryable: classification.retryable,
 					attempt,
 				},
 				{
@@ -1768,11 +2099,126 @@ export class SessionChainController {
 		}
 	}
 
+	private async processRollupPublication(
+		host: SessionChainHost,
+		scheduled: SessionChainRollupPublicationV1,
+	): Promise<void> {
+		try {
+			await this.store.withRollupGenerationLock(
+				scheduled.chainId,
+				scheduled.branchId,
+				scheduled.windowIndex,
+				async () => this.processRollupPublicationLocked(host, scheduled),
+			);
+			return;
+		} catch (error) {
+			if (!(error instanceof SessionChainLockedError)) throw error;
+		}
+		const diagnostic = await this.store.inspectRollupGenerationLock(
+			scheduled.chainId,
+			scheduled.branchId,
+			scheduled.windowIndex,
+		);
+		if (!diagnostic || diagnostic.ownerState !== "missing" || !diagnostic.nonce) return;
+		await this.store.repairAbandonedRollupGenerationLock(
+			scheduled.chainId,
+			scheduled.branchId,
+			scheduled.windowIndex,
+			diagnostic.nonce,
+		);
+		await this.store.withRollupGenerationLock(
+			scheduled.chainId,
+			scheduled.branchId,
+			scheduled.windowIndex,
+			async () => this.processRollupPublicationLocked(host, scheduled),
+		);
+	}
+
+	private async processRollupPublicationLocked(
+		host: SessionChainHost,
+		scheduled: SessionChainRollupPublicationV1,
+	): Promise<void> {
+		let job =
+			(await this.getRollupPublication(scheduled.chainId, scheduled.branchId, scheduled.windowIndex)) ?? scheduled;
+		let replay = await this.store.replayChain(job.chainId);
+		let branch = findBranch(replay, job.branchId);
+		const existing = branch.rollups.find(
+			(rollup) => rollup.windowIndex === job.windowIndex && rollup.sourceDigest === job.sourceDigest,
+		);
+		if (existing) {
+			await this.writeRollupPublication({
+				...job,
+				status: "published",
+				artifactId: existing.artifactId,
+				errorCode: null,
+				retryable: null,
+				updatedAt: this.now(),
+			});
+			return;
+		}
+		if (!(await this.getRollupConfig()).enabled) {
+			if (job.status === "generating") {
+				await this.writeRollupPublication({ ...job, status: "scheduled", updatedAt: this.now() });
+			}
+			return;
+		}
+		job = {
+			...job,
+			status: "generating",
+			attempt: job.attempt + 1,
+			errorCode: null,
+			retryable: null,
+			updatedAt: this.now(),
+		};
+		await this.writeRollupPublication(job);
+		await this.publishNextRollup(host, job.chainId, job.branchId, "auto", job, async (artifactId) => {
+			job = {
+				...job,
+				status: "artifact_ready",
+				artifactId,
+				updatedAt: this.now(),
+			};
+			await this.writeRollupPublication(job);
+		});
+		replay = await this.store.replayChain(job.chainId);
+		branch = findBranch(replay, job.branchId);
+		const published = branch.rollups.find(
+			(rollup) => rollup.windowIndex === job.windowIndex && rollup.sourceDigest === job.sourceDigest,
+		);
+		if (published) {
+			await this.writeRollupPublication({
+				...job,
+				status: "published",
+				artifactId: published.artifactId,
+				errorCode: null,
+				retryable: null,
+				updatedAt: this.now(),
+			});
+			return;
+		}
+		const failure = branch.rollupFailures
+			.filter((candidate) => candidate.windowIndex === job.windowIndex)
+			.sort((left, right) => right.attempt - left.attempt)[0];
+		if (!failure) {
+			await this.writeRollupPublication({ ...job, status: "scheduled", updatedAt: this.now() });
+			return;
+		}
+		await this.writeRollupPublication({
+			...job,
+			status: "failed",
+			errorCode: failure.errorCode,
+			retryable: failure.retryable,
+			updatedAt: this.now(),
+		});
+	}
+
 	private async publishNextRollup(
 		host: SessionChainHost,
 		chainId: string,
 		branchId: string,
 		mode: "auto" | "backfill" = "auto",
+		publication?: SessionChainRollupPublicationV1,
+		onArtifactReady?: (artifactId: string) => Promise<void>,
 	): Promise<boolean> {
 		const config = await this.getRollupConfig();
 		if (!config.enabled && mode === "auto") return false;
@@ -1783,11 +2229,15 @@ export class SessionChainController {
 			0,
 		);
 		const state = await this.loadRollupState(chainId, branchId, sealedThroughOrdinal, config.interval);
-		if (mode === "auto" && (initialBranch.rollups.at(-1)?.endOrdinal ?? 0) < state.migrationBackfillEndOrdinal) {
+		if (
+			mode === "auto" &&
+			!publication &&
+			(initialBranch.rollups.at(-1)?.endOrdinal ?? 0) < state.migrationBackfillEndOrdinal
+		) {
 			return false;
 		}
 		const previous = initialBranch.rollups.at(-1);
-		const expectedWindow = {
+		const expectedWindow = publication ?? {
 			chainId,
 			branchId,
 			windowIndex: (previous?.windowIndex ?? 0) + 1,
@@ -1797,15 +2247,41 @@ export class SessionChainController {
 		let stage = "source_validation";
 		try {
 			const pending = await this.readPendingRollup(chainId, branchId, expectedWindow.windowIndex);
-			const configuredWindow = pending ? null : await this.nextRollupWindow(chainId, branchId, config.interval);
+			const publicationArtifact =
+				!pending && publication?.artifactId
+					? {
+							artifactId: publication.artifactId,
+							window: await this.rollupWindowForArtifact(
+								publication.artifactId,
+								chainId,
+								branchId,
+								expectedWindow.windowIndex,
+							),
+						}
+					: null;
+			const configuredWindow = pending
+				? null
+				: publication
+					? await this.rollupWindowForRange(
+							chainId,
+							branchId,
+							publication.windowIndex,
+							publication.startOrdinal,
+							publication.endOrdinal,
+						)
+					: await this.nextRollupWindow(chainId, branchId, config.interval);
 			if (!pending && !configuredWindow && mode === "auto") return false;
-			const orphaned = pending ? null : await this.readOrphanedRollup(chainId, branchId, expectedWindow.windowIndex);
-			const window = pending?.window ?? orphaned?.window ?? configuredWindow;
+			const orphaned =
+				pending || publication
+					? null
+					: await this.readOrphanedRollup(chainId, branchId, expectedWindow.windowIndex);
+			const window = pending?.window ?? publicationArtifact?.window ?? orphaned?.window ?? configuredWindow;
 			if (!window) return false;
 			stage = "artifact_generation";
-			let artifactId = pending?.artifactId ?? orphaned?.artifactId ?? null;
+			let artifactId = pending?.artifactId ?? publicationArtifact?.artifactId ?? orphaned?.artifactId ?? null;
 			if (!artifactId) {
 				artifactId = await this.generateRollupArtifact(host, window);
+				await onArtifactReady?.(artifactId);
 			}
 			if (!pending) {
 				await this.writePendingRollup(window, artifactId);
@@ -1838,8 +2314,8 @@ export class SessionChainController {
 				renderRollupMarkdown(artifactId, rollup),
 			);
 			return true;
-		} catch {
-			await this.recordRollupFailure(expectedWindow, stage);
+		} catch (error) {
+			await this.recordRollupFailure(expectedWindow, stage, error);
 			return false;
 		}
 	}
@@ -1848,6 +2324,7 @@ export class SessionChainController {
 		if (!Number.isInteger(limit) || limit <= 0) {
 			throw new SessionChainControllerError("Session Chain Rollup backfill limit must be a positive integer");
 		}
+		await this.waitForRollupPublications(chainId, branchId);
 		let published = 0;
 		while (published < limit && (await this.publishNextRollup(host, chainId, branchId, "backfill"))) published += 1;
 		return published;
@@ -1946,7 +2423,9 @@ export class SessionChainController {
 			targetSegmentId,
 			sourceLeafId,
 		);
-		const summaryArtifactId = await this.store.putSegmentSummary(generated.summary);
+		const storedSummary = await this.storeCanonicalSegmentSummary(generated.summary);
+		const summaryArtifactId = storedSummary.artifactId;
+		const canonicalSummary = storedSummary.summary;
 		const targetSegment = this.managedSegment(
 			targetSegmentId,
 			segment.ordinal + 1,
@@ -1988,7 +2467,7 @@ export class SessionChainController {
 					target.appendCustomEntry(PI_XK_SESSION_CHAIN_LINK_CUSTOM_TYPE, targetBinding);
 					copySessionProjection(sourceManager, target);
 					await options.initializeTarget?.(target);
-					appendSummaryIn(target, summaryArtifactId, generated.summary.carryForwardMarkdown);
+					appendSummaryIn(target, summaryArtifactId, canonicalSummary.carryForwardMarkdown);
 				},
 				finalizeSource: (frozenSource) => {
 					if (frozenSource.getLeafId() !== generated.sourceLeafId) {
@@ -2000,17 +2479,17 @@ export class SessionChainController {
 						artifactId: summaryArtifactId,
 						targetSegmentId,
 						sourceLeafId: generated.sourceLeafId,
-						segmentDeltaMarkdown: generated.summary.segmentDeltaMarkdown,
-						carryForwardMarkdown: generated.summary.carryForwardMarkdown,
-						segmentDeltaHash: hashText(generated.summary.segmentDeltaMarkdown),
-						carryForwardHash: hashText(generated.summary.carryForwardMarkdown),
+						segmentDeltaMarkdown: canonicalSummary.segmentDeltaMarkdown,
+						carryForwardMarkdown: canonicalSummary.carryForwardMarkdown,
+						segmentDeltaHash: hashText(canonicalSummary.segmentDeltaMarkdown),
+						carryForwardHash: hashText(canonicalSummary.carryForwardMarkdown),
 					};
 					summaryOutEntryId = frozenSource.appendCustomEntry(PI_XK_SESSION_CHAIN_SUMMARY_OUT_CUSTOM_TYPE, marker);
 				},
 				commit: async () => {
 					if (!summaryOutEntryId) throw new SessionChainControllerError("Session Chain source was not finalized");
 					const targetManager = PiSessionManager.open(targetSessionFile);
-					const targetMarkers = this.targetMarkers(targetManager, targetBinding, generated.summary);
+					const targetMarkers = this.targetMarkers(targetManager, targetBinding, canonicalSummary);
 					const sourceSeal = await this.sourceSeal(sourceManager, summaryArtifactId, summaryOutEntryId);
 					await this.store.appendRolloverCommitted(
 						binding.chainId,
@@ -2059,11 +2538,7 @@ export class SessionChainController {
 				);
 			}
 			if (!hostResult.cancelled) {
-				try {
-					await this.publishNextRollup(replacementHost ?? host, binding.chainId, binding.branchId);
-				} catch {
-					// A Rollup is L2 derived state and must never invalidate a committed rollover.
-				}
+				await this.scheduleRollupPublication(replacementHost ?? host, binding.chainId, binding.branchId);
 			}
 			return {
 				cancelled: hostResult.cancelled,
@@ -2167,7 +2642,9 @@ export class SessionChainController {
 			sourceEntryId,
 		);
 		await this.assertSealedSegmentIntegrity(sourceSegment, sourceSessionFile);
-		const summaryArtifactId = await this.store.putSegmentSummary(generated.summary);
+		const storedSummary = await this.storeCanonicalSegmentSummary(generated.summary);
+		const summaryArtifactId = storedSummary.artifactId;
+		const canonicalSummary = storedSummary.summary;
 		const createdAt = this.now();
 		const targetSegment = this.managedSegment(
 			targetSegmentId,
@@ -2184,9 +2661,9 @@ export class SessionChainController {
 		targetManager.appendCustomEntry(PI_XK_SESSION_CHAIN_LINK_CUSTOM_TYPE, targetBinding);
 		copySessionProjection(sourceManager, targetManager, sourceEntryId);
 		await options.initializeTarget?.(targetManager);
-		appendSummaryIn(targetManager, summaryArtifactId, generated.summary.carryForwardMarkdown);
+		appendSummaryIn(targetManager, summaryArtifactId, canonicalSummary.carryForwardMarkdown);
 		flushSessionDurably(targetManager);
-		this.targetMarkers(targetManager, targetBinding, generated.summary);
+		this.targetMarkers(targetManager, targetBinding, canonicalSummary);
 
 		try {
 			await this.store.appendBranchCreated(
@@ -2252,7 +2729,9 @@ export class SessionChainController {
 			targetSegmentId,
 			sourceLeafId,
 		);
-		const summaryArtifactId = await this.store.putSegmentSummary(generated.summary);
+		const storedSummary = await this.storeCanonicalSegmentSummary(generated.summary);
+		const summaryArtifactId = storedSummary.artifactId;
+		const canonicalSummary = storedSummary.summary;
 		const targetSegment = this.managedSegment(targetSegmentId, 1, segment.segmentId, summaryArtifactId, this.now());
 		const targetBinding = bindingFor(binding.chainId, targetBranchId, targetSegment);
 		const targetSessionFile = this.segmentPath(binding.chainId, targetBranchId, targetSegment);
@@ -2267,7 +2746,7 @@ export class SessionChainController {
 				target.appendCustomEntry(PI_XK_SESSION_CHAIN_LINK_CUSTOM_TYPE, targetBinding);
 				copySessionProjection(sourceManager, target);
 				await options.initializeTarget?.(target);
-				appendSummaryIn(target, summaryArtifactId, generated.summary.carryForwardMarkdown);
+				appendSummaryIn(target, summaryArtifactId, canonicalSummary.carryForwardMarkdown);
 			},
 			finalizeSource: (frozenSource) => {
 				if (frozenSource.getLeafId() !== options.sourceEntryId) {
@@ -2276,7 +2755,7 @@ export class SessionChainController {
 			},
 			commit: async () => {
 				const targetManager = PiSessionManager.open(targetSessionFile);
-				this.targetMarkers(targetManager, targetBinding, generated.summary);
+				this.targetMarkers(targetManager, targetBinding, canonicalSummary);
 				await this.store.appendBranchCreated(
 					binding.chainId,
 					{
@@ -2418,8 +2897,8 @@ export class SessionChainController {
 	async getCurrentStatus(manager: ReadonlySessionManager): Promise<SessionChainCurrentStatus | null> {
 		const binding = this.getCurrentBinding(manager);
 		if (!binding) return null;
-		const replay = await this.store.replayChain(binding.chainId);
-		const branch = findBranch(replay, binding.branchId);
+		const readModel = await this.store.loadChainReadModel(binding.chainId);
+		const branch = findBranch(readModel, binding.branchId);
 		const segment = findSegment(branch, binding.segmentId);
 		const sessionFile = manager.getSessionFile();
 		if (!sessionFile) throw new SessionChainControllerError("Session Chain status requires a persisted session");
@@ -2428,7 +2907,8 @@ export class SessionChainController {
 			resolve(sessionFile) === resolve(this.segmentPath(binding.chainId, binding.branchId, segment));
 		return {
 			chainId: binding.chainId,
-			title: replay.title,
+			title: readModel.title,
+			archived: readModel.archived,
 			branchId: binding.branchId,
 			segmentId: binding.segmentId,
 			ordinal: segment.ordinal,
@@ -2657,14 +3137,27 @@ export class SessionChainController {
 		return repaired;
 	}
 
-	async doctor(chainId: string): Promise<SessionChainDoctorReport> {
+	async repairProjections(chainId: string): Promise<string[]> {
+		await this.store.rebuildChainReadModel(chainId);
+		await this.store.rebuildCatalog();
+		return ["rebuilt read model", "rebuilt catalog", ...(await this.repairRollupProjections(chainId))];
+	}
+
+	private async doctorDeep(chainId: string): Promise<SessionChainDoctorReport> {
+		const startedAt = Date.now();
 		const diagnostics: SessionChainDiagnostic[] = [];
+		let filesChecked = 1;
+		let bytesRead = 0;
 		let replay: SessionChainReplay;
 		try {
 			replay = await this.store.replayChain(chainId);
 		} catch (error) {
 			return {
 				chainId,
+				mode: "deep",
+				durationMs: Date.now() - startedAt,
+				filesChecked,
+				bytesRead,
 				diagnostics: [
 					{
 						severity: "error",
@@ -2674,11 +3167,38 @@ export class SessionChainController {
 				],
 			};
 		}
+		try {
+			bytesRead += (await stat(join(this.projectRoot, ".pi-xk", "sessions", "chains", chainId, "events.jsonl")))
+				.size;
+		} catch {
+			// replayChain already reported an actionable event-log error when the facts were unreadable.
+		}
 		if (replay.tailDiagnostic) {
 			diagnostics.push({
 				severity: "error",
 				code: "event_log_partial_tail",
 				message: `Session Chain event log has ${replay.tailDiagnostic.discardedBytes} trailing bytes`,
+			});
+		}
+		try {
+			const lock = await this.store.inspectWriteLock(chainId);
+			if (lock) {
+				const abandoned = !lock.malformed && lock.ownerState === "missing" && lock.nonce;
+				diagnostics.push({
+					severity: abandoned ? "warning" : "error",
+					code: abandoned ? "write_lock_abandoned" : "write_lock_unrecoverable",
+					message: abandoned
+						? `Write lock owner PID ${lock.pid} is missing; run /chain doctor repair-lock ${lock.nonce}`
+						: lock.malformed
+							? "Write lock metadata is malformed and cannot be automatically recovered"
+							: `Write lock owner state is ${lock.ownerState}; explicit recovery is not allowed`,
+				});
+			}
+		} catch (error) {
+			diagnostics.push({
+				severity: "error",
+				code: "write_lock_diagnostic_failed",
+				message: error instanceof Error ? error.message : String(error),
 			});
 		}
 		try {
@@ -2745,6 +3265,8 @@ export class SessionChainController {
 				try {
 					const fileStat = await stat(path);
 					bytes = fileStat.size;
+					filesChecked += 1;
+					bytesRead += bytes;
 					fileHash = await hashFile(path);
 				} catch (error) {
 					diagnostics.push({
@@ -2889,12 +3411,34 @@ export class SessionChainController {
 				if (branch.rollups.some((rollup) => rollup.windowIndex === failure.windowIndex)) continue;
 				diagnostics.push({
 					severity: "warning",
-					code: "rollup_retry_pending",
-					message: `Rollup W${failure.windowIndex} failed at ${failure.stage} and remains retryable`,
+					code: failure.retryable ? "rollup_retry_pending" : "rollup_source_repair_required",
+					message: failure.retryable
+						? `Rollup W${failure.windowIndex} failed at ${failure.stage} and remains retryable`
+						: `Rollup W${failure.windowIndex} failed at ${failure.stage} and requires source or configuration repair`,
 					branchId: branch.branchId,
 				});
 			}
 		}
-		return { chainId, diagnostics };
+		return {
+			chainId,
+			mode: "deep",
+			durationMs: Date.now() - startedAt,
+			filesChecked,
+			bytesRead,
+			diagnostics,
+		};
+	}
+
+	async doctor(chainId: string, mode: "quick" | "deep" = "quick"): Promise<SessionChainDoctorReport> {
+		return mode === "deep"
+			? await this.doctorDeep(chainId)
+			: await runQuickSessionChainDoctor({
+					chainId,
+					store: this.store,
+					getRollupPublication: (requestedChainId, branchId, windowIndex) =>
+						this.getRollupPublication(requestedChainId, branchId, windowIndex),
+					rollupMarkdownPath: (requestedChainId, branchId, windowIndex) =>
+						this.rollupMarkdownPath(requestedChainId, branchId, windowIndex),
+				});
 	}
 }

@@ -1,4 +1,4 @@
-import { appendFile, mkdir, readFile, rm } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -15,6 +15,7 @@ import {
 	SessionChainHeadConflictError,
 	SessionChainIdempotencyConflictError,
 	SessionChainLifecycleTransitionError,
+	SessionChainLockedError,
 	SessionChainRecoveryRequiredError,
 	SessionChainStore,
 } from "../src/session-chain-store.ts";
@@ -292,6 +293,33 @@ describe("SessionChainStore", () => {
 		expect(await store.readChainRollup(artifactId)).toEqual(rollup);
 	});
 
+	it("replays a v3 archive event without changing historical v1 events", async () => {
+		const { store } = await createStore();
+		const spec = createSpec("chain_archive_event");
+		const created = await store.createChain(spec, {
+			eventId: "event-created",
+			idempotencyKey: "create:archive",
+		});
+		await store.appendArchiveUpdated(
+			spec.chainId,
+			{ archived: true },
+			{
+				eventId: "event-archived",
+				idempotencyKey: "archive:true",
+				expectedHead: created.head,
+			},
+		);
+
+		const replay = await store.replayChain(spec.chainId);
+		expect(replay.archived).toBe(true);
+		expect(replay.events.map((event) => [event.schemaVersion, event.eventType])).toEqual([
+			[1, "chain_created"],
+			[3, "chain_archive_updated"],
+		]);
+		expect(await store.loadChainReadModel(spec.chainId)).toMatchObject({ archived: true });
+		expect(await store.listChains()).toEqual([expect.objectContaining({ chainId: spec.chainId, archived: true })]);
+	});
+
 	it("deduplicates retries and rejects stale heads and invalid transitions", async () => {
 		const { store } = await createStore();
 		const spec = createSpec("chain_guards");
@@ -482,5 +510,126 @@ describe("SessionChainStore", () => {
 		const repaired = await store.repairTrailingPartialEvent(spec.chainId);
 		expect(repaired.tailDiagnostic).toBeUndefined();
 		expect(await readFile(eventsPath, "utf8")).toMatch(/\n$/);
+	});
+
+	it("fails closed and explicitly repairs an abandoned Session Chain write lock", async () => {
+		const { store, projectRoot } = await createStore();
+		const spec = createSpec("chain_abandoned_lock");
+		const created = await store.createChain(spec, { eventId: "event-created", idempotencyKey: "create:lock" });
+		const lockPath = join(projectRoot, ".pi-xk", "sessions", "chains", spec.chainId, "locks", "write.lock");
+		await writeFile(
+			lockPath,
+			`${JSON.stringify({ pid: 999_999_999, nonce: "abandoned-chain", createdAt: "2026-07-22T00:01:00.000Z" })}\n`,
+		);
+
+		await expect(
+			store.appendMetadataUpdated(
+				spec.chainId,
+				{ title: "Must remain locked" },
+				{
+					eventId: "event-metadata-locked",
+					idempotencyKey: "metadata:locked",
+					expectedHead: created.head,
+				},
+			),
+		).rejects.toBeInstanceOf(SessionChainLockedError);
+		expect(await store.inspectWriteLock(spec.chainId)).toMatchObject({
+			nonce: "abandoned-chain",
+			ownerState: "missing",
+			malformed: false,
+		});
+		await expect(store.repairAbandonedWriteLock(spec.chainId, "wrong-owner")).rejects.toThrow("conflicted");
+		await expect(store.repairAbandonedWriteLock(spec.chainId, "abandoned-chain")).resolves.toBe(true);
+		await expect(
+			store.appendMetadataUpdated(
+				spec.chainId,
+				{ title: "Recovered" },
+				{
+					eventId: "event-metadata-recovered",
+					idempotencyKey: "metadata:recovered",
+					expectedHead: created.head,
+				},
+			),
+		).resolves.toMatchObject({ head: { sequence: 2 } });
+	});
+
+	it("serializes Rollup generation across Store instances", async () => {
+		const { store, projectRoot } = await createStore();
+		const secondStore = new SessionChainStore(projectRoot);
+		const chainId = "chain_rollup_generation_lock";
+		let releaseFirst: (() => void) | undefined;
+		const firstGate = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		let firstStarted = false;
+		let secondStarted = false;
+		const first = store.withRollupGenerationLock(chainId, "branch_main", 1, async () => {
+			firstStarted = true;
+			await firstGate;
+			return "first";
+		});
+		while (!firstStarted) await new Promise<void>((resolve) => setTimeout(resolve, 5));
+		const second = secondStore.withRollupGenerationLock(chainId, "branch_main", 1, async () => {
+			secondStarted = true;
+			return "second";
+		});
+		await new Promise<void>((resolve) => setTimeout(resolve, 30));
+		expect(secondStarted).toBe(false);
+
+		releaseFirst?.();
+		await expect(Promise.all([first, second])).resolves.toEqual(["first", "second"]);
+	});
+
+	it("fails closed and CAS-repairs abandoned Rollup generation locks", async () => {
+		const { store, projectRoot } = await createStore();
+		const secondStore = new SessionChainStore(projectRoot);
+		const chainId = "chain_rollup_generation_repair";
+		const lockDirectory = join(
+			projectRoot,
+			".pi-xk",
+			"sessions",
+			"chains",
+			chainId,
+			"branches",
+			"branch_main",
+			"rollups",
+		);
+		const lockPath = join(lockDirectory, "000001.generation.lock");
+		await mkdir(lockDirectory, { recursive: true });
+		await writeFile(
+			lockPath,
+			`${JSON.stringify({ pid: 999_999_999, nonce: "abandoned-rollup", createdAt: "2026-07-22T00:01:00.000Z" })}\n`,
+		);
+
+		expect(await store.inspectRollupGenerationLock(chainId, "branch_main", 1)).toMatchObject({
+			nonce: "abandoned-rollup",
+			ownerState: "missing",
+			malformed: false,
+		});
+		await expect(store.repairAbandonedRollupGenerationLock(chainId, "branch_main", 1, "wrong-owner")).rejects.toThrow(
+			"conflicted",
+		);
+		const recoveries = await Promise.allSettled([
+			store.repairAbandonedRollupGenerationLock(chainId, "branch_main", 1, "abandoned-rollup"),
+			secondStore.repairAbandonedRollupGenerationLock(chainId, "branch_main", 1, "abandoned-rollup"),
+		]);
+		expect(recoveries.filter((result) => result.status === "fulfilled" && result.value)).toHaveLength(1);
+		expect(await store.inspectRollupGenerationLock(chainId, "branch_main", 1)).toBeUndefined();
+
+		await writeFile(
+			lockPath,
+			`${JSON.stringify({ pid: process.pid, nonce: "live-rollup", createdAt: "2026-07-22T00:02:00.000Z" })}\n`,
+		);
+		await expect(store.repairAbandonedRollupGenerationLock(chainId, "branch_main", 1, "live-rollup")).rejects.toThrow(
+			"owner is alive",
+		);
+		await writeFile(lockPath, "not-json\n");
+		expect(await store.inspectRollupGenerationLock(chainId, "branch_main", 1)).toMatchObject({
+			ownerState: "unknown",
+			malformed: true,
+		});
+		await expect(store.repairAbandonedRollupGenerationLock(chainId, "branch_main", 1, "live-rollup")).rejects.toThrow(
+			"malformed",
+		);
 	});
 });

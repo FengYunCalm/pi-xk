@@ -1,4 +1,4 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -8,7 +8,7 @@ import {
 	type SessionSegmentDescriptorV1,
 } from "../src/session-chain-contract.ts";
 import { SessionChainReadModelStaleError } from "../src/session-chain-read-model.ts";
-import { SessionChainStore } from "../src/session-chain-store.ts";
+import { SessionChainCorruptionError, SessionChainStore } from "../src/session-chain-store.ts";
 
 const tempDirs: string[] = [];
 
@@ -116,5 +116,80 @@ describe("Session Chain read models", () => {
 		stored.title = "Tampered";
 		await writeFile(readModelPath, `${JSON.stringify(stored)}\n`);
 		await expect(store.loadChainReadModel(chain.chainId)).rejects.toBeInstanceOf(SessionChainReadModelStaleError);
+	});
+
+	it("reads only the event tail and then verifies the checkpoint head on the fast path", async () => {
+		const { store, projectRoot } = await storeForTest();
+		const chain = spec("chain_incremental_projection");
+		const created = await store.createChain(chain, {
+			eventId: "event-created",
+			idempotencyKey: "create:incremental",
+		});
+		const chainDirectory = join(projectRoot, ".pi-xk", "sessions", "chains", chain.chainId);
+		const readModelPath = join(chainDirectory, "chain-read-model.json");
+		const checkpointPath = join(chainDirectory, "chain-read-model.checkpoint.json");
+		const eventsPath = join(chainDirectory, "events.jsonl");
+		const originalReadModel = await readFile(readModelPath, "utf8");
+		const originalCheckpoint = await readFile(checkpointPath, "utf8");
+
+		await store.appendMetadataUpdated(
+			chain.chainId,
+			{ title: "Tail title" },
+			{
+				eventId: "event-tail",
+				idempotencyKey: "metadata:tail",
+				expectedHead: created.head,
+			},
+		);
+		await writeFile(readModelPath, originalReadModel);
+		await writeFile(checkpointPath, originalCheckpoint);
+
+		const recovered = await store.loadChainReadModelSnapshot(chain.chainId);
+		expect(recovered.readModel).toMatchObject({ sequence: 2, title: "Tail title" });
+		expect(recovered.diagnostic.mode).toBe("tail");
+		expect(recovered.diagnostic.bytesRead).toBeGreaterThan(0);
+		expect(recovered.diagnostic.bytesRead).toBeLessThanOrEqual((await stat(eventsPath)).size);
+
+		const fast = await store.loadChainReadModelSnapshot(chain.chainId);
+		expect(fast.readModel).toMatchObject({ sequence: 2, title: "Tail title" });
+		expect(fast.diagnostic.mode).toBe("fast");
+		expect(fast.diagnostic.bytesRead).toBeGreaterThan(0);
+		expect(fast.diagnostic.bytesRead).toBeLessThan((await stat(eventsPath)).size);
+	});
+
+	it("rejects an in-place mutation of the checkpoint head event", async () => {
+		const { store, projectRoot } = await storeForTest();
+		const chain = spec("chain_checkpoint_head_tamper");
+		await store.createChain(chain, {
+			eventId: "event-created",
+			idempotencyKey: "create:head-tamper",
+		});
+		const eventsPath = join(projectRoot, ".pi-xk", "sessions", "chains", chain.chainId, "events.jsonl");
+		const original = await readFile(eventsPath, "utf8");
+		const tampered = original.replace("event-created", "event-altered");
+		expect(Buffer.byteLength(tampered)).toBe(Buffer.byteLength(original));
+		await writeFile(eventsPath, tampered);
+
+		await expect(store.loadChainReadModelSnapshot(chain.chainId)).rejects.toBeInstanceOf(SessionChainCorruptionError);
+	});
+
+	it("upgrades an old read model without a checkpoint through verified full replay", async () => {
+		const { store, projectRoot } = await storeForTest();
+		const chain = spec("chain_checkpoint_upgrade");
+		await store.createChain(chain, { eventId: "event-created", idempotencyKey: "create:upgrade" });
+		const checkpointPath = join(
+			projectRoot,
+			".pi-xk",
+			"sessions",
+			"chains",
+			chain.chainId,
+			"chain-read-model.checkpoint.json",
+		);
+		await rm(checkpointPath);
+
+		const upgraded = await store.loadChainReadModelSnapshot(chain.chainId);
+		expect(upgraded.diagnostic.mode).toBe("full");
+		expect(upgraded.diagnostic.bytesRead).toBeGreaterThan(0);
+		await expect(stat(checkpointPath)).resolves.toMatchObject({ isFile: expect.any(Function) });
 	});
 });
