@@ -19,11 +19,12 @@ Pi-XK 是 Pi 的维护型 fork 与扩展层。它在保留 Pi provider、Agent l
 | 完整 TaskSupervisor | 未实现 | 不承诺并发、DAG、预算、deadline、RPC child、worktree 合并或 descendant 回收 |
 | Proposal/反省闭环 | 未实现 | 不自动修改 Skill、规则、依赖、权限或代码 |
 
-`pi-xk-extension` 当前是仓库内的私有本地 package，不是稳定公开发行包。主要支持场景是个人本机、交互式 TUI、full-access profile。RPC、无人值守、共享多写者和不可信项目不是当前产品化承诺。
+`pi-xk-extension` 仍是私有 package，不发布到 npm。开发者可从可信 checkout 本地安装；固定版本通过独立 `pi-xk-v*` GitHub 二进制归档交付，归档内携带 Extension 与 Core。主要支持场景是个人本机、交互式 TUI、full-access profile。RPC、无人值守、共享多写者和不可信项目不是当前产品化承诺。
 
 ## 从哪里开始
 
 - 第一次安装和试用：[上手指南](getting-started.md)
+- 下载、校验和维护独立二进制：[GitHub-only 发行](github-release.md)
 - 理解 Session、Goal、Task、Chain 的关系：[设计与边界](design-and-boundaries.md)
 - 查看文件布局、恢复和故障处理：[运维与恢复](operations-and-recovery.md)
 - 评估安装后对现有 Pi 的影响：[兼容性与使用影响](compatibility-and-impact.md)
@@ -82,4 +83,4 @@ flowchart LR
 
 ## 版本基线
 
-当前文档对应 2026-07-25 的 Pi-XK 稳定化实现。修正后的 `npm run test:pi-xk` 已覆盖 Core `62/62`、Pi/Host 集成 `150/150`，包括 Task 输入队列和摘要语义质量套件；旧的 `42/97`、`55/119` 都不再是完整验收证据。发布前还必须运行 `npm run check`、`./test.sh`、两组 Session Chain benchmark、摘要质量评估和 `git diff --check`。
+当前文档对应 2026-07-26 的 Pi-XK 稳定化与 GitHub-only 发行实现。修正后的 `npm run test:pi-xk` 覆盖 Core `63/63`、Pi/Host 与发行集成 `157/157`；旧的 `42/97`、`55/119` 都不再是完整验收证据。发布前还必须运行 `npm run check`、`./test.sh`、两组 Session Chain benchmark、摘要质量评估、单平台归档 smoke 和 `git diff --check`。

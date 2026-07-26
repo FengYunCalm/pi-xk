@@ -38,10 +38,11 @@ To learn more about Pi:
 
 This fork also contains Pi-XK, an extension-first workflow layer for durable Goals, bounded child Tasks, project artifacts, and long-running Session Chains composed of native Pi JSONL segments. It preserves Pi's provider, agent loop, session tree, message schema, and compaction model.
 
-Pi-XK is currently a private, repository-local package intended for trusted personal full-access use. It does not yet provide a capability policy, sandbox, concurrent task scheduler, general context controller, or long-term memory.
+Pi-XK keeps its Core and Extension packages private and does not publish them to npm. It supports repository-local installation for development and independently versioned GitHub-only binary archives that bundle the private runtime payload. It is intended for trusted personal full-access use and does not provide a capability policy, sandbox, concurrent task scheduler, general context controller, or long-term memory.
 
 - [Pi-XK documentation](docs/pi-xk/README.md)
 - [Getting started](docs/pi-xk/getting-started.md)
+- [GitHub-only releases](docs/pi-xk/github-release.md)
 - [Design and boundaries](docs/pi-xk/design-and-boundaries.md)
 - [Operations and recovery](docs/pi-xk/operations-and-recovery.md)
 - [Compatibility and user impact](docs/pi-xk/compatibility-and-impact.md)

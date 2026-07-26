@@ -106,10 +106,11 @@ function normalizeTag(tagOrVersion) {
 	if (!tagOrVersion) {
 		return undefined;
 	}
-	return tagOrVersion.startsWith("v") ? tagOrVersion : `v${tagOrVersion}`;
+	return tagOrVersion.startsWith("v") || tagOrVersion.startsWith("pi-xk-v") ? tagOrVersion : `v${tagOrVersion}`;
 }
 
 function versionFromTag(tag) {
+	if (tag.startsWith("pi-xk-v")) return tag.slice("pi-xk-v".length);
 	return tag.startsWith("v") ? tag.slice(1) : tag;
 }
 

@@ -17,6 +17,7 @@
 - Added the private Pi-XK Core and Extension packages with event-backed Goal V2 and Task V1 state, review and lifecycle commands, explicit abandoned-lock repair, and conservative restart behavior.
 - Added Session Chain v1.1 with manual and threshold rollover, resumable prepared commits, successor branches, verified L1 summaries, asynchronous L2 Rollups, model summary tools, incremental read models, and fast/deep doctor paths.
 - Added managed local Pi-XK install, upgrade, uninstall, and dry-run commands plus `/xk status` for a combined Chain, Goal, Task, Rollup, and recovery view.
+- Added independent GitHub-only Pi-XK binary releases with a bundled private extension/Core payload, dual Pi-XK/Pi version provenance, six platform archives, and SHA-256 checksums.
 
 ### Fixed
 

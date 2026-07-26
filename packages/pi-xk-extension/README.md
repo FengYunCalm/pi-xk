@@ -6,13 +6,20 @@ This package README is the command and installation reference. Start with the re
 
 - [Pi-XK overview](../../docs/pi-xk/README.md)
 - [Getting started](../../docs/pi-xk/getting-started.md)
+- [GitHub-only releases](../../docs/pi-xk/github-release.md)
 - [Design and boundaries](../../docs/pi-xk/design-and-boundaries.md)
 - [Operations and recovery](../../docs/pi-xk/operations-and-recovery.md)
 - [Compatibility and user impact](../../docs/pi-xk/compatibility-and-impact.md)
 - [Session Chain Rollups and model retrieval](../../docs/pi-xk/session-chain-rollups-and-model-retrieval.md)
 - [Host patch boundary](../../docs/pi-xk/host-patch-boundary.md)
 
-The package is currently private and installed from a built local checkout. Its supported baseline is a trusted, personal, interactive full-access profile. It does not provide a sandbox, per-tool permission policy, concurrent Tasks, worktree isolation, general long-term memory, or an unattended execution guarantee.
+The package remains private and is never published to npm. Development installs reference a built local checkout; fixed GitHub-only releases bundle its built output and `pi-xk-core` beside a dedicated `pi-xk` executable. Its supported baseline is a trusted, personal, interactive full-access profile. It does not provide a sandbox, per-tool permission policy, concurrent Tasks, worktree isolation, general long-term memory, or an unattended execution guarantee.
+
+## GitHub Binary Release
+
+The `pi-xk-v*` release line is independent from the upstream Pi package version. Each archive contains `pi-xk`, a base `pi` executable without automatic Pi-XK loading, `PI-XK-RELEASE.json`, this private extension, bundled Core, and the Pi-XK documentation. `pi-xk --version` reports both versions. The dedicated entrypoint validates the adjacent manifest and payload before loading the extension; moving the executable out of the extracted directory is unsupported.
+
+No GitHub-only release job publishes `pi-xk-extension`, `pi-xk-core`, or any `@earendil-works/*` package to npm. See the release guide for archive verification and upgrade behavior.
 
 ## Local Installation
 

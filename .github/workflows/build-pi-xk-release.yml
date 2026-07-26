@@ -1,0 +1,248 @@
+name: Build Pi-XK Release
+
+on:
+  push:
+    tags:
+      - 'pi-xk-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing Pi-XK tag to build (for example, pi-xk-v0.1.0)'
+        required: true
+        type: string
+      source_ref:
+        description: 'Source ref to build (defaults to tag; release recovery only)'
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: build-pi-xk-release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      SOURCE_REF: ${{ github.event.inputs.source_ref || github.event.inputs.tag || github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SOURCE_REF }}
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep zip
+          sudo ln -s "$(which fdfind)" /usr/local/bin/fd
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Verify release source
+        run: |
+          set -euo pipefail
+          version="$(node -p "JSON.parse(require('fs').readFileSync('pi-xk-release.json', 'utf8')).version")"
+          expected_tag="pi-xk-v${version}"
+          if [[ "${RELEASE_TAG}" != "${expected_tag}" ]]; then
+            echo "::error::Release tag ${RELEASE_TAG} does not match ${expected_tag}."
+            exit 1
+          fi
+          if ! rg -Fq "## [${version}]" docs/pi-xk/CHANGELOG.md; then
+            echo "::error::Pi-XK changelog does not contain a ${version} release section."
+            exit 1
+          fi
+          git rev-parse HEAD > /tmp/pi-xk-source-sha
+
+      - name: Check
+        run: |
+          npm run check
+          git diff --exit-code
+
+      - name: Test
+        run: ./test.sh
+
+      - name: Test Pi-XK
+        run: npm run test:pi-xk
+
+      - name: Build Pi-XK archives
+        run: |
+          ./scripts/build-pi-xk-binaries.sh \
+            --skip-install \
+            --out "${GITHUB_WORKSPACE}/release-assets" \
+            --tag "${RELEASE_TAG}" \
+            --source-sha "$(cat /tmp/pi-xk-source-sha)"
+
+      - name: Prepare release notes
+        env:
+          GH_REPO: ${{ github.repository }}
+        run: |
+          version="${RELEASE_TAG#pi-xk-v}"
+          node scripts/release-notes.mjs extract \
+            --version "${version}" \
+            --tag "${RELEASE_TAG}" \
+            --changelog docs/pi-xk/CHANGELOG.md \
+            --base-path docs/pi-xk \
+            --repo "${GH_REPO}" \
+            --out release-assets/RELEASE_NOTES.md
+
+      - name: Validate release payload
+        run: |
+          set -euo pipefail
+          cd release-assets
+          expected_assets=(
+            pi-xk-darwin-arm64.tar.gz
+            pi-xk-darwin-x64.tar.gz
+            pi-xk-linux-arm64.tar.gz
+            pi-xk-linux-x64.tar.gz
+            pi-xk-windows-arm64.zip
+            pi-xk-windows-x64.zip
+            PI-XK-RELEASE.json
+            SHA256SUMS
+            RELEASE_NOTES.md
+          )
+          for asset in "${expected_assets[@]}"; do test -f "${asset}"; done
+          sha256sum -c SHA256SUMS
+
+      - name: Upload release payload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pi-xk-release-${{ env.RELEASE_TAG }}
+          path: |
+            release-assets/pi-xk-*.tar.gz
+            release-assets/pi-xk-*.zip
+            release-assets/PI-XK-RELEASE.json
+            release-assets/SHA256SUMS
+            release-assets/RELEASE_NOTES.md
+          if-no-files-found: error
+          retention-days: 14
+
+  stage-github-release:
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - name: Download release payload
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5a8093 # v4.3.0
+        with:
+          name: pi-xk-release-${{ env.RELEASE_TAG }}
+          path: release-assets
+
+      - name: Validate downloaded release payload
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum -c SHA256SUMS
+          expected_assets=(
+            PI-XK-RELEASE.json
+            SHA256SUMS
+            pi-xk-darwin-arm64.tar.gz
+            pi-xk-darwin-x64.tar.gz
+            pi-xk-linux-arm64.tar.gz
+            pi-xk-linux-x64.tar.gz
+            pi-xk-windows-arm64.zip
+            pi-xk-windows-x64.zip
+          )
+          for asset in "${expected_assets[@]}"; do test -f "${asset}"; done
+
+      - name: Create draft GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          existing_release="$(gh release view "${RELEASE_TAG}" --json isDraft --jq .isDraft 2>/dev/null || true)"
+          if [[ "${existing_release}" == "false" ]]; then
+            echo "::error::GitHub Release ${RELEASE_TAG} is already published."
+            exit 1
+          fi
+          if [[ "${existing_release}" == "true" ]]; then
+            gh release delete "${RELEASE_TAG}" --yes
+          fi
+          gh release create "${RELEASE_TAG}" \
+            --verify-tag \
+            --draft \
+            --title "Pi-XK ${RELEASE_TAG#pi-xk-v}" \
+            --notes-file release-assets/RELEASE_NOTES.md \
+            release-assets/pi-xk-*.tar.gz \
+            release-assets/pi-xk-*.zip \
+            release-assets/PI-XK-RELEASE.json \
+            release-assets/SHA256SUMS
+          expected_asset_names="$(printf '%s\n' \
+            PI-XK-RELEASE.json \
+            SHA256SUMS \
+            pi-xk-darwin-arm64.tar.gz \
+            pi-xk-darwin-x64.tar.gz \
+            pi-xk-linux-arm64.tar.gz \
+            pi-xk-linux-x64.tar.gz \
+            pi-xk-windows-arm64.zip \
+            pi-xk-windows-x64.zip | sort)"
+          actual_asset_names="$(gh release view "${RELEASE_TAG}" --json assets --jq '.assets[].name' | sort)"
+          if [[ "${actual_asset_names}" != "${expected_asset_names}" ]]; then
+            echo "::error::Draft GitHub Release asset set is incomplete."
+            exit 1
+          fi
+
+  publish-github-release:
+    runs-on: ubuntu-latest
+    needs: stage-github-release
+    permissions:
+      contents: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - name: Publish staged GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          is_draft="$(gh release view "${RELEASE_TAG}" --json isDraft --jq .isDraft 2>/dev/null || true)"
+          if [[ "${is_draft}" != "true" ]]; then
+            echo "::error::Draft GitHub Release ${RELEASE_TAG} does not exist."
+            exit 1
+          fi
+          gh release edit "${RELEASE_TAG}" --draft=false
+
+  cleanup-draft-github-release:
+    runs-on: ubuntu-latest
+    needs:
+      - build
+      - stage-github-release
+      - publish-github-release
+    if: ${{ always() && needs.stage-github-release.result != 'skipped' && (needs.stage-github-release.result != 'success' || needs.publish-github-release.result != 'success') }}
+    permissions:
+      contents: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - name: Delete draft GitHub Release after failure
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          existing_release="$(gh release view "${RELEASE_TAG}" --json isDraft --jq .isDraft 2>/dev/null || true)"
+          if [[ "${existing_release}" == "true" ]]; then
+            gh release delete "${RELEASE_TAG}" --yes
+          fi
