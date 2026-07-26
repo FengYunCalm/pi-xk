@@ -149,10 +149,6 @@ export const VERCEL_AI_GATEWAY_MODELS = values as {
 		id: "anthropic/claude-opus-4.7";
 		provider: "vercel-ai-gateway";
 	};
-	"anthropic/claude-opus-4.7-fast": Model<"anthropic-messages"> & {
-		id: "anthropic/claude-opus-4.7-fast";
-		provider: "vercel-ai-gateway";
-	};
 	"anthropic/claude-opus-4.8": Model<"anthropic-messages"> & {
 		id: "anthropic/claude-opus-4.8";
 		provider: "vercel-ai-gateway";
@@ -259,10 +255,6 @@ export const VERCEL_AI_GATEWAY_MODELS = values as {
 	};
 	"google/gemini-3.1-flash-lite": Model<"anthropic-messages"> & {
 		id: "google/gemini-3.1-flash-lite";
-		provider: "vercel-ai-gateway";
-	};
-	"google/gemini-3.1-flash-lite-preview": Model<"anthropic-messages"> & {
-		id: "google/gemini-3.1-flash-lite-preview";
 		provider: "vercel-ai-gateway";
 	};
 	"google/gemini-3.1-pro-preview": Model<"anthropic-messages"> & {
@@ -513,10 +505,6 @@ export const VERCEL_AI_GATEWAY_MODELS = values as {
 		id: "openai/gpt-5";
 		provider: "vercel-ai-gateway";
 	};
-	"openai/gpt-5-chat": Model<"anthropic-messages"> & {
-		id: "openai/gpt-5-chat";
-		provider: "vercel-ai-gateway";
-	};
 	"openai/gpt-5-codex": Model<"anthropic-messages"> & {
 		id: "openai/gpt-5-codex";
 		provider: "vercel-ai-gateway";
@@ -555,10 +543,6 @@ export const VERCEL_AI_GATEWAY_MODELS = values as {
 	};
 	"openai/gpt-5.2": Model<"anthropic-messages"> & {
 		id: "openai/gpt-5.2";
-		provider: "vercel-ai-gateway";
-	};
-	"openai/gpt-5.2-chat": Model<"anthropic-messages"> & {
-		id: "openai/gpt-5.2-chat";
 		provider: "vercel-ai-gateway";
 	};
 	"openai/gpt-5.2-codex": Model<"anthropic-messages"> & {
