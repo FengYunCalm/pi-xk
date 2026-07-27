@@ -89,6 +89,42 @@ describe("regression #6363: agent settled event and idle waiting", () => {
 		expect(settledIdleStates).toEqual([true]);
 	});
 
+	it("waitForIdle waits for awaited agent_settled handlers", async () => {
+		let releaseSettled = () => {};
+		const settledReleased = new Promise<void>((resolve) => {
+			releaseSettled = resolve;
+		});
+		let markSettledStarted = () => {};
+		const settledStarted = new Promise<void>((resolve) => {
+			markSettledStarted = resolve;
+		});
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("agent_settled", async () => {
+						markSettledStarted();
+						await settledReleased;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("done")]);
+
+		const promptPromise = harness.session.prompt("start");
+		await settledStarted;
+		let idleResolved = false;
+		const idlePromise = harness.session.waitForIdle().then(() => {
+			idleResolved = true;
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(idleResolved).toBe(false);
+
+		releaseSettled();
+		await Promise.all([promptPromise, idlePromise]);
+		expect(idleResolved).toBe(true);
+	});
+
 	it("extension command waitForIdle waits for session-level settlement", async () => {
 		let releaseTool = () => {};
 		const released = new Promise<void>((resolve) => {

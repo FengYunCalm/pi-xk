@@ -1274,10 +1274,27 @@ export class SessionChainStore {
 		return { event: existing, head: headFor(existing) };
 	}
 
-	private assertHead(expected: SessionChainHead, actual: SessionChainHead): void {
-		if (expected.sequence !== actual.sequence || expected.hash !== actual.hash) {
-			throw new SessionChainHeadConflictError(expected, actual);
+	private assertAppendHead(
+		expected: SessionChainHead,
+		replay: SessionChainReplay,
+		eventType: Exclude<SessionChainEventType, "chain_created">,
+	): void {
+		if (expected.sequence === replay.head.sequence && expected.hash === replay.head.hash) return;
+		if (
+			(eventType === "rollover_prepared" ||
+				eventType === "rollover_committed" ||
+				eventType === "rollover_aborted" ||
+				eventType === "branch_created") &&
+			replay.events[expected.sequence - 1]?.hash === expected.hash &&
+			replay.events
+				.slice(expected.sequence)
+				.every((event) => event.eventType === "rollup_published" || event.eventType === "rollup_failed")
+		) {
+			// Rollup publication is derived branch metadata and may finish while a topology source is summarized.
+			// The lifecycle projection below still validates the rollover or successor branch atomically.
+			return;
 		}
+		throw new SessionChainHeadConflictError(expected, replay.head);
 	}
 
 	private async writeProjections(paths: SessionChainPaths, replay: SessionChainReplay): Promise<void> {
@@ -1548,7 +1565,7 @@ export class SessionChainStore {
 				await this.writeProjections(paths, replay);
 				return retry;
 			}
-			this.assertHead(options.expectedHead, replay.head);
+			this.assertAppendHead(options.expectedHead, replay, eventType);
 			const nextEvents = [...replay.events, event];
 			const projected = project(nextEvents);
 			await this.appendEvent(paths, event);
