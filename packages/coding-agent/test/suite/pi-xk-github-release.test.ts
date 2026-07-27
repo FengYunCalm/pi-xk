@@ -152,6 +152,9 @@ describe("Pi-XK GitHub release packaging", () => {
 	});
 
 	it("rejects a mismatched local release tag before replacing existing output", async () => {
+		const releaseConfig = JSON.parse(await readFile(join(workspaceRoot, "pi-xk-release.json"), "utf8")) as {
+			version: string;
+		};
 		const root = await mkdtemp(join(tmpdir(), "pi-xk-release-build-"));
 		temporaryDirectories.push(root);
 		const outputRoot = join(root, "output");
@@ -178,7 +181,9 @@ describe("Pi-XK GitHub release packaging", () => {
 		);
 
 		expect(result.status).toBe(1);
-		expect(`${result.stdout}${result.stderr}`).toContain("does not match Pi-XK release version 0.1.0");
+		expect(`${result.stdout}${result.stderr}`).toContain(
+			`does not match Pi-XK release version ${releaseConfig.version}`,
+		);
 		expect(await readFile(sentinelPath, "utf8")).toBe("keep\n");
 	});
 
