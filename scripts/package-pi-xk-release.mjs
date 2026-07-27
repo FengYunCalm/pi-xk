@@ -4,7 +4,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { createReadStream, existsSync } from "node:fs";
 import { cp, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const supportedPlatforms = [
 	"darwin-arm64",
@@ -15,6 +16,7 @@ const supportedPlatforms = [
 	"windows-x64",
 ];
 const semverPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+const createZipArchiveScriptPath = join(dirname(fileURLToPath(import.meta.url)), "create-zip-archive.sh");
 
 function usage() {
 	console.log(`Usage: node scripts/package-pi-xk-release.mjs [options]
@@ -106,7 +108,7 @@ async function createArchives(input, platforms) {
 		if (platform.startsWith("windows-")) {
 			const archivePath = join(input, `pi-xk-${platform}.zip`);
 			await rm(archivePath, { force: true });
-			run("zip", ["-qr", archivePath, "."], platformRoot);
+			run(createZipArchiveScriptPath, [platformRoot, archivePath], input);
 			archives.push(archivePath);
 			continue;
 		}

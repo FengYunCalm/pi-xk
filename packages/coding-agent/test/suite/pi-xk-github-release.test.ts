@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -53,31 +53,35 @@ async function createReleaseFixture(): Promise<ReleaseFixture> {
 	return { binaryRoot, docsRoot, extensionRoot, releaseConfigPath };
 }
 
-function runPackager(fixture: ReleaseFixture, tag: string) {
-	return spawnSync(
-		process.execPath,
-		[
-			packagerPath,
-			"--input",
-			fixture.binaryRoot,
-			"--platform",
-			"linux-x64",
-			"--release-config",
-			fixture.releaseConfigPath,
-			"--extension-root",
-			fixture.extensionRoot,
-			"--docs-root",
-			fixture.docsRoot,
-			"--tag",
-			tag,
-			"--source-sha",
-			sourceCommit,
-			"--pi-version",
-			"0.80.10",
-			"--stage-only",
-		],
-		{ encoding: "utf8" },
-	);
+type PackagerOptions = {
+	env?: NodeJS.ProcessEnv;
+	platform?: string;
+	stageOnly?: boolean;
+};
+
+function runPackager(fixture: ReleaseFixture, tag: string, options: PackagerOptions = {}) {
+	const platform = options.platform ?? "linux-x64";
+	const arguments_ = [
+		packagerPath,
+		"--input",
+		fixture.binaryRoot,
+		"--platform",
+		platform,
+		"--release-config",
+		fixture.releaseConfigPath,
+		"--extension-root",
+		fixture.extensionRoot,
+		"--docs-root",
+		fixture.docsRoot,
+		"--tag",
+		tag,
+		"--source-sha",
+		sourceCommit,
+		"--pi-version",
+		"0.80.10",
+	];
+	if (options.stageOnly ?? true) arguments_.push("--stage-only");
+	return spawnSync(process.execPath, arguments_, { encoding: "utf8", env: options.env });
 }
 
 afterEach(async () => {
@@ -246,6 +250,52 @@ describe("Pi-XK GitHub release packaging", () => {
 		expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
 		expect(existsSync(destinationDirectory)).toBe(true);
 		expect((await readFile(capturePath, "utf8")).trim().split("\n")).toEqual([archivePath, destinationDirectory]);
+	});
+
+	it("packages Windows Pi-XK releases through the WSL PowerShell zip fallback", async () => {
+		const fixture = await createReleaseFixture();
+		const platformRoot = join(fixture.binaryRoot, "windows-x64");
+		await mkdir(platformRoot);
+		await Promise.all([
+			writeFile(join(platformRoot, "pi.exe"), "base pi binary\n"),
+			writeFile(join(platformRoot, "pi-xk.exe"), "pi-xk binary\n"),
+		]);
+
+		const fakeBin = join(dirname(fixture.binaryRoot), "bin");
+		const capturePath = join(dirname(fixture.binaryRoot), "powershell-args.txt");
+		await mkdir(fakeBin);
+		const bashLookup = spawnSync("bash", ["-lc", "command -v bash"], { encoding: "utf8" });
+		expect(bashLookup.status, `${bashLookup.stdout}${bashLookup.stderr}`).toBe(0);
+		await symlink(bashLookup.stdout.trim(), join(fakeBin, "bash"));
+		const fakeWslPath = join(fakeBin, "wslpath");
+		await writeFile(fakeWslPath, '#!/bin/bash\n[[ "$1" == "-w" ]] || exit 2\nprintf "%s\\n" "$2"\n');
+		const fakePowerShell = join(fakeBin, "powershell.exe");
+		await writeFile(
+			fakePowerShell,
+			[
+				"#!/bin/bash",
+				'capture="$' + '{PI_XK_TEST_CAPTURE:?}"',
+				'destination_path=""',
+				"while (($#)); do",
+				'\tif [[ "$1" == "-DestinationPath" ]]; then destination_path="$2"; shift 2; else shift; fi',
+				"done",
+				'printf "%s\\n" "$destination_path" > "$capture"',
+				': > "$destination_path"',
+				"",
+			].join("\n"),
+		);
+		await Promise.all([chmod(fakeWslPath, 0o755), chmod(fakePowerShell, 0o755)]);
+
+		const result = runPackager(fixture, "pi-xk-v0.1.0", {
+			env: { ...process.env, PATH: fakeBin, PI_XK_TEST_CAPTURE: capturePath },
+			platform: "windows-x64",
+			stageOnly: false,
+		});
+
+		expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+		const archivePath = join(fixture.binaryRoot, "pi-xk-windows-x64.zip");
+		expect(existsSync(archivePath)).toBe(true);
+		expect((await readFile(capturePath, "utf8")).trim()).toBe(archivePath);
 	});
 
 	it("rejects a mismatched local release tag before replacing existing output", async () => {
