@@ -116,18 +116,18 @@ compaction 继续按 context token 触发；rollover 独立按物理字节数、
 
 ### 加载性能基线
 
-2026-07-24 在 WSL2 Linux 6.6、Node v24.14.1 上生成含 4 KiB custom entry 的合法 Pi JSONL，并在独立 Node 进程中对 `SessionManager.open()` 运行三次。命令为 `npm run benchmark:session-chain -- --sizes 1,8,32,128 --runs 3 --json`。Git 基线为 `126db23`，测量时工作区包含尚未提交的 Session Chain v1.1 实现；发布提交后应更新为最终 commit。表中记录三次中位打开耗时、吞吐量和进程 peak RSS。测量不调用模型或使用真实会话。
+2026-07-27 在 WSL2 Linux 6.6.87.2、Node v24.14.1 上生成含 4 KiB custom entry 的合法 Pi JSONL，并在独立 Node 进程中对 `SessionManager.open()` 运行三次。命令为 `npm run benchmark:session-chain -- --sizes 1,8,32,128 --runs 3 --json`。被测实现对应 Git commit `ed9c3e3`。表中记录三次中位打开耗时、吞吐量和进程 peak RSS。测量不调用模型或使用真实会话。
 
 | 目标文件 | 实际文件 | events | open 中位数 | 中位吞吐量 | 中位 peak RSS |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 1 MiB | 1.043 MiB | 256 | 95 ms | 11.0 MiB/s | 152.4 MiB |
-| 8 MiB | 8.341 MiB | 2,048 | 422 ms | 19.8 MiB/s | 185.7 MiB |
-| 32 MiB | 32.324 MiB | 7,936 | 1,603 ms | 20.2 MiB/s | 294.7 MiB |
-| 128 MiB | 128.275 MiB | 31,488 | 6,492 ms | 19.8 MiB/s | 518.0 MiB |
+| 1 MiB | 1.043 MiB | 256 | 26.84 ms | 38.84 MiB/s | 154.42 MiB |
+| 8 MiB | 8.341 MiB | 2,048 | 121.83 ms | 68.46 MiB/s | 186.62 MiB |
+| 32 MiB | 32.324 MiB | 7,936 | 483.92 ms | 66.80 MiB/s | 296.25 MiB |
+| 128 MiB | 128.275 MiB | 31,488 | 1,890.11 ms | 67.87 MiB/s | 518.78 MiB |
 
-因此 soft threshold 放在 16 MiB/4,000 entries，使正常 settled 边界在 32 MiB 量级前主动轮转；hard threshold 放在 64 MiB/16,000 entries，避免继续增长到已出现多秒打开和约 518 MiB 进程 peak RSS 的 128 MiB 量级。peak RSS 包含 Node 进程与已加载 runtime 的基线，不等于纯 Session 增量。该基线用于 v1 默认值，不代表所有磁盘、CPU 或真实消息分布；Host 或数据形态变化后应重新测量。
+因此 soft threshold 放在 16 MiB/4,000 entries，使正常 settled 边界在 32 MiB 量级前主动轮转；hard threshold 放在 64 MiB/16,000 entries，避免继续增长到接近 1.9 秒打开和约 519 MiB 进程 peak RSS 的 128 MiB 量级。peak RSS 包含 Node 进程与已加载 runtime 的基线，不等于纯 Session 增量。该基线用于 v1 默认值，不代表所有磁盘、CPU 或真实消息分布；Host 或数据形态变化后应重新测量。
 
-稳定化版本另增加 `npm run benchmark:session-chain-events -- --counts 100,1000 --runs 3 --json`。它构造确定性 v1 event log、先完整 rebuild read model，再重复加载 snapshot；验收要求每次为 `fast` mode，实际读取 checkpoint head event，且读取量小于完整 event log 的 10%。该基准证明常规 status/manifest 能以常量级证据验证 checkpoint，而不是盲信零字节投影；它不取消 `/chain doctor deep` 的线性事实验证职责。
+稳定化版本另增加 `npm run benchmark:session-chain-events -- --counts 100,1000 --runs 3 --json`。它构造确定性 v1 event log、先完整 rebuild read model，再重复加载 snapshot；验收要求每次为 `fast` mode，实际读取 checkpoint head event，且读取量小于完整 event log 的 10%。本轮 100-event 日志为 45,750 bytes，中位加载 15.00 ms、最多读取 458 bytes；1,000-event 日志为 458,956 bytes，中位加载 13.44 ms、最多读取 463 bytes，两种规模三次均为 `fast`。该基准证明常规 status/manifest 能以常量级证据验证 checkpoint，而不是盲信零字节投影；它不取消 `/chain doctor deep` 的线性事实验证职责。
 
 ## 后果
 
