@@ -4,7 +4,7 @@
 
 ### Changed
 
-- Refreshed generated provider catalogs to add Claude Opus 5 for GitHub Copilot and remove four model aliases no longer returned by Vercel AI Gateway.
+- Refreshed generated Cloudflare AI Gateway, Fireworks, and NVIDIA catalogs to add Claude Opus 5 and remove four model entries no longer returned by their upstream providers.
 
 ### Fixed
 
