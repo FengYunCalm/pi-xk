@@ -21,6 +21,7 @@
 
 ### Fixed
 
+- Fixed local Windows binary packaging under WSL to use PowerShell archive fallbacks when `zip` or `unzip` is unavailable.
 - Fixed `waitForIdle()` to include awaited `agent_settled` extension handlers, preventing session mutation from racing post-run persistence.
 - Fixed mutable Session Chain commands to wait for full settlement and recheck the Task gate before changing Chain state.
 - Fixed Session Chain rollover and successor-branch writes to tolerate only intervening Rollup publication or diagnostic events instead of failing with a false topology head conflict.

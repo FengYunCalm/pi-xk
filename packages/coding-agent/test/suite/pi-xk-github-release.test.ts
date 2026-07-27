@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +9,8 @@ import { afterEach, describe, expect, it } from "vitest";
 const suiteDirectory = dirname(fileURLToPath(import.meta.url));
 const workspaceRoot = resolve(suiteDirectory, "../../../..");
 const buildScriptPath = join(workspaceRoot, "scripts", "build-pi-xk-binaries.sh");
+const zipArchiveScriptPath = join(workspaceRoot, "scripts", "create-zip-archive.sh");
+const extractZipArchiveScriptPath = join(workspaceRoot, "scripts", "extract-zip-archive.sh");
 const packagerPath = join(workspaceRoot, "scripts", "package-pi-xk-release.mjs");
 const releaseNotesPath = join(workspaceRoot, "scripts", "release-notes.mjs");
 const releaseWorkflowPath = join(workspaceRoot, ".github", "workflows", "build-pi-xk-release.yml");
@@ -149,6 +151,101 @@ describe("Pi-XK GitHub release packaging", () => {
 			expect(workflow).toContain("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1");
 			expect(workflow).toContain("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1");
 		}
+	});
+
+	it("falls back to PowerShell when zip is unavailable in WSL", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-xk-zip-fallback-"));
+		temporaryDirectories.push(root);
+		const sourceDirectory = join(root, "source");
+		const archivePath = join(root, "release.zip");
+		const capturePath = join(root, "powershell-args.txt");
+		const fakeBin = join(root, "bin");
+		await mkdir(sourceDirectory);
+		await mkdir(fakeBin);
+		await writeFile(join(sourceDirectory, "payload.txt"), "payload\n");
+		const fakeWslPath = join(fakeBin, "wslpath");
+		await writeFile(fakeWslPath, '#!/bin/bash\n[[ "$1" == "-w" ]] || exit 2\nprintf "%s\\n" "$2"\n');
+		const fakePowerShell = join(fakeBin, "powershell.exe");
+		await writeFile(
+			fakePowerShell,
+			[
+				"#!/bin/bash",
+				'capture="$' + '{PI_XK_TEST_CAPTURE:?}"',
+				'source_directory=""',
+				'destination_path=""',
+				"while (($#)); do",
+				'\tcase "$1" in',
+				'\t\t-SourceDirectory) source_directory="$2"; shift 2 ;;',
+				'\t\t-DestinationPath) destination_path="$2"; shift 2 ;;',
+				"\t\t*) shift ;;",
+				"\tesac",
+				"done",
+				'printf "%s\\n%s\\n" "$source_directory" "$destination_path" > "$capture"',
+				': > "$destination_path"',
+				"",
+			].join("\n"),
+		);
+		await Promise.all([chmod(fakeWslPath, 0o755), chmod(fakePowerShell, 0o755)]);
+		const bashLookup = spawnSync("bash", ["-lc", "command -v bash"], { encoding: "utf8" });
+		expect(bashLookup.status, `${bashLookup.stdout}${bashLookup.stderr}`).toBe(0);
+
+		const result = spawnSync(bashLookup.stdout.trim(), [zipArchiveScriptPath, sourceDirectory, archivePath], {
+			encoding: "utf8",
+			env: { ...process.env, PATH: fakeBin, PI_XK_TEST_CAPTURE: capturePath },
+		});
+
+		expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+		expect(existsSync(archivePath)).toBe(true);
+		expect((await readFile(capturePath, "utf8")).trim().split("\n")).toEqual([sourceDirectory, archivePath]);
+	});
+
+	it("falls back to PowerShell when unzip is unavailable in WSL", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-xk-unzip-fallback-"));
+		temporaryDirectories.push(root);
+		const archivePath = join(root, "release.zip");
+		const destinationDirectory = join(root, "extracted");
+		const capturePath = join(root, "powershell-args.txt");
+		const fakeBin = join(root, "bin");
+		await mkdir(fakeBin);
+		await writeFile(archivePath, "archive fixture\n");
+		const fakeWslPath = join(fakeBin, "wslpath");
+		await writeFile(fakeWslPath, '#!/bin/bash\n[[ "$1" == "-w" ]] || exit 2\nprintf "%s\\n" "$2"\n');
+		const fakePowerShell = join(fakeBin, "powershell.exe");
+		await writeFile(
+			fakePowerShell,
+			[
+				"#!/bin/bash",
+				'capture="$' + '{PI_XK_TEST_CAPTURE:?}"',
+				'source_archive=""',
+				'destination_directory=""',
+				"while (($#)); do",
+				'\tcase "$1" in',
+				'\t\t-SourceArchive) source_archive="$2"; shift 2 ;;',
+				'\t\t-DestinationDirectory) destination_directory="$2"; shift 2 ;;',
+				"\t\t*) shift ;;",
+				"\tesac",
+				"done",
+				'printf "%s\\n%s\\n" "$source_archive" "$destination_directory" > "$capture"',
+				'command -p mkdir -p "$destination_directory"',
+				"",
+			].join("\n"),
+		);
+		await Promise.all([chmod(fakeWslPath, 0o755), chmod(fakePowerShell, 0o755)]);
+		const bashLookup = spawnSync("bash", ["-lc", "command -v bash"], { encoding: "utf8" });
+		expect(bashLookup.status, `${bashLookup.stdout}${bashLookup.stderr}`).toBe(0);
+
+		const result = spawnSync(
+			bashLookup.stdout.trim(),
+			[extractZipArchiveScriptPath, archivePath, destinationDirectory],
+			{
+				encoding: "utf8",
+				env: { ...process.env, PATH: fakeBin, PI_XK_TEST_CAPTURE: capturePath },
+			},
+		);
+
+		expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+		expect(existsSync(destinationDirectory)).toBe(true);
+		expect((await readFile(capturePath, "utf8")).trim().split("\n")).toEqual([archivePath, destinationDirectory]);
 	});
 
 	it("rejects a mismatched local release tag before replacing existing output", async () => {
