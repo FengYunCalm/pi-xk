@@ -46,6 +46,7 @@ import {
 	validateGoalReadModel,
 } from "./goal-read-model.ts";
 import { stableJsonStringify } from "./stable-json.ts";
+import { syncDirectory } from "./sync-directory.ts";
 import {
 	type FileWriteLockOptions,
 	inspectFileWriteLock,
@@ -868,15 +869,6 @@ export class GoalStore {
 		return await withFileWriteLock(this.lockOptions(paths, goalId), action);
 	}
 
-	private async syncDirectory(directory: string): Promise<void> {
-		const handle = await open(directory, "r");
-		try {
-			await handle.sync();
-		} finally {
-			await handle.close();
-		}
-	}
-
 	private async appendEvent(paths: GoalPaths, event: GoalEvent): Promise<void> {
 		const handle = await open(paths.eventsPath, "a", 0o600);
 		try {
@@ -905,7 +897,7 @@ export class GoalStore {
 				await handle.close();
 			}
 			await rename(temporaryPath, paths.projectionPath);
-			await this.syncDirectory(paths.goalDirectory);
+			await syncDirectory(paths.goalDirectory);
 		} finally {
 			await rm(temporaryPath, { force: true });
 		}
@@ -923,7 +915,7 @@ export class GoalStore {
 				await handle.close();
 			}
 			await rename(temporaryPath, paths.readModelProjectionPath);
-			await this.syncDirectory(paths.goalDirectory);
+			await syncDirectory(paths.goalDirectory);
 		} finally {
 			await rm(temporaryPath, { force: true });
 		}
@@ -952,7 +944,7 @@ export class GoalStore {
 				await handle.close();
 			}
 			await rename(temporaryPath, paths.eventsPath);
-			await this.syncDirectory(paths.goalDirectory);
+			await syncDirectory(paths.goalDirectory);
 		} finally {
 			await rm(temporaryPath, { force: true });
 		}

@@ -56,6 +56,7 @@ import {
 	validateSessionChainReadModel,
 } from "./session-chain-read-model.ts";
 import { stableJsonStringify } from "./stable-json.ts";
+import { syncDirectory } from "./sync-directory.ts";
 import {
 	type FileWriteLockOptions,
 	inspectFileWriteLock,
@@ -1038,15 +1039,6 @@ export class SessionChainStore {
 		return await withFileWriteLock(this.fileLockOptions(lockPath, lockDirectory, label), action);
 	}
 
-	private async syncDirectory(directory: string): Promise<void> {
-		const handle = await open(directory, "r");
-		try {
-			await handle.sync();
-		} finally {
-			await handle.close();
-		}
-	}
-
 	private async replaceFile(path: string, directory: string, content: string): Promise<void> {
 		await mkdir(directory, { recursive: true });
 		const temporary = join(directory, `.${basename(path)}-${randomUUID()}.tmp`);
@@ -1059,7 +1051,7 @@ export class SessionChainStore {
 				await handle.close();
 			}
 			await rename(temporary, path);
-			await this.syncDirectory(directory);
+			await syncDirectory(directory);
 		} finally {
 			await rm(temporary, { force: true });
 		}
