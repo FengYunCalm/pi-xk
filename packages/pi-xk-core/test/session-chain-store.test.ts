@@ -293,6 +293,268 @@ describe("SessionChainStore", () => {
 		expect(await store.readChainRollup(artifactId)).toEqual(rollup);
 	});
 
+	it("commits a prepared rollover after an independent Rollup publication", async () => {
+		const { store } = await createStore();
+		const spec = createSpec("chain_rollup_during_rollover");
+		const created = await store.createChain(spec, {
+			eventId: "event-created",
+			idempotencyKey: "create:chain_rollup_during_rollover",
+		});
+		const firstSummary = createSummary(spec.chainId);
+		const firstSummaryArtifactId = await store.putSegmentSummary(firstSummary);
+		const firstTarget: SessionSegmentDescriptorV1 = {
+			segmentId: "session-next",
+			ordinal: 2,
+			location: { kind: "managed", fileName: "000002_session-next.jsonl" },
+			predecessorSegmentId: "session-root",
+			summaryInArtifactId: firstSummaryArtifactId,
+			createdAt: "2026-07-22T00:02:00.000Z",
+		};
+		const firstPrepared = await store.appendRolloverPrepared(
+			spec.chainId,
+			{
+				branchId: "branch_main",
+				sourceSegmentId: "session-root",
+				sourceLeafId: "leaf-root",
+				targetSegment: firstTarget,
+				summaryArtifactId: firstSummaryArtifactId,
+				reason: "first rollover",
+			},
+			{
+				eventId: "event-first-prepared",
+				idempotencyKey: "rollover:first:prepare",
+				expectedHead: created.head,
+			},
+		);
+		const firstCommitted = await store.appendRolloverCommitted(
+			spec.chainId,
+			{
+				branchId: "branch_main",
+				sourceSegmentId: "session-root",
+				targetSegmentId: "session-next",
+				sourceSeal: {
+					bytes: 4096,
+					fileHash: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+					leafId: "summary-out-entry",
+					summaryArtifactId: firstSummaryArtifactId,
+					summaryOutEntryId: "summary-out-entry",
+				},
+				targetMarkers: { chainLinkEntryId: "chain-link-entry", summaryInEntryId: "summary-in-entry" },
+			},
+			{
+				eventId: "event-first-committed",
+				idempotencyKey: "rollover:first:commit",
+				expectedHead: firstPrepared.head,
+			},
+		);
+
+		const secondSummaryArtifactId = await store.putSegmentSummary({
+			...firstSummary,
+			sourceSegmentId: "session-next",
+			sourceLeafId: "leaf-next",
+			targetSegmentId: "session-third",
+			baseSummaryArtifactId: firstSummaryArtifactId,
+			sourceRange: {
+				firstEntryId: "entry-next-first",
+				lastEntryId: "leaf-next",
+				entryCount: 3,
+				entriesHash: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+			},
+		});
+		const secondPrepared = await store.appendRolloverPrepared(
+			spec.chainId,
+			{
+				branchId: "branch_main",
+				sourceSegmentId: "session-next",
+				sourceLeafId: "leaf-next",
+				targetSegment: {
+					segmentId: "session-third",
+					ordinal: 3,
+					location: { kind: "managed", fileName: "000003_session-third.jsonl" },
+					predecessorSegmentId: "session-next",
+					summaryInArtifactId: secondSummaryArtifactId,
+					createdAt: "2026-07-22T00:05:00.000Z",
+				},
+				summaryArtifactId: secondSummaryArtifactId,
+				reason: "second rollover",
+			},
+			{
+				eventId: "event-second-prepared",
+				idempotencyKey: "rollover:second:prepare",
+				expectedHead: firstCommitted.head,
+			},
+		);
+
+		const rollup = createRollup(spec.chainId, firstSummaryArtifactId);
+		const rollupArtifactId = await store.putChainRollup(rollup);
+		await store.appendRollupPublished(
+			spec.chainId,
+			{
+				branchId: "branch_main",
+				windowIndex: 1,
+				startOrdinal: 1,
+				endOrdinal: 1,
+				artifactId: rollupArtifactId,
+				sourceDigest: rollup.sourceDigest,
+			},
+			{
+				eventId: "event-rollup-published",
+				idempotencyKey: "rollup:published:during-rollover",
+				expectedHead: secondPrepared.head,
+			},
+		);
+
+		await store.appendRolloverCommitted(
+			spec.chainId,
+			{
+				branchId: "branch_main",
+				sourceSegmentId: "session-next",
+				targetSegmentId: "session-third",
+				sourceSeal: {
+					bytes: 2048,
+					fileHash: "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+					leafId: "summary-out-next",
+					summaryArtifactId: secondSummaryArtifactId,
+					summaryOutEntryId: "summary-out-next",
+				},
+				targetMarkers: {
+					chainLinkEntryId: "chain-link-third",
+					summaryInEntryId: "summary-in-third",
+				},
+			},
+			{
+				eventId: "event-second-committed",
+				idempotencyKey: "rollover:second:commit",
+				expectedHead: secondPrepared.head,
+			},
+		);
+
+		const replay = await store.replayChain(spec.chainId);
+		expect(replay.events.map((event) => event.eventType)).toEqual([
+			"chain_created",
+			"rollover_prepared",
+			"rollover_committed",
+			"rollover_prepared",
+			"rollup_published",
+			"rollover_committed",
+		]);
+		expect(replay.branches[0]).toMatchObject({
+			headSegmentId: "session-third",
+			rollups: [expect.objectContaining({ artifactId: rollupArtifactId })],
+		});
+	});
+
+	it("creates a successor branch after an independent Rollup publication", async () => {
+		const { store } = await createStore();
+		const spec = createSpec("chain_rollup_during_branch");
+		const created = await store.createChain(spec, {
+			eventId: "event-created",
+			idempotencyKey: "create:chain_rollup_during_branch",
+		});
+		const summaryArtifactId = await store.putSegmentSummary(createSummary(spec.chainId));
+		const prepared = await store.appendRolloverPrepared(
+			spec.chainId,
+			{
+				branchId: "branch_main",
+				sourceSegmentId: "session-root",
+				sourceLeafId: "leaf-root",
+				targetSegment: {
+					segmentId: "session-next",
+					ordinal: 2,
+					location: { kind: "managed", fileName: "000002_session-next.jsonl" },
+					predecessorSegmentId: "session-root",
+					summaryInArtifactId: summaryArtifactId,
+					createdAt: "2026-07-22T00:02:00.000Z",
+				},
+				summaryArtifactId,
+				reason: "seal Rollup source",
+			},
+			{
+				eventId: "event-prepared",
+				idempotencyKey: "rollover:prepare",
+				expectedHead: created.head,
+			},
+		);
+		const committed = await store.appendRolloverCommitted(
+			spec.chainId,
+			{
+				branchId: "branch_main",
+				sourceSegmentId: "session-root",
+				targetSegmentId: "session-next",
+				sourceSeal: {
+					bytes: 4096,
+					fileHash: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+					leafId: "summary-out-entry",
+					summaryArtifactId,
+					summaryOutEntryId: "summary-out-entry",
+				},
+				targetMarkers: { chainLinkEntryId: "chain-link-entry", summaryInEntryId: "summary-in-entry" },
+			},
+			{
+				eventId: "event-committed",
+				idempotencyKey: "rollover:commit",
+				expectedHead: prepared.head,
+			},
+		);
+		const rollup = createRollup(spec.chainId, summaryArtifactId);
+		const rollupArtifactId = await store.putChainRollup(rollup);
+		await store.appendRollupPublished(
+			spec.chainId,
+			{
+				branchId: "branch_main",
+				windowIndex: 1,
+				startOrdinal: 1,
+				endOrdinal: 1,
+				artifactId: rollupArtifactId,
+				sourceDigest: rollup.sourceDigest,
+			},
+			{
+				eventId: "event-rollup-published",
+				idempotencyKey: "rollup:published:during-branch",
+				expectedHead: committed.head,
+			},
+		);
+
+		await store.appendBranchCreated(
+			spec.chainId,
+			{
+				branchId: "branch_successor",
+				fromBranchId: "branch_main",
+				sourceSegmentId: "session-root",
+				sourceEntryId: "summary-out-entry",
+				segment: {
+					segmentId: "session-successor",
+					ordinal: 1,
+					location: { kind: "managed", fileName: "000001_session-successor.jsonl" },
+					predecessorSegmentId: "session-root",
+					summaryInArtifactId: summaryArtifactId,
+					createdAt: "2026-07-22T00:05:00.000Z",
+				},
+			},
+			{
+				eventId: "event-successor-created",
+				idempotencyKey: "branch:successor:create",
+				expectedHead: committed.head,
+			},
+		);
+
+		const replay = await store.replayChain(spec.chainId);
+		expect(replay.events.map((event) => event.eventType)).toEqual([
+			"chain_created",
+			"rollover_prepared",
+			"rollover_committed",
+			"rollup_published",
+			"branch_created",
+		]);
+		expect(replay.branches).toContainEqual(
+			expect.objectContaining({
+				branchId: "branch_successor",
+				headSegmentId: "session-successor",
+				forkedFrom: expect.objectContaining({ branchId: "branch_main", segmentId: "session-root" }),
+			}),
+		);
+	});
+
 	it("replays a v3 archive event without changing historical v1 events", async () => {
 		const { store } = await createStore();
 		const spec = createSpec("chain_archive_event");

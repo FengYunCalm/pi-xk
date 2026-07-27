@@ -243,18 +243,24 @@ afterEach(async () => {
 });
 
 describe("Pi-XK Session Chain extension", () => {
-	it("bootstraps an empty Pi session into a managed chain before ordinary input", async () => {
+	it("defers managed Chain bootstrap until the first ordinary input", async () => {
 		const harness = await createChainRuntime(createPiXkSessionChainExtension());
 		harnesses.push(harness);
-		const managedSessionFile = harness.runtime.session.sessionFile;
-		expect(managedSessionFile).toContain(join(".pi-xk", "sessions", "chains"));
+		const initialSessionFile = harness.runtime.session.sessionFile;
+		expect(initialSessionFile).not.toContain(join(".pi-xk", "sessions", "chains"));
+		expect(
+			new SessionChainController({ projectRoot: harness.projectRoot }).getCurrentBinding(
+				harness.runtime.session.sessionManager,
+			),
+		).toBeNull();
 		harness.setResponses([fauxAssistantMessage("first managed response")]);
 
 		await harness.runtime.session.prompt("first managed request");
 
 		const currentSession = harness.runtime.session.sessionManager;
 		const currentSessionFile = currentSession.getSessionFile();
-		expect(currentSessionFile).toBe(managedSessionFile);
+		expect(currentSessionFile).toContain(join(".pi-xk", "sessions", "chains"));
+		expect(currentSessionFile).not.toBe(initialSessionFile);
 		expect(harness.providerCalls()).toBe(1);
 		expect(
 			harness.runtime.session.messages
@@ -268,6 +274,26 @@ describe("Pi-XK Session Chain extension", () => {
 			binding?.segmentId,
 		);
 		expect((await controller.getStore().replayChain(binding!.chainId)).title).toBe("first managed request");
+	});
+
+	it("leaves ephemeral no-session prompts outside Session Chain management", async () => {
+		const harness = await createChainRuntime(createPiXkSessionChainExtension(), {
+			sessionManager: SessionManager.inMemory(),
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("ephemeral response")]);
+
+		await harness.runtime.session.prompt("ephemeral request");
+
+		expect(harness.runtime.session.sessionFile).toBeUndefined();
+		expect(harness.providerCalls()).toBe(1);
+		expect(harness.runtime.session.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+		expect(
+			new SessionChainController({ projectRoot: harness.projectRoot }).getCurrentBinding(
+				harness.runtime.session.sessionManager,
+			),
+		).toBeNull();
+		expect(existsSync(join(harness.projectRoot, ".pi-xk", "sessions", "chains"))).toBe(false);
 	});
 
 	it("adopts an existing persisted Pi transcript as an external root without copying it", async () => {
@@ -612,6 +638,15 @@ describe("Pi-XK Session Chain extension", () => {
 		const notifications: string[] = [];
 		const harness = await createChainRuntime(createPiXkRuntimeExtension(), {
 			uiContext: chainTestUi({ notifications }),
+			initializeSession: (sessionManager) => {
+				sessionManager.appendMessage({
+					role: "user",
+					content: [{ type: "text", text: "runtime status fixture" }],
+					timestamp: Date.now(),
+				});
+				sessionManager.appendMessage(fauxAssistantMessage("runtime status response"));
+				sessionManager.flushDurable();
+			},
 		});
 		harnesses.push(harness);
 		const sessionId = harness.runtime.session.sessionManager.getSessionId();
@@ -739,6 +774,72 @@ describe("Pi-XK Session Chain extension", () => {
 		expect(notifications.at(-1)).toBe(`Session Chain advanced to S2 (${binding?.segmentId})`);
 	});
 
+	it("waits for post-run settlement before a manual rollover snapshots the source", async () => {
+		let releaseSettled = () => {};
+		const settledReleased = new Promise<void>((resolve) => {
+			releaseSettled = resolve;
+		});
+		let markSettledStarted = () => {};
+		const settledStarted = new Promise<void>((resolve) => {
+			markSettledStarted = resolve;
+		});
+		let releaseSummary = () => {};
+		const summaryReleased = new Promise<void>((resolve) => {
+			releaseSummary = resolve;
+		});
+		let markSummaryStarted = () => {};
+		const summaryStarted = new Promise<void>((resolve) => {
+			markSummaryStarted = resolve;
+		});
+		let delayNextSettlement = true;
+		const notifications: string[] = [];
+		const harness = await createChainRuntime(
+			(pi) => {
+				pi.on("agent_settled", async () => {
+					if (!delayNextSettlement) return;
+					delayNextSettlement = false;
+					markSettledStarted();
+					await settledReleased;
+					pi.appendEntry("pi-xk.test.late-checkpoint", { settled: true });
+				});
+				createPiXkSessionChainExtension()(pi);
+			},
+			{ uiContext: chainTestUi({ notifications }) },
+		);
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("checkpoint response"),
+			async () => {
+				markSummaryStarted();
+				await summaryReleased;
+				return fauxAssistantMessage(
+					"<segment-delta>Checkpoint settled.</segment-delta><carry-forward>Preserve the settled checkpoint.</carry-forward>",
+				);
+			},
+		]);
+
+		const promptPromise = harness.runtime.session.prompt("checkpoint request");
+		await settledStarted;
+		const rolloverPromise = harness.runtime.session.prompt("/chain rollover after checkpoint");
+		const startedTooEarly = await Promise.race([
+			summaryStarted.then(() => true),
+			new Promise<false>((resolve) => setTimeout(() => resolve(false), 200)),
+		]);
+
+		releaseSettled();
+		await promptPromise;
+		await summaryStarted;
+		releaseSummary();
+		await rolloverPromise;
+
+		const controller = new SessionChainController({ projectRoot: harness.projectRoot });
+		const binding = controller.getCurrentBinding(harness.runtime.session.sessionManager);
+		expect(startedTooEarly).toBe(false);
+		expect(binding?.ordinal).toBe(2);
+		expect(notifications.at(-1)).toBe(`Session Chain advanced to S2 (${binding?.segmentId})`);
+		expect(harness.providerCalls()).toBe(2);
+	});
+
 	it("shows chain history, progressive summary, and doctor diagnostics", async () => {
 		const notifications: string[] = [];
 		const harness = await createChainRuntime(createPiXkSessionChainExtension(), {
@@ -784,6 +885,15 @@ describe("Pi-XK Session Chain extension", () => {
 		const notifications: string[] = [];
 		const harness = await createChainRuntime(createPiXkSessionChainExtension(), {
 			uiContext: chainTestUi({ notifications }),
+			initializeSession: (sessionManager) => {
+				sessionManager.appendMessage({
+					role: "user",
+					content: [{ type: "text", text: "abandoned lock fixture" }],
+					timestamp: Date.now(),
+				});
+				sessionManager.appendMessage(fauxAssistantMessage("abandoned lock response"));
+				sessionManager.flushDurable();
+			},
 		});
 		harnesses.push(harness);
 		const controller = new SessionChainController({ projectRoot: harness.projectRoot });

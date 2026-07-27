@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+## [0.1.1]
+
+### Changed
+
+- Empty persistent Pi sessions now enter a managed Session Chain only when the first ordinary request arrives; stateful existing transcripts are adopted in place, while `--no-session` runs remain ephemeral.
+- Split the Pi-XK checkpoint, Goal, and Session Chain Rollup implementations into focused modules while preserving the package facade and runtime protocols.
+
+### Fixed
+
+- Session idle waits now include awaited `agent_settled` handlers, so mutable Chain commands cannot snapshot a Segment before post-run persistence finishes.
+- Mutable `/chain` commands recheck the Task gate after settlement before changing Chain state.
+- Rollover and successor-branch commits no longer conflict when an independently generated Rollup publication or diagnostic event lands after their expected topology head.
+- Rollup publication state rejects path-unsafe Chain, branch, and Segment identifiers after the controller split.
+
 ## [0.1.0]
 
 ### Added

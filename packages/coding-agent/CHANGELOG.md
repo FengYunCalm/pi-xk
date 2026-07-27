@@ -21,6 +21,11 @@
 
 ### Fixed
 
+- Fixed local Windows binary packaging under WSL to use PowerShell archive fallbacks when `zip` or `unzip` is unavailable.
+- Fixed `waitForIdle()` to include awaited `agent_settled` extension handlers, preventing session mutation from racing post-run persistence.
+- Fixed mutable Session Chain commands to wait for full settlement and recheck the Task gate before changing Chain state.
+- Fixed Session Chain rollover and successor-branch writes to tolerate only intervening Rollup publication or diagnostic events instead of failing with a false topology head conflict.
+- Fixed empty persistent sessions to defer managed Chain creation until the first ordinary request, preserve stateful transcripts through external-root adoption, and leave `--no-session` runs unmanaged.
 - Fixed OpenCode Zen Go models configured for the OpenAI Responses API to dispatch through the Responses endpoint.
 - Fixed explicit clipboard environment overrides from inheriting host WSL detection.
 - Fixed prompt-template defaults for all arguments (`${@:-default}` and `${ARGUMENTS:-default}`) ([#6695](https://github.com/earendil-works/pi/issues/6695)).

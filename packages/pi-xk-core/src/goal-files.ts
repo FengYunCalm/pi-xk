@@ -3,6 +3,7 @@ import { type FileHandle, open, readFile, rename, rm, unlink } from "node:fs/pro
 import { dirname, join } from "node:path";
 import { GOAL_FILE_SCHEMA, type GoalContractV2 } from "./contract.ts";
 import { stableJsonStringify } from "./stable-json.ts";
+import { syncDirectory } from "./sync-directory.ts";
 
 const GOAL_FILE_HEADER_PREFIX = "<!-- pi-xk-goal-file: ";
 const GOAL_FILE_HEADER_SUFFIX = " -->";
@@ -193,12 +194,7 @@ async function writeAtomic(path: string, content: string): Promise<void> {
 			await handle.close();
 		}
 		await rename(temporaryPath, path);
-		const directoryHandle = await open(directory, "r");
-		try {
-			await directoryHandle.sync();
-		} finally {
-			await directoryHandle.close();
-		}
+		await syncDirectory(directory);
 	} finally {
 		await rm(temporaryPath, { force: true });
 	}

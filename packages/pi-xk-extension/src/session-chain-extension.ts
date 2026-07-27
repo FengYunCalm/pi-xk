@@ -357,6 +357,34 @@ function hasConversationBody(ctx: ExtensionContext): boolean {
 		);
 }
 
+function hasPersistentSession(ctx: ExtensionContext): boolean {
+	return ctx.sessionManager.getSessionFile() !== undefined;
+}
+
+async function adoptCurrentSessionAsExternalRoot(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	controller: SessionChainController,
+	title?: string | null,
+): Promise<void> {
+	await controller.adoptExternalRootWithHost(ctx.sessionManager, {
+		...(title === undefined ? {} : { title }),
+		appendMarkers: (binding, summaryIn) => {
+			pi.appendEntry(PI_XK_SESSION_CHAIN_LINK_CUSTOM_TYPE, binding);
+			pi.sendMessage(
+				{
+					customType: PI_XK_SESSION_CHAIN_SUMMARY_IN_CUSTOM_TYPE,
+					content: SESSION_CHAIN_ROOT_SUMMARY,
+					display: false,
+					details: summaryIn,
+				},
+				{ triggerTurn: false },
+			);
+		},
+		flush: () => ctx.flushSession(),
+	});
+}
+
 function isPhysicalBranchHead(ctx: ExtensionContext): boolean {
 	return ctx.sessionManager.getEntries().at(-1)?.id === ctx.sessionManager.getLeafId();
 }
@@ -565,9 +593,16 @@ export function createPiXkSessionChainExtension(options: PiXkSessionChainExtensi
 				const trimmed = args.trim();
 				let replacementContext: ReplacedSessionContext | undefined;
 				try {
+					const readOnly = isReadOnlySessionChainCommand(trimmed);
 					const gates = await options.getGateState?.(ctx);
-					if (gates?.taskRunning && !isReadOnlySessionChainCommand(trimmed)) {
+					if (gates?.taskRunning && !readOnly) {
 						throw new Error("Session Chain changes are blocked while a Task is running");
+					}
+					if (!readOnly) {
+						await ctx.waitForIdle();
+						if ((await options.getGateState?.(ctx))?.taskRunning) {
+							throw new Error("Session Chain changes are blocked while a Task is running");
+						}
 					}
 					if (trimmed.length === 0) {
 						const choice = await selectSessionChainHead(ctx, controller);
@@ -861,32 +896,18 @@ export function createPiXkSessionChainExtension(options: PiXkSessionChainExtensi
 			}
 		});
 		pi.on("session_start", async (_event, ctx) => {
+			if (!hasPersistentSession(ctx)) {
+				ctx.ui.setStatus(PI_XK_CHAIN_STATUS_KEY, undefined);
+				return;
+			}
 			const controller = controllerFor(ctx.cwd);
 			try {
 				if (await resumeCommittedHead(ctx, controller)) return;
 				if (!controller.getCurrentBinding(ctx.sessionManager)) {
 					if (hasConversationBody(ctx)) {
-						await controller.adoptExternalRootWithHost(ctx.sessionManager, {
-							appendMarkers: (binding, summaryIn) => {
-								pi.appendEntry(PI_XK_SESSION_CHAIN_LINK_CUSTOM_TYPE, binding);
-								pi.sendMessage(
-									{
-										customType: PI_XK_SESSION_CHAIN_SUMMARY_IN_CUSTOM_TYPE,
-										content: SESSION_CHAIN_ROOT_SUMMARY,
-										display: false,
-										details: summaryIn,
-									},
-									{ triggerTurn: false },
-								);
-							},
-							flush: () => ctx.flushSession(),
-						});
+						await adoptCurrentSessionAsExternalRoot(pi, ctx, controller);
 					} else {
-						await controller.bootstrapManagedChain(sessionChainHost(ctx), {
-							withSession: async (replacementContext) => {
-								await refreshSessionChainFooter(replacementContext, controller);
-							},
-						});
+						ctx.ui.setStatus(PI_XK_CHAIN_STATUS_KEY, undefined);
 						return;
 					}
 				}
@@ -910,6 +931,7 @@ export function createPiXkSessionChainExtension(options: PiXkSessionChainExtensi
 			}
 		});
 		pi.on("input", async (event, ctx) => {
+			if (!hasPersistentSession(ctx)) return { action: "continue" };
 			const projectRoot = ctx.cwd;
 			const controller = controllerFor(projectRoot);
 			const binding = controller.getCurrentBinding(ctx.sessionManager);
@@ -1016,6 +1038,21 @@ export function createPiXkSessionChainExtension(options: PiXkSessionChainExtensi
 					return { action: "handled" };
 				}
 			}
+			if (hasConversationBody(ctx)) {
+				try {
+					await adoptCurrentSessionAsExternalRoot(pi, ctx, controller, sessionChainTitleFromInput(event.text));
+					await refreshSessionChainFooter(ctx, controller);
+					return { action: "continue" };
+				} catch (error) {
+					reportSessionChainError(
+						ctx,
+						options,
+						"Pi-XK Session Chain adoption failed; input was not delivered",
+						error,
+					);
+					return { action: "handled" };
+				}
+			}
 			let replacementContext: ReplacedSessionContext | undefined;
 			forwardingRolloverProjects.add(projectRoot);
 			try {
@@ -1044,6 +1081,7 @@ export function createPiXkSessionChainExtension(options: PiXkSessionChainExtensi
 			}
 		});
 		pi.on("agent_settled", async (_event, ctx) => {
+			if (!hasPersistentSession(ctx)) return;
 			if (forwardingRolloverProjects.has(ctx.cwd)) return;
 			await maybeAutoRollover(ctx, controllerFor(ctx.cwd), options);
 		});

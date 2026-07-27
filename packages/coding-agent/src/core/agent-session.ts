@@ -297,6 +297,7 @@ export class AgentSession {
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _isAgentRunActive = false;
+	private _isAgentSettling = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
 	private _isRolloverPending = false;
@@ -555,7 +556,7 @@ export class AgentSession {
 	}
 
 	private _resolveIdleWaitIfIdle(): void {
-		if (this._isAgentRunActive || !this._resolveIdleWait) {
+		if (this._isAgentRunActive || this._isAgentSettling || !this._resolveIdleWait) {
 			return;
 		}
 		const resolve = this._resolveIdleWait;
@@ -565,11 +566,13 @@ export class AgentSession {
 	}
 
 	private async _emitAgentSettled(): Promise<void> {
+		this._isAgentSettling = true;
 		this._isAgentRunActive = false;
 		try {
 			await this._extensionRunner.emit({ type: "agent_settled" });
 			this._emit({ type: "agent_settled" });
 		} finally {
+			this._isAgentSettling = false;
 			this._resolveIdleWaitIfIdle();
 		}
 	}
@@ -1573,7 +1576,7 @@ export class AgentSession {
 	}
 
 	async waitForIdle(): Promise<void> {
-		if (this.isIdle) {
+		if (this.isIdle && !this._isAgentSettling) {
 			return;
 		}
 		await this._getIdleWaitPromise();

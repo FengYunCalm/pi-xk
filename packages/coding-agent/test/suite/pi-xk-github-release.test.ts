@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +9,8 @@ import { afterEach, describe, expect, it } from "vitest";
 const suiteDirectory = dirname(fileURLToPath(import.meta.url));
 const workspaceRoot = resolve(suiteDirectory, "../../../..");
 const buildScriptPath = join(workspaceRoot, "scripts", "build-pi-xk-binaries.sh");
+const zipArchiveScriptPath = join(workspaceRoot, "scripts", "create-zip-archive.sh");
+const extractZipArchiveScriptPath = join(workspaceRoot, "scripts", "extract-zip-archive.sh");
 const packagerPath = join(workspaceRoot, "scripts", "package-pi-xk-release.mjs");
 const releaseNotesPath = join(workspaceRoot, "scripts", "release-notes.mjs");
 const releaseWorkflowPath = join(workspaceRoot, ".github", "workflows", "build-pi-xk-release.yml");
@@ -51,31 +53,35 @@ async function createReleaseFixture(): Promise<ReleaseFixture> {
 	return { binaryRoot, docsRoot, extensionRoot, releaseConfigPath };
 }
 
-function runPackager(fixture: ReleaseFixture, tag: string) {
-	return spawnSync(
-		process.execPath,
-		[
-			packagerPath,
-			"--input",
-			fixture.binaryRoot,
-			"--platform",
-			"linux-x64",
-			"--release-config",
-			fixture.releaseConfigPath,
-			"--extension-root",
-			fixture.extensionRoot,
-			"--docs-root",
-			fixture.docsRoot,
-			"--tag",
-			tag,
-			"--source-sha",
-			sourceCommit,
-			"--pi-version",
-			"0.80.10",
-			"--stage-only",
-		],
-		{ encoding: "utf8" },
-	);
+type PackagerOptions = {
+	env?: NodeJS.ProcessEnv;
+	platform?: string;
+	stageOnly?: boolean;
+};
+
+function runPackager(fixture: ReleaseFixture, tag: string, options: PackagerOptions = {}) {
+	const platform = options.platform ?? "linux-x64";
+	const arguments_ = [
+		packagerPath,
+		"--input",
+		fixture.binaryRoot,
+		"--platform",
+		platform,
+		"--release-config",
+		fixture.releaseConfigPath,
+		"--extension-root",
+		fixture.extensionRoot,
+		"--docs-root",
+		fixture.docsRoot,
+		"--tag",
+		tag,
+		"--source-sha",
+		sourceCommit,
+		"--pi-version",
+		"0.80.10",
+	];
+	if (options.stageOnly ?? true) arguments_.push("--stage-only");
+	return spawnSync(process.execPath, arguments_, { encoding: "utf8", env: options.env });
 }
 
 afterEach(async () => {
@@ -151,7 +157,151 @@ describe("Pi-XK GitHub release packaging", () => {
 		}
 	});
 
+	it("falls back to PowerShell when zip is unavailable in WSL", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-xk-zip-fallback-"));
+		temporaryDirectories.push(root);
+		const sourceDirectory = join(root, "source");
+		const archivePath = join(root, "release.zip");
+		const capturePath = join(root, "powershell-args.txt");
+		const fakeBin = join(root, "bin");
+		await mkdir(sourceDirectory);
+		await mkdir(fakeBin);
+		await writeFile(join(sourceDirectory, "payload.txt"), "payload\n");
+		const fakeWslPath = join(fakeBin, "wslpath");
+		await writeFile(fakeWslPath, '#!/bin/bash\n[[ "$1" == "-w" ]] || exit 2\nprintf "%s\\n" "$2"\n');
+		const fakePowerShell = join(fakeBin, "powershell.exe");
+		await writeFile(
+			fakePowerShell,
+			[
+				"#!/bin/bash",
+				'capture="$' + '{PI_XK_TEST_CAPTURE:?}"',
+				'source_directory=""',
+				'destination_path=""',
+				"while (($#)); do",
+				'\tcase "$1" in',
+				'\t\t-SourceDirectory) source_directory="$2"; shift 2 ;;',
+				'\t\t-DestinationPath) destination_path="$2"; shift 2 ;;',
+				"\t\t*) shift ;;",
+				"\tesac",
+				"done",
+				'printf "%s\\n%s\\n" "$source_directory" "$destination_path" > "$capture"',
+				': > "$destination_path"',
+				"",
+			].join("\n"),
+		);
+		await Promise.all([chmod(fakeWslPath, 0o755), chmod(fakePowerShell, 0o755)]);
+		const bashLookup = spawnSync("bash", ["-lc", "command -v bash"], { encoding: "utf8" });
+		expect(bashLookup.status, `${bashLookup.stdout}${bashLookup.stderr}`).toBe(0);
+
+		const result = spawnSync(bashLookup.stdout.trim(), [zipArchiveScriptPath, sourceDirectory, archivePath], {
+			encoding: "utf8",
+			env: { ...process.env, PATH: fakeBin, PI_XK_TEST_CAPTURE: capturePath },
+		});
+
+		expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+		expect(existsSync(archivePath)).toBe(true);
+		expect((await readFile(capturePath, "utf8")).trim().split("\n")).toEqual([sourceDirectory, archivePath]);
+	});
+
+	it("falls back to PowerShell when unzip is unavailable in WSL", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-xk-unzip-fallback-"));
+		temporaryDirectories.push(root);
+		const archivePath = join(root, "release.zip");
+		const destinationDirectory = join(root, "extracted");
+		const capturePath = join(root, "powershell-args.txt");
+		const fakeBin = join(root, "bin");
+		await mkdir(fakeBin);
+		await writeFile(archivePath, "archive fixture\n");
+		const fakeWslPath = join(fakeBin, "wslpath");
+		await writeFile(fakeWslPath, '#!/bin/bash\n[[ "$1" == "-w" ]] || exit 2\nprintf "%s\\n" "$2"\n');
+		const fakePowerShell = join(fakeBin, "powershell.exe");
+		await writeFile(
+			fakePowerShell,
+			[
+				"#!/bin/bash",
+				'capture="$' + '{PI_XK_TEST_CAPTURE:?}"',
+				'source_archive=""',
+				'destination_directory=""',
+				"while (($#)); do",
+				'\tcase "$1" in',
+				'\t\t-SourceArchive) source_archive="$2"; shift 2 ;;',
+				'\t\t-DestinationDirectory) destination_directory="$2"; shift 2 ;;',
+				"\t\t*) shift ;;",
+				"\tesac",
+				"done",
+				'printf "%s\\n%s\\n" "$source_archive" "$destination_directory" > "$capture"',
+				'command -p mkdir -p "$destination_directory"',
+				"",
+			].join("\n"),
+		);
+		await Promise.all([chmod(fakeWslPath, 0o755), chmod(fakePowerShell, 0o755)]);
+		const bashLookup = spawnSync("bash", ["-lc", "command -v bash"], { encoding: "utf8" });
+		expect(bashLookup.status, `${bashLookup.stdout}${bashLookup.stderr}`).toBe(0);
+
+		const result = spawnSync(
+			bashLookup.stdout.trim(),
+			[extractZipArchiveScriptPath, archivePath, destinationDirectory],
+			{
+				encoding: "utf8",
+				env: { ...process.env, PATH: fakeBin, PI_XK_TEST_CAPTURE: capturePath },
+			},
+		);
+
+		expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+		expect(existsSync(destinationDirectory)).toBe(true);
+		expect((await readFile(capturePath, "utf8")).trim().split("\n")).toEqual([archivePath, destinationDirectory]);
+	});
+
+	it("packages Windows Pi-XK releases through the WSL PowerShell zip fallback", async () => {
+		const fixture = await createReleaseFixture();
+		const platformRoot = join(fixture.binaryRoot, "windows-x64");
+		await mkdir(platformRoot);
+		await Promise.all([
+			writeFile(join(platformRoot, "pi.exe"), "base pi binary\n"),
+			writeFile(join(platformRoot, "pi-xk.exe"), "pi-xk binary\n"),
+		]);
+
+		const fakeBin = join(dirname(fixture.binaryRoot), "bin");
+		const capturePath = join(dirname(fixture.binaryRoot), "powershell-args.txt");
+		await mkdir(fakeBin);
+		const bashLookup = spawnSync("bash", ["-lc", "command -v bash"], { encoding: "utf8" });
+		expect(bashLookup.status, `${bashLookup.stdout}${bashLookup.stderr}`).toBe(0);
+		await symlink(bashLookup.stdout.trim(), join(fakeBin, "bash"));
+		const fakeWslPath = join(fakeBin, "wslpath");
+		await writeFile(fakeWslPath, '#!/bin/bash\n[[ "$1" == "-w" ]] || exit 2\nprintf "%s\\n" "$2"\n');
+		const fakePowerShell = join(fakeBin, "powershell.exe");
+		await writeFile(
+			fakePowerShell,
+			[
+				"#!/bin/bash",
+				'capture="$' + '{PI_XK_TEST_CAPTURE:?}"',
+				'destination_path=""',
+				"while (($#)); do",
+				'\tif [[ "$1" == "-DestinationPath" ]]; then destination_path="$2"; shift 2; else shift; fi',
+				"done",
+				'printf "%s\\n" "$destination_path" > "$capture"',
+				': > "$destination_path"',
+				"",
+			].join("\n"),
+		);
+		await Promise.all([chmod(fakeWslPath, 0o755), chmod(fakePowerShell, 0o755)]);
+
+		const result = runPackager(fixture, "pi-xk-v0.1.0", {
+			env: { ...process.env, PATH: fakeBin, PI_XK_TEST_CAPTURE: capturePath },
+			platform: "windows-x64",
+			stageOnly: false,
+		});
+
+		expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+		const archivePath = join(fixture.binaryRoot, "pi-xk-windows-x64.zip");
+		expect(existsSync(archivePath)).toBe(true);
+		expect((await readFile(capturePath, "utf8")).trim()).toBe(archivePath);
+	});
+
 	it("rejects a mismatched local release tag before replacing existing output", async () => {
+		const releaseConfig = JSON.parse(await readFile(join(workspaceRoot, "pi-xk-release.json"), "utf8")) as {
+			version: string;
+		};
 		const root = await mkdtemp(join(tmpdir(), "pi-xk-release-build-"));
 		temporaryDirectories.push(root);
 		const outputRoot = join(root, "output");
@@ -178,7 +328,9 @@ describe("Pi-XK GitHub release packaging", () => {
 		);
 
 		expect(result.status).toBe(1);
-		expect(`${result.stdout}${result.stderr}`).toContain("does not match Pi-XK release version 0.1.0");
+		expect(`${result.stdout}${result.stderr}`).toContain(
+			`does not match Pi-XK release version ${releaseConfig.version}`,
+		);
 		expect(await readFile(sentinelPath, "utf8")).toBe("keep\n");
 	});
 

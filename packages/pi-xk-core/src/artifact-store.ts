@@ -9,6 +9,7 @@ import {
 	GoalValidationError,
 } from "./contract.ts";
 import { stableJsonStringify } from "./stable-json.ts";
+import { syncDirectory } from "./sync-directory.ts";
 
 export const ARTIFACT_REDACTION_VERSION = "pi-xk.redaction.v1";
 
@@ -317,15 +318,6 @@ export class ArtifactStore {
 		return { objectDirectory, dataPath, metadataPath };
 	}
 
-	private async syncDirectory(directory: string): Promise<void> {
-		const handle = await open(directory, "r");
-		try {
-			await handle.sync();
-		} finally {
-			await handle.close();
-		}
-	}
-
 	private async publishIfAbsent(path: string, content: string, kind: "data" | "metadata"): Promise<boolean> {
 		const directory = dirname(path);
 		const temporaryPath = join(directory, `.${basename(path)}-${randomUUID()}.tmp`);
@@ -343,7 +335,7 @@ export class ArtifactStore {
 				await link(temporaryPath, path);
 				linked = true;
 				await this.onWritePhase?.(`${kind}_directory_sync`);
-				await this.syncDirectory(directory);
+				await syncDirectory(directory);
 			} catch (error) {
 				if (!isErrno(error, "EEXIST")) throw error;
 			}

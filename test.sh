@@ -22,6 +22,15 @@ fi
 # Skip local LLM tests (ollama, lmstudio)
 export PI_NO_LOCAL_LLM=1
 
+# WSL can inherit a Windows temp directory under /mnt, where fsync-heavy tests
+# are slow enough to time out. Keep test artifacts on the native Linux filesystem.
+INHERITED_TEMP_DIR="${TMPDIR:-${TMP:-${TEMP:-/tmp}}}"
+if [[ "$(uname -s)" == "Linux" && "$INHERITED_TEMP_DIR" == /mnt/* && -d /tmp ]]; then
+    export TMPDIR=/tmp
+    export TMP=/tmp
+    export TEMP=/tmp
+fi
+
 # Unset API keys (see packages/ai/src/stream.ts getEnvApiKey)
 unset ANTHROPIC_API_KEY
 unset ANTHROPIC_OAUTH_TOKEN

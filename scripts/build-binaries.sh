@@ -25,6 +25,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+REPOSITORY_ROOT="$(pwd)"
 
 SKIP_INSTALL=false
 SKIP_DEPS=false
@@ -211,7 +212,7 @@ for platform in "${PLATFORMS[@]}"; do
     if [[ "$platform" == windows-* ]]; then
         # Windows (zip)
         echo "Creating pi-$platform.zip..."
-        (cd "$platform" && zip -r ../pi-$platform.zip .)
+        "$REPOSITORY_ROOT/scripts/create-zip-archive.sh" "$platform" "pi-$platform.zip"
     else
         # Unix platforms (tar.gz) - use wrapper directory for mise compatibility
         echo "Creating pi-$platform.tar.gz..."
@@ -224,7 +225,7 @@ echo "==> Extracting archives for testing..."
 for platform in "${PLATFORMS[@]}"; do
     rm -rf "$platform"
     if [[ "$platform" == windows-* ]]; then
-        mkdir -p "$platform" && (cd "$platform" && unzip -q ../pi-$platform.zip)
+        "$REPOSITORY_ROOT/scripts/extract-zip-archive.sh" "pi-$platform.zip" "$platform"
     else
         tar -xzf pi-$platform.tar.gz && mv pi "$platform"
     fi

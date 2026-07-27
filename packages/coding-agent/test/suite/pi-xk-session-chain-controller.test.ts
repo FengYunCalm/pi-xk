@@ -151,6 +151,48 @@ describe("SessionChainController roots", () => {
 		).toBe(false);
 	});
 
+	it("rejects path-unsafe Rollup lookup and publication Segment IDs", async () => {
+		const projectRoot = await createTempDir();
+		const controller = new SessionChainController({ projectRoot });
+
+		await expect(controller.getRollupPublication("../outside", "branch_safe", 1)).rejects.toThrow();
+
+		const rollupDirectory = join(
+			projectRoot,
+			".pi-xk",
+			"sessions",
+			"chains",
+			"chain_safe",
+			"branches",
+			"branch_safe",
+			"rollups",
+		);
+		await mkdir(rollupDirectory, { recursive: true });
+		await writeFile(
+			join(rollupDirectory, "000001.job.json"),
+			`${JSON.stringify({
+				schema: "pi-xk.session-chain-rollup-publication.v1",
+				chainId: "chain_safe",
+				branchId: "branch_safe",
+				windowIndex: 1,
+				startOrdinal: 1,
+				endOrdinal: 1,
+				segmentIds: ["../outside"],
+				summaryArtifactIds: [`sha256:${"a".repeat(64)}`],
+				sourceDigest: `sha256:${"b".repeat(64)}`,
+				status: "scheduled",
+				artifactId: null,
+				attempt: 0,
+				errorCode: null,
+				retryable: null,
+				updatedAt: "2026-07-27T00:00:00.000Z",
+			})}\n`,
+			{ mode: 0o600 },
+		);
+
+		await expect(controller.getRollupPublication("chain_safe", "branch_safe", 1)).rejects.toThrow();
+	});
+
 	it("bootstraps a new logical chain into a managed project Segment", async () => {
 		const projectRoot = await createTempDir();
 		const source = createPersistedSession(projectRoot, "bootstrap-source", false);

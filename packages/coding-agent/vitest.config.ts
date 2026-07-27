@@ -12,7 +12,8 @@ export default defineConfig({
 	test: {
 		globals: true,
 		environment: "node",
-		maxWorkers: 8,
+		// Entrypoint loading and max-size session fixtures can each use hundreds of MiB.
+		maxWorkers: 4,
 		testTimeout: 30000,
 		reporters: process.env.GITHUB_ACTIONS ? ["dot", "github-actions"] : ["dot"],
 		silent: "passed-only",

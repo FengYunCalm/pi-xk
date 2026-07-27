@@ -3,6 +3,7 @@ import { open, readdir, readFile, rename, rm } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { ArtifactCorruptionError, ArtifactNotFoundError, ArtifactStore } from "./artifact-store.ts";
 import { stableJsonStringify } from "./stable-json.ts";
+import { syncDirectory } from "./sync-directory.ts";
 import {
 	assertTaskId,
 	TASK_EVENT_SCHEMA,
@@ -451,15 +452,6 @@ export class TaskStore {
 		return await withFileWriteLock(this.lockOptions(paths, taskId), action);
 	}
 
-	private async syncDirectory(directory: string): Promise<void> {
-		const handle = await open(directory, "r");
-		try {
-			await handle.sync();
-		} finally {
-			await handle.close();
-		}
-	}
-
 	private async replaceFile(path: string, directory: string, content: string): Promise<void> {
 		const temporary = join(directory, `.${basename(path)}-${randomUUID()}.tmp`);
 		try {
@@ -471,7 +463,7 @@ export class TaskStore {
 				await handle.close();
 			}
 			await rename(temporary, path);
-			await this.syncDirectory(directory);
+			await syncDirectory(directory);
 		} finally {
 			await rm(temporary, { force: true });
 		}
