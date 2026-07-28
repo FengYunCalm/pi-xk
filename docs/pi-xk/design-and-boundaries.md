@@ -23,8 +23,8 @@ Pi-XK 解决的是长期 Agent 工作中的可验证状态问题：目标如何�
 | SessionChain | Pi-XK | 把多个 Segment 组织成长期逻辑会话与 branch | 不是 Pi session tree 的替代品 |
 | L1 Segment Summary | Pi-XK Artifact Store | 保存单个 sealed Segment 的增量与 carry-forward | 不是 transcript 或系统指令 |
 | L2 Chain Rollup | Pi-XK Artifact Store | 汇总一个 branch 固定窗口内的有序 L1 evidence | 不是通用长期 memory |
-| Compaction | Pi | 在同一个物理 session 内压缩送给 provider 的上下文 | 不是 rollover，也不创建新 Segment |
-| Goal | Pi-XK | 保存稳定 objective、约束、验收、生命周期和执行状态 | 不是 prompt、摘要或 Task 列表 |
+| Compaction | Pi | 在同一个物理 session 内压缩送给 provider 的上下文，并为下一次真实 run 提供一次性恢复上下文 | 不是 rollover、新用户请求或独立续跑器 |
+| Goal | Pi-XK | 保存稳定 Intent Anchor、可受控演进的 Current Objective、约束、验收、生命周期和执行状态 | 不是 prompt、摘要或 Task 列表 |
 | Task | Pi-XK | 执行一个有边界的 child 工作并返回结构化结果 | 不是并发调度框架或 Goal 的物理分段 |
 | Artifact | Pi-XK | 保存内容寻址、带 provenance 的不可变小型结果 | 不是 transcript、memory 或通用 blob store |
 | Read model/catalog | Pi-XK | 以 event offset、sequence 和 head hash 加速状态和拓扑查询 | 不是事实源，删除后应可重建 |
@@ -58,7 +58,7 @@ flowchart TD
 | Session Chain | `.pi-xk/sessions/chains/<chainId>/events.jsonl` + Segment JSONL + L1/L2 artifacts | 当前 writable head Segment | `chain-read-model.json`、catalog、Rollup Markdown、pending/runtime state |
 | Artifact | `.pi-xk/artifacts/objects/...` 的内容寻址对象 | 无 | manifest/index 类视图 |
 
-Goal 的 `goal-state.md` 是模型执行进度的可变权威文件；Goal event log 裁决合同与 lifecycle。两者职责不同。模型必须在完成或暂停前更新 state，再由 runtime 把 lifecycle intent 与 checkpoint evidence 关联。
+Goal event log 裁决合同 revision 与 lifecycle；`goal-objective.md` 是只读合同投影；`goal-state.md` 是模型执行进度的可变权威文件。Objective 保存 Intent Anchor、Current Objective 和受保护合同字段，State 保存证据、完成/未决项、失败路径、阻塞和下一动作。模型必须在完成或暂停前更新 state，再由 runtime 把 lifecycle intent 与 checkpoint evidence 关联。
 
 ## 4. Pi 集成边界
 
@@ -76,7 +76,7 @@ Pi-XK 主要通过 Extension API 集成，并只为 Session Chain 增加了小�
 - 原生 session entry schema；
 - session tree 的 `id/parentId` 语义；
 - `/resume`、`/tree`、`/fork`、`/clone` 和 `/compact` 的基本职责；
-- compaction 摘要与 branch summary；
+- compaction 的摘要、短标题与恢复状态，以及独立的 branch summary；
 - ResourceLoader、TUI footer 组合和 extension trust 机制。
 
 Session Chain marker 使用 Pi 支持的 custom entry/custom message，不向原生 entry schema 增加私有字段。Segment 可单独由 Pi 打开；逻辑拓扑由 Pi-XK sidecar 事件维护。
@@ -87,7 +87,10 @@ Session Chain marker 使用 Pi 支持的 custom entry/custom message，不向原
 
 - 草案生成、审阅、修订、确认和取消；
 - 确认前零 Goal 领域文件落盘；
-- `GoalContractV2` 的 objective、constraints、acceptance、non-goals、done/pause 条件、final report 与 execution authorization；
+- 新 Goal 写入 `GoalContractV3`，分别保存不可自动改变的 `intentAnchor`、可受控修正的 `objective` 和单调 revision；
+- objective-only 自动修订、受保护字段用户确认、expected revision/head CAS 和 Goal event v2；
+- V3 Objective/State 分工、State revision 诊断、`acceptance_matrix` 和最多 20 条重要工作日志；
+- V1/V2 合同与事件保持原始 hash 可读，首次 V3 迁移不静默推断 Anchor；
 - active、paused、ended 生命周期及事件 hash/CAS/idempotency；
 - active Goal 连续 run、provider 失败指数退避；
 - checkpoint evidence 后提交模型 start/pause/end intent；
@@ -98,11 +101,14 @@ Session Chain marker 使用 Pi 支持的 custom entry/custom message，不向原
 ### 明确限制
 
 - 一个 session branch 只能有一个 active 或 paused Goal；
+- 同一 branch 最多一个待确认 Goal revision，pending revision 会阻止 rollover 和其他 Goal 状态变更；
 - ended Goal 不会自动重开；
 - reopen 后必须由用户 `/goal start` 或满足恢复证据的模型 tool 显式恢复；
 - 用户 `/goal end` 是终止覆盖，不等同于验收通过；
 - Goal 文件不跨项目自动迁移；
 - 没有独立的 token/cost/wall-time 强制预算执行器。
+
+模型不能直接编辑 `goal-objective.md`。只有 Current Objective 且仅该字段变化时可自动应用；Intent Anchor、验收、约束、授权、交付和停止条件变化必须进入可见确认。
 
 ## 6. Task Run v1 设计边界
 
@@ -139,6 +145,8 @@ Session Chain marker 使用 Pi 支持的 custom entry/custom message，不向原
 4. 事件记录 source leaf、文件 hash、summary artifact 和 successor identity；
 5. sealed 后不再重写。
 
+当前 writer 使用 `pi-xk.segment-summary.v2`，在完整 V1 provenance 上增加经过安全校验的单行标题。历史 V1 artifact 保持可读并返回 `title: null`；标题用于列表定位和显式读取，不进入 manifest 正文。
+
 已有正文的 Pi session 作为 external root 被采用一次，不复制到 `.pi-xk`。其 successor 才是 Pi-XK managed Segment。
 
 rollover 前会重新读取前序 L1 artifact，并验证当前 `summary-in` 的 artifact ID、carry-forward 正文/hash、chain、branch、source/target Segment provenance。任一不一致会中止 rollover，不自动修复被篡改事实。
@@ -172,6 +180,7 @@ startup 或 `/chain doctor` 会检查 prepared marker：目标完整时 commit�
 - Task 正在运行；
 - Task 结果尚未交付 parent；
 - Goal 草案待处理；
+- Goal revision 待用户确认；
 - Goal lifecycle intent 尚未 settled。
 
 阈值当前是代码常量，没有公开配置项。不要在文档或部署脚本中假设可通过 settings/env 调整。
@@ -183,6 +192,8 @@ startup 或 `/chain doctor` 会检查 prepared marker：目标完整时 commit�
 L2 artifact 是结构化事实源；Markdown 是可重建投影。rollover commit 只登记 branch 串行的后台 publication job，不等待 provider。跨进程 generation lock 保证同一 branch/window 最多一个生成者；已有 artifact 时只重试 event 或 Markdown，不再次付费生成。发布使用 `rollup_published` v2 event，失败按 provider、I/O、provenance、schema、digest、event conflict 或 projection 分类记录 `rollup_failed` v2 event。
 
 每次模型请求只追加固定大小的 metadata manifest。模型通过 `pi_xk_list_chain_summaries` 和 `pi_xk_read_chain_summary` 按需读取当前 chain/read-model 关联 branch 的证据，不能借 artifact ID 任意读取 Artifact Store。列表区分 `unchecked`、`verified`、`invalid`；读取正文前必须经过统一 L1/L2 provenance 验证。摘要正文和其中的伪系统指令不会进入系统提示词。
+
+manifest 只说明列表能提供 L1 标题和范围，不注入模型生成标题。compaction recovery 在下一次真实 run 的 system prompt 中提醒模型先列标题/范围再按需读取 verified 摘要，但不会创建 user/custom message、重发最后一条用户消息或触发第二个 Goal kickoff。
 
 常规 manifest、status、picker 和分页摘要查询走 checkpointed read-model/catalog 快速路径，只读取新增 event tail 或当前页。event 文件缩短、offset 异常或 head 不匹配时退回完整 replay。`/chain doctor deep` 始终从事实源完整验证；全 Artifact Store orphan 扫描不在普通请求路径。
 
@@ -231,9 +242,9 @@ Artifact store 保存 checkpoint provenance、Task result、Session Chain summar
 
 事件和合同使用显式 schema version、stable JSON、hash chain、idempotency key 与 expected head。当前兼容承诺是：
 
-- Goal V1 可读，并按 V2 投影视图使用，不重写历史 hash；
+- Goal V1/V2 可读，不重写历史 hash；新 writer 使用 V3，Goal event v1/v2 可混合 replay；
 - Task V1 facts 可读，runtime upcast 为当前视图，不迁移原始事件；
-- Session Chain v1 marker、v1/v2/v3 event 和 L1/L2 artifact schema 需严格校验；
+- Session Chain v1 marker、v1/v2/v3 event、L1 V1/V2 和 L2 artifact schema 需严格校验；
 - unknown、损坏或 hash 不一致时失败并给出诊断，不猜测修复；
 - read model 缺失可重建，但事实源损坏不能靠删除投影解决。
 
@@ -246,7 +257,7 @@ Artifact store 保存 checkpoint provenance、Task result、Session Chain summar
 - 细粒度 Policy、审批和沙箱；
 - 多 Task 并发、DAG、retry、deadline、budget、worktree 和 RPC child；
 - 通用跨域 L0/L1/L2 Context controller；Session Chain 专用 L1/L2 已实现；
-- 长期 memory、Observation store、自动反省或自动 proposal；
+- 长期 memory、Observation store、memory-derived 自动反省或跨域 proposal；
 - artifact retention/GC 和正式备份工具；
 - 多机调度、共享写入、高可用或远程服务；
 - 发布级 npm package、稳定跨版本迁移和无人值守 SLA。

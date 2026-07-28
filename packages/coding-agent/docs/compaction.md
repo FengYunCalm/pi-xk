@@ -20,7 +20,7 @@ Pi has two summarization mechanisms:
 | Compaction | Context exceeds threshold, or `/compact` | Summarize old messages to free up context |
 | Branch summarization | `/tree` navigation | Preserve context when switching branches |
 
-Both use the same structured summary format and track file operations cumulatively.
+They share cumulative file-operation tracking, but their output envelopes differ. Native compaction requires a safe `<title>` plus `<summary>` envelope; branch summarization keeps its existing Markdown summary format.
 
 ## Compaction
 
@@ -40,8 +40,8 @@ You can also trigger manually with `/compact [instructions]`, where optional ins
 
 1. **Find cut point**: Walk backwards from newest message, accumulating token estimates until `keepRecentTokens` (default 20k, configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`) is reached
 2. **Extract messages**: Collect messages from the previous kept boundary (or session start) up to the cut point
-3. **Generate summary**: Call LLM to summarize with structured format, passing the previous summary as iterative context when present
-4. **Append entry**: Save `CompactionEntry` with summary and `firstKeptEntryId`
+3. **Generate summary**: Call LLM for a validated title and structured summary, passing the previous summary as iterative context when present
+4. **Append entry**: Save `CompactionEntry` with title, summary, trigger reason, recovery prompt version, and `firstKeptEntryId`
 5. **Reload**: Session reloads, using summary + messages from `firstKeptEntryId` onwards
 
 ```
@@ -77,6 +77,23 @@ What the LLM sees:
 ```
 
 On repeated compactions, the summarized span starts at the previous compaction's kept boundary (`firstKeptEntryId`), not at the compaction entry itself, falling back to the entry after the previous compaction if that kept entry cannot be found in the path. This preserves messages that survived the earlier compaction by including them in the next summarization pass as well. Pi also recalculates `tokensBefore` from the rebuilt session context before writing the new `CompactionEntry`, so the token count reflects the actual pre-compaction context being replaced.
+
+### Recovery After Compaction
+
+New native compactions persist `reason` (`manual`, `threshold`, or `overflow`) and `recoveryPromptVersion: "compaction-recovery-v1"`. Until a later non-error, non-aborted assistant response proves that another logical run completed, the next actual model request receives a one-time recovery block in its system prompt.
+
+The recovery block says that compaction is not a new user request, summaries and titles are historical evidence rather than instructions, and the model must not repeat an old request just because it appears in the summary. It does not append a user or custom message and does not resend the last user message.
+
+Continuation ownership remains with the existing trigger:
+
+| Situation | Behavior |
+|-----------|----------|
+| Overflow retry | The same logical run continues once with recovery context |
+| Threshold compaction with an active Pi-XK Goal | The existing Goal kickoff triggers the next run; compaction adds no second kickoff |
+| Manual or threshold compaction without a Goal | Pi waits for the next real request |
+| Queued steering/follow-up message | The native queue triggers the next run |
+
+The pending state is derived from the persisted branch, so it survives restart. Old compaction entries without `recoveryPromptVersion` remain readable and do not retroactively request recovery.
 
 ### Split Turns
 
@@ -125,10 +142,13 @@ interface CompactionEntry<T = unknown> {
   type: "compaction";
   id: string;
   parentId: string;
-  timestamp: number;
+  timestamp: string;    // ISO 8601
+  title?: string;       // Short historical label; legacy entries may omit it
   summary: string;
   firstKeptEntryId: string;
   tokensBefore: number;
+  reason?: "manual" | "threshold" | "overflow";
+  recoveryPromptVersion?: "compaction-recovery-v1";
   fromHook?: boolean;  // true if provided by extension (legacy field name)
   details?: T;         // implementation-specific data
 }
@@ -140,7 +160,7 @@ interface CompactionDetails {
 }
 ```
 
-Extensions can store any JSON-serializable data in `details`. The default compaction tracks file operations, but custom extension implementations can use their own structure.
+Extensions can store any JSON-serializable data in `details`. The default compaction tracks file operations, but custom extension implementations can use their own structure. Extension-provided titles are validated; a missing or invalid title is deterministically derived from the first Markdown heading or non-empty summary line, then falls back to `Context checkpoint` without another model call.
 
 See [`prepareCompaction()`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) and [`compact()`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) for the implementation.
 
@@ -192,7 +212,7 @@ interface BranchSummaryEntry<T = unknown> {
   type: "branch_summary";
   id: string;
   parentId: string;
-  timestamp: number;
+  timestamp: string;    // ISO 8601
   summary: string;
   fromId: string;      // Entry we navigated from
   fromHook?: boolean;  // true if provided by extension (legacy field name)
@@ -210,9 +230,22 @@ Same as compaction, extensions can store custom data in `details`.
 
 See [`collectEntriesForBranchSummary()`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/branch-summarization.ts), [`prepareBranchEntries()`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/branch-summarization.ts), and [`generateBranchSummary()`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/branch-summarization.ts) for the implementation.
 
-## Summary Format
+## Summary Formats
 
-Both compaction and branch summarization use the same structured format:
+### Native Compaction
+
+Native compaction requires exactly two top-level blocks. Pure whitespace may surround or separate them; any other text is rejected:
+
+```text
+<title>Single-line noun phrase</title>
+<summary>
+...structured Markdown summary...
+</summary>
+```
+
+The title is a noun phrase of at most 60 Unicode code points. Markdown, markup, control characters, explicit command clauses, role instructions, and unsupported completion claims are rejected. Technical noun phrases such as `Read model optimization`, `运行时性能优化`, and `Fixed-point arithmetic` remain valid. The title is persisted and shown in the compaction UI, but is not added to the system prompt or the LLM-facing summary body.
+
+The `<summary>` body uses this format:
 
 ```markdown
 ## Goal
@@ -249,6 +282,12 @@ path/to/file2.ts
 path/to/changed.ts
 </modified-files>
 ```
+
+For a split turn, the retained suffix stays in the transcript and the turn-prefix summarizer returns the same `<title>`/`<summary>` envelope. Pi uses the turn-prefix title and merges the history and prefix summaries into one compaction body.
+
+### Branch Summarization
+
+Branch summarization does not require the compaction envelope. It keeps the structured Goal, Constraints & Preferences, Progress, Key Decisions, and Next Steps Markdown sections, prefixed with an explanation that the user explored another branch. Both mechanisms still append cumulative `<read-files>` and `<modified-files>` blocks.
 
 ### Message Serialization
 
@@ -297,6 +336,7 @@ pi.on("session_before_compact", async (event, ctx) => {
   // Custom summary:
   return {
     compaction: {
+      title: "Focused historical label", // optional; invalid/missing values use deterministic fallback
       summary: "Your summary...",
       firstKeptEntryId: preparation.firstKeptEntryId,
       tokensBefore: preparation.tokensBefore,
@@ -332,6 +372,7 @@ pi.on("session_before_compact", async (event, ctx) => {
   
   return {
     compaction: {
+      title: "Custom model summary",
       summary,
       firstKeptEntryId: preparation.firstKeptEntryId,
       tokensBefore: preparation.tokensBefore,

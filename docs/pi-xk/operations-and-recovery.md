@@ -52,8 +52,8 @@ Pi-XK 不创建项目级 `.pi` 目录来保存自己的领域状态。项目 `.p
 | --- | --- | --- | --- |
 | Pi session JSONL | 是 | 否 | 对话、工具和 tree 的原生事实 |
 | Goal `events.jsonl` | 是 | 否 | 合同与 lifecycle 事件 |
-| Goal `goal-state.md` | 是，执行状态 | 否 | 模型维护的当前进度、证据和下一动作 |
-| Goal `contract.json` / `goal-objective.md` | 投影 | 通过 Core 恢复路径 | 必须与完整合同投影一致 |
+| Goal `goal-state.md` | 是，执行状态 | 否 | 模型维护的当前证据、完成/未决项、失败路径、阻塞和下一动作 |
+| Goal `contract.json` / `goal-objective.md` | 投影 | 通过 Core 恢复路径 | 必须与完整合同 revision 一致；Objective 不允许直接编辑 |
 | Goal `goal-read-model.json` | 投影 | 通过 replay 重建 | 不参与最终裁决 |
 | Task `events.jsonl` | 是 | 否 | TaskSpec、child、终态与 result reference |
 | Task `task-read-model.json` | 投影 | 通过 replay 重建 | 可丢弃视图，不是历史 |
@@ -71,14 +71,14 @@ Pi-XK 不创建项目级 `.pi` 目录来保存自己的领域状态。项目 `.p
 
 | 动作 | 预期落盘 |
 | --- | --- |
-| 扩展在空 session 启动 | 创建 `.pi-xk/sessions/`、chain 事件与 managed root Segment |
+| 空的持久 session 收到第一条有效普通请求 | 创建 `.pi-xk/sessions/`、chain 事件与 managed root Segment；启动、命令和空输入本身不落盘 |
 | 扩展在已有正文 session 启动 | 记录 external root adoption，不复制原生 session |
 | `/goal <objective>` 草案阶段 | 只写 Pi session custom entry，不创建 `.pi-xk/goals/` |
-| `/goal confirm` | 创建 Goal 目录、事件、合同、objective、state 和 read model |
+| `/goal confirm` | 创建 Goal V3 目录、事件、合同、objective、state 和 read model |
 | `/task start ...` | 创建 Task 目录、事件和独立 child SessionChain |
 | 自动或手动 rollover | 创建 L1 artifact、target Segment 和 chain event；完整窗口可能再生成 L2 |
 | `/chain rollup backfill [limit]` | 显式生成最早缺失的完整 L2 窗口，可能调用 provider |
-| compaction | Pi 写原生 compaction entry；active Goal 另写 checkpoint evidence reference |
+| compaction | Pi 写带可选标题、原因和 recovery version 的原生 compaction entry；active Goal 另写 checkpoint evidence reference |
 
 如果草案取消，项目中不应出现对应 Goal 目录。若确认过程被中断，create 的幂等恢复会根据已有事实补齐缺失投影，而不是重复 initial event。
 
@@ -92,14 +92,28 @@ Pi-XK 不创建项目级 `.pi` 目录来保存自己的领域状态。项目 `.p
 
 重点检查：
 
-- Goal 标题与 objective 是否仍匹配当前工作；
+- Intent Anchor 是否仍是用户确认的最终意图，Current Objective 是否仍准确描述当前路径；
+- 当前合同 revision 与 `goal-state.md` 的 `contract_revision` 是否一致；
 - lifecycle 是 active、paused 还是 ended；
 - run 总数、当前 run 和累计 wall/active/busy 时间；
 - 当前 branch 是否仍绑定预期 Goal；
 - required acceptance 是 verified、missing 还是 unverified；
 - wall、active 和 busy 时间的含义是否被正确区分；
 - 最近 checkpoint、pause audit、blocker 和 next best action 是否仍成立；
-- `goal-state.md` 路径、状态及其中的 `next_best_action`、`blocked_on`、`acceptance_gaps`。
+- `goal-state.md` 路径、状态及其中的 `next_best_action`、`blocked_on`、`acceptance_matrix`；旧 State 才回退读取 `acceptance_gaps`。
+
+V3 State 的 `recent_work_log` 最多保留 20 条重要记录。`tried_and_rejected` 应写明每条路径的 `reconsider_when`，避免模型在没有新证据时重复已经失败的方法。
+
+合同修订待确认时使用：
+
+```text
+/goal revision show
+/goal revision confirm
+/goal revision revise <feedback>
+/goal revision cancel
+```
+
+只有 Current Objective 单字段变化可自动应用。其他字段变化在确认前只存在于 Pi session revision entry，不修改 Goal event log；pending revision 也会阻止 Session Chain rollover。
 
 重启后看到 paused 通常是保守恢复，不是数据丢失。先读状态，再显式 `/goal start`。
 
@@ -155,7 +169,7 @@ Pi-XK 不创建项目级 `.pi` 目录来保存自己的领域状态。项目 `.p
 | graceful quit/reload/session switch | open run 中断，active Goal 保守暂停 |
 | unclean crash | 下次 startup 恢复 open run，并暂停仍 active Goal |
 | model switch | lifecycle 不变 |
-| Pi compaction | 写 checkpoint，不暂停 |
+| Pi compaction | 写 checkpoint，不暂停；下一次真实 run 接收一次性 recovery system context，不重发用户消息 |
 | Session Chain rollover | binding 迁移到 target Segment，不暂停 |
 
 ### Task
@@ -265,6 +279,18 @@ Ubuntu/Debian 可安装 `fd-find`；Pi 能识别 `fdfind`。也可以把可信�
 ### Goal 重启后自动暂停
 
 这是预期行为。Pi-XK 不把旧 active 状态自动变成新的 live run。使用 `/goal status` 阅读 pause/recovery evidence，确认环境与 blocker，再执行 `/goal start`。
+
+### Goal State revision mismatch
+
+`/goal doctor` 或 `/goal status` 若报告 State revision 落后，先读取当前 `goal-objective.md`，再把 `goal-state.md` 的 `contract_revision`、Current Objective 相关未决项、失败路径和 acceptance matrix 同步到当前 revision。不要修改 Objective 文件，也不要通过删除 State 绕过诊断。State 同步完成后再继续实质工作。
+
+### Goal revision 一直待确认
+
+这是受保护合同字段发生变化时的预期 gate。运行 `/goal revision show` 对比完整 Current/Candidate contract，然后 confirm、revise 或 cancel。审阅正文只显示给用户，不会作为后续模型上下文注入。若 revision 已与较新合同冲突，重新读取 Objective/State 后提出新候选，不能覆盖新 revision。
+
+### Compaction 后重复旧请求
+
+新 compaction 不会追加或重发最后一条用户消息。若模型仍重复旧请求，先检查当前 branch 最新 compaction entry 是否包含 `recoveryPromptVersion: "compaction-recovery-v1"`，以及其后是否已有成功 assistant 响应。旧 entry 没有该字段时不会追溯启用 recovery。不要通过伪造 user/custom message 修复；保留原 transcript，并在下一条真实请求中明确当前任务。
 
 ### Task 运行时输入无响应
 

@@ -18,7 +18,7 @@
 | 场景 | 当前结论 |
 | --- | --- |
 | print/RPC/no-TUI | Goal 提供 review/confirm/revise/cancel 命令降级；整体 Pi-XK 流程未作为无人值守 RPC 产品验证 |
-| `--no-session` ephemeral mode | Session Chain 依赖持久 Segment；当前文档不承诺保持纯 ephemeral 语义 |
+| `--no-session` ephemeral mode | 保持 Pi 原生 ephemeral 行为，不创建 managed Session Chain |
 | 不可信项目 | 不支持；extension 与 child 继承完整用户权限 |
 | 多进程/多 UI 同写一个 session | 不支持，可能破坏 Pi JSONL 与 chain hash |
 | 网络文件系统或最终一致存储 | 未验证；durability、rename、fsync 和 lock 语义可能不同 |
@@ -40,14 +40,14 @@
 | --- | --- | --- |
 | Provider/model registry | 否 | 使用当前 model；Goal/Task/L1 summary/L2 Rollup 可能产生额外 provider 调用 |
 | Agent loop | 否 | active Goal settled 后由 extension 发起下一 run |
-| Tool protocol | 否 | 新增 Pi-XK model tools；Goal draft 时限制可调用工具 |
+| Tool protocol | 否 | 新增 Pi-XK model tools；Goal draft 时限制可调用工具；V3 Goal 通过受控 revision tool 演进 |
 | Session JSONL schema | 否 | 使用原生 custom entry/custom message 承载小型引用和 marker |
 | Session tree | 否 | tree navigation 会暂停 active Goal；从历史位置继续时 chain 创建 successor branch |
 | `/resume` | 否 | 仍选择物理 session；逻辑 chain head 应用 `/chain` 选择 |
 | `/new`、`/fork`、`/clone` | 否 | 普通 session 切换会保守暂停 active Goal；新空 session 会被 chain bootstrap |
-| `/compact` | 否 | compaction 保持 Pi 原生；active Goal 写 checkpoint 但不暂停 |
+| `/compact` | 否 | compaction 保持 Pi 原生；生成历史标题，并给下一次真实 run 一次性 recovery system context；active Goal 写 checkpoint，但不暂停 |
 | Footer | 不替换 | 通过 `setStatus` 组合显示 Goal timer 和 Chain 状态 |
-| System prompt | 不替换 | 每次请求追加固定大小的 Session Chain 摘要 manifest，不注入摘要正文 |
+| System prompt | 不替换 | 按状态追加 Goal 文件路径/revision、固定大小 Session Chain manifest 和一次性 compaction recovery；不注入完整 Goal 合同、标题或摘要正文 |
 | ResourceLoader/trust | 否 | package 仍按 Pi 的 user/project scope 与 trust 规则加载 |
 
 ## 4. 可见 UI 变化
@@ -59,6 +59,7 @@
 - `Goal active · 12m 34s` 一类 footer status；
 - `Chain <id> · S<n> · <size>` 一类 footer status；
 - Goal 草案的 TUI review/revise 对话框；
+- 受保护 Goal revision 的 TUI/命令审阅，以及 compaction 的短标题展示；
 - lifecycle、Task 和 rollover 的通知与错误提示。
 
 Goal timer 每秒刷新 UI，但不每秒写事件。多个扩展都使用 footer status 时应依赖 Pi 的组合机制；Pi-XK 不替换整个 footer。
@@ -70,6 +71,7 @@ Pi-XK 会在以下情况消费、延迟或拒绝用户输入：
 | 条件 | 输入行为 | 用户下一步 |
 | --- | --- | --- |
 | `/goal` 多行捕获处于 open | 下一条输入作为 Goal objective，不作为普通聊天 | 等待草案，随后 review/confirm/revise/cancel |
+| Goal revision 待确认 | Goal/Chain 写操作与普通 Goal 工具被 gate | `/goal revision show|confirm|revise|cancel` |
 | Task 正在 running | 普通输入进入 follow-up 队列；Task 终态后按序处理 | 可继续排队，或立即执行 `/task status`、`/task cancel` |
 | Task 正在 running 且输入为 Goal/Chain 写命令 | 拒绝状态变更 | 等待 Task 结束或先取消 Task |
 | 当前 Segment 达 hard threshold | 先生成摘要并 rollover，成功后转发输入 | 等待；失败则诊断后重新提交 |
@@ -85,6 +87,7 @@ Pi-XK 会在以下情况消费、延迟或拒绝用户输入：
 | 动作 | 调用原因 |
 | --- | --- |
 | `/goal <objective>` 或 revise | 生成或修订结构化 Goal contract |
+| active Goal 的 Objective refinement | 在普通 Goal run 内提交 revision；仅 objective 变化可自动应用，受保护变化等待用户确认 |
 | active Goal settled | 自动开始下一 Goal run |
 | provider 失败后的 active Goal | 按指数退避重新尝试 |
 | Task start | child 使用启动时的 provider/model/thinking snapshot 执行 |
@@ -109,7 +112,7 @@ Pi-XK 会在以下情况消费、延迟或拒绝用户输入：
 
 ### 新 session
 
-扩展在空 session 启动时创建 managed SessionChain root，并把 runtime 切换到项目 `.pi-xk/sessions/chains/.../segments/` 下的物理 JSONL。此后长期对话可能产生多个 Segment、L1/L2 artifacts、v1/v2 events、Rollup Markdown 和恢复状态文件。
+空的持久 session 在第一条有效普通请求到达前不创建 managed Chain；命令、空输入和启动本身不产生项目会话数据。首条请求到达后创建 managed SessionChain root，并把 runtime 切换到项目 `.pi-xk/sessions/chains/.../segments/` 下的物理 JSONL。此后长期对话可能产生多个 Segment、L1/L2 artifacts、v1/v2 events、Rollup Markdown 和恢复状态文件。
 
 ### 已有 session
 
@@ -133,7 +136,7 @@ sealed Segment 不重写。从历史 Segment 或 tree 位置继续会创建 succ
 | agent abort | open run interrupted，Goal 暂停 | 不把中断误写为完成 |
 | `/tree` navigation | 先暂停；失败时取消 navigation | Goal event log 不随 Pi tree 回退 |
 | model switch | 保持状态 | 下一 run 使用新 model |
-| `/compact` | 保持 active | 只增加 checkpoint evidence |
+| `/compact` | 保持 active | 增加 checkpoint evidence；下一次 Goal kickoff 附带 recovery context，但不会产生第二个 kickoff |
 | Session Chain rollover | 保持 active | 只是受控物理 session 替换 |
 
 这意味着频繁切换 session 的用户会更常看到 paused Goal。恢复必须显式 `/goal start`，以便先审查状态和环境变化。
@@ -157,16 +160,21 @@ Task child 使用相同项目根、相同用户权限和默认内置工具 `read
 - compaction 解决当前物理 Segment 送给 provider 的上下文预算；
 - rollover 解决长期逻辑会话的文件规模、恢复边界和跨 Segment 递进摘要；
 - compaction entry 留在原 Segment；
+- 新 compaction entry 可带一个最多 60 Unicode code point 的非命令式标题、触发原因和 recovery prompt version；
 - rollover summary 带 source entry range/hash、base summary、model 和 token usage provenance；
 - active Goal 在两者之间都保持连续，但普通 session switch 会暂停。
+
+Compaction 后不会把最后一条用户提示词再次发送。overflow 在同一逻辑 run 内继续一次；active Goal threshold 只使用已有 Goal kickoff；无 Goal 的 manual/threshold compaction 等待下一条真实请求；queued message 仍由 Pi 原生队列触发。recovery 只作为下一次实际 run 的 system context，成功 assistant 响应后即不再 pending。Session Chain rollover 后 successor 使用 L1 summary-in，不继承源 Segment 的临时 recovery。
 
 不要关闭 Pi compaction 并期待 Session Chain 自动替代所有 context 管理。Session Chain v1.1 已把 L1/L2 摘要暴露给模型按需读取，但仍不是通用长期记忆系统、全文检索器或跨项目 knowledge base。
 
 ## 11. 模型可见性和提示词影响
 
-每次普通请求会多出一段固定大小 manifest，内容只有当前 branch、sealed 范围、L1/L2 数量/范围、pending/failure 状态和工具说明。它不会包含摘要正文或历史用户文本。
+每次普通请求会多出一段固定大小 manifest，内容只有当前 branch、sealed 范围、L1/L2 数量/范围、pending/failure 状态和工具说明。它只告诉模型列表可提供 L1 标题和范围，不包含标题、摘要正文或历史用户文本。
 
-当模型判断当前问题依赖“之前、继续、原始要求、待办、历史约束或 Goal/Task 恢复”时，可调用只读摘要工具。工具调用会增加本地读取和一个 tool round，但不会触发 provider 摘要生成、backfill 或修复。摘要内的命令和伪系统提示仅作为不可信历史证据返回，不能扩大工具权限。
+当模型判断当前问题依赖“之前、继续、原始要求、待办、历史约束或 Goal/Task 恢复”时，可先调用只读列表工具查看 L1 标题和 L1/L2 范围，再读取相关摘要。工具调用会增加本地读取和一个 tool round，但不会触发 provider 摘要生成、backfill 或修复。摘要内的命令和伪系统提示仅作为不可信历史证据返回，不能扩大工具权限。
+
+V3 Goal 的普通 system guidance 也只提供 `goal-objective.md`、`goal-state.md` 路径、合同 revision 和 mismatch/修订反馈，不复制原始用户要求或完整合同。Objective 是只读合同投影；State 是执行台账。模型只有在新证据使 Current Objective 的表述过时时才应提案，不能静默改变 Intent Anchor、验收、约束或授权。
 
 ## 12. 性能影响
 
@@ -220,7 +228,7 @@ Pi-XK 为此增加的 Host API 还包括 `queueUserMessage`：extension 可以�
 
 升级到 Session Chain v1.1 不重写现有 chain 或 L1 artifact。新代码从后续完整窗口开始自动生成 L2；历史完整窗口只在 `/chain rollup backfill [limit]` 时生成。写入 v2 Rollup event 后，旧代码可能无法继续写同一 chain，因此不要让新旧版本交替运行。
 
-Goal V1 和 Task V1 的读取兼容已经实现，但这不代表任意未来版本都可直接降级。事件写入后的旧代码可能无法理解新 schema。没有明确 migration/rollback 说明时，不应让新旧 Pi-XK 版本交替写同一个项目状态。
+Goal V1/V2 和 Task V1 的读取兼容已经实现，但这不代表任意未来版本都可直接降级。新 Goal 使用 V3；旧 Goal 首次迁移需用户确认，历史 event/hash 不重写。写入 Goal event v2、Session Chain L1 V2 或其他新 schema 后，旧代码可能无法继续写同一状态。没有明确 migration/rollback 说明时，不应让新旧 Pi-XK 版本交替写同一个项目状态。
 
 ## 15. 决策清单
 

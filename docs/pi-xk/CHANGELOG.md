@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Added
+
+- Goal V3 contracts with a stable Intent Anchor, revisioned Current Objective, controlled objective-only refinement, protected-field confirmation, and separate Objective/State projections.
+- L1 Segment Summary V2 titles exposed through verified Session Chain list/read flows while preserving L1 V1 compatibility.
+
+### Changed
+
+- Native compaction now records a safe historical title and adds one-time recovery guidance to the next actual Agent run instead of resending the last user request or creating a second Goal kickoff.
+- Goal runtime guidance now provides Objective/State paths and contract revision diagnostics instead of repeating the original request or complete contract.
+
+### Fixed
+
+- Goal revision state is scoped to the current binding's Goal ID and generation, and automatic objective refinement terminates superseded feedback so stale entries cannot block or leak into later Goal runs.
+- Goal revision review content remains visible to the user but is excluded from subsequent model context.
+- V3 Goals can no longer start at a later revision or be downgraded through the legacy V2 update/event path.
+- Compaction and L1 title validation now accepts technical noun phrases and pure envelope whitespace without accepting extra response text.
+
 ## [0.1.1]
 
 ### Changed

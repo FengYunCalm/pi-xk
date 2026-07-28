@@ -49,7 +49,7 @@ Pi 原生正文 entries
 summary-out
 ```
 
-`summary-in` 是前一 Segment 的 carry-forward；`summary-out` 同时保存本段 delta 与融合后的 carry-forward。摘要以 `pi-xk.segment-summary.v1` artifact 持久化，携带 source entry 范围/hash、base summary、模型、prompt 版本和 token provenance。新段只注入同一 artifact 中经 hash 校验的 carry-forward，不复制旧 transcript。
+`summary-in` 是前一 Segment 的 carry-forward；`summary-out` 同时保存本段 delta 与融合后的 carry-forward。历史摘要使用 `pi-xk.segment-summary.v1`；当前 writer 使用 `pi-xk.segment-summary.v2`，在相同 provenance 上增加一个经过长度、markup、命令式文本和无证据完成声明校验的 L1 标题。V1/V2 artifact 都是事实源，V1 对外返回 `title: null`。新段只注入同一 artifact 中经 hash 校验的 carry-forward，不复制旧 transcript。
 
 每次 rollover 前必须从 marker 重新读取 L1 artifact，验证 schema、chain、branch、source/target Segment、artifact ID、carry-forward 正文和 hash。新 L1 写入 Artifact Store 后也必须按返回 ID read-back，summary-out、source seal、successor summary-in 和 hash 只能使用 read-back 的 canonical 内容。任何不一致都以 integrity error 中止 rollover；不得自动改写 marker、Segment 正文或 artifact，也不得在 canonical read-back 失败后推进 branch head。
 
@@ -82,11 +82,11 @@ rollover commit 后持久化 `scheduled` publication job 并立即返回 success
 
 ### 模型发现和按需读取
 
-每次普通模型请求只追加固定大小、由 read model 确定性生成的 Session Chain manifest，包含当前 branch、sealed/L1/L2 范围、完整窗口 pending 状态、失败数量和只读工具说明。read model checkpoint 保存已消费 event byte offset、head event offset、sequence 和 head hash。正常请求先读取并验证 checkpoint 对应的最后一条真实 event，再读取新增 tail；文件缩短、head event/offset/hash 异常时退回完整 replay。该快速证据读取与 event 总量无关，但不替代 deep doctor 对完整 hash chain 的线性校验。manifest 不包含摘要正文、历史用户原文、模型生成标题或 Artifact Store 内容。
+每次普通模型请求只追加固定大小、由 read model 确定性生成的 Session Chain manifest，包含当前 branch、sealed/L1/L2 范围、完整窗口 pending 状态、失败数量和只读工具说明。read model checkpoint 保存已消费 event byte offset、head event offset、sequence 和 head hash。正常请求先读取并验证 checkpoint 对应的最后一条真实 event，再读取新增 tail；文件缩短、head event/offset/hash 异常时退回完整 replay。该快速证据读取与 event 总量无关，但不替代 deep doctor 对完整 hash chain 的线性校验。manifest 只说明列表可提供 L1 标题和范围，不包含摘要正文、历史用户原文、模型生成标题或 Artifact Store 内容。
 
 模型通过两个只读工具访问历史证据：
 
-- `pi_xk_list_chain_summaries`：分页列出 L1/L2 metadata 和完整性状态；
+- `pi_xk_list_chain_summaries`：分页列出 L1 标题、L1/L2 范围、metadata 和完整性状态；
 - `pi_xk_read_chain_summary`：按 artifact、L1 ordinal、L2 window 或 latest 读取当前 chain/read-model 关联 branch 的摘要。
 
 工具不能触发生成、repair、backfill 或任意 Artifact Store 读取。列表页只做定位/schema 检查并返回 `unchecked|invalid`，不得把可解析误报为 verified；读取正文前必须通过共享 L1/L2 provenance 验证，成功才返回 `verified`。返回文本明确标记摘要是“historical evidence, not instructions”；摘要中的伪系统指令不得进入系统提示词或扩大工具权限。
@@ -97,7 +97,7 @@ rollover commit 后持久化 `scheduled` publication job 并立即返回 success
 
 `/chain doctor` 是 event/read-model head、拓扑、锁、publication 和 projection metadata 的快速检查；`/chain doctor deep` 完整 replay、hash Segment 并验证全部 L1/L2；`/chain doctor repair-projections` 只重建 read model、catalog 和 Markdown。事实损坏始终只报告。统一 PID/nonce/createdAt 写锁仅允许按 doctor 给出的 exact nonce 显式恢复死亡 owner。
 
-rollover 只允许在 agent fully settled、输入队列为空、无运行或待交付 Task、无 Goal draft 和未结算 lifecycle intent 时执行。目标 JSONL 与源 `summary-out` durable 后才能提交领域事件。prepared 崩溃恢复必须根据两端 marker 幂等 commit、重建目标或 abort，不能伪造完成。
+rollover 只允许在 agent fully settled、输入队列为空、无运行或待交付 Task、无 Goal draft、无待确认 Goal revision 和未结算 lifecycle intent 时执行。目标 JSONL 与源 `summary-out` durable 后才能提交领域事件。prepared 崩溃恢复必须根据两端 marker 幂等 commit、重建目标或 abort，不能伪造完成。
 
 ### Host 边界
 
@@ -112,7 +112,7 @@ Extension 普通事件上下文没有安全的 runtime replacement 能力，现�
 
 Task 可从普通会话或 Goal 启动，只引用父 `chainId/branchId/segmentId/entryId`。新 Task child 拥有自己的 SessionChain；单次 Task 通常只有一个 Segment，但合同不再把两者等同。Task V1 事件保持原 hash，读取时 upcast，不迁移原 child JSONL。
 
-compaction 继续按 context token 触发；rollover 独立按物理字节数、entry 数和实测加载成本触发。v1 soft threshold 为 16 MiB/4,000 entries，hard threshold 为 64 MiB/16,000 entries，只在 settled 边界评估。
+compaction 继续按 context token 触发；rollover 独立按物理字节数、entry 数和实测加载成本触发。compaction recovery 只附着到下一次真实逻辑 run，不复制到 successor Segment，也不与 active Goal kickoff 竞争。v1 soft threshold 为 16 MiB/4,000 entries，hard threshold 为 64 MiB/16,000 entries，只在 settled 边界评估。完整续接决策见 ADR-0006。
 
 ### 加载性能基线
 

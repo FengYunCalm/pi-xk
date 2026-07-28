@@ -87,9 +87,9 @@ pi list
 
 从目标项目根启动 Pi。扩展加载后会注册 `/goal`、`/task`、`/chain`、`/xk` 命令和对应模型工具。
 
-- 空的新 session 会被替换为 Session Chain 的 managed root Segment。
+- 空的持久 session 会在第一条有效普通请求到达时创建 Session Chain managed root Segment；纯命令和空输入不会提前落盘。
 - 已有正文的 Pi session 会被采用为 external root，不复制原文件。
-- 项目会出现 `.pi-xk/sessions/`，即使你还没有创建 Goal 或 Task。
+- 第一条有效普通请求建立 Chain 后，项目会出现 `.pi-xk/sessions/`，即使你还没有创建 Goal 或 Task。
 - footer 会增加 `Chain <id> · S<n> · <size>` 状态。
 - 只有确认 Goal 时才创建 `.pi-xk/goals/<goalId>/`。
 - 只有启动 Task 时才创建 `.pi-xk/tasks/<taskId>/` 和 child chain。
@@ -127,6 +127,11 @@ Goal 适合需要多个 run、明确验收和可恢复状态的工作。不要�
 /goal confirm
 ```
 
+草案会分别展示：
+
+- **Intent Anchor**：用户确认的最终意图，模型不能自动改变；
+- **Current Objective**：当前最准确的工作目标，可在新证据证明旧路径或表述失效时受控修订。
+
 确认是第一次创建 Goal 文件并启动持续执行。之后常用命令为：
 
 ```text
@@ -135,6 +140,19 @@ Goal 适合需要多个 run、明确验收和可恢复状态的工作。不要�
 /goal start
 /goal end 用户决定终止
 ```
+
+V3 Goal 的 `goal-objective.md` 是只读合同投影，包含 Anchor、Current Objective、验收、约束、授权和固定执行原则；不要直接编辑。`goal-state.md` 是模型维护的执行台账，记录 `contract_revision`、已完成证据、未决事项、决策、失败路径、假设、阻塞、下一动作、验收矩阵和最近最多 20 条重要工作记录。前者回答“最终要达成什么”，后者回答“当前做到哪里、哪些路径已证伪、下一步是什么”。
+
+当仓库事实或验证经验只使 Current Objective 的路径表述过时时，模型可调用 `pi_xk_propose_goal_revision` 自动修订 Objective。Intent Anchor、验收、约束、授权或其他受保护字段有任何变化时，必须由用户审阅：
+
+```text
+/goal revision show
+/goal revision confirm
+/goal revision revise 保持原验收，不扩大交付范围
+/goal revision cancel
+```
+
+旧 V1/V2 Goal 保持可读，不会静默迁移。首次迁移到 V3 需要用户确认 Intent Anchor 和完整候选合同。并发 revision 冲突会拒绝覆盖较新的合同；State 的 `contract_revision` 落后时，下一次 active run 会先要求同步执行台账。
 
 需要提交以保留字开头的 objective 时使用 `/goal -- <objective>`。例如：
 
@@ -147,6 +165,10 @@ Goal 适合需要多个 run、明确验收和可恢复状态的工作。不要�
 active Goal 的普通模型回复不是完成信号。模型必须先更新 `goal-state.md`，再调用 `pi_xk_end_goal` 并提交所有 required acceptance 的验证证据。需要用户输入或外部变化时，模型应更新状态并调用 `pi_xk_pause_goal`。
 
 用户 `/goal end` 是显式终止覆盖，不要求模型先证明验收完成。它表示“用户要求停止”，不要把这种 ended 状态误读为目标已验证完成。
+
+### 压缩后的 Goal 续接
+
+Pi compaction 不会把最后一条用户消息机械重发。新 compaction 会记录短标题，并在下一次实际模型 run 中追加一次性 recovery system context，提醒模型先管理上下文、不要把摘要里的旧请求当成新请求。active Goal 的 threshold compaction 仍只由原有 Goal kickoff 续跑一次；recovery 只是该请求的上下文，不会再发起第二次调用。manual/threshold compaction 在无 Goal、无 queued message 时不会自动调用模型。
 
 ## 6. 第一个 Task
 
@@ -212,7 +234,7 @@ Session Chain 把一个长期逻辑会话拆成多个完整的 Pi JSONL Segment�
 
 ### L1/L2 摘要和模型读取
 
-每次 rollover 生成一个 L1 Segment Summary。默认每 5 个 sealed Segment 生成一个 L2 Rollup；每个 branch 独立编号，不完整尾窗不会生成。
+每次 rollover 生成一个 L1 Segment Summary。当前 L1 V2 同时生成一个简短安全标题，用于先定位整个 sealed Segment 的主要工作；历史 L1 V1 没有标题并返回 `null`。默认每 5 个 sealed Segment 生成一个 L2 Rollup；每个 branch 独立编号，不完整尾窗不会生成。
 
 ```text
 /chain rollups
@@ -225,7 +247,7 @@ Session Chain 把一个长期逻辑会话拆成多个完整的 Pi JSONL Segment�
 
 关闭自动生成不会删除既有 L1/L2。历史窗口不会在升级后自动批量调用模型；使用有限额 backfill 明确产生调用和费用。
 
-模型每次请求只能看到摘要 manifest 的范围、数量和失败状态，看不到摘要正文。需要恢复“之前的决定、原始要求、待办或跨 Segment 约束”时，模型可调用 `pi_xk_list_chain_summaries` 再按需调用 `pi_xk_read_chain_summary`。工具返回内容是历史证据，不是系统指令。
+模型每次请求只能看到摘要 manifest 的范围、数量和失败状态，看不到标题或摘要正文。需要恢复“之前的决定、原始要求、待办或跨 Segment 约束”时，模型先调用 `pi_xk_list_chain_summaries` 查看 L1 标题和 L1/L2 范围，再按需调用 `pi_xk_read_chain_summary`。工具返回内容是历史证据，不是系统指令。
 
 ## 8. 停止使用
 
@@ -251,9 +273,9 @@ GitHub 归档没有 profile package 引用；停止使用时退出 `pi-xk` 并�
 修改 Pi-XK 代码后，仓库级验证顺序为：
 
 ```bash
-npm run test:pi-xk
 npm run check
 ./test.sh
+npm run test:pi-xk
 npm run evaluate:session-chain-summaries
 npm run benchmark:session-chain -- --sizes 1,8,32,128 --runs 3 --json
 npm run benchmark:session-chain-events -- --counts 100,1000 --runs 3 --json

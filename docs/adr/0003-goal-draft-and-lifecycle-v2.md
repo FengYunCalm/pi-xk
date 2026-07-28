@@ -4,7 +4,7 @@
 >
 > **日期**：2026-07-21
 >
-> **决策范围**：新 Goal 草案、合同 v2、模型/用户生命周期控制、Pi session 链接和交付提交规则。
+> **决策范围**：Goal 草案、合同 v2 基线、模型/用户生命周期控制、Pi session 链接和交付提交规则。合同演进与提示词续接部分已由 [ADR-0006](0006-goal-v3-and-compaction-recovery.md) 扩展。
 >
 > **关联设计**：[Pi-XK 架构策划案](../pi-xk-architecture-proposal.md)、[ADR-0001 Pi 集成边界](0001-pi-integration-boundaries.md)、[ADR-0002 Artifact Store 与 Goal Read Model](0002-artifact-store-v1.md)
 
@@ -26,9 +26,9 @@ TUI 环境使用 Pi 原生 `ctx.ui.custom` 显示全宽草案对话框。`/goal`
 
 同一 session branch 只允许一个当前 Goal。当前绑定 Goal 仍为 active 或 paused 时拒绝创建新草案；必须先结束当前 Goal，避免只替换 binding 却把旧 Goal 留在不可见的 active 状态。
 
-### 2. 合同 v2 是新写入格式，v1 保持可验证历史
+### 2. 合同 v2 建立兼容基线，v1 保持可验证历史
 
-新增 `GoalContractV2`，在既有字段之外持久化：
+本 ADR 实施时新增 `GoalContractV2`，在既有字段之外持久化：
 
 - `nonGoals`；
 - `doneCondition`；
@@ -36,7 +36,7 @@ TUI 环境使用 Pi 原生 `ctx.ui.custom` 显示全宽草案对话框。`/goal`
 - `finalReport`；
 - `executionAuthorization`。
 
-新建 v2 Goal 至少有一个 `required` acceptance。历史 v1 JSONL 不原地迁移，也不重算 hash。replay 先按其原始 schema 校验事件 payload，再以纯 upcaster 提供统一的内存合同；新 writer 只生成 v2。contract/read-model 和 Markdown 均由上转换后的合同投影，仍可删除重建。
+新建 v2 Goal 至少有一个 `required` acceptance。历史 v1 JSONL 不原地迁移，也不重算 hash。replay 先按其原始 schema 校验事件 payload，再以纯 upcaster 提供统一的内存合同。当前新 Goal writer 已按 ADR-0006 生成 V3；V1/V2 仍按原始 payload/hash 读取，首次 V3 修订必须经用户确认。contract/read-model 和 Markdown 均由上转换后的合同投影，仍可删除重建。
 
 ### 3. 生命周期事件承载可验证决策
 
@@ -62,7 +62,7 @@ paused Goal 收到普通用户输入时，只获得轻量恢复提示：先读�
 
 ### 5. 统一提示词决策表
 
-每个 active run 和隐藏 kickoff 都注入同一规则：先读取 `goal-objective.md` 与 `goal-state.md`，审计 required acceptance；有可执行动作就继续；普通回复、部分结果、token 消耗、run 数或“计划已写好”均不是 pause/end 理由。暂停前必须记录未达验收、证据、阻塞和待答问题；所有 required acceptance 有验证证据后先更新 state 再结束。
+每个 active run 和隐藏 kickoff 都要求先读取 `goal-objective.md` 与 `goal-state.md`，审计 required acceptance；有可执行动作就继续；普通回复、部分结果、token 消耗、run 数或“计划已写好”均不是 pause/end 理由。当前实现只注入文件路径、合同 revision 和必要诊断，不复制原始用户要求或完整合同正文。Objective/State 的 V3 分工、受控修订和 compaction recovery 见 ADR-0006。
 
 提示词只约束模型决策，不能替代 host 校验。模型不能借提示词获得额外文件、网络、部署或 Git 权限；`executionAuthorization` 只说明用户已授权的 Goal 范围内代码、测试、脚本和正式文档修改。
 
@@ -99,7 +99,7 @@ active Goal 的自动续跑只属于当前 live session。以下边界必须保�
 
 - 用户始终拥有新 Goal 的创建、取消和最终终止权；模型仅在已确认 Goal 内做可审计的生命周期判断。
 - 草案不会污染项目 `.pi-xk` 目录，但 session 恢复需要能重建其待确认状态。
-- v1 数据保持可重放，v2 的更强验证只用于新 writer，避免历史 hash 链被破坏。
+- v1 数据保持可重放；本 ADR 引入的 v2 验证和 ADR-0006 的 V3 revision 均不重写历史 hash 链。
 - 自动续跑不再依赖 run 上限；在 live session 内是否暂停或结束由验收证据和 host 校验共同决定，runtime 关闭和树导航按上表保守暂停。
 - CLI 计时和草案交互是可删除的扩展投影；不会成为 Goal 或 Pi session 的新事实源。
 - 本阶段不实现通用 Context/memory、TaskSupervisor、Policy/沙箱、外部问答依赖或未确认 Goal 的自动执行。

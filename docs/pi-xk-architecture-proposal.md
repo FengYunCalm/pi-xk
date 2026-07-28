@@ -2,9 +2,9 @@
 
 > **状态**：`pi-xk-v0.1.0` 已于 2026-07-26 正式发布；Phase 0、Phase 1.1–1.8、Task Run v1、Session Chain v1.1 / Rollup v1、正确性、恢复、长链性能、本地产品化和 GitHub-only 发行链均已落地。`pi-xk-v0.1.1` 正在进行发布后稳定化与完整验收，尚未标记完成。Policy/沙箱、完整 TaskSupervisor、通用 Context/memory 与 Proposal/反省闭环不在当前范围。
 >
-> **版本**：1.1.2
+> **版本**：1.1.3
 >
-> **日期**：2026-07-27
+> **日期**：2026-07-28
 >
 > **定位**：基于 Pi 的维护型 fork，加上可验证的领域层、任务编排层和安全边界。
 >
@@ -64,7 +64,7 @@ Pi-XK 不从头重写 Agent，也不把一个大型 Pi fork 整体吞入本仓�
 | `packages/agent/docs/hooks.md` | hook 顺序、取消和错误策略 | 本地设计/实现说明 |
 | `packages/coding-agent/docs/containerization.md` 与 `README.md` | Pi 没有内置完整权限/沙箱，需要外部边界 | 本地官方说明 |
 | `/home/mechrevo/projects/claude-code-source` | tool execution/hooks、compact、AgentTool、tasks、coordinator、MCP 结构 | 已获授权的参考源码；仅作能力和边界参考 |
-| `/tmp/pi-xk-research` | 2026-07-19 的 Pi 生态源码、npm 元数据和许可证快照 | 外部研究快照，版本需在采用前复核 |
+| [Pi 生态研究地图](research/pi-ecosystem-forum-map.md)与 2026-07-28 GitHub/npm 在线核验 | 第三方 Pi 扩展、fork、npm 元数据、关键入口和采用边界 | 外部研究快照；未复制第三方源码，版本需在采用前复核 |
 
 ### 1.2 术语边界
 
@@ -323,7 +323,7 @@ contract.json 是由事件日志生成的、可校验且便于人审的当前合
 
 创建 Goal 时，goal_created 事件保存完整规范化合同；后续变更追加 goal_contract_updated 事件。contract.json 只保存当前有效合同的可重建投影，并保留 baseHash 和事件序列号；发生不一致时以事件日志为准并重新生成。验收条件必须能指向命令、测试、artifact 或人工审批，不能只有“模型认为完成”。其中 command 只是声明，真正执行时仍要重新经过 CapabilityPolicy。
 
-Phase 1.8 开始为新 Goal 写入 `GoalContractV2`：除上述稳定目标与约束外，还要求 `nonGoals`、`doneCondition`、`pauseCondition`、`finalReport` 和 `executionAuthorization`，并要求至少一个 required acceptance。v1 事件与其原始 payload/hash 永远保持不变；读取侧先验证原始版本，再用纯 upcaster 生成统一内存合同。禁止为了升级而重写 JSONL 或把草案当作已确认合同。
+Phase 1.8 以 `GoalContractV2` 引入 `nonGoals`、`doneCondition`、`pauseCondition`、`finalReport` 和 `executionAuthorization`，并要求至少一个 required acceptance。ADR-0006 后的新 writer 使用 `GoalContractV3`，进一步区分不可自动改变的 Intent Anchor 与可受控修正的 Current Objective，并以 revision 和 Goal event v2 记录演进 provenance。V1/V2 合同和历史 payload/hash 保持原样可读；首次迁移到 V3 必须由用户确认。禁止为了升级而重写 JSONL、静默推断 Anchor 或把草案当作已确认合同。
 
 ### 6.3 事件协议
 
@@ -765,7 +765,7 @@ Claude Code 的具体源码可能继续变化，本次快照中部分 reactive/s
 
 ## 14. Pi 生态组件评估矩阵
 
-以下是 2026-07-19 研究快照。版本和维护状态在实际引入前必须重新核验；表中的“复用”指在边界内接入，不是无审查复制。
+以下矩阵以 2026-07-19 基线为主，并在 2026-07-28 增量核验用户指定的 6 个候选。版本和维护状态在实际引入前必须重新核验；表中的“复用”指在边界内接入，不是无审查复制。详细证据和实验顺序见 [Pi 生态研究地图](research/pi-ecosystem-forum-map.md)。
 
 | 组件 | 快照许可证/版本 | 能复用的部分 | Pi-XK 决策 | 风险与边界 |
 | --- | --- | --- | --- | --- |
@@ -778,10 +778,12 @@ Claude Code 的具体源码可能继续变化，本次快照中部分 reactive/s
 | Magic Context | MIT / 0.32.3 | SQLite、tiered compartments、cache-stable context、historian/dreamer | 研究其分层思想，不作为基础依赖 | 体量、Rust/native 和状态复杂度过高 |
 | pi-hermes-memory | MIT / 0.8.1 | FTS5 session search、failure/correction memory、secret scan | 参考搜索和失败记忆 | 不让搜索索引取代 Pi session |
 | pi-lcm | MIT / 0.1.3 | SQLite 保留消息、DAG 分层摘要 | 研究无损压缩思路 | 与 Pi 原生 compaction/session 真相可能竞争 |
-| oh-my-pi | MIT | LSP、DAP、browser、collab、memory、native worker 等大型集成 | 只做架构和测试研究，不整体合并 | fork 面过大，升级和许可证 notices 复杂 |
-| @juicesharp/rpiv-ask-user-question | MIT / 1.20.0 | 多问题 tab、预览、滚动、复核和自由输入 UX | 只借鉴 Goal 草案 custom UI，不直接依赖 | 引入 rpiv-config/i18n 和大于当前需求的状态面 |
-| pi-tool-display | MIT / 0.5.0 | 响应式 overlay、分栏 inspector、窄终端降级 | modal 设计参考 | 工具渲染和配置系统不属于 Goal UI 范围 |
-| pi-nano-context | MIT / 0.1.1 | 紧凑 widget、footer status 组合方式 | `setStatus` 设计参考 | 发布包仍声明旧 Pi peer 名；自定义 footer 可能与其他 UI 竞争 |
+| pi-observational-memory | MIT / npm 3.0.3 | observation/reflection/dropper、预计算 compaction、按 ID recall | 独立 profile 的 context/memory 对照实验 | V3 不读取 V2 格式；注册自己的 compaction trigger/hook，与 Pi-XK recovery 和 Session Chain 语义重叠 |
+| pi-ace-tool | `package.json` 声明 MIT / repo 0.1.0 | Augment 兼容语义检索、增量索引、OAuth、显式 prompt enhance | GitHub-only 可选检索 adapter | npm 无同名包且仓库无 LICENSE 文件；索引代码块会上传远端，不能成为本地事实源 |
+| oh-my-pi / `@oh-my-pi/pi-coding-agent` | MIT / npm 17.1.7 | 独立 `omp` harness、LSP/DAP、browser、collab、memory、native worker 等 | 只做架构、工具和 benchmark 研究，不整体合并 | 不是 Pi extension；fork 面和状态/发布链不同。无 scope 的 `oh-my-pi` 是另一项目 |
+| @juicesharp/rpiv-ask-user-question | MIT / 2.1.0 | 最多四题、tab、预览、note、复核、自由输入和 RPC/ACP fallback | 通用澄清 UI 候选，不替代 Goal revision | 引入 rpiv-config；工具回答不能绕过受保护字段确认和 Goal event CAS |
+| pi-tool-display | MIT / 0.5.0 | 内置/MCP/custom tool renderer、紧凑输出、pending diff、窄终端降级 | 隔离 profile 的可选 TUI | 默认工具 ownership 可能冲突；发布包含条件式 postinstall，采用前需审查 |
+| pi-nano-context | MIT / 0.1.1 | 分段 context widget、替换式 footer、extension status 汇总 | 等 peer 修复后做 TUI 兼容实验 | 发布包仍声明旧 Pi peer 名；`setFooter` 可能与其他 UI 竞争 |
 | pi-adaptative | MIT | autonomy、reflection、memory、research、proposal/reload 思路 | 借鉴 proposal/approval/generation | 自动化面广，不作为 Pi-XK 核心依赖 |
 | pi-fast-subagent / subagent-isolation | 需逐版本核验 | worker pool、后台 job、隔离工作区思路 | 仅做 benchmark 和 adapter 评估 | 不默认引入另一套任务事实源 |
 | @mjasnikovs/pi-task | AGPL-3.0-only | Goal/task 交互想法 | 不进入 MIT 基线 | 需单独许可证和分发决策 |
@@ -854,7 +856,7 @@ pi_xk.artifact.*
 - 工具结果已持久化后的 `turn_end` 与 `session_before_compact` 的自动 checkpoint；
 - artifact store、redaction 和可重建 read model。
 
-**2026-07-25 实现状态：** Phase 1.1–1.8 和 Task Run v1 均已完成。Session Chain v1.1 把长期逻辑会话拆为完整原生 Pi JSONL Segment：新空会话进入项目级 managed Segment，既有 Pi session 作为不复制的 external root 被采用，`events.jsonl` 是拓扑事实源，而 catalog/read model 可重建。soft（16 MiB/4,000 entries）只在 settled 后轮转，hard（64 MiB/16,000 entries）在下一次 provider turn 前强制轮转；Task 运行、Task 结果待交付、Goal 草案或 lifecycle intent 会阻止轮转。L1 以 Artifact Store read-back 内容为 canonical，并由统一验证器核对 marker/seal/successor provenance。默认每 5 个 sealed Segment 登记只读取 L1 的后台 L2 publication；branch 串行队列与 generation lock 避免重复付费调用。checkpointed read model 通过 event tail 快速更新，普通 status/manifest/picker 不再完整 replay。系统提示词只注入 metadata manifest，模型读取正文前完成完整 provenance 验证。active Goal 在 `reason: "rollover"` 下继续。Task 普通输入使用 Pi follow-up 队列延迟处理，仍保持单 child 与父屏障。Chain 标题/归档、分级 doctor、统一锁恢复、`/xk status` 与本地安装脚本已经落地。尚未实现的是通用跨域 Context controller、long-term memory、完整 TaskSupervisor（并发/DAG/retry/budget/deadline/RPC/worktree/sandbox）以及 Policy、artifact retention/GC。
+**2026-07-28 实现状态：** Phase 1.1–1.8、Goal V3 和 Task Run v1 均已完成。Goal 使用只读 Objective 合同投影与可变 State 执行台账；新证据只能自动修正 Current Objective，Intent Anchor、验收、约束和授权等受保护字段必须由用户确认。原生 compaction 持久化安全短标题，并只在下一次真实逻辑 run 注入一次 recovery system context，不重复最后一条用户消息，也不与 Goal kickoff 竞争。Session Chain v1.1 把长期逻辑会话拆为完整原生 Pi JSONL Segment：新空会话进入项目级 managed Segment，既有 Pi session 作为不复制的 external root 被采用，`events.jsonl` 是拓扑事实源，而 catalog/read model 可重建。soft（16 MiB/4,000 entries）只在 settled 后轮转，hard（64 MiB/16,000 entries）在下一次 provider turn 前强制轮转；Task 运行、Task 结果待交付、Goal 草案、待确认 Goal revision 或 lifecycle intent 会阻止轮转。L1 以 Artifact Store read-back 内容为 canonical；当前 V2 writer 增加可检索标题，统一验证器继续核对 marker/seal/successor provenance。默认每 5 个 sealed Segment 登记只读取 L1 的后台 L2 publication；branch 串行队列与 generation lock 避免重复付费调用。checkpointed read model 通过 event tail 快速更新，普通 status/manifest/picker 不再完整 replay。系统提示词只注入 metadata manifest，模型读取正文前完成完整 provenance 验证。active Goal 在 `reason: "rollover"` 下继续。Task 普通输入使用 Pi follow-up 队列延迟处理，仍保持单 child 与父屏障。Chain 标题/归档、分级 doctor、统一锁恢复、`/xk status` 与本地安装脚本已经落地。尚未实现的是通用跨域 Context controller、long-term memory、完整 TaskSupervisor（并发/DAG/retry/budget/deadline/RPC/worktree/sandbox）以及 Policy、artifact retention/GC。
 
 #### Phase 1.7：Goal 连续执行（已完成）
 
@@ -864,10 +866,11 @@ pi_xk.artifact.*
 - Goal 自动续跑沿用既有 checkpoint、生命周期和 branch binding，本身不承担 Task 调度或沙箱职责；Task Run v1 由独立的 Task event log 和 child `AgentSession` 承担单子任务运行。
 - runtime 关闭、会话切换、agent abort 或 tree navigation 会保守暂停；重开后不自动续跑，必须手动 `/goal start`。model switch 和 compaction 不改变 lifecycle。
 
-#### Phase 1.8：Goal 草案与模型全生命周期控制（已完成）
+#### Phase 1.8：Goal 草案与模型全生命周期控制（已完成；合同演进由 ADR-0006 扩展）
 
 - 新 Goal 在用户确认前只存在于 Pi session draft entry；原生 UI 和无 UI 命令均提供确认、修订和取消，确认前不创建 Goal 目录或事件。
-- 新 writer 使用 `GoalContractV2`，历史 v1 hash 链只读并在 replay 时上转换；v2 合同要求非目标、完成/暂停条件、最终报告和执行授权。
+- 新 writer 使用 `GoalContractV3`：Intent Anchor 固定用户最终意图，Current Objective 可依据新事实受控修正；历史 V1/V2 hash 链保持原样可读，首次 V3 迁移必须由用户确认。
+- 模型不能直接编辑 `goal-objective.md`。仅 Objective 单字段变化可自动写入 revision；Anchor、验收、约束、授权、交付物或停止条件变化必须进入 TUI/命令确认，事件 head CAS 与 expected revision 冲突时拒绝覆盖。
 - 模型的 start/pause/end 工具经过 host 状态和 acceptance 校验；pause/end 仅在最终 checkpoint 后提交，普通模型回复仍会自动续跑。
 - 最终 checkpoint 必须已成为可重放的 Goal event；失败时 lifecycle intent 保持 pending。状态不再兼容的旧 intent 标记 rejected，不会在未来重复生效。
 - 当前 branch 的 Goal 未 ended 时拒绝新草案；`goal-objective.md` 按完整合同正文校验并在合同投影重建时同步刷新。
@@ -1063,13 +1066,15 @@ Session Chain 专用 L1/L2 与按需读取已经完成；本 Phase 剩余范围�
 - [Magic Context](https://github.com/cortexkit/magic-context)
 - [pi-hermes-memory](https://github.com/chandra447/pi-hermes-memory)
 - [pi-lcm](https://github.com/codexstar69/pi-lcm)
+- [pi-observational-memory](https://github.com/elpapi42/pi-observational-memory)
+- [pi-ace-tool](https://github.com/justhil/pi-ace-tool)
 - [oh-my-pi](https://github.com/can1357/oh-my-pi)
 - [rpiv-ask-user-question](https://www.npmjs.com/package/@juicesharp/rpiv-ask-user-question)
-- [pi-tool-display](https://github.com/MasuRii/pi-tool-display)
-- [pi-nano-context](https://github.com/daynin/nano-context)
+- [pi-tool-display](https://www.npmjs.com/package/pi-tool-display)
+- [pi-nano-context](https://www.npmjs.com/package/pi-nano-context)
 - [pi-adaptative](https://github.com/Caupulican/pi-adaptative)
 
-外部研究快照存放在本机临时目录 /tmp/pi-xk-research，没有把第三方源码复制进 Pi-XK 仓库。版本、许可证和维护状态以采用前重新审计为准。
+外部研究结论和证据入口记录在[Pi 生态研究地图](research/pi-ecosystem-forum-map.md)，没有把第三方源码复制进 Pi-XK 仓库。版本、许可证和维护状态以采用前重新审计为准。
 
 ## 20. 最终决策摘要
 

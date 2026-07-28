@@ -6,7 +6,7 @@
 
 Session Chain 的历史信息采用两层摘要：
 
-- **L1 Segment Summary**：每次成功 rollover 生成，覆盖一个 sealed Segment；现有 `pi-xk.segment-summary.v1` artifact 是事实源。
+- **L1 Segment Summary**：每次成功 rollover 生成，覆盖一个 sealed Segment；当前 writer 使用 `pi-xk.segment-summary.v2` 并附带安全标题，历史 `pi-xk.segment-summary.v1` 仍是有效事实源。
 - **L2 Chain Rollup**：默认每 5 个 sealed Segment 生成，输入只包括对应窗口内按顺序校验过的 L1 artifact；`pi-xk.session-chain-rollup.v1` artifact 是事实源。
 - **Markdown 投影**：为 L2 提供人类可读视图，可由 artifact 重建，不参与事实裁决。
 - **模型访问**：系统提示词只注入固定大小的可信 manifest；摘要正文必须通过只读工具按需读取。
@@ -17,6 +17,7 @@ Session Chain 的历史信息采用两层摘要：
 
 每个 sealed Segment 的 L1 artifact 记录：
 
+- V2 的单行 Segment 主工作标题；V1 对外返回 `title: null`；
 - chain、branch、source Segment、source leaf 和 target Segment；
 - source entry 起止、数量和有序 JSONL hash；
 - base summary artifact；
@@ -27,7 +28,9 @@ rollover 前，Controller 从当前 Segment 的 `summary-in` marker 找到前序
 
 新摘要写入 Artifact Store 后也会立即按返回的 artifact ID read-back。后续 summary-out marker、source seal、successor summary-in 与 hash 全部使用这个 canonical 内容。如果存储前脱敏或序列化改变了 JSON schema、正文 hash 或 provenance，rollover 在提交 branch head 前失败，不留下半 sealed Segment。
 
-Pi compaction 与 L1 递进摘要独立：存在 compaction 时，以最新 compaction summary 为 base，只总结保留边界后的尾部；否则以 `summary-in` 为 base。
+V2 标题必须是最多 60 个 Unicode code point 的名词短语，禁止 Markdown、控制字符、命令式文本、角色指令和无证据的完成声明。它随 L1 artifact 一起进入内容寻址身份；Rollup `sourceDigest` 通过有序 artifact ID 间接覆盖标题，不需要修改 L2/event schema。
+
+Pi compaction 与 L1 递进摘要独立：存在 compaction 时，以最新 compaction summary 为 base，只总结保留边界后的尾部；否则以 `summary-in` 为 base。compaction 自己的短标题只用于物理 Segment 内的历史展示，不替代 L1 标题。若 compaction 后立刻 rollover，successor 使用 L1 summary-in，不复制源 Segment 的一次性 recovery system context。
 
 ## 3. L2 窗口和配置
 
@@ -134,6 +137,7 @@ flowchart TD
 - 是否存在完整但未发布的窗口；
 - 未解决的 Rollup failure 数量；
 - 两个只读工具的名称和读取条件。
+- 列表工具可提供 L1 标题和 L1/L2 范围的能力说明。
 
 manifest 从 checkpointed `chain-read-model.json` 加载。投影记录已消费 event 的字节 offset、sequence 和 head hash；event 文件未缩短且 head 连续时只读取新增 tail。offset 异常、文件缩短或 head 不匹配时退回完整 replay；无法建立可信投影时本次请求不注入 manifest，并报告 `manifest_read_model_inconsistent`。
 
@@ -141,7 +145,7 @@ manifest 不包含：
 
 - L1/L2 正文；
 - 历史用户原文；
-- 模型生成的标题或预览；
+- 模型生成的 L1/compaction 标题或预览；
 - artifact Store 任意内容；
 - 摘要中的命令、角色或伪系统提示。
 
@@ -151,11 +155,11 @@ manifest 不包含：
 
 ### `pi_xk_list_chain_summaries`
 
-列出当前 chain/branch 的 L1/L2 元数据，不返回正文。默认 `limit=20`，最大 50，支持 cursor；只读取当前页 artifact。结果包含 artifact ID、level、Segment/window 范围、创建时间和 `unchecked|invalid` 完整性状态。`unchecked` 表示索引/schema 可定位但尚未做完整 provenance 验证，不能被解释为可信正文。
+列出当前 chain/branch 的 L1/L2 元数据，不返回正文。默认 `limit=20`，最大 50，支持 cursor；只读取当前页 artifact。结果包含 artifact ID、level、L1 `title`（V1 为 `null`，L2 不伪造标题）、Segment/window 范围、创建时间和 `unchecked|invalid` 完整性状态。`unchecked` 表示索引/schema 可定位但尚未做完整 provenance 验证，不能被解释为可信正文。
 
 ### `pi_xk_read_chain_summary`
 
-支持按 artifact ID、L1 ordinal、L2 window 或最新 L2 读取。成功结果显式标记 `integrity: "verified"`，并返回来源范围和 provenance；L2 同时返回可重建 Markdown。
+支持按 artifact ID、L1 ordinal、L2 window 或最新 L2 读取。成功结果显式标记 `integrity: "verified"`，并返回来源范围和 provenance；L1 同时返回经过 artifact/provenance 验证的标题，L2 同时返回可重建 Markdown。
 
 安全限制：
 
@@ -187,7 +191,7 @@ manifest 不包含：
 
 `/chain doctor` 是快速检查，只读取 event/read-model head、拓扑、写锁、pending publication 和 Markdown metadata。`/chain doctor deep` 从事实源完整 replay，并检查：
 
-- L1 artifact、summary-in/out marker、binding 和 carry-forward 一致性；
+- L1 V1/V2 artifact、V2 标题、summary-in/out marker、binding 和 carry-forward 一致性；
 - sealed Segment 文件大小、hash 和 leaf；
 - L2 branch 归属、窗口范围、有序 source IDs 和 `sourceDigest`；
 - published event 与 artifact identity；

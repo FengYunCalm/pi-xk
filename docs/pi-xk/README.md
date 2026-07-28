@@ -8,7 +8,7 @@ Pi-XK 是 Pi 的维护型 fork 与扩展层。它在保留 Pi provider、Agent l
 
 | 能力 | 状态 | 当前边界 |
 | --- | --- | --- |
-| Goal contract 与生命周期 | 已实现 | 每个 session branch 只能绑定一个未结束 Goal；确认前不创建 Goal 文件 |
+| Goal contract 与生命周期 | 已实现 | 新 Goal 使用 V3 Intent Anchor/Current Objective；受保护修订需确认，每个 session branch 只能绑定一个未结束 Goal |
 | Goal 连续执行 | 已实现 | active Goal 会自动继续，直到模型提交合格的 pause/end intent 或用户显式控制 |
 | Task Run v1 | 已实现 | 同一 parent 只运行一个 in-process child；无并发、DAG、retry、deadline 或 worktree 隔离 |
 | Session Chain v1.1 | 已实现 | 物理 Segment、L1 递进摘要、默认每 5 段 L2 Rollup、模型按需检索、恢复和 successor branch |
@@ -83,4 +83,4 @@ flowchart LR
 
 ## 版本基线
 
-当前文档对应 2026-07-26 的 Pi-XK 稳定化与 GitHub-only 发行实现。修正后的 `npm run test:pi-xk` 覆盖 Core `63/63`、Pi/Host 与发行集成 `157/157`；旧的 `42/97`、`55/119` 都不再是完整验收证据。发布前还必须运行 `npm run check`、`./test.sh`、两组 Session Chain benchmark、摘要质量评估、单平台归档 smoke 和 `git diff --check`。
+当前文档对应 2026-07-28 的 Pi-XK Goal V3、compaction recovery、Session Chain L1 V2 标题与既有 GitHub-only 发行实现。修正后的 `npm run test:pi-xk` 覆盖 Core `93/93`、Pi/Host 与 Extension `241 passed / 2 skipped`；旧的 `42/97`、`55/119`、`63/157` 都不再是完整验收证据。发布前还必须运行 `npm run check`、`./test.sh`、两组 Session Chain benchmark、摘要质量评估、单平台归档 smoke 和 `git diff --check`。
