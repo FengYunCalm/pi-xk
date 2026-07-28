@@ -38,16 +38,18 @@ export class CompactionSummaryMessageComponent extends Box {
 		this.addChild(new Spacer(1));
 
 		if (this.expanded) {
-			const header = `**Compacted from ${tokenStr} tokens**\n\n`;
+			const title = this.message.title ? `**${this.message.title}**\n\n` : "";
+			const header = `${title}Compacted from ${tokenStr} tokens\n\n`;
 			this.addChild(
 				new Markdown(header + this.message.summary, 0, 0, this.markdownTheme, {
 					color: (text: string) => theme.fg("customMessageText", text),
 				}),
 			);
 		} else {
+			const title = this.message.title ? `${this.message.title} - ` : "";
 			this.addChild(
 				new Text(
-					theme.fg("customMessageText", `Compacted from ${tokenStr} tokens (`) +
+					theme.fg("customMessageText", `${title}Compacted from ${tokenStr} tokens (`) +
 						theme.fg("dim", keyText("app.tools.expand")) +
 						theme.fg("customMessageText", " to expand)"),
 					0,

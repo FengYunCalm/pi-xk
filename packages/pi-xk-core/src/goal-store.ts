@@ -7,6 +7,7 @@ import {
 	GOAL_CHECKPOINT_SCHEMA,
 	GOAL_CONTRACT_PROJECTION_SCHEMA,
 	GOAL_EVENT_SCHEMA,
+	GOAL_EVENT_V2_SCHEMA,
 	type GoalActor,
 	type GoalArtifactMetadata,
 	type GoalCheckpoint,
@@ -14,9 +15,13 @@ import {
 	type GoalCheckpointV2,
 	type GoalContract,
 	type GoalContractProjection,
-	type GoalContractUpdatedEvent,
+	type GoalContractRevisionRecord,
+	type GoalContractUpdatedEventV1,
+	type GoalContractUpdatedEventV2,
 	type GoalContractV2,
+	type GoalContractV3,
 	type GoalCreatedEvent,
+	type GoalCurrentContract,
 	type GoalEvent,
 	type GoalHead,
 	type GoalLifecycleEvent,
@@ -30,6 +35,7 @@ import {
 	validateGoalCheckpoint,
 	validateGoalContract,
 	validateGoalContractV2,
+	validateGoalContractV3,
 	validateGoalLifecycleEventForContract,
 	validateGoalLifecycleEventInput,
 } from "./contract.ts";
@@ -84,6 +90,13 @@ export class GoalHeadConflictError extends GoalStoreError {
 			`Goal head conflict: expected ${expected.sequence}/${expected.hash}, got ${actual.sequence}/${actual.hash}`,
 		);
 		this.name = "GoalHeadConflictError";
+	}
+}
+
+export class GoalRevisionConflictError extends GoalStoreError {
+	constructor(expected: number, actual: number) {
+		super(`Goal revision conflict: expected ${expected}, got ${actual}`);
+		this.name = "GoalRevisionConflictError";
 	}
 }
 
@@ -156,7 +169,7 @@ export interface GoalTailDiagnostic {
 export interface GoalReplay {
 	goalId: string;
 	/** The current contract projected into the v2 in-memory representation. */
-	contract: GoalContractV2;
+	contract: GoalCurrentContract;
 	/** The exact latest on-disk contract payload used to validate the event hash chain. */
 	sourceContract: GoalContract;
 	head: GoalHead;
@@ -181,6 +194,13 @@ export interface GoalContractUpdateOptions extends GoalMutationOptions {
 	expectedHead: GoalHead;
 }
 
+export interface GoalContractRevisionOptions extends GoalContractUpdateOptions {
+	expectedRevision: number;
+	mode: GoalContractRevisionRecord["mode"];
+	reason: string;
+	evidence: string;
+}
+
 export interface GoalWriteResult {
 	event: GoalEvent;
 	head: GoalHead;
@@ -201,7 +221,7 @@ interface EventInput {
 type GoalContractEventType = "goal_created" | "goal_contract_updated";
 
 interface GoalEventHashInput {
-	schema: typeof GOAL_EVENT_SCHEMA;
+	schema: typeof GOAL_EVENT_SCHEMA | typeof GOAL_EVENT_V2_SCHEMA;
 	eventId: string;
 	goalId: string;
 	sequence: number;
@@ -210,7 +230,7 @@ interface GoalEventHashInput {
 	timestamp: string;
 	prevHash: string | null;
 	payload: GoalEvent["payload"];
-	schemaVersion: 1;
+	schemaVersion: 1 | 2;
 	idempotencyKey: string;
 }
 
@@ -239,6 +259,78 @@ function assertActor(value: GoalActor): void {
 	if (value !== "user" && value !== "runtime" && value !== "model" && value !== "child-task" && value !== "system") {
 		throw new GoalValidationError("actor is invalid");
 	}
+}
+
+const GOAL_REVISION_FIELDS = [
+	"title",
+	"intentAnchor",
+	"objective",
+	"constraints",
+	"acceptance",
+	"capabilities",
+	"budgets",
+	"nonGoals",
+	"doneCondition",
+	"pauseCondition",
+	"finalReport",
+	"executionAuthorization",
+] as const;
+
+function revisionValues(contract: GoalCurrentContract): Record<(typeof GOAL_REVISION_FIELDS)[number], unknown> {
+	return {
+		title: contract.title,
+		intentAnchor: contract.schema === "pi-xk.goal.contract.v3" ? contract.intentAnchor : null,
+		objective: contract.objective,
+		constraints: contract.constraints,
+		acceptance: contract.acceptance,
+		capabilities: contract.capabilities,
+		budgets: contract.budgets,
+		nonGoals: contract.nonGoals,
+		doneCondition: contract.doneCondition,
+		pauseCondition: contract.pauseCondition,
+		finalReport: contract.finalReport,
+		executionAuthorization: contract.executionAuthorization,
+	};
+}
+
+export function changedGoalContractFields(current: GoalCurrentContract, candidate: GoalContractV3): string[] {
+	const before = revisionValues(current);
+	const after = revisionValues(candidate);
+	return GOAL_REVISION_FIELDS.filter(
+		(field) => stableJsonStringify(before[field]) !== stableJsonStringify(after[field]),
+	);
+}
+
+function validateGoalRevision(
+	current: GoalCurrentContract,
+	candidate: GoalContractV3,
+	revision: GoalContractRevisionRecord,
+): string[] {
+	const currentRevision = current.schema === "pi-xk.goal.contract.v3" ? current.revision : 0;
+	if (revision.fromRevision !== currentRevision || revision.toRevision !== currentRevision + 1) {
+		throw new GoalRevisionConflictError(revision.fromRevision, currentRevision);
+	}
+	if (candidate.revision !== revision.toRevision) {
+		throw new GoalValidationError("Goal candidate revision must equal toRevision");
+	}
+	const changedFields = changedGoalContractFields(current, candidate);
+	if (changedFields.length === 0)
+		throw new GoalValidationError("Goal revision must change at least one contract field");
+	if (stableJsonStringify(changedFields) !== stableJsonStringify(revision.changedFields)) {
+		throw new GoalValidationError("Goal revision changedFields do not match the candidate contract");
+	}
+	assertNonEmptyString(revision.reason, "revision reason");
+	assertNonEmptyString(revision.evidence, "revision evidence");
+	if (current.schema !== "pi-xk.goal.contract.v3" && revision.mode !== "user-confirmed") {
+		throw new GoalValidationError("V1/V2 Goal migration to V3 must be user-confirmed");
+	}
+	if (
+		revision.mode === "automatic-objective-refinement" &&
+		(changedFields.length !== 1 || changedFields[0] !== "objective")
+	) {
+		throw new GoalValidationError("Automatic Goal revisions may change only objective");
+	}
+	return changedFields;
 }
 
 function eventHashInput(event: GoalEventHashInput): string {
@@ -347,7 +439,7 @@ function createEvent(input: EventInput): GoalEvent {
 		};
 		return { ...eventWithoutHash, hash: calculateEventHash(eventWithoutHash) };
 	}
-	const eventWithoutHash: Omit<GoalContractUpdatedEvent, "hash"> = {
+	const eventWithoutHash: Omit<GoalContractUpdatedEventV1, "hash"> = {
 		schema: GOAL_EVENT_SCHEMA,
 		eventId: input.eventId,
 		goalId: input.goalId,
@@ -358,6 +450,29 @@ function createEvent(input: EventInput): GoalEvent {
 		prevHash: input.prevHash,
 		payload: { contract: getContractFromPayload(input.payload) },
 		schemaVersion: 1,
+		idempotencyKey: input.idempotencyKey,
+	};
+	return { ...eventWithoutHash, hash: calculateEventHash(eventWithoutHash) };
+}
+
+function createRevisionEvent(
+	input: Omit<EventInput, "payload" | "eventType"> & {
+		prevHash: string;
+		contract: GoalContractV3;
+		revision: GoalContractRevisionRecord;
+	},
+): GoalContractUpdatedEventV2 {
+	const eventWithoutHash: Omit<GoalContractUpdatedEventV2, "hash"> = {
+		schema: GOAL_EVENT_V2_SCHEMA,
+		eventId: input.eventId,
+		goalId: input.goalId,
+		sequence: input.sequence,
+		eventType: "goal_contract_updated",
+		actor: input.actor,
+		timestamp: input.timestamp,
+		prevHash: input.prevHash,
+		payload: { contract: input.contract, ...input.revision },
+		schemaVersion: 2,
 		idempotencyKey: input.idempotencyKey,
 	};
 	return { ...eventWithoutHash, hash: calculateEventHash(eventWithoutHash) };
@@ -397,8 +512,13 @@ function parseGoalEvent(value: unknown, lineNumber: number): GoalEvent {
 	if (keys.length !== requiredKeys.length || keys.some((key, index) => key !== [...requiredKeys].sort()[index])) {
 		throw new GoalCorruptionError(`Event ${lineNumber} has unknown or missing fields`);
 	}
-	if (value.schema !== GOAL_EVENT_SCHEMA || value.schemaVersion !== 1) {
+	const isV1 = value.schema === GOAL_EVENT_SCHEMA && value.schemaVersion === 1;
+	const isV2 = value.schema === GOAL_EVENT_V2_SCHEMA && value.schemaVersion === 2;
+	if (!isV1 && !isV2) {
 		throw new GoalCorruptionError(`Event ${lineNumber} has an unsupported schema`);
+	}
+	if (isV2 && value.eventType !== "goal_contract_updated") {
+		throw new GoalCorruptionError(`Event ${lineNumber} has an unsupported v2 event type`);
 	}
 	if (typeof value.eventId !== "string" || value.eventId.length === 0 || typeof value.goalId !== "string") {
 		throw new GoalCorruptionError(`Event ${lineNumber} has invalid identifiers`);
@@ -436,6 +556,7 @@ function parseGoalEvent(value: unknown, lineNumber: number): GoalEvent {
 	}
 	let event: GoalEvent;
 	if (value.eventType === "goal_created") {
+		if (!isV1) throw new GoalCorruptionError(`Event ${lineNumber} has an unsupported create schema`);
 		if (Object.keys(value.payload).length !== 1 || !("contract" in value.payload)) {
 			throw new GoalCorruptionError(`Event ${lineNumber} has an invalid create payload`);
 		}
@@ -458,28 +579,86 @@ function parseGoalEvent(value: unknown, lineNumber: number): GoalEvent {
 		};
 		event = createdEvent;
 	} else if (value.eventType === "goal_contract_updated") {
-		if (Object.keys(value.payload).length !== 1 || !("contract" in value.payload)) {
-			throw new GoalCorruptionError(`Event ${lineNumber} has an invalid update payload`);
-		}
 		if (typeof value.prevHash !== "string") {
 			throw new GoalCorruptionError(`Event ${lineNumber} update event has no previous hash`);
 		}
-		const updatedEvent: GoalContractUpdatedEvent = {
-			schema: GOAL_EVENT_SCHEMA,
-			eventId: value.eventId,
-			goalId: value.goalId,
-			sequence: value.sequence,
-			eventType: "goal_contract_updated",
-			actor: value.actor as GoalActor,
-			timestamp: value.timestamp,
-			prevHash: value.prevHash,
-			payload: { contract: validateGoalContract(value.payload.contract) },
-			schemaVersion: 1,
-			idempotencyKey: value.idempotencyKey,
-			hash: value.hash,
-		};
-		event = updatedEvent;
+		if (isV1) {
+			if (Object.keys(value.payload).length !== 1 || !("contract" in value.payload)) {
+				throw new GoalCorruptionError(`Event ${lineNumber} has an invalid update payload`);
+			}
+			const updatedEvent: GoalContractUpdatedEventV1 = {
+				schema: GOAL_EVENT_SCHEMA,
+				eventId: value.eventId,
+				goalId: value.goalId,
+				sequence: value.sequence,
+				eventType: "goal_contract_updated",
+				actor: value.actor as GoalActor,
+				timestamp: value.timestamp,
+				prevHash: value.prevHash,
+				payload: { contract: validateGoalContract(value.payload.contract) },
+				schemaVersion: 1,
+				idempotencyKey: value.idempotencyKey,
+				hash: value.hash,
+			};
+			event = updatedEvent;
+		} else {
+			const expectedPayloadKeys = [
+				"contract",
+				"fromRevision",
+				"toRevision",
+				"mode",
+				"reason",
+				"evidence",
+				"changedFields",
+			].sort();
+			const payloadKeys = Object.keys(value.payload).sort();
+			if (
+				payloadKeys.length !== expectedPayloadKeys.length ||
+				payloadKeys.some((key, index) => key !== expectedPayloadKeys[index]) ||
+				typeof value.payload.fromRevision !== "number" ||
+				!Number.isInteger(value.payload.fromRevision) ||
+				value.payload.fromRevision < 0 ||
+				typeof value.payload.toRevision !== "number" ||
+				!Number.isInteger(value.payload.toRevision) ||
+				value.payload.toRevision !== value.payload.fromRevision + 1 ||
+				(value.payload.mode !== "automatic-objective-refinement" && value.payload.mode !== "user-confirmed") ||
+				typeof value.payload.reason !== "string" ||
+				value.payload.reason.trim().length === 0 ||
+				typeof value.payload.evidence !== "string" ||
+				value.payload.evidence.trim().length === 0 ||
+				!Array.isArray(value.payload.changedFields) ||
+				value.payload.changedFields.length === 0 ||
+				value.payload.changedFields.some((field) => typeof field !== "string" || field.trim().length === 0) ||
+				new Set(value.payload.changedFields).size !== value.payload.changedFields.length
+			) {
+				throw new GoalCorruptionError(`Event ${lineNumber} has an invalid revision payload`);
+			}
+			const updatedEvent: GoalContractUpdatedEventV2 = {
+				schema: GOAL_EVENT_V2_SCHEMA,
+				eventId: value.eventId,
+				goalId: value.goalId,
+				sequence: value.sequence,
+				eventType: "goal_contract_updated",
+				actor: value.actor as GoalActor,
+				timestamp: value.timestamp,
+				prevHash: value.prevHash,
+				payload: {
+					contract: validateGoalContractV3(value.payload.contract),
+					fromRevision: value.payload.fromRevision,
+					toRevision: value.payload.toRevision,
+					mode: value.payload.mode,
+					reason: value.payload.reason,
+					evidence: value.payload.evidence,
+					changedFields: [...(value.payload.changedFields as string[])],
+				},
+				schemaVersion: 2,
+				idempotencyKey: value.idempotencyKey,
+				hash: value.hash,
+			};
+			event = updatedEvent;
+		}
 	} else if (value.eventType === "goal_checkpointed") {
+		if (!isV1) throw new GoalCorruptionError(`Event ${lineNumber} has an unsupported checkpoint schema`);
 		if (Object.keys(value.payload).length !== 1 || !("checkpoint" in value.payload)) {
 			throw new GoalCorruptionError(`Event ${lineNumber} has an invalid checkpoint payload`);
 		}
@@ -510,6 +689,7 @@ function parseGoalEvent(value: unknown, lineNumber: number): GoalEvent {
 		value.eventType === "goal_run_settled" ||
 		value.eventType === "goal_run_interrupted"
 	) {
+		if (!isV1) throw new GoalCorruptionError(`Event ${lineNumber} has an unsupported lifecycle schema`);
 		if (typeof value.prevHash !== "string") {
 			throw new GoalCorruptionError(`Event ${lineNumber} lifecycle event has no previous hash`);
 		}
@@ -762,6 +942,38 @@ function replayEvents(goalId: string, raw: string, now = new Date().toISOString(
 			if (sourceContract && nextContract.createdAt !== sourceContract.createdAt) {
 				throw new GoalCorruptionError(`Event ${index + 1} changes the Goal creation timestamp`);
 			}
+			if (sourceContract && nextContract.ownerSessionId !== sourceContract.ownerSessionId) {
+				throw new GoalCorruptionError(`Event ${index + 1} changes the Goal owner session`);
+			}
+			if (
+				event.eventType === "goal_created" &&
+				nextContract.schema === "pi-xk.goal.contract.v3" &&
+				nextContract.revision !== 1
+			) {
+				throw new GoalCorruptionError("A new V3 Goal must start at revision 1");
+			}
+			if (
+				sourceContract?.schema === "pi-xk.goal.contract.v3" &&
+				event.eventType === "goal_contract_updated" &&
+				event.schemaVersion === 1
+			) {
+				throw new GoalCorruptionError(`Event ${index + 1} cannot update a V3 Goal through event v1`);
+			}
+			if (event.eventType === "goal_contract_updated" && event.schemaVersion === 2) {
+				if (!sourceContract) {
+					throw new GoalCorruptionError(`Event ${index + 1} has no preceding Goal contract`);
+				}
+				try {
+					validateGoalRevision(upcastGoalContract(sourceContract), event.payload.contract, event.payload);
+				} catch (error) {
+					if (error instanceof GoalValidationError || error instanceof GoalRevisionConflictError) {
+						throw new GoalCorruptionError(`Event ${index + 1} has an invalid Goal revision`);
+					}
+					throw error;
+				}
+			} else if (event.eventType === "goal_contract_updated" && nextContract.schema === "pi-xk.goal.contract.v3") {
+				throw new GoalCorruptionError(`Event ${index + 1} writes a V3 contract without Goal event v2`);
+			}
 			sourceContract = nextContract;
 		}
 		if (isGoalLifecycleEvent(event)) {
@@ -958,7 +1170,7 @@ export class GoalStore {
 	}
 
 	private buildEvent(
-		contract: GoalContractV2,
+		contract: GoalCurrentContract,
 		eventType: GoalContractEventType,
 		options: GoalMutationOptions,
 		sequence: number,
@@ -1009,6 +1221,32 @@ export class GoalStore {
 		});
 	}
 
+	private buildRevisionEvent(
+		contract: GoalContractV3,
+		revision: GoalContractRevisionRecord,
+		options: GoalMutationOptions,
+		sequence: number,
+		prevHash: string,
+	): GoalContractUpdatedEventV2 {
+		assertNonEmptyString(options.eventId, "eventId");
+		assertNonEmptyString(options.idempotencyKey, "idempotencyKey");
+		const actor = options.actor ?? "runtime";
+		assertActor(actor);
+		const timestamp = options.timestamp ?? new Date().toISOString();
+		assertIsoTimestamp(timestamp, "timestamp");
+		return createRevisionEvent({
+			eventId: options.eventId,
+			goalId: contract.goalId,
+			actor,
+			timestamp,
+			prevHash,
+			sequence,
+			idempotencyKey: options.idempotencyKey,
+			contract,
+			revision,
+		});
+	}
+
 	private buildLifecycleEvent(
 		goalId: string,
 		input: GoalLifecycleEventInput,
@@ -1044,8 +1282,15 @@ export class GoalStore {
 		return { event: existing, head: headForEvent(existing) };
 	}
 
-	async createGoal(contractInput: GoalContractV2, options: GoalMutationOptions): Promise<GoalWriteResult> {
-		const contract = validateGoalContractV2(contractInput);
+	async createGoal(contractInput: GoalCurrentContract, options: GoalMutationOptions): Promise<GoalWriteResult> {
+		const validated = validateGoalContract(contractInput);
+		if (validated.schema === "pi-xk.goal.contract.v1") {
+			throw new GoalValidationError("New Goal writers must use contract v2 or v3");
+		}
+		const contract = validated;
+		if (contract.schema === "pi-xk.goal.contract.v3" && contract.revision !== 1) {
+			throw new GoalValidationError("New V3 Goals must start at revision 1");
+		}
 		const paths = this.paths(contract.goalId);
 		return await this.withGoalLock(paths, contract.goalId, async () => {
 			let existing: GoalReplay | undefined;
@@ -1172,6 +1417,9 @@ export class GoalStore {
 			);
 			const retry = this.ensureRetryMatches(replay, event);
 			if (retry) return retry;
+			if (replay.contract.schema === "pi-xk.goal.contract.v3") {
+				throw new GoalValidationError("V3 Goal contracts must use reviseGoalContract");
+			}
 			if (options.expectedHead.sequence !== replay.head.sequence || options.expectedHead.hash !== replay.head.hash) {
 				throw new GoalHeadConflictError(options.expectedHead, replay.head);
 			}
@@ -1192,6 +1440,83 @@ export class GoalStore {
 				head: headForEvent(event),
 				events: [...replay.events, event],
 				lifecycle: projectGoalLifecycle([...replay.events, event], options.timestamp ?? new Date().toISOString()),
+			};
+			await writeGoalObjectiveProjection(paths.goalDirectory, contract);
+			await this.writeDerivedProjections(paths, nextReplay);
+			return { event, head: nextReplay.head };
+		});
+	}
+
+	async reviseGoalContract(
+		contractInput: GoalContractV3,
+		options: GoalContractRevisionOptions,
+	): Promise<GoalWriteResult> {
+		const contract = validateGoalContractV3(contractInput);
+		if (!Number.isInteger(options.expectedRevision) || options.expectedRevision < 0) {
+			throw new GoalValidationError("expectedRevision must be a non-negative integer");
+		}
+		assertNonEmptyString(options.reason, "revision reason");
+		assertNonEmptyString(options.evidence, "revision evidence");
+		const paths = this.paths(contract.goalId);
+		return await this.withGoalLock(paths, contract.goalId, async () => {
+			const replay = await this.readReplay(paths, contract.goalId);
+			if (replay.tailDiagnostic) throw new GoalRecoveryRequiredError(contract.goalId);
+			const existing = replay.events.find((event) => event.idempotencyKey === options.idempotencyKey);
+			if (existing) {
+				if (
+					existing.eventType !== "goal_contract_updated" ||
+					existing.schemaVersion !== 2 ||
+					stableJsonStringify(existing.payload.contract) !== stableJsonStringify(contract) ||
+					existing.payload.fromRevision !== options.expectedRevision ||
+					existing.payload.toRevision !== contract.revision ||
+					existing.payload.mode !== options.mode ||
+					existing.payload.reason !== options.reason ||
+					existing.payload.evidence !== options.evidence
+				) {
+					throw new GoalIdempotencyConflictError(options.idempotencyKey);
+				}
+				await writeGoalObjectiveProjection(paths.goalDirectory, replay.contract);
+				await this.writeDerivedProjections(paths, replay);
+				return { event: existing, head: headForEvent(existing) };
+			}
+			if (options.expectedHead.sequence !== replay.head.sequence || options.expectedHead.hash !== replay.head.hash) {
+				throw new GoalHeadConflictError(options.expectedHead, replay.head);
+			}
+			const currentRevision = replay.contract.schema === "pi-xk.goal.contract.v3" ? replay.contract.revision : 0;
+			if (options.expectedRevision !== currentRevision) {
+				throw new GoalRevisionConflictError(options.expectedRevision, currentRevision);
+			}
+			if (contract.goalId !== replay.contract.goalId) {
+				throw new GoalValidationError("Goal revisions cannot change goalId");
+			}
+			if (contract.createdAt !== replay.contract.createdAt) {
+				throw new GoalValidationError("Goal revisions cannot change createdAt");
+			}
+			if (contract.ownerSessionId !== replay.contract.ownerSessionId) {
+				throw new GoalValidationError("Goal revisions cannot change ownerSessionId");
+			}
+			if (replay.lifecycle.status === "ended") {
+				throw new GoalValidationError("ended Goal contracts cannot be revised");
+			}
+			const revision: GoalContractRevisionRecord = {
+				fromRevision: currentRevision,
+				toRevision: contract.revision,
+				mode: options.mode,
+				reason: options.reason,
+				evidence: options.evidence,
+				changedFields: changedGoalContractFields(replay.contract, contract),
+			};
+			validateGoalRevision(replay.contract, contract, revision);
+			const event = this.buildRevisionEvent(contract, revision, options, replay.head.sequence + 1, replay.head.hash);
+			await this.appendEvent(paths, event);
+			const events = [...replay.events, event];
+			const nextReplay: GoalReplay = {
+				goalId: contract.goalId,
+				contract,
+				sourceContract: contract,
+				head: headForEvent(event),
+				events,
+				lifecycle: projectGoalLifecycle(events, options.timestamp ?? new Date().toISOString()),
 			};
 			await writeGoalObjectiveProjection(paths.goalDirectory, contract);
 			await this.writeDerivedProjections(paths, nextReplay);

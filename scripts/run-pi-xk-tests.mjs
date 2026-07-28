@@ -11,6 +11,7 @@ const testTempDir =
 		: inheritedTempDir;
 const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
 const commands = [
+	["--workspace", "@earendil-works/pi-agent-core", "run", "build"],
 	["--workspace", "@earendil-works/pi-coding-agent", "run", "build"],
 	["--workspace", "pi-xk-core", "run", "build"],
 	["--workspace", "pi-xk-extension", "run", "build"],
@@ -22,6 +23,7 @@ const commands = [
 		"--",
 		"test/goal-store.test.ts",
 		"test/goal-contract-v2.test.ts",
+		"test/goal-contract-v3.test.ts",
 		"test/goal-lifecycle.test.ts",
 		"test/artifact-store.test.ts",
 		"test/goal-read-model.test.ts",
@@ -31,6 +33,7 @@ const commands = [
 		"test/session-chain-contract.test.ts",
 		"test/session-chain-store.test.ts",
 		"test/session-chain-read-model.test.ts",
+		"test/session-chain-summary-v2.test.ts",
 	],
 	[
 		"--workspace",
@@ -38,6 +41,9 @@ const commands = [
 		"run",
 		"test",
 		"--",
+		"test/compaction.test.ts",
+		"test/compaction-recovery.test.ts",
+		"test/suite/agent-session-compaction.test.ts",
 		"test/suite/pi-xk-session-link.test.ts",
 		"test/suite/pi-xk-checkpoint-bridge.test.ts",
 		"test/suite/pi-xk-goal-extension.test.ts",

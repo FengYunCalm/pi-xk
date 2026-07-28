@@ -91,7 +91,9 @@ describe("AgentSession auto-compaction queue resume", () => {
 					type: "done",
 					reason: "stop",
 					message: {
-						...fauxAssistantMessage("compacted"),
+						...fauxAssistantMessage(
+							"<title>Queued message compaction</title>\n<summary>Compacted queue context.</summary>",
+						),
 						api: summaryModel.api,
 						provider: summaryModel.provider,
 						model: summaryModel.id,

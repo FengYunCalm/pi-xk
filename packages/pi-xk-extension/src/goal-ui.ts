@@ -15,19 +15,17 @@ export interface GoalDraftReviewComponent {
 
 export interface GoalDraftReviewComponentOptions {
 	markdown: string;
+	title?: string;
+	confirmLabel?: string;
+	reviseLabel?: string;
 	tui: GoalDraftReviewTui;
 	theme: Theme;
 	keybindings: KeybindingsManager;
 	done: (result: GoalDraftReviewAction) => void;
 }
 
-const ACTIONS: ReadonlyArray<{ action: Exclude<GoalDraftReviewAction, "cancel">; label: string }> = [
-	{ action: "confirm", label: "确认，启动 Goal" },
-	{ action: "revise", label: "修改草案" },
-];
-
 function dialogMarkdown(markdown: string): string {
-	return markdown.replace(/^# Goal Draft(?:\r?\n)+/, "");
+	return markdown.replace(/^# Goal (?:Draft|Revision)(?:\r?\n)+/, "");
 }
 
 function styleDraftLine(line: string, theme: Theme): string {
@@ -38,6 +36,10 @@ function styleDraftLine(line: string, theme: Theme): string {
 }
 
 export function createGoalDraftReviewComponent(options: GoalDraftReviewComponentOptions): GoalDraftReviewComponent {
+	const actions: ReadonlyArray<{ action: Exclude<GoalDraftReviewAction, "cancel">; label: string }> = [
+		{ action: "confirm", label: options.confirmLabel ?? "确认，启动 Goal" },
+		{ action: "revise", label: options.reviseLabel ?? "修改草案" },
+	];
 	let selectedIndex = 0;
 	let scrollOffset = 0;
 	let bodyPageSize = 1;
@@ -62,12 +64,12 @@ export function createGoalDraftReviewComponent(options: GoalDraftReviewComponent
 			return;
 		}
 		if (options.keybindings.matches(data, "tui.select.down")) {
-			selectedIndex = Math.min(ACTIONS.length - 1, selectedIndex + 1);
+			selectedIndex = Math.min(actions.length - 1, selectedIndex + 1);
 			refresh();
 			return;
 		}
 		if (options.keybindings.matches(data, "tui.select.confirm")) {
-			const selected = ACTIONS[selectedIndex];
+			const selected = actions[selectedIndex];
 			if (selected) options.done(selected.action);
 			return;
 		}
@@ -98,8 +100,8 @@ export function createGoalDraftReviewComponent(options: GoalDraftReviewComponent
 				? options.theme.fg("dim", ` · ${scrollOffset + 1}-${bodyEnd}/${bodyLines.length}`)
 				: "";
 		const border = options.theme.fg("accent", "─".repeat(renderWidth));
-		const title = ` ${options.theme.fg("accent", options.theme.bold("Goal Draft"))}${overflow}`;
-		const actionLines = ACTIONS.map((action, index) => {
+		const title = ` ${options.theme.fg("accent", options.theme.bold(options.title ?? "Goal Draft"))}${overflow}`;
+		const actionLines = actions.map((action, index) => {
 			const selected = index === selectedIndex;
 			const prefix = selected ? options.theme.fg("accent", "> ") : "  ";
 			return `${prefix}${options.theme.fg(selected ? "accent" : "text", action.label)}`;

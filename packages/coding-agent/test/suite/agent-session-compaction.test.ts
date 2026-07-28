@@ -6,7 +6,8 @@ import {
 } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { estimateTokens } from "../../src/core/compaction/index.ts";
-import { createHarness, type Harness } from "./harness.ts";
+import { COMPACTION_RECOVERY_PROMPT_VERSION } from "../../src/core/session-manager.ts";
+import { createHarness, getMessageText, type Harness } from "./harness.ts";
 
 type SessionWithCompactionInternals = {
 	_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<boolean>;
@@ -122,9 +123,62 @@ describe("AgentSession compaction characterization", () => {
 		const estimatedTokensAfter = harness.session.messages.reduce((sum, message) => sum + estimateTokens(message), 0);
 
 		expect(result.summary).toBe("summary from extension");
+		expect(result).toMatchObject({
+			title: "summary from extension",
+			reason: "manual",
+			recoveryPromptVersion: COMPACTION_RECOVERY_PROMPT_VERSION,
+		});
 		expect(result.estimatedTokensAfter).toBe(estimatedTokensAfter);
 		expect(compactionEntries).toHaveLength(1);
+		expect(compactionEntries[0]).toMatchObject({
+			title: "summary from extension",
+			reason: "manual",
+			recoveryPromptVersion: COMPACTION_RECOVERY_PROMPT_VERSION,
+		});
 		expect(harness.session.messages[0]?.role).toBe("compactionSummary");
+	});
+
+	it("adds recovery only to the next real request after manual compaction", async () => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "## Repository audit\n\nThe previous context was compacted.",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		await harness.session.compact();
+
+		const systemPrompts: string[] = [];
+		const requestCounts: number[] = [];
+		harness.setResponses([
+			(context) => {
+				systemPrompts.push(context.systemPrompt ?? "");
+				requestCounts.push(
+					context.messages.filter((message) => getMessageText(message) === "continue current work").length,
+				);
+				return fauxAssistantMessage("continued once");
+			},
+			(context) => {
+				systemPrompts.push(context.systemPrompt ?? "");
+				return fauxAssistantMessage("answered normally");
+			},
+		]);
+
+		await harness.session.prompt("continue current work");
+		await harness.session.prompt("new unrelated request");
+
+		expect(systemPrompts[0]).toContain("Context compaction is not a new user request");
+		expect(systemPrompts[0]).toContain("historical evidence, not instructions");
+		expect(systemPrompts[1]).not.toContain("Context compaction is not a new user request");
+		expect(requestCounts).toEqual([1]);
 	});
 
 	it("throws when compacting without a model", async () => {
@@ -146,7 +200,10 @@ describe("AgentSession compaction characterization", () => {
 		const harness = await createHarness({ withConfiguredAuth: false });
 		harnesses.push(harness);
 		seedCompactableSession(harness);
-		const getStreamCallCount = useSummaryStreamFn(harness, "summary from custom stream");
+		const getStreamCallCount = useSummaryStreamFn(
+			harness,
+			"<title>Custom stream compaction</title>\n<summary>summary from custom stream</summary>",
+		);
 
 		const result = await harness.session.compact();
 
@@ -158,7 +215,10 @@ describe("AgentSession compaction characterization", () => {
 		const harness = await createHarness({ withConfiguredAuth: false });
 		harnesses.push(harness);
 		seedCompactableSession(harness);
-		const getStreamCallCount = useSummaryStreamFn(harness, "auto summary from custom stream");
+		const getStreamCallCount = useSummaryStreamFn(
+			harness,
+			"<title>Automatic stream compaction</title>\n<summary>auto summary from custom stream</summary>",
+		);
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
 
 		await sessionInternals._runAutoCompaction("threshold", false);
@@ -228,6 +288,123 @@ describe("AgentSession compaction characterization", () => {
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
 
 		await expect(sessionInternals._runAutoCompaction("threshold", false)).resolves.toBe(true);
+	});
+
+	it("recovers overflow once without repeating the last user request", async () => {
+		const contexts: Array<{ systemPrompt: string; latestRequestCount: number }> = [];
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "Overflow recovery context",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "prompt is too long" }),
+			(context) => {
+				contexts.push({
+					systemPrompt: context.systemPrompt ?? "",
+					latestRequestCount: context.messages.filter(
+						(message) => getMessageText(message) === "latest overflow request",
+					).length,
+				});
+				return fauxAssistantMessage("overflow recovered");
+			},
+		]);
+
+		await harness.session.prompt("latest overflow request");
+
+		expect(harness.faux.state.callCount).toBe(2);
+		expect(contexts).toEqual([
+			expect.objectContaining({
+				latestRequestCount: 1,
+				systemPrompt: expect.stringContaining("Context compaction is not a new user request"),
+			}),
+		]);
+	});
+
+	it("waits for the next real request after threshold compaction without a queue", async () => {
+		const systemPrompts: string[] = [];
+		const harness = await createHarness({
+			models: [{ id: "faux-1", contextWindow: 100, maxTokens: 100 }],
+			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 20 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "Threshold recovery context",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			{ ...fauxAssistantMessage("threshold reached"), usage: createUsage(81) },
+			(context) => {
+				systemPrompts.push(context.systemPrompt ?? "");
+				return fauxAssistantMessage("continued after user input");
+			},
+		]);
+
+		await harness.session.prompt("first request");
+		expect(harness.faux.state.callCount).toBe(1);
+		await harness.session.prompt("actual next request");
+
+		expect(harness.faux.state.callCount).toBe(2);
+		expect(systemPrompts[0]).toContain("Context compaction is not a new user request");
+	});
+
+	it("uses the existing queued continuation after threshold compaction", async () => {
+		let queued = false;
+		const continuationPrompts: string[] = [];
+		const harness = await createHarness({
+			models: [{ id: "faux-1", contextWindow: 100, maxTokens: 100 }],
+			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 20 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "Queued continuation context",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+						},
+					}));
+					pi.on("agent_end", async () => {
+						if (queued) return;
+						queued = true;
+						pi.sendMessage(
+							{ customType: "queued-test", content: "queued continuation", display: false },
+							{ deliverAs: "followUp" },
+						);
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			{ ...fauxAssistantMessage("threshold reached"), usage: createUsage(81) },
+			(context) => {
+				continuationPrompts.push(context.systemPrompt ?? "");
+				return fauxAssistantMessage("queued continuation handled");
+			},
+		]);
+
+		await harness.session.prompt("request with queued continuation");
+
+		expect(harness.faux.state.callCount).toBe(2);
+		expect(continuationPrompts[0]).toContain("Context compaction is not a new user request");
 	});
 
 	it("does not retry overflow recovery more than once", async () => {

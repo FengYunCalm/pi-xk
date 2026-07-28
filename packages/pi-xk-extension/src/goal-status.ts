@@ -46,7 +46,9 @@ export function renderGoalStatus(
 	const unavailable = "Unavailable while goal-state.md is invalid.";
 	const nextAction = stateMarkdown ? readGoalStateSection(stateMarkdown, "next_best_action") : unavailable;
 	const blockers = stateMarkdown ? readGoalStateSection(stateMarkdown, "blocked_on") : unavailable;
-	const acceptanceGaps = stateMarkdown ? readGoalStateSection(stateMarkdown, "acceptance_gaps") : unavailable;
+	const acceptanceLedger = stateMarkdown
+		? readGoalStateSection(stateMarkdown, "acceptance_matrix", readGoalStateSection(stateMarkdown, "acceptance_gaps"))
+		: unavailable;
 	const requiredAcceptanceIds = replay.contract.acceptance
 		.filter((acceptance) => acceptance.required)
 		.map((acceptance) => acceptance.id);
@@ -72,7 +74,7 @@ export function renderGoalStatus(
 		`goal-state.md: ${files.state.path} (${files.state.status})`,
 		`Next action: ${nextAction}`,
 		`Blockers: ${blockers}`,
-		`Acceptance gaps: ${acceptanceGaps}`,
+		`Acceptance ledger: ${acceptanceLedger}`,
 		`Files: objective ${files.objective.status}, state ${files.state.status}`,
 	].join("\n");
 }

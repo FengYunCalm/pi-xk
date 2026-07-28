@@ -6,7 +6,7 @@ import {
 	assertSessionChainId,
 	assertSessionSegmentId,
 	CHAIN_ROLLUP_SCHEMA,
-	type SegmentSummaryV1,
+	type SegmentSummary,
 	type SessionBranchProjectionV1,
 	SessionChainLockedError,
 	type SessionChainRollupV1,
@@ -79,7 +79,7 @@ interface SessionChainRollupWindow {
 	startOrdinal: number;
 	endOrdinal: number;
 	segments: Array<SessionSegmentProjectionV1 & { seal: NonNullable<SessionSegmentProjectionV1["seal"]> }>;
-	summaries: SegmentSummaryV1[];
+	summaries: SegmentSummary[];
 	summaryArtifactIds: string[];
 	sourceDigest: string;
 }
@@ -491,7 +491,7 @@ export class SessionChainRollupManager {
 			if (!segment || segment.status !== "sealed" || !segment.seal) return null;
 			segments.push({ ...segment, seal: segment.seal });
 		}
-		const summaries: SegmentSummaryV1[] = [];
+		const summaries: SegmentSummary[] = [];
 		const summaryArtifactIds: string[] = [];
 		for (const segment of segments) {
 			const artifactId = segment.seal.summaryArtifactId;
@@ -537,6 +537,7 @@ export class SessionChainRollupManager {
 			ordinal: window.startOrdinal + index,
 			segmentId: summary.sourceSegmentId,
 			artifactId: window.summaryArtifactIds[index],
+			title: "title" in summary ? summary.title : null,
 			segmentDeltaMarkdown: summary.segmentDeltaMarkdown,
 			carryForwardMarkdown: summary.carryForwardMarkdown,
 			generator: summary.generator,

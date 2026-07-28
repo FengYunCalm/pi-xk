@@ -2,10 +2,14 @@ export const GOAL_CONTRACT_V1_SCHEMA = "pi-xk.goal.contract.v1";
 
 export const GOAL_CONTRACT_V2_SCHEMA = "pi-xk.goal.contract.v2";
 
+export const GOAL_CONTRACT_V3_SCHEMA = "pi-xk.goal.contract.v3";
+
 /** @deprecated Use GOAL_CONTRACT_V1_SCHEMA or GOAL_CONTRACT_V2_SCHEMA explicitly. */
 export const GOAL_CONTRACT_SCHEMA = GOAL_CONTRACT_V1_SCHEMA;
 
 export const GOAL_EVENT_SCHEMA = "pi-xk.goal-event.v1";
+
+export const GOAL_EVENT_V2_SCHEMA = "pi-xk.goal-event.v2";
 
 export const GOAL_CONTRACT_PROJECTION_SCHEMA = "pi-xk.goal-contract-projection.v1";
 
@@ -78,8 +82,42 @@ export interface GoalContractV2 {
 	executionAuthorization: string;
 }
 
+export interface GoalContractV3 {
+	schema: typeof GOAL_CONTRACT_V3_SCHEMA;
+	goalId: string;
+	title: string;
+	objective: string;
+	constraints: string[];
+	acceptance: GoalAcceptance[];
+	capabilities: GoalCapabilities;
+	budgets: GoalBudgets;
+	ownerSessionId: string;
+	createdAt: string;
+	schemaVersion: 3;
+	nonGoals: string[];
+	doneCondition: string;
+	pauseCondition: string;
+	finalReport: string;
+	executionAuthorization: string;
+	revision: number;
+	intentAnchor: string;
+}
+
 /** Raw on-disk contract payloads preserve their original version for hash replay. */
-export type GoalContract = GoalContractV1 | GoalContractV2;
+export type GoalContract = GoalContractV1 | GoalContractV2 | GoalContractV3;
+
+export type GoalCurrentContract = GoalContractV2 | GoalContractV3;
+
+export type GoalRevisionMode = "automatic-objective-refinement" | "user-confirmed";
+
+export interface GoalContractRevisionRecord {
+	fromRevision: number;
+	toRevision: number;
+	mode: GoalRevisionMode;
+	reason: string;
+	evidence: string;
+	changedFields: string[];
+}
 
 export type GoalActor = "user" | "runtime" | "model" | "child-task" | "system";
 
@@ -116,9 +154,15 @@ export interface GoalCreatedEventPayload {
 	contract: GoalContract;
 }
 
-export interface GoalContractUpdatedEventPayload {
+export interface GoalContractUpdatedEventPayloadV1 {
 	contract: GoalContract;
 }
+
+export interface GoalContractUpdatedEventPayloadV2 extends GoalContractRevisionRecord {
+	contract: GoalContractV3;
+}
+
+export type GoalContractUpdatedEventPayload = GoalContractUpdatedEventPayloadV1 | GoalContractUpdatedEventPayloadV2;
 
 export type GoalCheckpointReason = "turn_end" | "session_before_compact";
 
@@ -267,7 +311,7 @@ export interface GoalCreatedEvent {
 	hash: string;
 }
 
-export interface GoalContractUpdatedEvent {
+export interface GoalContractUpdatedEventV1 {
 	schema: typeof GOAL_EVENT_SCHEMA;
 	eventId: string;
 	goalId: string;
@@ -276,11 +320,28 @@ export interface GoalContractUpdatedEvent {
 	actor: GoalActor;
 	timestamp: string;
 	prevHash: string;
-	payload: GoalContractUpdatedEventPayload;
+	payload: GoalContractUpdatedEventPayloadV1;
 	schemaVersion: 1;
 	idempotencyKey: string;
 	hash: string;
 }
+
+export interface GoalContractUpdatedEventV2 {
+	schema: typeof GOAL_EVENT_V2_SCHEMA;
+	eventId: string;
+	goalId: string;
+	sequence: number;
+	eventType: "goal_contract_updated";
+	actor: GoalActor;
+	timestamp: string;
+	prevHash: string;
+	payload: GoalContractUpdatedEventPayloadV2;
+	schemaVersion: 2;
+	idempotencyKey: string;
+	hash: string;
+}
+
+export type GoalContractUpdatedEvent = GoalContractUpdatedEventV1 | GoalContractUpdatedEventV2;
 
 export interface GoalCheckpointedEvent {
 	schema: typeof GOAL_EVENT_SCHEMA;
@@ -362,7 +423,7 @@ export interface GoalContractProjection {
 	goalId: string;
 	sequence: number;
 	baseHash: string;
-	contract: GoalContractV2;
+	contract: GoalCurrentContract;
 }
 
 export type GoalArtifactDiagnosticStatus = "valid" | "missing" | "corrupt";
@@ -411,6 +472,12 @@ function requireNonNegativeInteger(value: unknown, field: string): number {
 		throw new GoalValidationError(`${field} must be a non-negative integer`);
 	}
 	return value;
+}
+
+function requirePositiveInteger(value: unknown, field: string): number {
+	const result = requireNonNegativeInteger(value, field);
+	if (result === 0) throw new GoalValidationError(`${field} must be a positive integer`);
+	return result;
 }
 
 function requireExactKeys(value: Record<string, unknown>, keys: readonly string[], field: string): void {
@@ -629,17 +696,65 @@ export function validateGoalContractV2(value: unknown): GoalContractV2 {
 	};
 }
 
+export function validateGoalContractV3(value: unknown): GoalContractV3 {
+	if (!isRecord(value)) {
+		throw new GoalValidationError("Goal contract must be an object");
+	}
+	requireExactKeys(
+		value,
+		[
+			"schema",
+			"goalId",
+			"title",
+			"objective",
+			"constraints",
+			"acceptance",
+			"capabilities",
+			"budgets",
+			"ownerSessionId",
+			"createdAt",
+			"schemaVersion",
+			"nonGoals",
+			"doneCondition",
+			"pauseCondition",
+			"finalReport",
+			"executionAuthorization",
+			"revision",
+			"intentAnchor",
+		],
+		"Goal contract",
+	);
+	if (value.schema !== GOAL_CONTRACT_V3_SCHEMA || value.schemaVersion !== 3) {
+		throw new GoalValidationError("Goal contract schema is unsupported");
+	}
+	const baseValue = { ...value };
+	delete baseValue.revision;
+	delete baseValue.intentAnchor;
+	const base = validateGoalContractV2({ ...baseValue, schema: GOAL_CONTRACT_V2_SCHEMA, schemaVersion: 2 });
+	return {
+		...base,
+		schema: GOAL_CONTRACT_V3_SCHEMA,
+		schemaVersion: 3,
+		revision: requirePositiveInteger(value.revision, "revision"),
+		intentAnchor: requireNonEmptyString(value.intentAnchor, "intentAnchor"),
+	};
+}
+
 export function validateGoalContract(value: unknown): GoalContract {
 	if (!isRecord(value)) {
 		throw new GoalValidationError("Goal contract must be an object");
 	}
 	if (value.schema === GOAL_CONTRACT_V1_SCHEMA) return validateGoalContractV1(value);
 	if (value.schema === GOAL_CONTRACT_V2_SCHEMA) return validateGoalContractV2(value);
+	if (value.schema === GOAL_CONTRACT_V3_SCHEMA) return validateGoalContractV3(value);
 	throw new GoalValidationError("Goal contract schema is unsupported");
 }
 
 /** Converts a validated raw contract into the current in-memory representation without changing its source payload. */
-export function upcastGoalContract(contract: GoalContract): GoalContractV2 {
+export function upcastGoalContract(contract: GoalContract): GoalCurrentContract {
+	if (contract.schema === GOAL_CONTRACT_V3_SCHEMA) {
+		return validateGoalContractV3(contract);
+	}
 	if (contract.schema === GOAL_CONTRACT_V2_SCHEMA) {
 		return validateGoalContractV2(contract);
 	}
@@ -1021,7 +1136,7 @@ export function validateGoalLifecycleEventInput(value: unknown): GoalLifecycleEv
 
 function assertV2AcceptanceIds(
 	acceptanceIds: readonly string[],
-	contract: GoalContractV2,
+	contract: GoalCurrentContract,
 	field: string,
 	requiredOnly: boolean,
 ): void {
@@ -1050,7 +1165,7 @@ export function validateGoalLifecycleEventForContract(
 	actor?: GoalActor,
 ): GoalLifecycleEventInput {
 	const input = validateGoalLifecycleEventInput(value);
-	if (contract.schema !== GOAL_CONTRACT_V2_SCHEMA) return input;
+	if (contract.schema === GOAL_CONTRACT_V1_SCHEMA) return input;
 	if (input.eventType === "goal_paused") {
 		const { reason, userRequest, nextBestAction, audit } = input.payload;
 		if (reason === undefined || userRequest === undefined || nextBestAction === undefined || audit === undefined) {

@@ -13,9 +13,10 @@ import {
 	assertSessionBranchId,
 	assertSessionChainId,
 	assertSessionSegmentId,
-	SEGMENT_SUMMARY_SCHEMA,
+	SEGMENT_SUMMARY_V2_SCHEMA,
 	SESSION_CHAIN_SPEC_SCHEMA,
-	type SegmentSummaryV1,
+	type SegmentSummary,
+	type SegmentSummaryV2,
 	type SessionBranchProjectionV1,
 	type SessionChainActor,
 	type SessionChainReplay,
@@ -56,7 +57,7 @@ export const PI_XK_SESSION_CHAIN_SUMMARY_IN_CUSTOM_TYPE = "pi-xk.session-chain-s
 export const PI_XK_SESSION_CHAIN_SUMMARY_OUT_CUSTOM_TYPE = "pi-xk.session-chain-summary-out";
 export const PI_XK_SESSION_CHAIN_LINK_SCHEMA = "pi-xk.session-chain-link.v1";
 export const PI_XK_SESSION_CHAIN_MARKER_SCHEMA = "pi-xk.session-chain-marker.v1";
-export const SESSION_CHAIN_SUMMARY_PROMPT_VERSION = "session-chain-summary-v1";
+export const SESSION_CHAIN_SUMMARY_PROMPT_VERSION = "session-chain-summary-v2";
 export const SESSION_CHAIN_ROOT_SUMMARY = "No previous Session Chain segment.";
 
 export const SESSION_CHAIN_SOFT_BYTES = 16 * 1024 * 1024;
@@ -117,6 +118,7 @@ export interface SessionChainGateState {
 	taskRunning: boolean;
 	taskResultPending: boolean;
 	goalDraftPending: boolean;
+	goalRevisionPending: boolean;
 	goalLifecycleIntentPending: boolean;
 }
 
@@ -184,6 +186,7 @@ export type SessionChainSummaryLevel = "l1" | "l2" | "all";
 export interface SessionChainSummaryListItem {
 	level: "l1" | "l2";
 	artifactId: string;
+	title: string | null;
 	createdAt: string;
 	integrity: "unchecked" | "verified" | "invalid";
 	segmentId?: string;
@@ -211,7 +214,8 @@ export type SessionChainSummaryReadResult =
 			integrity: "verified";
 			segmentId: string;
 			segmentOrdinal: number;
-			summary: SegmentSummaryV1;
+			title: string | null;
+			summary: SegmentSummary;
 	  }
 	| {
 			level: "l2";
@@ -764,7 +768,7 @@ export class SessionChainController {
 		chainId: string,
 		branch: SessionBranchProjectionV1,
 		segment: SessionSegmentProjectionV1,
-	): Promise<SegmentSummaryV1> {
+	): Promise<SegmentSummary> {
 		if (segment.status !== "sealed" || !segment.seal) {
 			throw new SessionChainControllerError("Session Chain L1 summary requires a sealed Segment");
 		}
@@ -922,6 +926,7 @@ export class SessionChainController {
 				items.push({
 					level: "l1",
 					artifactId: segment.seal.summaryArtifactId,
+					title: null,
 					createdAt: segment.createdAt,
 					integrity: "unchecked",
 					segmentId: segment.segmentId,
@@ -934,6 +939,7 @@ export class SessionChainController {
 				items.push({
 					level: "l2",
 					artifactId: projection.artifactId,
+					title: null,
 					createdAt: projection.publishedAt,
 					integrity: "unchecked",
 					windowIndex: projection.windowIndex,
@@ -947,7 +953,11 @@ export class SessionChainController {
 				try {
 					if (item.level === "l1") {
 						const summary = await this.store.readSegmentSummary(item.artifactId);
-						return { ...item, createdAt: summary.generator.generatedAt };
+						return {
+							...item,
+							title: summary.schema === SEGMENT_SUMMARY_V2_SCHEMA ? summary.title : null,
+							createdAt: summary.generator.generatedAt,
+						};
 					}
 					await this.store.readChainRollup(item.artifactId);
 					return item;
@@ -976,13 +986,15 @@ export class SessionChainController {
 		);
 		if (l1?.seal) {
 			try {
+				const summary = await this.verifyL1SummaryEvidence(chainId, branch, l1);
 				return {
 					level: "l1",
 					artifactId: l1.seal.summaryArtifactId,
 					integrity: "verified",
 					segmentId: l1.segmentId,
 					segmentOrdinal: l1.ordinal,
-					summary: await this.verifyL1SummaryEvidence(chainId, branch, l1),
+					title: summary.schema === SEGMENT_SUMMARY_V2_SCHEMA ? summary.title : null,
+					summary,
 				};
 			} catch (error) {
 				throw new SessionChainControllerError(
@@ -1310,6 +1322,7 @@ export class SessionChainController {
 			gates?.taskRunning ? "running Task" : null,
 			gates?.taskResultPending ? "pending Task result" : null,
 			gates?.goalDraftPending ? "Goal draft" : null,
+			gates?.goalRevisionPending ? "Goal revision" : null,
 			gates?.goalLifecycleIntentPending ? "Goal lifecycle intent" : null,
 		].filter((value): value is string => value !== null);
 		if (blocked.length > 0) {
@@ -1432,7 +1445,7 @@ export class SessionChainController {
 		segment: SessionSegmentProjectionV1,
 		targetSegmentId: string,
 		sourceLeafId: string,
-	): Promise<{ summary: SegmentSummaryV1; sourceLeafId: string }> {
+	): Promise<{ summary: SegmentSummaryV2; sourceLeafId: string }> {
 		if (!host.model) throw new SessionChainControllerError("Session Chain rollover requires a selected model");
 		await this.assertSummaryInProvenance(sourceManager, binding);
 		const selection = this.buildSummarySelection(sourceManager, binding, segment, sourceLeafId);
@@ -1443,9 +1456,11 @@ export class SessionChainController {
 			customInstructions: [
 				"Treat <previous-summary> as the cumulative state before this Segment delta.",
 				"Treat <segment-delta> as the only new source material.",
-				"Return exactly two non-empty blocks in this order and no other text:",
+				"Return exactly three non-empty blocks in this order and no other text:",
+				"<title>A single-line noun phrase describing the Segment's main work.</title>",
 				"<segment-delta>Markdown describing only this Segment's completed work, failures, decisions, and state changes.</segment-delta>",
 				"<carry-forward>Markdown that integrates the previous summary with the Segment delta for the next Segment.</carry-forward>",
+				"The title must be at most 60 Unicode code points, with no Markdown, control characters, commands, role instructions, or unsupported completion claims.",
 			].join("\n"),
 			maxOutputTokens,
 		});
@@ -1466,7 +1481,8 @@ export class SessionChainController {
 		return {
 			sourceLeafId,
 			summary: {
-				schema: SEGMENT_SUMMARY_SCHEMA,
+				schema: SEGMENT_SUMMARY_V2_SCHEMA,
+				title: envelope.title,
 				chainId: binding.chainId,
 				branchId: binding.branchId,
 				sourceSegmentId: binding.segmentId,
@@ -1494,8 +1510,8 @@ export class SessionChainController {
 	}
 
 	private async storeCanonicalSegmentSummary(
-		summary: SegmentSummaryV1,
-	): Promise<{ artifactId: string; summary: SegmentSummaryV1 }> {
+		summary: SegmentSummaryV2,
+	): Promise<{ artifactId: string; summary: SegmentSummary }> {
 		const artifactId = await this.store.putSegmentSummary(summary);
 		return { artifactId, summary: await this.store.readSegmentSummary(artifactId) };
 	}
@@ -1503,7 +1519,7 @@ export class SessionChainController {
 	async backfillRollups(host: SessionChainHost, chainId: string, branchId: string, limit = 1): Promise<number> {
 		return await this.rollups.backfill(host, chainId, branchId, limit);
 	}
-	private validateSummaryMarker(summary: SegmentSummaryV1, marker: PiXkSessionChainSummaryOutV1): void {
+	private validateSummaryMarker(summary: SegmentSummary, marker: PiXkSessionChainSummaryOutV1): void {
 		if (
 			marker.sourceLeafId !== summary.sourceLeafId ||
 			marker.segmentDeltaMarkdown !== summary.segmentDeltaMarkdown ||
@@ -1538,7 +1554,7 @@ export class SessionChainController {
 	private targetMarkers(
 		targetManager: SessionManager,
 		binding: PiXkSessionChainBindingV1,
-		summary: SegmentSummaryV1,
+		summary: SegmentSummary,
 	): { chainLinkEntryId: string; summaryInEntryId: string } {
 		let chainLinkEntryId: string | undefined;
 		let summaryInEntryId: string | undefined;
@@ -1966,7 +1982,7 @@ export class SessionChainController {
 		source: ReadonlySessionManager,
 		target: SessionManager,
 		binding: PiXkSessionChainBindingV1,
-		summary: SegmentSummaryV1,
+		summary: SegmentSummary,
 	): void {
 		target.appendCustomEntry(PI_XK_SESSION_CHAIN_LINK_CUSTOM_TYPE, binding);
 		copySessionProjection(source, target);
@@ -2121,7 +2137,7 @@ export class SessionChainController {
 		manager: ReadonlySessionManager,
 		binding: PiXkSessionChainBindingV1 | null,
 		diagnostics: SessionChainDiagnostic[],
-		readSummary: (artifactId: string) => Promise<SegmentSummaryV1>,
+		readSummary: (artifactId: string) => Promise<SegmentSummary>,
 	): Promise<void> {
 		if (binding) {
 			try {
@@ -2177,7 +2193,7 @@ export class SessionChainController {
 		}
 
 		if (segment.status !== "sealed" || !segment.seal) return;
-		let summary: SegmentSummaryV1;
+		let summary: SegmentSummary;
 		try {
 			summary = await readSummary(segment.seal.summaryArtifactId);
 		} catch (error) {
@@ -2356,8 +2372,8 @@ export class SessionChainController {
 				message: `Session Chain summary manifest cannot trust the current read model: ${error instanceof Error ? error.message : String(error)}`,
 			});
 		}
-		const summaryCache = new Map<string, Promise<SegmentSummaryV1>>();
-		const readSummary = (artifactId: string): Promise<SegmentSummaryV1> => {
+		const summaryCache = new Map<string, Promise<SegmentSummary>>();
+		const readSummary = (artifactId: string): Promise<SegmentSummary> => {
 			let pending = summaryCache.get(artifactId);
 			if (!pending) {
 				pending = this.store.readSegmentSummary(artifactId);

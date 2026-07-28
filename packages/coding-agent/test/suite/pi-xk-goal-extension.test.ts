@@ -10,6 +10,7 @@ import {
 	type GoalCheckpointV2,
 	type GoalContractUpdateOptions,
 	type GoalContractV2,
+	type GoalContractV3,
 	GoalStore,
 	type GoalWriteResult,
 } from "../../../pi-xk-core/src/index.ts";
@@ -19,14 +20,17 @@ import {
 	createPiXkGoalDraft,
 	createPiXkGoalExtension,
 	createPiXkGoalLifecycleIntent,
+	createPiXkGoalRevision,
 	isPiXkGoalCapture,
 	isPiXkGoalDraft,
 	isPiXkGoalLifecycleIntent,
+	isPiXkGoalRevision,
 	isPiXkSessionLink,
 	PI_XK_SESSION_LINK_CUSTOM_TYPE,
 	type PiXkGoalCapture,
 	type PiXkGoalDraft,
 	type PiXkGoalLifecycleIntent,
+	type PiXkGoalRevision,
 	type PiXkSessionLink,
 } from "../../../pi-xk-extension/src/index.ts";
 import type { ExtensionUIContext, KeybindingsManager } from "../../src/core/extensions/index.ts";
@@ -104,9 +108,23 @@ function getCurrentGoalDraft(harness: Harness): PiXkGoalDraft | undefined {
 	return harness.sessionManager.getEntries().filter(isGoalDraftEntry).at(-1)?.data;
 }
 
+function getCurrentGoalRevision(harness: Harness): PiXkGoalRevision | undefined {
+	for (const entry of [...harness.sessionManager.getEntries()].reverse()) {
+		if (
+			entry.type === "custom" &&
+			entry.customType === PI_XK_SESSION_LINK_CUSTOM_TYPE &&
+			isPiXkGoalRevision(entry.data)
+		) {
+			return entry.data;
+		}
+	}
+	return undefined;
+}
+
 function draftProposal(objective: string) {
 	return {
 		title: "Verify drafted Goal",
+		intentAnchor: "Deliver the user-confirmed Goal outcome with verified evidence.",
 		objective,
 		constraints: ["Keep the test isolated."],
 		acceptance: [
@@ -172,6 +190,53 @@ async function createActiveGoal(harness: Harness, goalId: string): Promise<GoalS
 	);
 	harness.sessionManager.appendCustomEntry(PI_XK_SESSION_LINK_CUSTOM_TYPE, createPiXkGoalBinding(goalId, 0));
 	return store;
+}
+
+async function createActiveV3Goal(
+	harness: Harness,
+	goalId: string,
+): Promise<{ store: GoalStore; contract: GoalContractV3 }> {
+	const store = new GoalStore(harness.tempDir);
+	const proposal = draftProposal(`Exercise V3 revision behavior for ${goalId}.`);
+	const contract: GoalContractV3 = {
+		schema: "pi-xk.goal.contract.v3",
+		goalId,
+		title: proposal.title,
+		intentAnchor: proposal.intentAnchor,
+		objective: proposal.objective,
+		constraints: proposal.constraints,
+		acceptance: proposal.acceptance,
+		capabilities: { filesystem: "unrestricted", network: "unrestricted", spawn: "unrestricted" },
+		budgets: { tokens: 0, costCents: 0, wallSeconds: 0 },
+		ownerSessionId: harness.sessionManager.getSessionId(),
+		createdAt: "2026-07-28T00:00:00.000Z",
+		schemaVersion: 3,
+		revision: 1,
+		nonGoals: proposal.nonGoals,
+		doneCondition: proposal.doneCondition,
+		pauseCondition: proposal.pauseCondition,
+		finalReport: proposal.finalReport,
+		executionAuthorization: proposal.executionAuthorization,
+	};
+	const created = await store.createGoal(contract, {
+		eventId: `evt-create-${goalId}`,
+		idempotencyKey: `create:${goalId}`,
+		actor: "user",
+		timestamp: contract.createdAt,
+	});
+	await store.appendLifecycleEvent(
+		goalId,
+		{ eventType: "goal_activated", payload: { sessionId: harness.sessionManager.getSessionId() } },
+		{
+			eventId: `evt-activate-${goalId}`,
+			idempotencyKey: `activate:${goalId}`,
+			actor: "user",
+			timestamp: contract.createdAt,
+			expectedHead: created.head,
+		},
+	);
+	harness.sessionManager.appendCustomEntry(PI_XK_SESSION_LINK_CUSTOM_TYPE, createPiXkGoalBinding(goalId, 0));
+	return { store, contract };
 }
 
 function createUiContext(overrides: {
@@ -278,6 +343,33 @@ describe("Pi-XK Goal extension", () => {
 		await harness.session.prompt("/goal doctor repair-lock abandoned-goal-command");
 		expect(notifications.at(-1)).toContain("repaired abandoned write lock");
 		expect(await store.inspectWriteLock(goalId)).toBeUndefined();
+	});
+
+	it("reports stale V3 state revisions and reads the V3 acceptance matrix in status", async () => {
+		const notifications: string[] = [];
+		const harness = await createHarness({
+			extensionFactories: [createPiXkGoalExtension()],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({
+			uiContext: createUiContext({ notify: (message) => notifications.push(message) }),
+		});
+		const goalId = "goal_v3_state_doctor";
+		await createActiveV3Goal(harness, goalId);
+
+		await harness.session.prompt("/goal status");
+		expect(notifications.at(-1)).toContain("Acceptance ledger: A-1: required; unverified; evidence not recorded.");
+
+		const statePath = join(harness.tempDir, ".pi-xk", "goals", goalId, "goal-state.md");
+		const state = await readFile(statePath, "utf8");
+		await writeFile(statePath, state.replace("## contract_revision\n- 1", "## contract_revision\n- 0"));
+
+		await harness.session.prompt("/goal doctor");
+		const doctor = notifications.at(-1) ?? "";
+		expect(doctor).toContain("write lock clear");
+		expect(doctor).toContain(`${statePath}: mismatched`);
+		expect(doctor).toContain("state contract revision 0 does not match current revision 1");
+		expect(harness.faux.state.callCount).toBe(0);
 	});
 
 	it("pauses an active Goal recovered at session startup instead of continuing it", async () => {
@@ -638,6 +730,7 @@ describe("Pi-XK Goal extension", () => {
 		expect(statusNotification).toContain("A-1=missing");
 		expect(statusNotification).toContain("goal-state.md:");
 		expect(statusNotification).toContain("Next action:");
+		expect(statusNotification).toContain("Acceptance ledger: Required acceptance evidence has not been audited yet.");
 	});
 
 	it("keeps a submitted Goal draft in the session until the user confirms it", async () => {
@@ -682,6 +775,7 @@ describe("Pi-XK Goal extension", () => {
 		});
 		expect(draftPrompts).toHaveLength(1);
 		expect(draftPrompts[0]).toContain("Draft the contract only");
+		expect(draftPrompts[0]).toContain("Intent Anchor");
 		expect(draftPrompts[0]).toContain("Do not put changing progress");
 		expect(draftPrompts[0]).toContain("commit/push");
 		expect(draftPrompts[0]).toContain(objective);
@@ -690,7 +784,531 @@ describe("Pi-XK Goal extension", () => {
 		await waitForAgent(harness);
 
 		expect(getCurrentGoalDraft(harness)).toMatchObject({ state: "confirmed", goalId: "goal_confirmed_draft" });
-		expect((await new GoalStore(harness.tempDir).replayGoal("goal_confirmed_draft")).lifecycle.status).toBe("ended");
+		const replay = await new GoalStore(harness.tempDir).replayGoal("goal_confirmed_draft");
+		expect(replay.lifecycle.status).toBe("ended");
+		expect(replay.contract).toMatchObject({
+			schema: "pi-xk.goal.contract.v3",
+			revision: 1,
+			intentAnchor: draftProposal("unused").intentAnchor,
+		});
+	});
+
+	it("applies an objective-only V3 revision automatically and reports stale state to the next run", async () => {
+		const prompts: string[] = [];
+		const goalErrors: string[] = [];
+		const harness = await createHarness({
+			extensionFactories: [createPiXkGoalExtension({ onGoalError: (error) => goalErrors.push(error.message) })],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const { store, contract } = await createActiveV3Goal(harness, "goal_auto_revision");
+		const candidate = {
+			...contract,
+			objective: "Use the corrected implementation path while preserving the confirmed outcome.",
+			revision: 2,
+		};
+		harness.setResponses([
+			(context) => {
+				prompts.push(context.systemPrompt ?? "");
+				return fauxAssistantMessage(
+					[
+						fauxToolCall("pi_xk_propose_goal_revision", {
+							expectedRevision: 1,
+							reason: "Repository evidence invalidated the old path wording.",
+							evidence: "The implementation now lives under the corrected module.",
+							candidate,
+						}),
+					],
+					{ stopReason: "toolUse" },
+				);
+			},
+			(context) => {
+				prompts.push(context.systemPrompt ?? "");
+				return fauxAssistantMessage(
+					[
+						fauxToolCall("pi_xk_end_goal", {
+							outcome: "completed",
+							reason: "revision behavior verified",
+							verifiedAcceptanceIds: ["A-1"],
+							finalEvidence: "The objective-only revision event was verified.",
+							finalSummary: "The V3 Goal revision completed.",
+						}),
+					],
+					{ stopReason: "toolUse" },
+				);
+			},
+		]);
+
+		await harness.session.prompt("Continue using the latest repository evidence.");
+		await waitForAgent(harness);
+
+		const replay = await store.replayGoal(contract.goalId);
+		expect(goalErrors).toEqual([]);
+		expect(replay.contract).toEqual(candidate);
+		expect(replay.events.find((event) => event.eventType === "goal_contract_updated")).toMatchObject({
+			schemaVersion: 2,
+			actor: "model",
+			payload: { mode: "automatic-objective-refinement", changedFields: ["objective"] },
+		});
+		expect(harness.faux.state.callCount).toBe(2);
+		expect(prompts[1]).toContain("contract_revision is 2");
+		expect(prompts[1]).toContain("State synchronization required");
+	});
+
+	it("clears superseded revision feedback after an objective-only revision applies", async () => {
+		const continuationSystemPrompts: string[] = [];
+		const harness = await createHarness({ extensionFactories: [createPiXkGoalExtension()] });
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const { store, contract } = await createActiveV3Goal(harness, "goal_revision_feedback");
+		const protectedCandidate = {
+			...contract,
+			constraints: [...contract.constraints, "Require an obsolete implementation path."],
+			revision: 2,
+		};
+		const objectiveCandidate = {
+			...contract,
+			objective: "Use the verified replacement path while preserving the confirmed outcome.",
+			revision: 2,
+		};
+		harness.setResponses([
+			fauxAssistantMessage(
+				[
+					fauxToolCall("pi_xk_propose_goal_revision", {
+						expectedRevision: 1,
+						reason: "A protected implementation constraint is proposed.",
+						evidence: "The candidate needs explicit user review.",
+						candidate: protectedCandidate,
+					}),
+				],
+				{ stopReason: "toolUse" },
+			),
+			(context) => {
+				continuationSystemPrompts.push(context.systemPrompt ?? "");
+				return fauxAssistantMessage(
+					[
+						fauxToolCall("pi_xk_propose_goal_revision", {
+							expectedRevision: 1,
+							reason: "Verified repository evidence invalidated the obsolete path.",
+							evidence: "The replacement module is the active implementation.",
+							candidate: objectiveCandidate,
+						}),
+					],
+					{ stopReason: "toolUse" },
+				);
+			},
+			(context) => {
+				continuationSystemPrompts.push(context.systemPrompt ?? "");
+				return fauxAssistantMessage(
+					[
+						fauxToolCall("pi_xk_end_goal", {
+							outcome: "completed",
+							reason: "revision feedback lifecycle verified",
+							verifiedAcceptanceIds: ["A-1"],
+							finalEvidence: "The applied revision replaced the superseded feedback state.",
+							finalSummary: "The Goal revision feedback lifecycle completed.",
+						}),
+					],
+					{ stopReason: "toolUse" },
+				);
+			},
+		]);
+
+		await harness.session.prompt("Propose the protected Goal revision.");
+		await waitForAgent(harness);
+		expect(getCurrentGoalRevision(harness)?.state).toBe("proposed");
+
+		await harness.session.prompt("/goal revision revise Keep the protected fields unchanged.");
+		await waitForAgent(harness);
+
+		expect((await store.replayGoal(contract.goalId)).contract).toEqual(objectiveCandidate);
+		expect(continuationSystemPrompts).toHaveLength(2);
+		expect(continuationSystemPrompts[0]).toContain("User revision feedback: Keep the protected fields unchanged.");
+		expect(continuationSystemPrompts[1]).not.toContain("User revision feedback:");
+		expect(getCurrentGoalRevision(harness)).toMatchObject({
+			state: "confirmed",
+			expectedRevision: 1,
+			changedFields: ["objective"],
+			revisionFeedback: null,
+			candidate: objectiveCandidate,
+		});
+	});
+
+	it("ignores superseded feedback when the contract event committed before the session terminal entry", async () => {
+		let continuationSystemPrompt = "";
+		const harness = await createHarness({ extensionFactories: [createPiXkGoalExtension()] });
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const { store, contract } = await createActiveV3Goal(harness, "goal_revision_feedback_crash_window");
+		const protectedCandidate = {
+			...contract,
+			constraints: [...contract.constraints, "Require an obsolete implementation path."],
+			revision: 2,
+		};
+		harness.sessionManager.appendCustomEntry(
+			PI_XK_SESSION_LINK_CUSTOM_TYPE,
+			createPiXkGoalRevision({
+				revisionId: "revision_crash_window",
+				goalId: contract.goalId,
+				generation: 0,
+				state: "superseded",
+				expectedRevision: 1,
+				reason: "A protected implementation constraint was proposed.",
+				evidence: "The candidate needed explicit user review.",
+				changedFields: ["constraints"],
+				revisionFeedback: "Keep the protected fields unchanged.",
+				candidate: protectedCandidate,
+				createdAt: "2026-07-28T00:01:00.000Z",
+			}),
+		);
+		const replay = await store.replayGoal(contract.goalId);
+		const objectiveCandidate = {
+			...contract,
+			objective: "Use the verified replacement path while preserving the confirmed outcome.",
+			revision: 2,
+		};
+		await store.reviseGoalContract(objectiveCandidate, {
+			eventId: "evt_revision_crash_window",
+			idempotencyKey: "goal-revision:crash-window",
+			actor: "model",
+			timestamp: "2026-07-28T00:02:00.000Z",
+			expectedHead: replay.head,
+			expectedRevision: 1,
+			mode: "automatic-objective-refinement",
+			reason: "Verified repository evidence invalidated the obsolete path.",
+			evidence: "The replacement module is the active implementation.",
+		});
+		harness.setResponses([
+			(context) => {
+				continuationSystemPrompt = context.systemPrompt ?? "";
+				return fauxAssistantMessage(
+					[
+						fauxToolCall("pi_xk_end_goal", {
+							outcome: "completed",
+							reason: "crash-window feedback handling verified",
+							verifiedAcceptanceIds: ["A-1"],
+							finalEvidence: "The stale feedback was excluded after the contract event committed.",
+							finalSummary: "The crash-window revision behavior completed.",
+						}),
+					],
+					{ stopReason: "toolUse" },
+				);
+			},
+		]);
+
+		await harness.session.prompt("Continue after recovering the revision event.");
+		await waitForAgent(harness);
+
+		expect(continuationSystemPrompt).toContain("contract_revision is 2");
+		expect(continuationSystemPrompt).not.toContain("User revision feedback:");
+		expect(getCurrentGoalRevision(harness)).toMatchObject({
+			state: "superseded",
+			expectedRevision: 1,
+		});
+	});
+
+	it("ignores a proposed revision from a previously bound Goal", async () => {
+		const harness = await createHarness({ extensionFactories: [createPiXkGoalExtension()] });
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const { contract: previousContract } = await createActiveV3Goal(harness, "goal_previous_revision");
+		harness.sessionManager.appendCustomEntry(
+			PI_XK_SESSION_LINK_CUSTOM_TYPE,
+			createPiXkGoalRevision({
+				revisionId: "revision_previous_goal",
+				goalId: previousContract.goalId,
+				generation: 0,
+				state: "proposed",
+				expectedRevision: 1,
+				reason: "The previous Goal proposed a protected change.",
+				evidence: "The previous Goal required user confirmation.",
+				changedFields: ["constraints"],
+				revisionFeedback: null,
+				candidate: {
+					...previousContract,
+					constraints: [...previousContract.constraints, "Previous Goal-only constraint."],
+					revision: 2,
+				},
+				createdAt: "2026-07-28T00:03:00.000Z",
+			}),
+		);
+		const { store, contract } = await createActiveV3Goal(harness, "goal_current_revision");
+		harness.setResponses([
+			fauxAssistantMessage("The current Goal made one verified step."),
+			fauxAssistantMessage(
+				[
+					fauxToolCall("pi_xk_end_goal", {
+						outcome: "completed",
+						reason: "current Goal continuation verified",
+						verifiedAcceptanceIds: ["A-1"],
+						finalEvidence: "The current Goal continued past the previous Goal revision.",
+						finalSummary: "The current Goal completed without cross-Goal revision interference.",
+					}),
+				],
+				{ stopReason: "toolUse" },
+			),
+		]);
+
+		await harness.session.prompt("Continue only the currently bound Goal.");
+		await waitForAgent(harness);
+
+		expect(harness.faux.state.callCount).toBe(2);
+		expect((await store.replayGoal(contract.goalId)).lifecycle.status).toBe("ended");
+	});
+
+	it("ignores superseded revision feedback from an earlier binding generation", async () => {
+		let currentSystemPrompt = "";
+		const harness = await createHarness({ extensionFactories: [createPiXkGoalExtension()] });
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const { store, contract } = await createActiveV3Goal(harness, "goal_rebound_revision");
+		harness.sessionManager.appendCustomEntry(
+			PI_XK_SESSION_LINK_CUSTOM_TYPE,
+			createPiXkGoalRevision({
+				revisionId: "revision_previous_generation",
+				goalId: contract.goalId,
+				generation: 0,
+				state: "superseded",
+				expectedRevision: 1,
+				reason: "The previous binding proposed a protected change.",
+				evidence: "The previous binding required user confirmation.",
+				changedFields: ["constraints"],
+				revisionFeedback: "Do not leak this feedback into the rebound Goal.",
+				candidate: {
+					...contract,
+					constraints: [...contract.constraints, "Previous binding-only constraint."],
+					revision: 2,
+				},
+				createdAt: "2026-07-28T00:04:00.000Z",
+			}),
+		);
+		harness.sessionManager.appendCustomEntry(
+			PI_XK_SESSION_LINK_CUSTOM_TYPE,
+			createPiXkGoalBinding(contract.goalId, 1),
+		);
+		harness.setResponses([
+			(context) => {
+				currentSystemPrompt = context.systemPrompt ?? "";
+				return fauxAssistantMessage(
+					[
+						fauxToolCall("pi_xk_end_goal", {
+							outcome: "completed",
+							reason: "binding generation isolation verified",
+							verifiedAcceptanceIds: ["A-1"],
+							finalEvidence: "The rebound Goal excluded feedback from generation zero.",
+							finalSummary: "Revision feedback remained scoped to its original binding.",
+						}),
+					],
+					{ stopReason: "toolUse" },
+				);
+			},
+		]);
+
+		await harness.session.prompt("Continue the rebound Goal binding.");
+		await waitForAgent(harness);
+
+		expect(currentSystemPrompt).not.toContain("User revision feedback:");
+		expect(currentSystemPrompt).not.toContain("Do not leak this feedback");
+		expect((await store.replayGoal(contract.goalId)).lifecycle.status).toBe("ended");
+	});
+
+	it("uses the existing Goal kickoff once after threshold compaction", async () => {
+		const continuationSystemPrompts: string[] = [];
+		const harness = await createHarness({
+			models: [{ id: "faux-1", contextWindow: 100, maxTokens: 100 }],
+			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 20 } },
+			extensionFactories: [
+				createPiXkGoalExtension(),
+				(pi) => {
+					pi.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "Active Goal threshold context",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const goalId = "goal_threshold_compaction";
+		const store = await createActiveGoal(harness, goalId);
+		harness.setResponses([
+			{
+				...fauxAssistantMessage("threshold reached"),
+				usage: {
+					input: 81,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 81,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+			},
+			(context) => {
+				continuationSystemPrompts.push(context.systemPrompt ?? "");
+				return fauxAssistantMessage(
+					[
+						fauxToolCall("pi_xk_end_goal", {
+							outcome: "verified",
+							reason: "threshold continuation verified",
+							verifiedAcceptanceIds: ["A-1"],
+							finalEvidence: "One Goal kickoff resumed after threshold compaction.",
+							finalSummary: "Threshold recovery used the existing Goal continuation.",
+						}),
+					],
+					{ stopReason: "toolUse" },
+				);
+			},
+		]);
+
+		await harness.session.prompt("advance the active Goal through compaction");
+		await waitForAgent(harness);
+
+		expect(harness.faux.state.callCount).toBe(2);
+		expect(continuationSystemPrompts).toHaveLength(1);
+		expect(continuationSystemPrompts[0]).toContain("Context compaction is not a new user request");
+		expect(
+			harness.session.messages.filter(
+				(message) => message.role === "custom" && message.customType === "pi-xk.goal-kickoff.v1",
+			),
+		).toHaveLength(1);
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
+		expect((await store.replayGoal(goalId)).lifecycle.status).toBe("ended");
+	});
+
+	it("holds protected V3 changes for explicit revision confirmation", async () => {
+		const continuationMessages: string[] = [];
+		const harness = await createHarness({ extensionFactories: [createPiXkGoalExtension()] });
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const { store, contract } = await createActiveV3Goal(harness, "goal_protected_revision");
+		const candidate = {
+			...contract,
+			constraints: [...contract.constraints, "Require a user-visible migration report."],
+			revision: 2,
+		};
+		harness.setResponses([
+			fauxAssistantMessage(
+				[
+					fauxToolCall("pi_xk_propose_goal_revision", {
+						expectedRevision: 1,
+						reason: "A protected constraint change is proposed.",
+						evidence: "The user must review this contract expansion.",
+						candidate,
+					}),
+				],
+				{ stopReason: "toolUse" },
+			),
+			(context) => {
+				continuationMessages.push(context.messages.map((message) => getMessageText(message)).join("\n"));
+				return fauxAssistantMessage(
+					[
+						fauxToolCall("pi_xk_end_goal", {
+							outcome: "completed",
+							reason: "protected revision confirmed",
+							verifiedAcceptanceIds: ["A-1"],
+							finalEvidence: "The protected revision was user-confirmed.",
+							finalSummary: "The confirmed revision completed.",
+						}),
+					],
+					{ stopReason: "toolUse" },
+				);
+			},
+		]);
+
+		await harness.session.prompt("Review the protected contract change.");
+		await waitForAgent(harness);
+
+		expect((await store.replayGoal(contract.goalId)).contract).toMatchObject({ revision: 1 });
+		expect(getCurrentGoalRevision(harness)).toMatchObject({
+			state: "proposed",
+			expectedRevision: 1,
+			changedFields: ["constraints"],
+		});
+		expect(harness.faux.state.callCount).toBe(1);
+
+		await harness.session.prompt("/goal revision show");
+		expect(harness.faux.state.callCount).toBe(1);
+		await harness.session.prompt("/goal revision confirm");
+		await waitForAgent(harness);
+
+		const replay = await store.replayGoal(contract.goalId);
+		expect(continuationMessages).toHaveLength(1);
+		expect(continuationMessages[0]).not.toContain("# Goal Revision");
+		expect(continuationMessages[0]).not.toContain("## Candidate contract");
+		expect(replay.contract).toEqual(candidate);
+		expect(getCurrentGoalRevision(harness)?.state).toBe("confirmed");
+		expect(replay.events.find((event) => event.eventType === "goal_contract_updated")).toMatchObject({
+			actor: "user",
+			payload: { mode: "user-confirmed", changedFields: ["constraints"] },
+		});
+	});
+
+	it("confirms a protected V3 revision through the native review dialog", async () => {
+		const dialogRenders: string[] = [];
+		const harness = await createHarness({ extensionFactories: [createPiXkGoalExtension()] });
+		harnesses.push(harness);
+		const custom = async <T>(factory: CustomUiFactory<T>): Promise<T> => {
+			const component = await factory(
+				{ terminal: { rows: 24 }, requestRender: () => {} } as never,
+				createPlainTheme(),
+				{ matches: (data: string, key: string) => data === key } as unknown as KeybindingsManager,
+				() => {},
+			);
+			const renders = [component.render(80).join("\n")];
+			for (let page = 0; page < 8; page++) {
+				component.handleInput?.("tui.select.pageDown");
+				renders.push(component.render(80).join("\n"));
+			}
+			dialogRenders.push(renders.join("\n"));
+			return "confirm" as T;
+		};
+		await harness.session.bindExtensions({ uiContext: createUiContext({ custom }), mode: "tui" });
+		const { store, contract } = await createActiveV3Goal(harness, "goal_ui_revision");
+		const candidate = {
+			...contract,
+			constraints: [...contract.constraints, "Require native revision review evidence."],
+			revision: 2,
+		};
+		harness.setResponses([
+			fauxAssistantMessage(
+				[
+					fauxToolCall("pi_xk_propose_goal_revision", {
+						expectedRevision: 1,
+						reason: "A protected constraint requires native review.",
+						evidence: "The review dialog must expose the complete candidate.",
+						candidate,
+					}),
+				],
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage(
+				[
+					fauxToolCall("pi_xk_end_goal", {
+						outcome: "completed",
+						reason: "native revision review verified",
+						verifiedAcceptanceIds: ["A-1"],
+						finalEvidence: "The native dialog confirmed the protected revision.",
+						finalSummary: "The protected revision completed after native review.",
+					}),
+				],
+				{ stopReason: "toolUse" },
+			),
+		]);
+
+		await harness.session.prompt("Review the protected revision in the native dialog.");
+		await waitForAgent(harness);
+
+		expect(dialogRenders).toHaveLength(1);
+		expect(dialogRenders[0]).toContain("Goal Revision");
+		expect(dialogRenders[0]).toContain("Require native revision review evidence.");
+		expect(dialogRenders[0]).toContain("确认合同修订");
+		expect(dialogRenders[0]).toContain("修改候选");
+		expect((await store.replayGoal(contract.goalId)).contract).toEqual(candidate);
+		expect((await store.replayGoal(contract.goalId)).lifecycle.status).toBe("ended");
+		expect(harness.faux.state.callCount).toBe(2);
 	});
 
 	it("uses native UI to revise a draft and confirm the revised contract", async () => {
@@ -1213,7 +1831,9 @@ describe("Pi-XK Goal extension", () => {
 		expect(activeKickoffText).toContain("goal-objective.md");
 		expect(activeKickoffText).toContain("goal-state.md");
 		expect(activeKickoffText.match(/goal-objective\.md/g)).toHaveLength(1);
-		expect(activeSystemPrompt).not.toContain("goal-state.md");
+		expect(activeSystemPrompt).toContain("goal-objective.md");
+		expect(activeSystemPrompt).toContain("goal-state.md");
+		expect(activeSystemPrompt.match(/goal-objective\.md/g)).toHaveLength(1);
 		expect(activeSystemPrompt).not.toContain(rawObjective);
 		expect(activeTurnText).toContain("goal-objective.md");
 		expect(activeTurnText).toContain("A normal assistant response does not end this Goal");

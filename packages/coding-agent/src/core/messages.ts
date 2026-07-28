@@ -62,6 +62,7 @@ export interface BranchSummaryMessage {
 export interface CompactionSummaryMessage {
 	role: "compactionSummary";
 	summary: string;
+	title?: string;
 	tokensBefore: number;
 	timestamp: number;
 }
@@ -110,10 +111,12 @@ export function createCompactionSummaryMessage(
 	summary: string,
 	tokensBefore: number,
 	timestamp: string,
+	title?: string,
 ): CompactionSummaryMessage {
 	return {
 		role: "compactionSummary",
 		summary: summary,
+		title,
 		tokensBefore,
 		timestamp: new Date(timestamp).getTime(),
 	};

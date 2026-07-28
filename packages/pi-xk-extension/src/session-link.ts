@@ -1,3 +1,5 @@
+import { type GoalContractV3, validateGoalContractV3 } from "pi-xk-core";
+
 export const PI_XK_SESSION_LINK_SCHEMA = "pi-xk.session-link.v1";
 
 export const PI_XK_SESSION_LINK_KIND = "goal_binding";
@@ -13,6 +15,8 @@ export const PI_XK_GOAL_CAPTURE_KIND = "goal_capture";
 export const PI_XK_GOAL_DRAFT_KIND = "goal_draft";
 
 export const PI_XK_GOAL_LIFECYCLE_INTENT_KIND = "goal_lifecycle_intent";
+
+export const PI_XK_GOAL_REVISION_KIND = "goal_revision";
 
 export interface PiXkSessionLink {
 	schema: typeof PI_XK_SESSION_LINK_SCHEMA;
@@ -88,6 +92,7 @@ export interface PiXkGoalDraftAcceptance {
 
 export interface PiXkGoalDraftProposal {
 	title: string;
+	intentAnchor: string;
 	objective: string;
 	constraints: string[];
 	acceptance: PiXkGoalDraftAcceptance[];
@@ -96,6 +101,24 @@ export interface PiXkGoalDraftProposal {
 	pauseCondition: string;
 	finalReport: string;
 	executionAuthorization: string;
+}
+
+export type PiXkGoalRevisionState = "proposed" | "confirmed" | "superseded" | "cancelled";
+
+export interface PiXkGoalRevision {
+	schema: typeof PI_XK_SESSION_LINK_SCHEMA;
+	kind: typeof PI_XK_GOAL_REVISION_KIND;
+	revisionId: string;
+	goalId: string;
+	generation: number;
+	state: PiXkGoalRevisionState;
+	expectedRevision: number;
+	reason: string;
+	evidence: string;
+	changedFields: string[];
+	revisionFeedback: string | null;
+	candidate: GoalContractV3;
+	createdAt: string;
 }
 
 /** A session-local candidate contract. It does not create a Goal until confirming has a Goal ID. */
@@ -273,6 +296,7 @@ function isGoalDraftProposal(value: unknown): value is PiXkGoalDraftProposal {
 		!isRecord(value) ||
 		!hasExactKeys(value, [
 			"title",
+			"intentAnchor",
 			"objective",
 			"constraints",
 			"acceptance",
@@ -283,6 +307,7 @@ function isGoalDraftProposal(value: unknown): value is PiXkGoalDraftProposal {
 			"executionAuthorization",
 		]) ||
 		!isNonEmptyString(value.title) ||
+		!isNonEmptyString(value.intentAnchor) ||
 		!isNonEmptyString(value.objective) ||
 		!isStringList(value.constraints) ||
 		!Array.isArray(value.acceptance) ||
@@ -301,6 +326,52 @@ function isGoalDraftProposal(value: unknown): value is PiXkGoalDraftProposal {
 		acceptanceIds.add(acceptance.id);
 	}
 	return value.acceptance.some((acceptance) => acceptance.required);
+}
+
+export function isPiXkGoalRevision(value: unknown): value is PiXkGoalRevision {
+	if (
+		!isRecord(value) ||
+		!hasExactKeys(value, [
+			"schema",
+			"kind",
+			"revisionId",
+			"goalId",
+			"generation",
+			"state",
+			"expectedRevision",
+			"reason",
+			"evidence",
+			"changedFields",
+			"revisionFeedback",
+			"candidate",
+			"createdAt",
+		]) ||
+		value.schema !== PI_XK_SESSION_LINK_SCHEMA ||
+		value.kind !== PI_XK_GOAL_REVISION_KIND ||
+		!isNonEmptyString(value.revisionId) ||
+		!isGoalId(value.goalId) ||
+		!isGeneration(value.generation) ||
+		(value.state !== "proposed" &&
+			value.state !== "confirmed" &&
+			value.state !== "superseded" &&
+			value.state !== "cancelled") ||
+		!isGeneration(value.expectedRevision) ||
+		!isNonEmptyString(value.reason) ||
+		!isNonEmptyString(value.evidence) ||
+		!isStringArray(value.changedFields) ||
+		value.changedFields.length === 0 ||
+		new Set(value.changedFields).size !== value.changedFields.length ||
+		(value.revisionFeedback !== null && !isNonEmptyString(value.revisionFeedback)) ||
+		!isTimestamp(value.createdAt)
+	) {
+		return false;
+	}
+	try {
+		const candidate = validateGoalContractV3(value.candidate);
+		return candidate.goalId === value.goalId && candidate.revision === value.expectedRevision + 1;
+	} catch {
+		return false;
+	}
 }
 
 function assertGoalPauseAudit(value: PiXkGoalPauseAudit): PiXkGoalPauseAudit {
@@ -671,6 +742,7 @@ export function createPiXkGoalCapture(
 function cloneGoalDraftProposal(proposal: PiXkGoalDraftProposal): PiXkGoalDraftProposal {
 	return {
 		title: proposal.title,
+		intentAnchor: proposal.intentAnchor,
 		objective: proposal.objective,
 		constraints: [...proposal.constraints],
 		acceptance: proposal.acceptance.map((acceptance) => ({ ...acceptance })),
@@ -680,6 +752,26 @@ function cloneGoalDraftProposal(proposal: PiXkGoalDraftProposal): PiXkGoalDraftP
 		finalReport: proposal.finalReport,
 		executionAuthorization: proposal.executionAuthorization,
 	};
+}
+
+export function createPiXkGoalRevision(revision: Omit<PiXkGoalRevision, "schema" | "kind">): PiXkGoalRevision {
+	const value: PiXkGoalRevision = {
+		schema: PI_XK_SESSION_LINK_SCHEMA,
+		kind: PI_XK_GOAL_REVISION_KIND,
+		revisionId: revision.revisionId,
+		goalId: revision.goalId,
+		generation: revision.generation,
+		state: revision.state,
+		expectedRevision: revision.expectedRevision,
+		reason: revision.reason,
+		evidence: revision.evidence,
+		changedFields: [...revision.changedFields],
+		revisionFeedback: revision.revisionFeedback,
+		candidate: validateGoalContractV3(revision.candidate),
+		createdAt: revision.createdAt,
+	};
+	if (!isPiXkGoalRevision(value)) throw new Error("Pi-XK Goal revision is invalid");
+	return value;
 }
 
 export function createPiXkGoalDraft(draft: Omit<PiXkGoalDraft, "schema" | "kind">): PiXkGoalDraft {

@@ -106,10 +106,11 @@ describe("Pi-XK session link integration", () => {
 		expect(harness.sessionManager.buildSessionContext().messages).toEqual([]);
 	});
 
-	it("keeps draft acceptance shapes aligned with GoalContractV2", () => {
+	it("keeps draft acceptance shapes aligned with GoalContractV3", () => {
 		const proposal = {
 			title: "Draft acceptance validation",
-			objective: "Reject draft acceptance that cannot become a v2 contract.",
+			intentAnchor: "Deliver a verified Goal without changing the requested outcome.",
+			objective: "Reject draft acceptance that cannot become a v3 contract.",
 			constraints: [],
 			acceptance: [
 				{
@@ -251,8 +252,8 @@ describe("Pi-XK session link integration", () => {
 		});
 		harnesses.push(harness);
 		harness.setResponses([
-			fauxAssistantMessage("native Pi history summary"),
-			fauxAssistantMessage("native Pi turn prefix"),
+			fauxAssistantMessage("<title>Native Pi history</title>\n<summary>native Pi history summary</summary>"),
+			fauxAssistantMessage("<title>Native Pi turn context</title>\n<summary>native Pi turn prefix</summary>"),
 		]);
 		harness.sessionManager.appendMessage({
 			role: "user",

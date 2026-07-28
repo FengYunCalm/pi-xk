@@ -32,7 +32,12 @@ function createModel(reasoning: boolean, maxTokens = 8192): Model<"anthropic-mes
 
 const mockSummaryResponse: AssistantMessage = {
 	role: "assistant",
-	content: [{ type: "text", text: "## Goal\nTest summary" }],
+	content: [
+		{
+			type: "text",
+			text: "<title>Compaction reasoning options</title>\n<summary>## Goal\nTest summary</summary>",
+		},
+	],
 	api: "anthropic-messages",
 	provider: "anthropic",
 	model: "claude-sonnet-4-5",

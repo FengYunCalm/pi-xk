@@ -309,18 +309,22 @@ describe("AgentSession model and extension characterization", () => {
 	});
 
 	it("allows before_agent_start handlers to inject custom messages and modify the system prompt", async () => {
+		const idleStates: boolean[] = [];
 		const harness = await createHarness({
 			extensionFactories: [
 				(pi) => {
-					pi.on("before_agent_start", async (event) => ({
-						message: {
-							customType: "before-start",
-							content: "injected",
-							display: true,
-							details: { injected: true },
-						},
-						systemPrompt: `${event.systemPrompt}\n\nextra instructions`,
-					}));
+					pi.on("before_agent_start", async (event, ctx) => {
+						idleStates.push(ctx.isIdle());
+						return {
+							message: {
+								customType: "before-start",
+								content: "injected",
+								display: true,
+								details: { injected: true },
+							},
+							systemPrompt: `${event.systemPrompt}\n\nextra instructions`,
+						};
+					});
 				},
 			],
 		});
@@ -342,11 +346,54 @@ describe("AgentSession model and extension characterization", () => {
 
 		await harness.session.prompt("hello");
 
+		expect(idleStates).toEqual([true]);
 		expect(providerSystemPrompt).toContain("extra instructions");
 		expect(sawInjectedUserMessage).toBe(true);
 		expect(
 			harness.session.messages.some((message) => message.role === "custom" && message.customType === "before-start"),
 		).toBe(true);
+	});
+
+	it("keeps the run active externally while before_agent_start observes the legacy idle state", async () => {
+		let markHookEntered: (() => void) | undefined;
+		let releaseHook: (() => void) | undefined;
+		const hookEntered = new Promise<void>((resolve) => {
+			markHookEntered = resolve;
+		});
+		const hookGate = new Promise<void>((resolve) => {
+			releaseHook = resolve;
+		});
+		const hookIdleStates: boolean[] = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", async (_event, ctx) => {
+						hookIdleStates.push(ctx.isIdle());
+						markHookEntered?.();
+						await hookGate;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("done")]);
+
+		const promptPromise = harness.session.prompt("hello");
+		await hookEntered;
+		let idleWaitResolved = false;
+		const idleWaitPromise = harness.session.waitForIdle().then(() => {
+			idleWaitResolved = true;
+		});
+		await Promise.resolve();
+
+		expect(hookIdleStates).toEqual([true]);
+		expect(harness.session.isStreaming).toBe(true);
+		expect(idleWaitResolved).toBe(false);
+
+		releaseHook?.();
+		await promptPromise;
+		await idleWaitPromise;
+		expect(idleWaitResolved).toBe(true);
 	});
 
 	it("bindExtensions emits session_start and reload emits session_shutdown then session_start", async () => {

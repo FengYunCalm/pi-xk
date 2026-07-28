@@ -1,8 +1,14 @@
 import { createHash } from "node:crypto";
-import { CHAIN_ROLLUP_SCHEMA, type SessionChainRollupContentV1, type SessionChainRollupV1 } from "pi-xk-core";
+import {
+	CHAIN_ROLLUP_SCHEMA,
+	type SessionChainRollupContentV1,
+	type SessionChainRollupV1,
+	validateSegmentSummaryTitle,
+} from "pi-xk-core";
 import { SessionChainControllerError } from "./session-chain-errors.ts";
 
 export interface ParsedSummaryEnvelope {
+	title: string;
 	segmentDeltaMarkdown: string;
 	carryForwardMarkdown: string;
 }
@@ -57,17 +63,25 @@ export function rollupSourceDigest(input: {
 
 export function parseSummaryEnvelope(summary: string): ParsedSummaryEnvelope {
 	const match =
-		/^\s*<segment-delta>\s*([\s\S]*?)\s*<\/segment-delta>\s*<carry-forward>\s*([\s\S]*?)\s*<\/carry-forward>\s*$/.exec(
+		/^\s*<title>([^\r\n]*)<\/title>\s*<segment-delta>\s*([\s\S]*?)\s*<\/segment-delta>\s*<carry-forward>\s*([\s\S]*?)\s*<\/carry-forward>\s*$/.exec(
 			summary,
 		);
-	const segmentDeltaMarkdown = match?.[1]?.trim();
-	const carryForwardMarkdown = match?.[2]?.trim();
-	if (!segmentDeltaMarkdown || !carryForwardMarkdown) {
+	const segmentDeltaMarkdown = match?.[2]?.trim();
+	const carryForwardMarkdown = match?.[3]?.trim();
+	if (!match?.[1] || !segmentDeltaMarkdown || !carryForwardMarkdown) {
 		throw new SessionChainControllerError(
-			"Session Chain summarizer returned an invalid summary envelope; expected segment-delta and carry-forward blocks",
+			"Session Chain summarizer returned an invalid summary envelope; expected title, segment-delta, and carry-forward blocks",
 		);
 	}
-	return { segmentDeltaMarkdown, carryForwardMarkdown };
+	let title: string;
+	try {
+		title = validateSegmentSummaryTitle(match[1]);
+	} catch (error) {
+		throw new SessionChainControllerError(
+			`Session Chain summarizer returned an invalid title: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	return { title, segmentDeltaMarkdown, carryForwardMarkdown };
 }
 
 export function parseRollupEnvelope(summary: string): SessionChainRollupContentV1 {

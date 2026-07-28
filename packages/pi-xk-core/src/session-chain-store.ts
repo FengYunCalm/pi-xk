@@ -19,12 +19,11 @@ import {
 	type RolloverPreparedPayloadV1,
 	type RollupFailedPayloadV1,
 	type RollupPublishedPayloadV1,
-	SEGMENT_SUMMARY_SCHEMA,
 	SESSION_CHAIN_CATALOG_SCHEMA,
 	SESSION_CHAIN_EVENT_SCHEMA,
 	SESSION_CHAIN_EVENT_V2_SCHEMA,
 	SESSION_CHAIN_EVENT_V3_SCHEMA,
-	type SegmentSummaryV1,
+	type SegmentSummary,
 	type SessionBranchProjectionV1,
 	type SessionChainActor,
 	type SessionChainCatalogEntryV1,
@@ -38,7 +37,7 @@ import {
 	SessionChainValidationError,
 	type SessionSegmentDescriptorV1,
 	type SessionSegmentSealV1,
-	validateSegmentSummaryV1,
+	validateSegmentSummary,
 	validateSessionChainActor,
 	validateSessionChainExactKeys,
 	validateSessionChainNonEmptyString,
@@ -1294,12 +1293,12 @@ export class SessionChainStore {
 		await this.updateCatalogEntry(readModel);
 	}
 
-	async putSegmentSummary(summaryInput: SegmentSummaryV1): Promise<string> {
-		const summary = validateSegmentSummaryV1(summaryInput);
+	async putSegmentSummary(summaryInput: SegmentSummary): Promise<string> {
+		const summary = validateSegmentSummary(summaryInput);
 		const metadata = await this.artifacts.put({
 			contentType: "application/json",
 			value: summary,
-			producer: SEGMENT_SUMMARY_SCHEMA,
+			producer: summary.schema,
 			sensitivity: "internal",
 			sourceIds: [summary.chainId, summary.sourceSegmentId, summary.targetSegmentId],
 			createdAt: summary.generator.generatedAt,
@@ -1307,11 +1306,15 @@ export class SessionChainStore {
 		return metadata.artifactId;
 	}
 
-	async readSegmentSummary(artifactId: string): Promise<SegmentSummaryV1> {
+	async readSegmentSummary(artifactId: string): Promise<SegmentSummary> {
 		assertSessionChainArtifactId(artifactId, "artifactId");
 		const stored = await this.artifacts.read(artifactId);
 		try {
-			return validateSegmentSummaryV1(JSON.parse(stored.content) as unknown);
+			const summary = validateSegmentSummary(JSON.parse(stored.content) as unknown);
+			if (stored.metadata.producer !== summary.schema) {
+				throw new SessionChainValidationError("Segment summary artifact producer does not match its schema");
+			}
+			return summary;
 		} catch (error) {
 			throw new SessionChainCorruptionError(
 				`Segment summary artifact is invalid: ${error instanceof Error ? error.message : artifactId}`,

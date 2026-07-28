@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added optional titles to compaction summary messages so hosts can preserve and render short historical labels without changing the LLM-facing summary body.
+
 ## [0.80.10] - 2026-07-16
 
 ## [0.80.9] - 2026-07-16

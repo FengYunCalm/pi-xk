@@ -4,7 +4,7 @@
 
 ### New Features
 
-- **Pi-XK durable agent workflows** - Use reviewable Goal V2 contracts, automatic Goal continuation, and one isolated Task V1 child run with explicit status, cancellation, shutdown recovery, and native queued follow-up input. See [Pi-XK Getting Started](../../docs/pi-xk/getting-started.md).
+- **Pi-XK durable agent workflows** - Use reviewable Goal V3 contracts with a stable Intent Anchor, controlled Current Objective revisions, automatic Goal continuation, and one isolated Task V2 child run with explicit status, cancellation, shutdown recovery, and native queued follow-up input. See [Pi-XK Getting Started](../../docs/pi-xk/getting-started.md).
 - **Segmented Session Chains** - Continue long-running work across complete native Pi JSONL Segments with safe rollover, successor branches, Goal and Task continuity, chain titles and archive controls, and tiered recovery diagnostics. See [Pi-XK Design and Boundaries](../../docs/pi-xk/design-and-boundaries.md).
 - **Verified L1/L2 history retrieval** - Preserve canonical per-Segment L1 summaries, publish non-blocking branch Rollups, expose only a bounded memory manifest, and let models read fully verified historical evidence on demand. See [Session Chain Rollups and Model Retrieval](../../docs/pi-xk/session-chain-rollups-and-model-retrieval.md).
 
@@ -14,10 +14,13 @@
 - Added extension registration for complete pi-ai providers, including native authentication, model refresh, filtering, and streaming behavior.
 - Added extension APIs for durable session flushing, context summarization, and settled physical-session rollover with replacement lifecycle events.
 - Added `queueUserMessage` for extensions to enqueue a native follow-up without immediately starting an agent turn.
-- Added the private Pi-XK Core and Extension packages with event-backed Goal V2 and Task V1 state, review and lifecycle commands, explicit abandoned-lock repair, and conservative restart behavior.
+- Added the private Pi-XK Core and Extension packages with event-backed Goal V3 and Task V2 state, review and lifecycle commands, explicit abandoned-lock repair, and conservative restart behavior.
 - Added Session Chain v1.1 with manual and threshold rollover, resumable prepared commits, successor branches, verified L1 summaries, asynchronous L2 Rollups, model summary tools, incremental read models, and fast/deep doctor paths.
 - Added managed local Pi-XK install, upgrade, uninstall, and dry-run commands plus `/xk status` for a combined Chain, Goal, Task, Rollup, and recovery view.
 - Added independent GitHub-only Pi-XK binary releases with a bundled private extension/Core payload, dual Pi-XK/Pi version provenance, six platform archives, and SHA-256 checksums.
+- Added validated compaction titles plus persisted trigger/recovery metadata for manual, threshold, and overflow compactions; the next actual Agent run receives one-time recovery system context without duplicating the last user message.
+- Added Pi-XK Goal V3 revisions with objective-only automatic refinement, protected-field review commands, state revision diagnostics, and read-only Objective projections.
+- Added Session Chain L1 V2 titles to summary list/read results while keeping L1 V1 artifacts readable with `title: null`.
 
 ### Fixed
 
@@ -32,6 +35,8 @@
 - Fixed obsolete custom UI, custom tool, and custom editor examples in the extension documentation ([#6735](https://github.com/earendil-works/pi/issues/6735)).
 - Fixed Kimi Coding sessions to show API-equivalent implied costs with the subscription indicator.
 - Fixed OpenAI Responses early stream endings to trigger automatic retry instead of ending the agent run ([#6727](https://github.com/earendil-works/pi/issues/6727)).
+- Fixed Pi-XK Goal revision review bodies and revision state from previous Goal bindings from blocking or leaking into later model context after a revision is shown, superseded, or automatically applied.
+- Fixed Pi-XK V3 contracts being writable through the legacy V2 update path, and narrowed summary-title command detection so technical noun phrases are not rejected.
 
 ## [0.80.10] - 2026-07-16
 

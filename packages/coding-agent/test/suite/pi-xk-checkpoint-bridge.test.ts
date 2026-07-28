@@ -331,8 +331,8 @@ describe("Pi-XK checkpoint bridge", () => {
 		});
 		harnesses.push(harness);
 		harness.setResponses([
-			fauxAssistantMessage("native Pi history summary"),
-			fauxAssistantMessage("native Pi turn prefix"),
+			fauxAssistantMessage("<title>Native Pi history</title>\n<summary>native Pi history summary</summary>"),
+			fauxAssistantMessage("<title>Native Pi turn context</title>\n<summary>native Pi turn prefix</summary>"),
 		]);
 		harness.sessionManager.appendMessage({
 			role: "user",

@@ -7,6 +7,7 @@ export const SESSION_CHAIN_EVENT_V3_SCHEMA = "pi-xk.session-chain-event.v3";
 export const SESSION_CHAIN_READ_MODEL_SCHEMA = "pi-xk.session-chain-read-model.v1";
 export const SESSION_CHAIN_CATALOG_SCHEMA = "pi-xk.session-chain-catalog.v1";
 export const SEGMENT_SUMMARY_SCHEMA = "pi-xk.segment-summary.v1";
+export const SEGMENT_SUMMARY_V2_SCHEMA = "pi-xk.segment-summary.v2";
 export const CHAIN_ROLLUP_SCHEMA = "pi-xk.session-chain-rollup.v1";
 
 const HASH_PATTERN = /^sha256:[a-f0-9]{64}$/;
@@ -69,6 +70,23 @@ export interface SegmentSummaryV1 {
 	carryForwardMarkdown: string;
 	generator: SegmentSummaryGeneratorV1;
 }
+
+export interface SegmentSummaryV2 {
+	schema: typeof SEGMENT_SUMMARY_V2_SCHEMA;
+	title: string;
+	chainId: string;
+	branchId: string;
+	sourceSegmentId: string;
+	sourceLeafId: string;
+	targetSegmentId: string;
+	baseSummaryArtifactId: string | null;
+	sourceRange: SegmentSummarySourceRangeV1;
+	segmentDeltaMarkdown: string;
+	carryForwardMarkdown: string;
+	generator: SegmentSummaryGeneratorV1;
+}
+
+export type SegmentSummary = SegmentSummaryV1 | SegmentSummaryV2;
 
 export interface SessionChainRollupContentV1 {
 	state: string;
@@ -492,6 +510,41 @@ function validateSummaryGenerator(value: unknown): SegmentSummaryGeneratorV1 {
 	};
 }
 
+const SUMMARY_TITLE_MAX_CODE_POINTS = 60;
+const SUMMARY_TITLE_CONTROL_CHARACTERS = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+const SUMMARY_TITLE_MARKDOWN = /(?:^#{1,6}\s|^[-*+]\s|^\d+[.)]\s|^>\s|```|`|\*\*|__|~~|\[[^\]]+\]\([^)]+\))/u;
+const SUMMARY_TITLE_ROLE_INSTRUCTION =
+	/(?:^|[|｜;；,.，。!?！？/\\()[\]{}]\s*|\s[-–—]\s*)(?:\[|\(|【)?\s*(?:system|developer|assistant|user|tool|human|系统|开发者|助手|用户|工具)\s*(?:\]|\)|】)?\s*[:：]|\b(?:act\s+as|you\s+are(?:\s+now)?)\b|(?:扮演|你(?:现在)?是)/iu;
+const SUMMARY_TITLE_IMPERATIVE =
+	/(?:^|[|｜:：;；,.，。!?！？/\\()[\]{}]\s*|\s[-–—]\s*|\b(?:then|and\s+then)\s+|(?:然后|并且|再)\s*)(?:(?:please|do|must|ignore|disregard|override|follow)\s+|(?:execute|run|read|open|call|delete|change|modify|continue)\s+(?:the|this|that|these|those|all|any|arbitrary|previous|system|developer|tool|tools|command|commands|instruction|instructions|file|files|task|tasks|everything|now)\b|(?:请|必须|务必)|(?:忽略|无视|覆盖|遵循|执行|运行|读取|打开|调用|删除|修改|继续)(?:任意|所有|全部|以下|上述|之前|当前|现在|系统|开发者|工具|命令|指令|文件|任务|操作))/iu;
+const SUMMARY_TITLE_COMPLETION_CLAIM =
+	/(?:^(?:completed|done|finished|shipped)\b|\b(?:completed|done|finished|fixed|resolved|shipped)\s*$|已完成|完成了|修复完成|已修复|已解决|交付完成)/iu;
+
+export function validateSegmentSummaryTitle(value: unknown): string {
+	const title = requireNonEmptyString(value, "title").trim();
+	if ([...title].length > SUMMARY_TITLE_MAX_CODE_POINTS) {
+		throw new SessionChainValidationError(
+			`title must not exceed ${SUMMARY_TITLE_MAX_CODE_POINTS} Unicode code points`,
+		);
+	}
+	if (SUMMARY_TITLE_CONTROL_CHARACTERS.test(title) || /[\r\n]/u.test(title)) {
+		throw new SessionChainValidationError("title must be a single line without control characters");
+	}
+	if (SUMMARY_TITLE_MARKDOWN.test(title) || /<[^>]*>/u.test(title)) {
+		throw new SessionChainValidationError("title must not contain Markdown or markup");
+	}
+	if (SUMMARY_TITLE_ROLE_INSTRUCTION.test(title)) {
+		throw new SessionChainValidationError("title must not contain role instructions");
+	}
+	if (SUMMARY_TITLE_IMPERATIVE.test(title)) {
+		throw new SessionChainValidationError("title must not contain imperative text");
+	}
+	if (SUMMARY_TITLE_COMPLETION_CLAIM.test(title)) {
+		throw new SessionChainValidationError("title must not contain an unverified completion claim");
+	}
+	return title;
+}
+
 export function validateSegmentSummaryV1(value: unknown): SegmentSummaryV1 {
 	if (!isRecord(value)) throw new SessionChainValidationError("Segment summary must be an object");
 	requireExactKeys(
@@ -538,6 +591,63 @@ export function validateSegmentSummaryV1(value: unknown): SegmentSummaryV1 {
 		carryForwardMarkdown: requireNonEmptyString(value.carryForwardMarkdown, "carryForwardMarkdown"),
 		generator: validateSummaryGenerator(value.generator),
 	};
+}
+
+export function validateSegmentSummaryV2(value: unknown): SegmentSummaryV2 {
+	if (!isRecord(value)) throw new SessionChainValidationError("Segment summary must be an object");
+	requireExactKeys(
+		value,
+		[
+			"schema",
+			"title",
+			"chainId",
+			"branchId",
+			"sourceSegmentId",
+			"sourceLeafId",
+			"targetSegmentId",
+			"baseSummaryArtifactId",
+			"sourceRange",
+			"segmentDeltaMarkdown",
+			"carryForwardMarkdown",
+			"generator",
+		],
+		"Segment summary",
+	);
+	if (value.schema !== SEGMENT_SUMMARY_V2_SCHEMA) {
+		throw new SessionChainValidationError("Segment summary schema is unsupported");
+	}
+	const chainId = requireNonEmptyString(value.chainId, "chainId");
+	assertSessionChainId(chainId);
+	const branchId = requireNonEmptyString(value.branchId, "branchId");
+	assertSessionBranchId(branchId);
+	const sourceSegmentId = requireNonEmptyString(value.sourceSegmentId, "sourceSegmentId");
+	const targetSegmentId = requireNonEmptyString(value.targetSegmentId, "targetSegmentId");
+	assertSessionSegmentId(sourceSegmentId);
+	assertSessionSegmentId(targetSegmentId);
+	return {
+		schema: SEGMENT_SUMMARY_V2_SCHEMA,
+		title: validateSegmentSummaryTitle(value.title),
+		chainId,
+		branchId,
+		sourceSegmentId,
+		sourceLeafId: requireNonEmptyString(value.sourceLeafId, "sourceLeafId"),
+		targetSegmentId,
+		baseSummaryArtifactId:
+			value.baseSummaryArtifactId === null
+				? null
+				: assertSessionChainArtifactId(value.baseSummaryArtifactId, "baseSummaryArtifactId"),
+		sourceRange: validateSummarySourceRange(value.sourceRange),
+		segmentDeltaMarkdown: requireNonEmptyString(value.segmentDeltaMarkdown, "segmentDeltaMarkdown"),
+		carryForwardMarkdown: requireNonEmptyString(value.carryForwardMarkdown, "carryForwardMarkdown"),
+		generator: validateSummaryGenerator(value.generator),
+	};
+}
+
+export function validateSegmentSummary(value: unknown): SegmentSummary {
+	if (!isRecord(value)) throw new SessionChainValidationError("Segment summary must be an object");
+	if (value.schema === SEGMENT_SUMMARY_SCHEMA) return validateSegmentSummaryV1(value);
+	if (value.schema === SEGMENT_SUMMARY_V2_SCHEMA) return validateSegmentSummaryV2(value);
+	throw new SessionChainValidationError("Segment summary schema is unsupported");
 }
 
 function validateNonEmptyStringArray(value: unknown, field: string): string[] {
