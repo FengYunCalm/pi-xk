@@ -5,23 +5,8 @@
  * and provides a transformer to convert them to LLM-compatible messages.
  */
 
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { type AgentMessage, formatHistoricalEvidence } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
-
-export const COMPACTION_SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary:
-
-<summary>
-`;
-
-export const COMPACTION_SUMMARY_SUFFIX = `
-</summary>`;
-
-export const BRANCH_SUMMARY_PREFIX = `The following is a summary of a branch that this conversation came back from:
-
-<summary>
-`;
-
-export const BRANCH_SUMMARY_SUFFIX = `</summary>`;
 
 /**
  * Message type for bash executions via the ! command.
@@ -173,14 +158,19 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 				case "branchSummary":
 					return {
 						role: "user",
-						content: [{ type: "text" as const, text: BRANCH_SUMMARY_PREFIX + m.summary + BRANCH_SUMMARY_SUFFIX }],
+						content: [
+							{ type: "text" as const, text: formatHistoricalEvidence("branch", { summary: m.summary }) },
+						],
 						timestamp: m.timestamp,
 					};
 				case "compactionSummary":
 					return {
 						role: "user",
 						content: [
-							{ type: "text" as const, text: COMPACTION_SUMMARY_PREFIX + m.summary + COMPACTION_SUMMARY_SUFFIX },
+							{
+								type: "text" as const,
+								text: formatHistoricalEvidence("compaction", { title: m.title ?? null, summary: m.summary }),
+							},
 						],
 						timestamp: m.timestamp,
 					};

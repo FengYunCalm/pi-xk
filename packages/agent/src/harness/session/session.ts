@@ -247,6 +247,7 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
 		tokensBefore: number,
 		details?: T,
 		fromHook?: boolean,
+		title?: string,
 	): Promise<string> {
 		return this.appendTypedEntry({
 			type: "compaction",
@@ -254,6 +255,7 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
 			parentId: await this.storage.getLeafId(),
 			timestamp: new Date().toISOString(),
 			summary,
+			title,
 			firstKeptEntryId,
 			tokensBefore,
 			details,

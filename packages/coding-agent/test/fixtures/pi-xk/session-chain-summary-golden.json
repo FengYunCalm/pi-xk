@@ -1,5 +1,5 @@
 {
-  "schema": "pi-xk.session-chain-summary-golden.v1",
+  "schema": "pi-xk.session-chain-summary-golden.v2",
   "facts": [
     {
       "id": "interval-default",
@@ -46,26 +46,58 @@
       "reversalPatterns": []
     }
   ],
-  "l1": [
+  "segments": [
     {
       "ordinal": 1,
-      "carryForward": "The default Rollup interval is 5. Do not add a Policy layer."
+      "evidence": "The default Rollup interval is 5. Do not add a Policy layer."
     },
     {
       "ordinal": 2,
-      "carryForward": "The default Rollup interval is 5. The Policy layer remains out of scope. A temporary provider retry is pending."
+      "evidence": "The Policy layer remains out of scope. A temporary provider retry is pending."
     },
     {
       "ordinal": 3,
-      "carryForward": "The default Rollup interval is 5. The Policy layer remains out of scope. TaskSupervisor remains rejected."
+      "evidence": "The temporary provider retry is resolved. TaskSupervisor remains rejected."
     },
     {
       "ordinal": 4,
-      "carryForward": "The default Rollup interval is 5. The Policy layer remains out of scope. TaskSupervisor remains rejected. The manifest stays metadata-only."
+      "evidence": "The manifest stays metadata-only and summary bodies remain on-demand."
     },
     {
       "ordinal": 5,
-      "carryForward": "The default Rollup interval is 5. The Policy layer remains out of scope. TaskSupervisor remains rejected. The manifest contains metadata only. Release smoke remains unresolved."
+      "evidence": "Release smoke remains unresolved. The background Rollup queue is implemented."
+    }
+  ],
+  "l1": [
+    {
+      "ordinal": 1,
+      "title": "Rollup policy baseline",
+      "segmentDeltaMarkdown": "The default Rollup interval is 5. Do not add a Policy layer.",
+      "carryForwardMarkdown": "The default Rollup interval is 5. Do not add a Policy layer."
+    },
+    {
+      "ordinal": 2,
+      "title": "Provider retry tracking",
+      "segmentDeltaMarkdown": "A temporary provider retry is pending.",
+      "carryForwardMarkdown": "The default Rollup interval is 5. The Policy layer remains out of scope. A temporary provider retry is pending."
+    },
+    {
+      "ordinal": 3,
+      "title": "TaskSupervisor rejection",
+      "segmentDeltaMarkdown": "The temporary provider retry is resolved. TaskSupervisor remains rejected.",
+      "carryForwardMarkdown": "The default Rollup interval is 5. The Policy layer remains out of scope. TaskSupervisor remains rejected."
+    },
+    {
+      "ordinal": 4,
+      "title": "Manifest metadata boundary",
+      "segmentDeltaMarkdown": "The manifest stays metadata-only and summary bodies remain on-demand.",
+      "carryForwardMarkdown": "The default Rollup interval is 5. The Policy layer remains out of scope. TaskSupervisor remains rejected. The manifest stays metadata-only."
+    },
+    {
+      "ordinal": 5,
+      "title": "Release smoke status",
+      "segmentDeltaMarkdown": "Release smoke remains unresolved. The background Rollup queue is implemented.",
+      "carryForwardMarkdown": "The default Rollup interval is 5. The Policy layer remains out of scope. TaskSupervisor remains rejected. The manifest contains metadata only. Release smoke remains unresolved."
     }
   ],
   "l2": {

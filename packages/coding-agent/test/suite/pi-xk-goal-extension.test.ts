@@ -150,6 +150,58 @@ function draftResponse(objective: string) {
 	});
 }
 
+interface GoalEndToolInput {
+	outcome: string;
+	reason: string;
+	verifiedAcceptanceIds: string[];
+	finalEvidence: string;
+	finalSummary: string;
+}
+
+function replaceGoalStateSection(content: string, section: string, lines: string[]): string {
+	const heading = `## ${section}`;
+	const start = content.indexOf(`${heading}\n`);
+	if (start < 0) throw new Error(`Goal State is missing ${heading}`);
+	const bodyStart = start + heading.length + 1;
+	const next = content.indexOf("\n## ", bodyStart);
+	const end = next < 0 ? content.length : next + 1;
+	return `${content.slice(0, bodyStart)}${lines.join("\n")}\n\n${content.slice(end)}`;
+}
+
+async function recordV3GoalCompletionState(harness: Harness, input: GoalEndToolInput): Promise<void> {
+	const goalId = getCurrentGoalId(harness);
+	if (!goalId) throw new Error("No Goal is bound while recording completion State");
+	const replay = await new GoalStore(harness.tempDir).replayGoal(goalId);
+	if (replay.contract.schema !== "pi-xk.goal.contract.v3") return;
+	const statePath = join(harness.tempDir, ".pi-xk", "goals", goalId, "goal-state.md");
+	let state = await readFile(statePath, "utf8");
+	state = replaceGoalStateSection(state, "contract_revision", [`- ${replay.contract.revision}`]);
+	state = replaceGoalStateSection(
+		state,
+		"acceptance_matrix",
+		replay.contract.acceptance.map((acceptance) =>
+			input.verifiedAcceptanceIds.includes(acceptance.id)
+				? `- ${acceptance.id}: ${acceptance.required ? "required" : "optional"}; verified; evidence: ${input.finalEvidence}`
+				: `- ${acceptance.id}: ${acceptance.required ? "required" : "optional"}; unverified; evidence: not recorded`,
+		),
+	);
+	state = replaceGoalStateSection(state, "final_evidence", [
+		`- ${JSON.stringify({
+			evidence: input.finalEvidence,
+			summary: input.finalSummary,
+			verifiedAcceptanceIds: input.verifiedAcceptanceIds,
+		})}`,
+	]);
+	await writeFile(statePath, state);
+}
+
+function successfulV3GoalEndResponse(harness: Harness, input: GoalEndToolInput): FauxResponseFactory {
+	return async () => {
+		await recordV3GoalCompletionState(harness, input);
+		return fauxAssistantMessage([fauxToolCall("pi_xk_end_goal", input)], { stopReason: "toolUse" });
+	};
+}
+
 async function createActiveGoal(harness: Harness, goalId: string): Promise<GoalStore> {
 	const store = new GoalStore(harness.tempDir);
 	const proposal = draftProposal(`Exercise lifecycle behavior for ${goalId}.`);
@@ -736,6 +788,7 @@ describe("Pi-XK Goal extension", () => {
 	it("keeps a submitted Goal draft in the session until the user confirms it", async () => {
 		const objective = "Draft a Goal without creating it immediately.";
 		const draftPrompts: string[] = [];
+		const draftSystemPrompts: string[] = [];
 		const harness = await createHarness({
 			extensionFactories: [createPiXkGoalExtension({ createGoalId: () => "goal_confirmed_draft" })],
 		});
@@ -743,23 +796,19 @@ describe("Pi-XK Goal extension", () => {
 		harness.setResponses([
 			(context) => {
 				draftPrompts.push(context.messages.map((message) => getMessageText(message)).join("\n"));
+				draftSystemPrompts.push(context.systemPrompt ?? "");
 				return fauxAssistantMessage(
 					[fauxToolCall("pi_xk_submit_goal_draft", draftProposal("Confirm the drafted Goal."))],
 					{ stopReason: "toolUse" },
 				);
 			},
-			fauxAssistantMessage(
-				[
-					fauxToolCall("pi_xk_end_goal", {
-						outcome: "accepted",
-						reason: "the draft was confirmed and verified",
-						verifiedAcceptanceIds: ["A-1"],
-						finalEvidence: "The confirmation flow completed.",
-						finalSummary: "The confirmed Goal completed.",
-					}),
-				],
-				{ stopReason: "toolUse" },
-			),
+			successfulV3GoalEndResponse(harness, {
+				outcome: "accepted",
+				reason: "the draft was confirmed and verified",
+				verifiedAcceptanceIds: ["A-1"],
+				finalEvidence: "The confirmation flow completed.",
+				finalSummary: "The confirmed Goal completed.",
+			}),
 		]);
 
 		await harness.session.bindExtensions({});
@@ -770,14 +819,26 @@ describe("Pi-XK Goal extension", () => {
 		expect(existsSync(join(harness.tempDir, ".pi-xk", "goals"))).toBe(false);
 		expect(getCurrentGoalDraft(harness)).toMatchObject({
 			state: "proposed",
+			objective,
 			goalId: null,
 			proposal: { objective: "Confirm the drafted Goal." },
 		});
 		expect(draftPrompts).toHaveLength(1);
-		expect(draftPrompts[0]).toContain("Draft the contract only");
-		expect(draftPrompts[0]).toContain("Intent Anchor");
-		expect(draftPrompts[0]).toContain("Do not put changing progress");
-		expect(draftPrompts[0]).toContain("commit/push");
+		expect(draftSystemPrompts).toHaveLength(1);
+		expect(draftSystemPrompts[0]).toContain("Draft the contract only");
+		expect(draftSystemPrompts[0]).toContain("Intent Anchor");
+		expect(draftSystemPrompts[0]).toContain(
+			"Intent Anchor -> Current Objective -> Required Acceptance -> Verification Evidence -> Done Condition -> Final Report",
+		);
+		expect(draftSystemPrompts[0]).toContain("Every material outcome in Current Objective");
+		expect(draftSystemPrompts[0]).toContain("Every required acceptance must trace back");
+		expect(draftSystemPrompts[0]).toContain("must not narrow, drop, or rewrite away any existing outcome dimension");
+		expect(draftSystemPrompts[0]).toContain("Do not put changing progress");
+		expect(draftSystemPrompts[0]).toContain("commit/push");
+		expect(draftSystemPrompts[0]).not.toContain(objective);
+		expect(draftPrompts[0]).not.toContain("Draft the contract only");
+		expect(draftPrompts[0]).toContain('"schema":"pi-xk.goal-draft-input.v1"');
+		expect(draftPrompts[0]).toContain('"requestedObjective"');
 		expect(draftPrompts[0]).toContain(objective);
 
 		await harness.session.prompt("/goal confirm");
@@ -793,6 +854,145 @@ describe("Pi-XK Goal extension", () => {
 		});
 	});
 
+	it("fails closed on ordinary Agent runs while a Goal draft awaits review", async () => {
+		const harness = await createHarness({ extensionFactories: [createPiXkGoalExtension()] });
+		harnesses.push(harness);
+		harness.setResponses([
+			draftResponse("Review this contract before any ordinary work."),
+			fauxAssistantMessage("ordinary work must not run"),
+		]);
+
+		await harness.session.bindExtensions({});
+		await harness.session.prompt("/goal Create a contract and wait for explicit review.");
+		await waitForAgent(harness);
+		expect(getCurrentGoalDraft(harness)?.state).toBe("proposed");
+		expect(harness.faux.state.callCount).toBe(1);
+
+		await harness.session.prompt("perform unrelated ordinary work");
+		await waitForAgent(harness);
+
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(getCurrentGoalDraft(harness)?.state).toBe("proposed");
+	});
+
+	it("keeps the original request and previous candidate while revising a Goal draft", async () => {
+		const originalRequest = "Deliver the complete cross-platform Goal workflow and its verification evidence.";
+		const prompts: string[] = [];
+		const harness = await createHarness({ extensionFactories: [createPiXkGoalExtension()] });
+		harnesses.push(harness);
+		harness.setResponses([
+			(context) => {
+				prompts.push(context.messages.map((message) => getMessageText(message)).join("\n"));
+				return draftResponse("First candidate objective.");
+			},
+			(context) => {
+				prompts.push(context.messages.map((message) => getMessageText(message)).join("\n"));
+				return draftResponse("Revised candidate objective.");
+			},
+		]);
+
+		await harness.session.bindExtensions({});
+		await harness.session.prompt(`/goal ${originalRequest}`);
+		await waitForAgent(harness);
+		await harness.session.prompt("/goal revise Keep every platform outcome and make the evidence explicit.");
+		await waitForAgent(harness);
+
+		expect(prompts).toHaveLength(2);
+		expect(prompts[1]).toContain(originalRequest);
+		expect(prompts[1]).toContain('"objective":"First candidate objective."');
+		expect(prompts[1]).toContain("Keep every platform outcome and make the evidence explicit.");
+		expect(getCurrentGoalDraft(harness)).toMatchObject({
+			state: "proposed",
+			objective: originalRequest,
+			proposal: { objective: "Revised candidate objective." },
+		});
+	});
+
+	it("recognizes Goal kickoffs when another extension appends a custom message", async () => {
+		const requestTexts: string[] = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				createPiXkGoalExtension({ createGoalId: () => "goal_post_kickoff_custom" }),
+				(pi) => {
+					pi.on("before_agent_start", async () => ({
+						message: {
+							customType: "test.after-kickoff",
+							content: "additional trusted host context",
+							display: false,
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			(context) => {
+				requestTexts.push(context.messages.map((message) => getMessageText(message)).join("\n"));
+				return draftResponse("Preserve kickoff recognition.");
+			},
+			(context) => {
+				requestTexts.push(context.messages.map((message) => getMessageText(message)).join("\n"));
+				return fauxAssistantMessage(
+					[
+						fauxToolCall("pi_xk_pause_goal", {
+							reason: "kickoff recognition verified",
+							userRequest: null,
+							nextBestAction: "Resume after the focused test.",
+							audit: {
+								unmetRequiredAcceptanceIds: ["A-1"],
+								currentEvidence: "Both kickoff messages reached the model.",
+								incompleteConclusion: "The test Goal remains intentionally paused.",
+							},
+						}),
+					],
+					{ stopReason: "toolUse" },
+				);
+			},
+		]);
+
+		await harness.session.bindExtensions({});
+		await harness.session.prompt("/goal Preserve kickoff recognition after custom host context.");
+		await waitForAgent(harness);
+		await harness.session.prompt("/goal confirm");
+		await waitForAgent(harness);
+
+		expect(requestTexts[0]).toContain('"schema":"pi-xk.goal-draft-input.v1"');
+		expect(requestTexts[1]).toContain("Continue the active Pi-XK Goal according to its durable contract.");
+		expect(requestTexts[1]).toContain("additional trusted host context");
+		expect((await new GoalStore(harness.tempDir).replayGoal("goal_post_kickoff_custom")).lifecycle.status).toBe(
+			"paused",
+		);
+	});
+
+	it("fails closed when a required draft tool is disabled and retries explicitly", async () => {
+		const notifications: string[] = [];
+		const harness = await createHarness({ extensionFactories: [createPiXkGoalExtension()] });
+		harnesses.push(harness);
+		await harness.session.bindExtensions({
+			uiContext: createUiContext({ notify: (message) => notifications.push(message) }),
+		});
+		const activeTools = harness.session.getActiveToolNames();
+		harness.session.setActiveToolsByName(activeTools.filter((name) => name !== "pi_xk_submit_goal_draft"));
+		harness.setResponses([draftResponse("Retry after restoring the draft tool.")]);
+
+		await harness.session.prompt("/goal Exercise an explicitly retryable draft kickoff.");
+		await waitForAgent(harness);
+
+		expect(harness.faux.state.callCount).toBe(0);
+		expect(getCurrentGoalDraft(harness)?.state).toBe("requested");
+		expect(notifications.join("\n")).toContain("pi_xk_submit_goal_draft");
+
+		harness.session.setActiveToolsByName(activeTools);
+		await harness.session.prompt("/goal retry");
+		await waitForAgent(harness);
+
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(getCurrentGoalDraft(harness)).toMatchObject({
+			state: "proposed",
+			objective: "Exercise an explicitly retryable draft kickoff.",
+		});
+	});
+
 	it("applies an objective-only V3 revision automatically and reports stale state to the next run", async () => {
 		const prompts: string[] = [];
 		const goalErrors: string[] = [];
@@ -804,7 +1004,7 @@ describe("Pi-XK Goal extension", () => {
 		const { store, contract } = await createActiveV3Goal(harness, "goal_auto_revision");
 		const candidate = {
 			...contract,
-			objective: "Use the corrected implementation path while preserving the confirmed outcome.",
+			objective: `${contract.objective} Use the corrected implementation path while preserving the confirmed outcome.`,
 			revision: 2,
 		};
 		harness.setResponses([
@@ -822,20 +1022,17 @@ describe("Pi-XK Goal extension", () => {
 					{ stopReason: "toolUse" },
 				);
 			},
-			(context) => {
+			async (context) => {
 				prompts.push(context.systemPrompt ?? "");
-				return fauxAssistantMessage(
-					[
-						fauxToolCall("pi_xk_end_goal", {
-							outcome: "completed",
-							reason: "revision behavior verified",
-							verifiedAcceptanceIds: ["A-1"],
-							finalEvidence: "The objective-only revision event was verified.",
-							finalSummary: "The V3 Goal revision completed.",
-						}),
-					],
-					{ stopReason: "toolUse" },
-				);
+				const completion = {
+					outcome: "completed",
+					reason: "revision behavior verified",
+					verifiedAcceptanceIds: ["A-1"],
+					finalEvidence: "The objective-only revision event was verified.",
+					finalSummary: "The V3 Goal revision completed.",
+				};
+				await recordV3GoalCompletionState(harness, completion);
+				return fauxAssistantMessage([fauxToolCall("pi_xk_end_goal", completion)], { stopReason: "toolUse" });
 			},
 		]);
 
@@ -853,10 +1050,114 @@ describe("Pi-XK Goal extension", () => {
 		expect(harness.faux.state.callCount).toBe(2);
 		expect(prompts[1]).toContain("contract_revision is 2");
 		expect(prompts[1]).toContain("State synchronization required");
+		expect(prompts[0]).toContain("must not narrow, drop, or rewrite away any existing outcome dimension");
+	});
+
+	it("automatically replaces stale objective wording while preserving the protected contract", async () => {
+		const harness = await createHarness({ extensionFactories: [createPiXkGoalExtension()] });
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const { store, contract } = await createActiveV3Goal(harness, "goal_revision_fidelity_gate");
+		const candidate = {
+			...contract,
+			objective: "Exercise V3 revision behavior through the verified replacement module.",
+			revision: 2,
+		};
+		harness.setResponses([
+			fauxAssistantMessage(
+				[
+					fauxToolCall("pi_xk_propose_goal_revision", {
+						expectedRevision: 1,
+						reason: "Attempt a non-provable objective rewrite.",
+						evidence: "The candidate uses different wording.",
+						candidate,
+					}),
+				],
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage(
+				[
+					fauxToolCall("pi_xk_pause_goal", {
+						reason: "objective replacement behavior verified",
+						userRequest: null,
+						nextBestAction: "Resume after the focused regression test.",
+						audit: {
+							unmetRequiredAcceptanceIds: ["A-1"],
+							currentEvidence: "The stale Objective wording was replaced without changing protected fields.",
+							incompleteConclusion: "The test Goal remains intentionally paused.",
+						},
+					}),
+				],
+				{ stopReason: "toolUse" },
+			),
+		]);
+
+		await harness.session.prompt("Replace the stale module path without changing the Goal contract.");
+		await waitForAgent(harness);
+
+		const replay = await store.replayGoal(contract.goalId);
+		expect(replay.contract).toEqual(candidate);
+		expect(replay.lifecycle.status).toBe("paused");
+		expect(replay.events.find((event) => event.eventType === "goal_contract_updated")).toMatchObject({
+			actor: "model",
+			payload: { mode: "automatic-objective-refinement", changedFields: ["objective"] },
+		});
+		expect(getCurrentGoalRevision(harness)).toMatchObject({ state: "confirmed", candidate });
+	});
+
+	it("restarts Goal preflight after a revision conflict instead of continuing the stale run", async () => {
+		let continuationMessages = "";
+		const harness = await createHarness({ extensionFactories: [createPiXkGoalExtension()] });
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const { store, contract } = await createActiveV3Goal(harness, "goal_revision_conflict_restart");
+		harness.setResponses([
+			fauxAssistantMessage(
+				[
+					fauxToolCall("pi_xk_propose_goal_revision", {
+						expectedRevision: 0,
+						reason: "The caller used a stale contract revision.",
+						evidence: "The current contract is already revision one.",
+						candidate: {
+							...contract,
+							objective: `${contract.objective} Use the stale candidate wording.`,
+						},
+					}),
+				],
+				{ stopReason: "toolUse" },
+			),
+			(context) => {
+				continuationMessages = context.messages.map((message) => getMessageText(message)).join("\n");
+				return fauxAssistantMessage(
+					[
+						fauxToolCall("pi_xk_pause_goal", {
+							reason: "revision conflict restart verified",
+							userRequest: null,
+							nextBestAction: "Resume after the focused regression test.",
+							audit: {
+								unmetRequiredAcceptanceIds: ["A-1"],
+								currentEvidence: "The stale run terminated before continuation.",
+								incompleteConclusion: "The test Goal remains intentionally paused.",
+							},
+						}),
+					],
+					{ stopReason: "toolUse" },
+				);
+			},
+		]);
+
+		await harness.session.prompt("Propose an intentionally stale Goal revision.");
+		await waitForAgent(harness);
+
+		expect(continuationMessages).toContain("Continue the active Pi-XK Goal according to its durable contract.");
+		expect(
+			(await store.replayGoal(contract.goalId)).events.filter((event) => event.eventType === "goal_run_started"),
+		).toHaveLength(2);
 	});
 
 	it("clears superseded revision feedback after an objective-only revision applies", async () => {
 		const continuationSystemPrompts: string[] = [];
+		const continuationMessages: string[] = [];
 		const harness = await createHarness({ extensionFactories: [createPiXkGoalExtension()] });
 		harnesses.push(harness);
 		await harness.session.bindExtensions({});
@@ -868,7 +1169,7 @@ describe("Pi-XK Goal extension", () => {
 		};
 		const objectiveCandidate = {
 			...contract,
-			objective: "Use the verified replacement path while preserving the confirmed outcome.",
+			objective: `${contract.objective} Use the verified replacement path while preserving the confirmed outcome.`,
 			revision: 2,
 		};
 		harness.setResponses([
@@ -885,6 +1186,7 @@ describe("Pi-XK Goal extension", () => {
 			),
 			(context) => {
 				continuationSystemPrompts.push(context.systemPrompt ?? "");
+				continuationMessages.push(context.messages.map((message) => getMessageText(message)).join("\n"));
 				return fauxAssistantMessage(
 					[
 						fauxToolCall("pi_xk_propose_goal_revision", {
@@ -897,20 +1199,18 @@ describe("Pi-XK Goal extension", () => {
 					{ stopReason: "toolUse" },
 				);
 			},
-			(context) => {
+			async (context) => {
 				continuationSystemPrompts.push(context.systemPrompt ?? "");
-				return fauxAssistantMessage(
-					[
-						fauxToolCall("pi_xk_end_goal", {
-							outcome: "completed",
-							reason: "revision feedback lifecycle verified",
-							verifiedAcceptanceIds: ["A-1"],
-							finalEvidence: "The applied revision replaced the superseded feedback state.",
-							finalSummary: "The Goal revision feedback lifecycle completed.",
-						}),
-					],
-					{ stopReason: "toolUse" },
-				);
+				continuationMessages.push(context.messages.map((message) => getMessageText(message)).join("\n"));
+				const completion = {
+					outcome: "completed",
+					reason: "revision feedback lifecycle verified",
+					verifiedAcceptanceIds: ["A-1"],
+					finalEvidence: "The applied revision replaced the superseded feedback state.",
+					finalSummary: "The Goal revision feedback lifecycle completed.",
+				};
+				await recordV3GoalCompletionState(harness, completion);
+				return fauxAssistantMessage([fauxToolCall("pi_xk_end_goal", completion)], { stopReason: "toolUse" });
 			},
 		]);
 
@@ -923,8 +1223,10 @@ describe("Pi-XK Goal extension", () => {
 
 		expect((await store.replayGoal(contract.goalId)).contract).toEqual(objectiveCandidate);
 		expect(continuationSystemPrompts).toHaveLength(2);
-		expect(continuationSystemPrompts[0]).toContain("User revision feedback: Keep the protected fields unchanged.");
-		expect(continuationSystemPrompts[1]).not.toContain("User revision feedback:");
+		expect(continuationSystemPrompts.join("\n")).not.toContain("Keep the protected fields unchanged.");
+		expect(continuationMessages[0]).toContain('"schema":"pi-xk.goal-revision-feedback.v1"');
+		expect(continuationMessages[0]).toContain(JSON.stringify("Keep the protected fields unchanged."));
+		expect(continuationMessages[1]).not.toContain("Keep the protected fields unchanged.");
 		expect(getCurrentGoalRevision(harness)).toMatchObject({
 			state: "confirmed",
 			expectedRevision: 1,
@@ -932,6 +1234,140 @@ describe("Pi-XK Goal extension", () => {
 			revisionFeedback: null,
 			candidate: objectiveCandidate,
 		});
+	});
+
+	it("consumes superseded revision feedback after the next successful Goal run", async () => {
+		const providerMessages: string[] = [];
+		const harness = await createHarness({ extensionFactories: [createPiXkGoalExtension()] });
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const { contract } = await createActiveV3Goal(harness, "goal_revision_feedback_once");
+		const feedback = "Keep the protected fields unchanged in the next candidate.";
+		harness.sessionManager.appendCustomEntry(
+			PI_XK_SESSION_LINK_CUSTOM_TYPE,
+			createPiXkGoalRevision({
+				revisionId: "revision_feedback_once",
+				goalId: contract.goalId,
+				generation: 0,
+				state: "superseded",
+				expectedRevision: 1,
+				reason: "The protected candidate needs revision.",
+				evidence: "User review rejected the candidate.",
+				changedFields: ["constraints"],
+				revisionFeedback: feedback,
+				candidate: { ...contract, constraints: [...contract.constraints, "Rejected constraint."], revision: 2 },
+				createdAt: "2026-07-28T00:11:00.000Z",
+			}),
+		);
+		harness.setResponses([
+			(context) => {
+				providerMessages.push(context.messages.map((message) => getMessageText(message)).join("\n"));
+				return fauxAssistantMessage("The feedback was considered; continue the active Goal.");
+			},
+			(context) => {
+				providerMessages.push(context.messages.map((message) => getMessageText(message)).join("\n"));
+				return fauxAssistantMessage(
+					[
+						fauxToolCall("pi_xk_pause_goal", {
+							reason: "one-shot feedback behavior verified",
+							userRequest: null,
+							nextBestAction: "Resume after the focused regression test.",
+							audit: {
+								unmetRequiredAcceptanceIds: ["A-1"],
+								currentEvidence: "The feedback was visible for exactly one successful Goal run.",
+								incompleteConclusion: "The test Goal remains intentionally paused.",
+							},
+						}),
+					],
+					{ stopReason: "toolUse" },
+				);
+			},
+		]);
+
+		await harness.session.prompt("Continue after revising the rejected candidate.");
+		await waitForAgent(harness);
+
+		expect(providerMessages).toHaveLength(2);
+		expect(providerMessages[0]).toContain(JSON.stringify(feedback));
+		expect(providerMessages[1]).not.toContain(feedback);
+	});
+
+	it("retains one revision feedback message across provider failure and consumes it after recovery", async () => {
+		const providerMessages: string[] = [];
+		const harness = await createHarness({
+			extensionFactories: [createPiXkGoalExtension({ retryDelayMs: () => 0 })],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const { contract } = await createActiveV3Goal(harness, "goal_revision_feedback_retry");
+		const feedback = "Preserve the acceptance wording during the retry.";
+		harness.sessionManager.appendCustomEntry(
+			PI_XK_SESSION_LINK_CUSTOM_TYPE,
+			createPiXkGoalRevision({
+				revisionId: "revision_feedback_retry",
+				goalId: contract.goalId,
+				generation: 0,
+				state: "superseded",
+				expectedRevision: 1,
+				reason: "The protected candidate needs revision.",
+				evidence: "User review rejected the candidate.",
+				changedFields: ["acceptance"],
+				revisionFeedback: feedback,
+				candidate: {
+					...contract,
+					acceptance: contract.acceptance.map((item) => ({ ...item, description: "Rejected wording." })),
+					revision: 2,
+				},
+				createdAt: "2026-07-28T00:12:00.000Z",
+			}),
+		);
+		harness.setResponses([
+			(context) => {
+				providerMessages.push(context.messages.map((message) => getMessageText(message)).join("\n"));
+				return fauxAssistantMessage("", {
+					stopReason: "error",
+					errorMessage: "temporary provider failure",
+				});
+			},
+			(context) => {
+				providerMessages.push(context.messages.map((message) => getMessageText(message)).join("\n"));
+				return fauxAssistantMessage("The provider recovered and the feedback was considered.");
+			},
+			(context) => {
+				providerMessages.push(context.messages.map((message) => getMessageText(message)).join("\n"));
+				return fauxAssistantMessage(
+					[
+						fauxToolCall("pi_xk_pause_goal", {
+							reason: "feedback retry behavior verified",
+							userRequest: null,
+							nextBestAction: "Resume after the focused regression test.",
+							audit: {
+								unmetRequiredAcceptanceIds: ["A-1"],
+								currentEvidence: "Provider failure retained one feedback message until recovery.",
+								incompleteConclusion: "The test Goal remains intentionally paused.",
+							},
+						}),
+					],
+					{ stopReason: "toolUse" },
+				);
+			},
+		]);
+
+		await harness.session.prompt("Continue after revising the rejected candidate.");
+		await waitForProviderCalls(harness, 3);
+		await waitForAgent(harness);
+
+		expect(providerMessages).toHaveLength(3);
+		expect(providerMessages[0]).toContain(JSON.stringify(feedback));
+		expect(providerMessages[1]).toContain(JSON.stringify(feedback));
+		expect(providerMessages[2]).not.toContain(feedback);
+		expect(
+			harness.sessionManager
+				.getBranch()
+				.filter(
+					(entry) => entry.type === "custom_message" && entry.customType === "pi-xk.goal-revision-feedback.v1",
+				),
+		).toHaveLength(1);
 	});
 
 	it("ignores superseded feedback when the contract event committed before the session terminal entry", async () => {
@@ -979,20 +1415,17 @@ describe("Pi-XK Goal extension", () => {
 			evidence: "The replacement module is the active implementation.",
 		});
 		harness.setResponses([
-			(context) => {
+			async (context) => {
 				continuationSystemPrompt = context.systemPrompt ?? "";
-				return fauxAssistantMessage(
-					[
-						fauxToolCall("pi_xk_end_goal", {
-							outcome: "completed",
-							reason: "crash-window feedback handling verified",
-							verifiedAcceptanceIds: ["A-1"],
-							finalEvidence: "The stale feedback was excluded after the contract event committed.",
-							finalSummary: "The crash-window revision behavior completed.",
-						}),
-					],
-					{ stopReason: "toolUse" },
-				);
+				const completion = {
+					outcome: "completed",
+					reason: "crash-window feedback handling verified",
+					verifiedAcceptanceIds: ["A-1"],
+					finalEvidence: "The stale feedback was excluded after the contract event committed.",
+					finalSummary: "The crash-window revision behavior completed.",
+				};
+				await recordV3GoalCompletionState(harness, completion);
+				return fauxAssistantMessage([fauxToolCall("pi_xk_end_goal", completion)], { stopReason: "toolUse" });
 			},
 		]);
 
@@ -1035,18 +1468,13 @@ describe("Pi-XK Goal extension", () => {
 		const { store, contract } = await createActiveV3Goal(harness, "goal_current_revision");
 		harness.setResponses([
 			fauxAssistantMessage("The current Goal made one verified step."),
-			fauxAssistantMessage(
-				[
-					fauxToolCall("pi_xk_end_goal", {
-						outcome: "completed",
-						reason: "current Goal continuation verified",
-						verifiedAcceptanceIds: ["A-1"],
-						finalEvidence: "The current Goal continued past the previous Goal revision.",
-						finalSummary: "The current Goal completed without cross-Goal revision interference.",
-					}),
-				],
-				{ stopReason: "toolUse" },
-			),
+			successfulV3GoalEndResponse(harness, {
+				outcome: "completed",
+				reason: "current Goal continuation verified",
+				verifiedAcceptanceIds: ["A-1"],
+				finalEvidence: "The current Goal continued past the previous Goal revision.",
+				finalSummary: "The current Goal completed without cross-Goal revision interference.",
+			}),
 		]);
 
 		await harness.session.prompt("Continue only the currently bound Goal.");
@@ -1087,20 +1515,17 @@ describe("Pi-XK Goal extension", () => {
 			createPiXkGoalBinding(contract.goalId, 1),
 		);
 		harness.setResponses([
-			(context) => {
+			async (context) => {
 				currentSystemPrompt = context.systemPrompt ?? "";
-				return fauxAssistantMessage(
-					[
-						fauxToolCall("pi_xk_end_goal", {
-							outcome: "completed",
-							reason: "binding generation isolation verified",
-							verifiedAcceptanceIds: ["A-1"],
-							finalEvidence: "The rebound Goal excluded feedback from generation zero.",
-							finalSummary: "Revision feedback remained scoped to its original binding.",
-						}),
-					],
-					{ stopReason: "toolUse" },
-				);
+				const completion = {
+					outcome: "completed",
+					reason: "binding generation isolation verified",
+					verifiedAcceptanceIds: ["A-1"],
+					finalEvidence: "The rebound Goal excluded feedback from generation zero.",
+					finalSummary: "Revision feedback remained scoped to its original binding.",
+				};
+				await recordV3GoalCompletionState(harness, completion);
+				return fauxAssistantMessage([fauxToolCall("pi_xk_end_goal", completion)], { stopReason: "toolUse" });
 			},
 		]);
 
@@ -1201,20 +1626,17 @@ describe("Pi-XK Goal extension", () => {
 				],
 				{ stopReason: "toolUse" },
 			),
-			(context) => {
+			async (context) => {
 				continuationMessages.push(context.messages.map((message) => getMessageText(message)).join("\n"));
-				return fauxAssistantMessage(
-					[
-						fauxToolCall("pi_xk_end_goal", {
-							outcome: "completed",
-							reason: "protected revision confirmed",
-							verifiedAcceptanceIds: ["A-1"],
-							finalEvidence: "The protected revision was user-confirmed.",
-							finalSummary: "The confirmed revision completed.",
-						}),
-					],
-					{ stopReason: "toolUse" },
-				);
+				const completion = {
+					outcome: "completed",
+					reason: "protected revision confirmed",
+					verifiedAcceptanceIds: ["A-1"],
+					finalEvidence: "The protected revision was user-confirmed.",
+					finalSummary: "The confirmed revision completed.",
+				};
+				await recordV3GoalCompletionState(harness, completion);
+				return fauxAssistantMessage([fauxToolCall("pi_xk_end_goal", completion)], { stopReason: "toolUse" });
 			},
 		]);
 
@@ -1244,6 +1666,44 @@ describe("Pi-XK Goal extension", () => {
 			actor: "user",
 			payload: { mode: "user-confirmed", changedFields: ["constraints"] },
 		});
+	});
+
+	it("fails closed on ordinary Agent runs while a protected Goal revision awaits confirmation", async () => {
+		const harness = await createHarness({ extensionFactories: [createPiXkGoalExtension()] });
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const { store, contract } = await createActiveV3Goal(harness, "goal_pending_revision_fail_closed");
+		const candidate = {
+			...contract,
+			constraints: [...contract.constraints, "Require explicit user confirmation."],
+			revision: 2,
+		};
+		harness.setResponses([
+			fauxAssistantMessage(
+				[
+					fauxToolCall("pi_xk_propose_goal_revision", {
+						expectedRevision: 1,
+						reason: "A protected constraint change is proposed.",
+						evidence: "The candidate requires explicit user review.",
+						candidate,
+					}),
+				],
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage("ordinary work must not run"),
+		]);
+
+		await harness.session.prompt("Propose a protected contract change.");
+		await waitForAgent(harness);
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(getCurrentGoalRevision(harness)).toMatchObject({ state: "proposed" });
+
+		await harness.session.prompt("perform unrelated ordinary work before confirmation");
+		await waitForAgent(harness);
+
+		expect(harness.faux.state.callCount).toBe(1);
+		expect((await store.replayGoal(contract.goalId)).contract).toEqual(contract);
+		expect(getCurrentGoalRevision(harness)).toMatchObject({ state: "proposed", candidate });
 	});
 
 	it("confirms a protected V3 revision through the native review dialog", async () => {
@@ -1284,18 +1744,13 @@ describe("Pi-XK Goal extension", () => {
 				],
 				{ stopReason: "toolUse" },
 			),
-			fauxAssistantMessage(
-				[
-					fauxToolCall("pi_xk_end_goal", {
-						outcome: "completed",
-						reason: "native revision review verified",
-						verifiedAcceptanceIds: ["A-1"],
-						finalEvidence: "The native dialog confirmed the protected revision.",
-						finalSummary: "The protected revision completed after native review.",
-					}),
-				],
-				{ stopReason: "toolUse" },
-			),
+			successfulV3GoalEndResponse(harness, {
+				outcome: "completed",
+				reason: "native revision review verified",
+				verifiedAcceptanceIds: ["A-1"],
+				finalEvidence: "The native dialog confirmed the protected revision.",
+				finalSummary: "The protected revision completed after native review.",
+			}),
 		]);
 
 		await harness.session.prompt("Review the protected revision in the native dialog.");
@@ -1332,18 +1787,13 @@ describe("Pi-XK Goal extension", () => {
 				revisionPrompts.push(context.messages.map((message) => getMessageText(message)).join("\n"));
 				return draftResponse("Revised drafted objective.");
 			},
-			fauxAssistantMessage(
-				[
-					fauxToolCall("pi_xk_end_goal", {
-						outcome: "accepted",
-						reason: "the revised contract was verified",
-						verifiedAcceptanceIds: ["A-1"],
-						finalEvidence: "The revised contract passed verification.",
-						finalSummary: "The revised Goal is complete.",
-					}),
-				],
-				{ stopReason: "toolUse" },
-			),
+			successfulV3GoalEndResponse(harness, {
+				outcome: "accepted",
+				reason: "the revised contract was verified",
+				verifiedAcceptanceIds: ["A-1"],
+				finalEvidence: "The revised contract passed verification.",
+				finalSummary: "The revised Goal is complete.",
+			}),
 		]);
 		const custom = async <T>(factory: CustomUiFactory<T>, options?: CustomUiOptions): Promise<T> => {
 			dialogOptions.push(options);
@@ -1391,7 +1841,7 @@ describe("Pi-XK Goal extension", () => {
 			expect.objectContaining({ overlay: true }),
 		]);
 		expect(editorCalls).toEqual([{ title: "修改 Goal 草案", prefill: "" }]);
-		expect(revisionPrompts[1]).toContain("Revision feedback:\nRequire explicit release evidence.");
+		expect(revisionPrompts[1]).toContain('"revisionFeedback":"Require explicit release evidence."');
 		expect(getCurrentGoalDraft(harness)).toMatchObject({ state: "confirmed", goalId: "goal_ui_draft" });
 		const replayed = await new GoalStore(harness.tempDir).replayGoal("goal_ui_draft");
 		expect(replayed.contract.objective).toBe("Revised drafted objective.");
@@ -1460,7 +1910,7 @@ describe("Pi-XK Goal extension", () => {
 
 		await harness.session.prompt("/goal revise add explicit release evidence");
 		await waitForAgent(harness);
-		expect(revisionPrompt).toContain("Revision feedback:\nadd explicit release evidence");
+		expect(revisionPrompt).toContain('"revisionFeedback":"add explicit release evidence"');
 		expect(revisionPrompt).not.toContain("# Goal Draft");
 		expect(getCurrentGoalDraft(harness)).toMatchObject({
 			state: "proposed",
@@ -1479,18 +1929,13 @@ describe("Pi-XK Goal extension", () => {
 		harnesses.push(harness);
 		harness.setResponses([
 			draftResponse("Confirm this draft once."),
-			fauxAssistantMessage(
-				[
-					fauxToolCall("pi_xk_end_goal", {
-						outcome: "accepted",
-						reason: "the Goal is complete",
-						verifiedAcceptanceIds: ["A-1"],
-						finalEvidence: "The Goal completed after one confirmation.",
-						finalSummary: "The Goal is complete.",
-					}),
-				],
-				{ stopReason: "toolUse" },
-			),
+			successfulV3GoalEndResponse(harness, {
+				outcome: "accepted",
+				reason: "the Goal is complete",
+				verifiedAcceptanceIds: ["A-1"],
+				finalEvidence: "The Goal completed after one confirmation.",
+				finalSummary: "The Goal is complete.",
+			}),
 		]);
 
 		await harness.session.bindExtensions({});
@@ -1639,18 +2084,13 @@ describe("Pi-XK Goal extension", () => {
 		harnesses.push(harness);
 		harness.setResponses([
 			draftResponse("End only after a durable final checkpoint."),
-			fauxAssistantMessage(
-				[
-					fauxToolCall("pi_xk_end_goal", {
-						outcome: "accepted",
-						reason: "the acceptance evidence is complete",
-						verifiedAcceptanceIds: ["A-1"],
-						finalEvidence: "The final checkpoint must be durable.",
-						finalSummary: "The Goal is complete after checkpoint persistence.",
-					}),
-				],
-				{ stopReason: "toolUse" },
-			),
+			successfulV3GoalEndResponse(harness, {
+				outcome: "accepted",
+				reason: "the acceptance evidence is complete",
+				verifiedAcceptanceIds: ["A-1"],
+				finalEvidence: "The final checkpoint must be durable.",
+				finalSummary: "The Goal is complete after checkpoint persistence.",
+			}),
 		]);
 
 		await harness.session.bindExtensions({});
@@ -1686,6 +2126,7 @@ describe("Pi-XK Goal extension", () => {
 
 	it("keeps an active Goal running until the model explicitly ends it and exposes the termination contract", async () => {
 		const requestTexts: string[] = [];
+		const requestSystemPrompts: string[] = [];
 		const harness = await createHarness({
 			extensionFactories: [createPiXkGoalExtension({ createGoalId: () => "goal_continuous" })],
 		});
@@ -1694,22 +2135,21 @@ describe("Pi-XK Goal extension", () => {
 			draftResponse("Continue until the model has verified completion."),
 			(context) => {
 				requestTexts.push(context.messages.map((message) => getMessageText(message)).join("\n"));
+				requestSystemPrompts.push(context.systemPrompt ?? "");
 				return fauxAssistantMessage("The first concrete action is complete.");
 			},
-			(context) => {
+			async (context) => {
 				requestTexts.push(context.messages.map((message) => getMessageText(message)).join("\n"));
-				return fauxAssistantMessage(
-					[
-						fauxToolCall("pi_xk_end_goal", {
-							outcome: "accepted",
-							reason: "the acceptance evidence is complete",
-							verifiedAcceptanceIds: ["A-1"],
-							finalEvidence: "state and verification are current",
-							finalSummary: "The declared acceptance is verified.",
-						}),
-					],
-					{ stopReason: "toolUse" },
-				);
+				requestSystemPrompts.push(context.systemPrompt ?? "");
+				const completion = {
+					outcome: "accepted",
+					reason: "the acceptance evidence is complete",
+					verifiedAcceptanceIds: ["A-1"],
+					finalEvidence: "state and verification are current",
+					finalSummary: "The declared acceptance is verified.",
+				};
+				await recordV3GoalCompletionState(harness, completion);
+				return fauxAssistantMessage([fauxToolCall("pi_xk_end_goal", completion)], { stopReason: "toolUse" });
 			},
 		]);
 
@@ -1718,9 +2158,15 @@ describe("Pi-XK Goal extension", () => {
 
 		expect(requestTexts).toHaveLength(2);
 		for (const requestText of requestTexts) {
-			expect(requestText).toContain("A normal assistant response does not end this Goal");
-			expect(requestText).toContain("Do not repeat work already recorded as done");
-			expect(requestText).toContain("pi_xk_end_goal");
+			expect(requestText).toContain("Continue the active Pi-XK Goal according to its durable contract.");
+			expect(requestText).not.toContain("A normal assistant response does not end this Goal");
+			expect(requestText).not.toContain("goal-objective.md");
+		}
+		for (const systemPrompt of requestSystemPrompts) {
+			expect(systemPrompt).toContain("A normal assistant response does not end this Goal");
+			expect(systemPrompt).toContain("Do not repeat work already recorded as done");
+			expect(systemPrompt).toContain("After material progress, update goal-state.md");
+			expect(systemPrompt).toContain("pi_xk_end_goal");
 		}
 		const goalId = getCurrentGoalId(harness);
 		const objective = await readFile(join(harness.tempDir, ".pi-xk", "goals", goalId!, "goal-objective.md"), "utf8");
@@ -1746,18 +2192,13 @@ describe("Pi-XK Goal extension", () => {
 		harness.setResponses([
 			draftResponse("Retry until the model confirms completion."),
 			fauxAssistantMessage("", { stopReason: "error", errorMessage: "temporary provider failure" }),
-			fauxAssistantMessage(
-				[
-					fauxToolCall("pi_xk_end_goal", {
-						outcome: "accepted",
-						reason: "recovered and verified",
-						verifiedAcceptanceIds: ["A-1"],
-						finalEvidence: "The retry completed its verification.",
-						finalSummary: "The recovered Goal is complete.",
-					}),
-				],
-				{ stopReason: "toolUse" },
-			),
+			successfulV3GoalEndResponse(harness, {
+				outcome: "accepted",
+				reason: "recovered and verified",
+				verifiedAcceptanceIds: ["A-1"],
+				finalEvidence: "The retry completed its verification.",
+				finalSummary: "The recovered Goal is complete.",
+			}),
 		]);
 
 		await harness.session.bindExtensions({});
@@ -1826,19 +2267,20 @@ describe("Pi-XK Goal extension", () => {
 		expect(goalId).toBe("goal_direct");
 		expect(harness.session.messages.filter((message) => message.role === "user")).toEqual([]);
 		expect(draftText).toContain(rawObjective);
-		expect(draftText).toContain("Draft the contract only");
+		expect(draftText).not.toContain("Draft the contract only");
 		expect(activeKickoffText).not.toContain(rawObjective);
-		expect(activeKickoffText).toContain("goal-objective.md");
-		expect(activeKickoffText).toContain("goal-state.md");
-		expect(activeKickoffText.match(/goal-objective\.md/g)).toHaveLength(1);
+		expect(activeKickoffText).toContain("Continue the active Pi-XK Goal according to its durable contract.");
+		expect(activeKickoffText).not.toContain("goal-objective.md");
+		expect(activeKickoffText).not.toContain("goal-state.md");
+		expect(activeKickoffText).not.toContain("A normal assistant response does not end this Goal");
 		expect(activeSystemPrompt).toContain("goal-objective.md");
 		expect(activeSystemPrompt).toContain("goal-state.md");
 		expect(activeSystemPrompt.match(/goal-objective\.md/g)).toHaveLength(1);
 		expect(activeSystemPrompt).not.toContain(rawObjective);
-		expect(activeTurnText).toContain("goal-objective.md");
-		expect(activeTurnText).toContain("A normal assistant response does not end this Goal");
-		expect(activeTurnText).toContain("goal-state.md");
-		expect(activeTurnText.match(/goal-objective\.md/g)).toHaveLength(1);
+		expect(activeTurnText).toContain("Continue the active Pi-XK Goal according to its durable contract.");
+		expect(activeTurnText).not.toContain("goal-objective.md");
+		expect(activeTurnText).not.toContain("goal-state.md");
+		expect(activeTurnText).not.toContain("A normal assistant response does not end this Goal");
 
 		const goalStore = new GoalStore(harness.tempDir);
 		const replayed = await goalStore.replayGoal(goalId!);
@@ -1850,6 +2292,139 @@ describe("Pi-XK Goal extension", () => {
 		).resolves.toContain("Ship the confirmed release.");
 	});
 
+	it("preserves user-authored Goal tags and carries revision feedback only as user-role JSON", async () => {
+		let providerSystemPrompt = "";
+		let providerMessages = "";
+		const userSystemBlock = "<pi-xk-goal>user-authored system content</pi-xk-goal>";
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", async (event) => ({
+						systemPrompt: `${event.systemPrompt}\n\n${userSystemBlock}`,
+					}));
+				},
+				createPiXkGoalExtension(),
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const { contract } = await createActiveV3Goal(harness, "goal_revision_feedback_role");
+		const feedback = "Keep the protected acceptance wording exactly unchanged.";
+		harness.sessionManager.appendCustomEntry(
+			PI_XK_SESSION_LINK_CUSTOM_TYPE,
+			createPiXkGoalRevision({
+				revisionId: "revision_feedback_role",
+				goalId: contract.goalId,
+				generation: 0,
+				state: "superseded",
+				expectedRevision: 1,
+				reason: "The protected candidate needs revision.",
+				evidence: "User review rejected the candidate.",
+				changedFields: ["constraints"],
+				revisionFeedback: feedback,
+				candidate: { ...contract, constraints: [...contract.constraints, "Rejected constraint."], revision: 2 },
+				createdAt: "2026-07-28T00:10:00.000Z",
+			}),
+		);
+		harness.setResponses([
+			(context) => {
+				providerSystemPrompt = context.systemPrompt ?? "";
+				providerMessages = context.messages.map((message) => getMessageText(message)).join("\n");
+				return fauxAssistantMessage(
+					[
+						fauxToolCall("pi_xk_pause_goal", {
+							reason: "feedback transport verified",
+							userRequest: null,
+							nextBestAction: "Resume after the focused assertion.",
+							audit: {
+								unmetRequiredAcceptanceIds: ["A-1"],
+								currentEvidence: "The feedback was visible as data.",
+								incompleteConclusion: "The Goal remains intentionally paused.",
+							},
+						}),
+					],
+					{ stopReason: "toolUse" },
+				);
+			},
+		]);
+
+		await harness.session.prompt("Continue after revising the candidate.");
+		await waitForAgent(harness);
+
+		expect(providerSystemPrompt).toContain(userSystemBlock);
+		expect(providerSystemPrompt).not.toContain(feedback);
+		expect(providerMessages).toContain('"schema":"pi-xk.goal-revision-feedback.v1"');
+		expect(providerMessages).toContain(JSON.stringify(feedback));
+	});
+
+	it("fails closed before the provider when active Goal files are corrupt", async () => {
+		const notifications: string[] = [];
+		const harness = await createHarness({ extensionFactories: [createPiXkGoalExtension()] });
+		harnesses.push(harness);
+		await harness.session.bindExtensions({
+			uiContext: createUiContext({ notify: (message) => notifications.push(message) }),
+		});
+		await createActiveV3Goal(harness, "goal_corrupt_fail_closed");
+		await writeFile(
+			join(harness.tempDir, ".pi-xk", "goals", "goal_corrupt_fail_closed", "goal-objective.md"),
+			"corrupt objective projection\n",
+		);
+		harness.setResponses([fauxAssistantMessage("must not run")]);
+
+		await harness.session.prompt("Continue the active Goal.");
+		await waitForAgent(harness);
+
+		expect(harness.faux.state.callCount).toBe(0);
+		expect(notifications.join("\n")).toContain("Goal files require repair");
+	});
+
+	it("rejects model completion until V3 State records verified acceptance and final evidence", async () => {
+		const harness = await createHarness({ extensionFactories: [createPiXkGoalExtension()] });
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const { store, contract } = await createActiveV3Goal(harness, "goal_v3_state_completion_gate");
+		harness.setResponses([
+			fauxAssistantMessage(
+				[
+					fauxToolCall("pi_xk_end_goal", {
+						outcome: "completed",
+						reason: "the model claims completion without updating State",
+						verifiedAcceptanceIds: ["A-1"],
+						finalEvidence: "Focused verification passed.",
+						finalSummary: "The Goal is complete.",
+					}),
+				],
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage(
+				[
+					fauxToolCall("pi_xk_pause_goal", {
+						reason: "State completion evidence is missing",
+						userRequest: null,
+						nextBestAction: "Record verified acceptance and final evidence in State.",
+						audit: {
+							unmetRequiredAcceptanceIds: ["A-1"],
+							currentEvidence: "The completion tool was rejected.",
+							incompleteConclusion: "Required State evidence remains missing.",
+						},
+					}),
+				],
+				{ stopReason: "toolUse" },
+			),
+		]);
+
+		await harness.session.prompt("Attempt completion without updating State.");
+		await waitForAgent(harness);
+
+		expect((await store.replayGoal(contract.goalId)).lifecycle.status).toBe("paused");
+		expect(
+			harness.session.messages
+				.filter((message) => message.role === "toolResult")
+				.map((message) => getMessageText(message))
+				.join("\n"),
+		).toContain("goal-state.md");
+	});
+
 	it("cancels capture, supports reserved-word objectives, and replaces only the branch binding", async () => {
 		const goalIds = ["goal_reserved", "goal_replacement"];
 		const harness = await createHarness({
@@ -1859,31 +2434,21 @@ describe("Pi-XK Goal extension", () => {
 		harness.setResponses([
 			fauxAssistantMessage("ordinary after cancelled capture"),
 			draftResponse("Pause release until reviewed."),
-			fauxAssistantMessage(
-				[
-					fauxToolCall("pi_xk_end_goal", {
-						outcome: "reserved complete",
-						reason: "reserved objective checked",
-						verifiedAcceptanceIds: ["A-1"],
-						finalEvidence: "The reserved objective was checked.",
-						finalSummary: "The reserved Goal is complete.",
-					}),
-				],
-				{ stopReason: "toolUse" },
-			),
+			successfulV3GoalEndResponse(harness, {
+				outcome: "reserved complete",
+				reason: "reserved objective checked",
+				verifiedAcceptanceIds: ["A-1"],
+				finalEvidence: "The reserved objective was checked.",
+				finalSummary: "The reserved Goal is complete.",
+			}),
 			draftResponse("Replacement objective."),
-			fauxAssistantMessage(
-				[
-					fauxToolCall("pi_xk_end_goal", {
-						outcome: "replacement complete",
-						reason: "replacement checked",
-						verifiedAcceptanceIds: ["A-1"],
-						finalEvidence: "The replacement objective was checked.",
-						finalSummary: "The replacement Goal is complete.",
-					}),
-				],
-				{ stopReason: "toolUse" },
-			),
+			successfulV3GoalEndResponse(harness, {
+				outcome: "replacement complete",
+				reason: "replacement checked",
+				verifiedAcceptanceIds: ["A-1"],
+				finalEvidence: "The replacement objective was checked.",
+				finalSummary: "The replacement Goal is complete.",
+			}),
 		]);
 
 		await harness.session.bindExtensions({});
@@ -1935,7 +2500,7 @@ describe("Pi-XK Goal extension", () => {
 			],
 		});
 		harnesses.push(harness);
-		const respond: FauxResponseFactory = (context) => {
+		const respond: FauxResponseFactory = async (context) => {
 			const requestText = context.messages.map((message) => getMessageText(message)).join("\n");
 			requestTexts.push(requestText);
 			requestSystemPrompts.push(context.systemPrompt ?? "");
@@ -1959,18 +2524,15 @@ describe("Pi-XK Goal extension", () => {
 			}
 			if (resumed && !endRequested) {
 				endRequested = true;
-				return fauxAssistantMessage(
-					[
-						fauxToolCall("pi_xk_end_goal", {
-							outcome: "accepted",
-							reason: "review complete",
-							verifiedAcceptanceIds: ["A-1"],
-							finalEvidence: "The state review is complete.",
-							finalSummary: "The Goal is complete after review.",
-						}),
-					],
-					{ stopReason: "toolUse" },
-				);
+				const completion = {
+					outcome: "accepted",
+					reason: "review complete",
+					verifiedAcceptanceIds: ["A-1"],
+					finalEvidence: "The state review is complete.",
+					finalSummary: "The Goal is complete after review.",
+				};
+				await recordV3GoalCompletionState(harness, completion);
+				return fauxAssistantMessage([fauxToolCall("pi_xk_end_goal", completion)], { stopReason: "toolUse" });
 			}
 			return fauxAssistantMessage("ordinary response");
 		};
@@ -2016,7 +2578,10 @@ describe("Pi-XK Goal extension", () => {
 		await harness.session.prompt("ordinary ended prompt");
 		await waitForAgent(harness);
 
-		expect(requestTexts[0]).toContain("goal-objective.md");
+		expect(requestTexts[0]).toContain("Continue the active Pi-XK Goal according to its durable contract.");
+		expect(requestTexts[0]).not.toContain("goal-objective.md");
+		expect(requestSystemPrompts[0]).toContain("goal-objective.md");
+		expect(requestSystemPrompts[0]).toContain("goal-state.md");
 		const endedRequest = requestTexts.find((requestText) => requestText.includes("ordinary ended prompt"));
 		expect(endedRequest).toBeDefined();
 		expect(endedRequest).not.toContain("goal-objective.md");
@@ -2071,6 +2636,7 @@ describe("Pi-XK Goal extension", () => {
 
 	it("lets the model resume a model-paused Goal only through a fresh active kickoff", async () => {
 		const requestTexts: string[] = [];
+		const requestSystemPrompts: string[] = [];
 		const harness = await createHarness({
 			extensionFactories: [createPiXkGoalExtension({ createGoalId: () => "goal_model_resume" })],
 		});
@@ -2094,6 +2660,7 @@ describe("Pi-XK Goal extension", () => {
 			),
 			(context) => {
 				requestTexts.push(context.messages.map((message) => getMessageText(message)).join("\n"));
+				requestSystemPrompts.push(context.systemPrompt ?? "");
 				return fauxAssistantMessage(
 					[
 						fauxToolCall("pi_xk_start_goal", {
@@ -2104,20 +2671,18 @@ describe("Pi-XK Goal extension", () => {
 					{ stopReason: "toolUse" },
 				);
 			},
-			(context) => {
+			async (context) => {
 				requestTexts.push(context.messages.map((message) => getMessageText(message)).join("\n"));
-				return fauxAssistantMessage(
-					[
-						fauxToolCall("pi_xk_end_goal", {
-							outcome: "accepted",
-							reason: "the resumed verification is complete",
-							verifiedAcceptanceIds: ["A-1"],
-							finalEvidence: "The supplied evidence was verified.",
-							finalSummary: "The resumed Goal is complete.",
-						}),
-					],
-					{ stopReason: "toolUse" },
-				);
+				requestSystemPrompts.push(context.systemPrompt ?? "");
+				const completion = {
+					outcome: "accepted",
+					reason: "the resumed verification is complete",
+					verifiedAcceptanceIds: ["A-1"],
+					finalEvidence: "The supplied evidence was verified.",
+					finalSummary: "The resumed Goal is complete.",
+				};
+				await recordV3GoalCompletionState(harness, completion);
+				return fauxAssistantMessage([fauxToolCall("pi_xk_end_goal", completion)], { stopReason: "toolUse" });
 			},
 		]);
 
@@ -2152,7 +2717,11 @@ describe("Pi-XK Goal extension", () => {
 		expect(pausedTurnIndex).toBeGreaterThanOrEqual(0);
 		expect(requestTexts).toHaveLength(2);
 		expect(requestTexts[pausedTurnIndex + 1]).toContain("Goal start requested.");
-		expect(requestTexts[pausedTurnIndex + 1]).toContain("An active Pi-XK Goal is bound to this session.");
+		expect(requestTexts[pausedTurnIndex + 1]).toContain(
+			"Continue the active Pi-XK Goal according to its durable contract.",
+		);
+		expect(requestTexts[pausedTurnIndex + 1]).not.toContain("An active Pi-XK Goal is bound to this session.");
+		expect(requestSystemPrompts[pausedTurnIndex + 1]).toContain("An active Pi-XK Goal is bound to this session.");
 		expect(replayed.events.filter((event) => event.eventType === "goal_run_started")).toHaveLength(2);
 	});
 
@@ -2172,18 +2741,13 @@ describe("Pi-XK Goal extension", () => {
 				],
 				{ stopReason: "toolUse" },
 			),
-			fauxAssistantMessage(
-				[
-					fauxToolCall("pi_xk_end_goal", {
-						outcome: "accepted",
-						reason: "the active Goal was verified",
-						verifiedAcceptanceIds: ["A-1"],
-						finalEvidence: "The required evidence was verified.",
-						finalSummary: "The Goal is complete.",
-					}),
-				],
-				{ stopReason: "toolUse" },
-			),
+			successfulV3GoalEndResponse(harness, {
+				outcome: "accepted",
+				reason: "the active Goal was verified",
+				verifiedAcceptanceIds: ["A-1"],
+				finalEvidence: "The required evidence was verified.",
+				finalSummary: "The Goal is complete.",
+			}),
 			fauxAssistantMessage(
 				[
 					fauxToolCall("pi_xk_start_goal", {
@@ -2232,18 +2796,13 @@ describe("Pi-XK Goal extension", () => {
 		harnesses.push(harness);
 		harness.setResponses([
 			draftResponse("Reject stale lifecycle intents."),
-			fauxAssistantMessage(
-				[
-					fauxToolCall("pi_xk_end_goal", {
-						outcome: "accepted",
-						reason: "the Goal is complete",
-						verifiedAcceptanceIds: ["A-1"],
-						finalEvidence: "The required evidence was verified.",
-						finalSummary: "The Goal is complete.",
-					}),
-				],
-				{ stopReason: "toolUse" },
-			),
+			successfulV3GoalEndResponse(harness, {
+				outcome: "accepted",
+				reason: "the Goal is complete",
+				verifiedAcceptanceIds: ["A-1"],
+				finalEvidence: "The required evidence was verified.",
+				finalSummary: "The Goal is complete.",
+			}),
 			fauxAssistantMessage("Process the stale intent without changing the ended Goal."),
 		]);
 
@@ -2322,18 +2881,13 @@ describe("Pi-XK Goal extension", () => {
 				],
 				{ stopReason: "toolUse" },
 			),
-			fauxAssistantMessage(
-				[
-					fauxToolCall("pi_xk_end_goal", {
-						outcome: "accepted",
-						reason: "the required acceptance was verified",
-						verifiedAcceptanceIds: ["A-1"],
-						finalEvidence: "The required evidence was verified.",
-						finalSummary: "The Goal is complete.",
-					}),
-				],
-				{ stopReason: "toolUse" },
-			),
+			successfulV3GoalEndResponse(harness, {
+				outcome: "accepted",
+				reason: "the required acceptance was verified",
+				verifiedAcceptanceIds: ["A-1"],
+				finalEvidence: "The required evidence was verified.",
+				finalSummary: "The Goal is complete.",
+			}),
 		]);
 
 		await harness.session.bindExtensions({});
@@ -2464,18 +3018,13 @@ describe("Pi-XK Goal extension", () => {
 		harnesses.push(harness);
 		harness.setResponses([
 			draftResponse("End through the model tool."),
-			fauxAssistantMessage(
-				[
-					fauxToolCall("pi_xk_end_goal", {
-						outcome: "accepted",
-						reason: "all checks passed",
-						verifiedAcceptanceIds: ["A-1"],
-						finalEvidence: "targeted tests are green",
-						finalSummary: "All required acceptance is verified.",
-					}),
-				],
-				{ stopReason: "toolUse" },
-			),
+			successfulV3GoalEndResponse(harness, {
+				outcome: "accepted",
+				reason: "all checks passed",
+				verifiedAcceptanceIds: ["A-1"],
+				finalEvidence: "targeted tests are green",
+				finalSummary: "All required acceptance is verified.",
+			}),
 		]);
 
 		await harness.session.bindExtensions({});

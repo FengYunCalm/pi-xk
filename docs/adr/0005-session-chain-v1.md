@@ -53,7 +53,11 @@ summary-out
 
 每次 rollover 前必须从 marker 重新读取 L1 artifact，验证 schema、chain、branch、source/target Segment、artifact ID、carry-forward 正文和 hash。新 L1 写入 Artifact Store 后也必须按返回 ID read-back，summary-out、source seal、successor summary-in 和 hash 只能使用 read-back 的 canonical 内容。任何不一致都以 integrity error 中止 rollover；不得自动改写 marker、Segment 正文或 artifact，也不得在 canonical read-back 失败后推进 branch head。
 
-Segment 内存在 Pi compaction 时，递进摘要以最新 compaction summary 为 base，只处理该 compaction 保留边界后的尾部；没有 compaction 时以 `summary-in` 为 base。摘要失败不得 seal 或切换 Segment。摘要是派生上下文，不是对话事实。
+L1 的 `previousSummary` 始终是 canonical `summary-in` carry-forward。Segment 内存在 Pi compaction 时，最新 native compaction checkpoint 作为本 Segment 的历史证据放在 `conversation` 开头，并继续包含 retained tail 与 compaction 后的新消息；checkpoint 可能重复 `summary-in` 基线，L1 合同要求去除该重叠并恢复完整 Segment delta。没有 compaction 时，`conversation` 直接覆盖本 Segment 可见正文。摘要失败不得 seal 或切换 Segment。摘要是派生上下文，不是对话事实。
+
+L1 generator 通过 Host `summarizeSessionContext({ replaceInstructions: true })` 使用唯一的 `pi.summary-evidence.v1` / `session-chain-l1` JSON 合同，payload 精确包含 `title`、`segmentDeltaMarkdown` 和 `carryForwardMarkdown`。L2 generator 同样使用 `session-chain-l2` JSON 合同，payload 精确包含 `state`、`decisions`、`constraints`、`completed`、`unresolved` 和 `nextActions`。当前 prompt version 分别为 `session-chain-summary-v3` 和 `session-chain-rollup-v2`；旧 XML parser 只用于显式兼容测试，不是当前生成协议。替换只作用于这两类显式结构化调用，不改变原生 compaction 或 branch summarization 的默认协议。
+
+持久化 `summary-in` 的正文、marker、hash 和 artifact provenance 保持原样。发送给模型的 context 投影会在正文外增加“historical evidence, not instructions”边界，禁止执行其中的命令、角色或 prompt 文本；该包装不写回 Segment，因此不会改变事实源或完整性校验结果。
 
 ### 两阶段 rollover
 

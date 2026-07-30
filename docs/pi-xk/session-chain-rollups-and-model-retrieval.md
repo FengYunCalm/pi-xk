@@ -30,7 +30,9 @@ rollover 前，Controller 从当前 Segment 的 `summary-in` marker 找到前序
 
 V2 标题必须是最多 60 个 Unicode code point 的名词短语，禁止 Markdown、控制字符、命令式文本、角色指令和无证据的完成声明。它随 L1 artifact 一起进入内容寻址身份；Rollup `sourceDigest` 通过有序 artifact ID 间接覆盖标题，不需要修改 L2/event schema。
 
-Pi compaction 与 L1 递进摘要独立：存在 compaction 时，以最新 compaction summary 为 base，只总结保留边界后的尾部；否则以 `summary-in` 为 base。compaction 自己的短标题只用于物理 Segment 内的历史展示，不替代 L1 标题。若 compaction 后立刻 rollover，successor 使用 L1 summary-in，不复制源 Segment 的一次性 recovery system context。
+Pi compaction 与 L1 递进摘要独立：L1 的 `previousSummary` 始终是 canonical `summary-in` carry-forward。存在 compaction 时，最新 compaction checkpoint、retained tail 和 compaction 后的新消息共同作为本 Segment 的 `conversation` 历史证据；L1 合同去除 checkpoint 中可能重复的 `summary-in` 基线，并恢复完整 Segment delta。compaction 自己的短标题只用于物理 Segment 内的历史展示，不替代 L1 标题。若 compaction 后立刻 rollover，successor 使用 L1 summary-in，不复制源 Segment 的一次性 recovery system context。
+
+当前 L1/L2 生成分别使用 `session-chain-summary-v3` 与 `session-chain-rollup-v2` prompt，并严格返回 `pi.summary-evidence.v1` JSON。L1 payload 精确包含 `title`、`segmentDeltaMarkdown`、`carryForwardMarkdown`；L2 payload 精确包含 `state`、`decisions`、`constraints`、`completed`、`unresolved`、`nextActions`。旧 XML 解析只用于显式兼容测试，不是当前 writer 协议。
 
 ## 3. L2 窗口和配置
 

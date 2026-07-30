@@ -12,6 +12,7 @@ import type {
 } from "../types.ts";
 import { collectEntriesForBranchSummary, generateBranchSummary } from "./compaction/branch-summarization.ts";
 import { compact, DEFAULT_COMPACTION_SETTINGS, prepareCompaction } from "./compaction/compaction.ts";
+import { normalizeSummaryTitle } from "./compaction/summarization-prompts.ts";
 import { convertToLlm } from "./messages.ts";
 import { formatPromptTemplateInvocation } from "./prompt-templates.ts";
 import { formatSkillInvocation } from "./skills.ts";
@@ -685,7 +686,7 @@ export class AgentHarness<
 
 	async compact(
 		customInstructions?: string,
-	): Promise<{ summary: string; firstKeptEntryId: string; tokensBefore: number; details?: unknown }> {
+	): Promise<{ summary: string; title: string; firstKeptEntryId: string; tokensBefore: number; details?: unknown }> {
 		if (this.phase !== "idle") throw new AgentHarnessError("busy", "compact() requires idle harness");
 		this.phase = "compaction";
 		try {
@@ -709,13 +710,15 @@ export class AgentHarness<
 				? { ok: true as const, value: provided }
 				: await compact(preparation, this.models, model, customInstructions, undefined, this.thinkingLevel);
 			if (!compactResult.ok) throw compactResult.error;
-			const result = compactResult.value;
+			const generated = compactResult.value;
+			const result = { ...generated, title: normalizeSummaryTitle(generated.title, generated.summary) };
 			const entryId = await this.session.appendCompaction(
 				result.summary,
 				result.firstKeptEntryId,
 				result.tokensBefore,
 				result.details,
 				provided !== undefined,
+				result.title,
 			);
 			const entry = await this.session.getEntry(entryId);
 			if (entry?.type === "compaction") {

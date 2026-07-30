@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { estimateTokens } from "../../src/core/compaction/index.ts";
 import { COMPACTION_RECOVERY_PROMPT_VERSION } from "../../src/core/session-manager.ts";
 import { createHarness, getMessageText, type Harness } from "./harness.ts";
+import { contextSummaryEvidence } from "./summary-evidence-fixtures.ts";
 
 type SessionWithCompactionInternals = {
 	_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<boolean>;
@@ -48,14 +49,17 @@ function createAssistant(
 	};
 }
 
-function useSummaryStreamFn(harness: Harness, summary: string): () => number {
+function useSummaryStreamFn(harness: Harness, title: string, summary: string): () => number {
 	let callCount = 0;
-	harness.session.agent.streamFn = (model) => {
+	harness.session.agent.streamFn = (model, context) => {
 		callCount++;
+		const kind = context.messages.some((message) => getMessageText(message).includes('Use "turn-prefix" as kind.'))
+			? "turn-prefix"
+			: "compaction";
 		const stream = createAssistantMessageEventStream();
 		queueMicrotask(() => {
 			const message: AssistantMessage = {
-				...fauxAssistantMessage(summary),
+				...fauxAssistantMessage(contextSummaryEvidence(kind, title, summary)),
 				api: model.api,
 				provider: model.provider,
 				model: model.id,
@@ -200,10 +204,7 @@ describe("AgentSession compaction characterization", () => {
 		const harness = await createHarness({ withConfiguredAuth: false });
 		harnesses.push(harness);
 		seedCompactableSession(harness);
-		const getStreamCallCount = useSummaryStreamFn(
-			harness,
-			"<title>Custom stream compaction</title>\n<summary>summary from custom stream</summary>",
-		);
+		const getStreamCallCount = useSummaryStreamFn(harness, "Custom stream compaction", "summary from custom stream");
 
 		const result = await harness.session.compact();
 
@@ -217,7 +218,8 @@ describe("AgentSession compaction characterization", () => {
 		seedCompactableSession(harness);
 		const getStreamCallCount = useSummaryStreamFn(
 			harness,
-			"<title>Automatic stream compaction</title>\n<summary>auto summary from custom stream</summary>",
+			"Automatic stream compaction",
+			"auto summary from custom stream",
 		);
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
 

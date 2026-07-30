@@ -25,6 +25,28 @@ export {
 	serializeConversation,
 	shouldCompact,
 } from "./harness/compaction/compaction.ts";
+export {
+	BRANCH_SUMMARIZATION_PROMPT,
+	type ContextSummaryEvidenceKind,
+	type ContextSummaryEvidenceV1,
+	contextSummaryOutputContract,
+	deriveSummaryTitle,
+	formatHistoricalEvidence,
+	formatHistoricalSummaryEvidence,
+	formatSummaryPromptInput,
+	INITIAL_SUMMARIZATION_PROMPT,
+	normalizeSummaryTitle,
+	parseContextSummaryEvidence,
+	parseSummaryEvidenceEnvelope,
+	SUMMARIZATION_SYSTEM_PROMPT,
+	SUMMARY_EVIDENCE_SCHEMA,
+	SUMMARY_INPUT_SCHEMA,
+	type SummaryEvidenceEnvelopeV1,
+	type SummaryEvidenceKind,
+	type SummaryPromptInputV1,
+	TURN_PREFIX_SUMMARIZATION_PROMPT,
+	UPDATE_SUMMARIZATION_PROMPT,
+} from "./harness/compaction/summarization-prompts.ts";
 export * from "./harness/messages.ts";
 export * from "./harness/prompt-templates.ts";
 export * from "./harness/session/jsonl-repo.ts";

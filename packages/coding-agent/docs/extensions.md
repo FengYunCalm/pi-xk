@@ -1166,15 +1166,15 @@ Navigate to a different point in the session tree:
 const result = await ctx.navigateTree("entry-id-456", {
   summarize: true,
   customInstructions: "Focus on error handling changes",
-  replaceInstructions: false, // true = replace default prompt entirely
+  replaceInstructions: false, // true + non-blank instructions = replace the complete output contract
   label: "review-checkpoint",
 });
 ```
 
 Options:
 - `summarize`: Whether to generate a summary of the abandoned branch
-- `customInstructions`: Custom instructions for the summarizer
-- `replaceInstructions`: If true, `customInstructions` replaces the default prompt instead of being appended
+- `customInstructions`: Optional content focus. By default it is untrusted summary input and cannot change the JSON response shape.
+- `replaceInstructions`: With `true` and non-blank `customInstructions`, use those instructions as the complete output contract and preserve the response for caller-defined parsing. Missing or whitespace-only instructions fall back to the default `pi.summary-evidence.v1` branch contract.
 - `label`: Label to attach to the branch summary entry (or target entry if not summarizing)
 
 ### ctx.switchSession(sessionPath, options?)

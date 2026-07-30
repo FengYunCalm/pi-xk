@@ -354,6 +354,27 @@ describe("AgentSession model and extension characterization", () => {
 		).toBe(true);
 	});
 
+	it("allows before_agent_start to cancel a run before any provider request", async () => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", async () => ({
+						cancel: true,
+						reason: "durable state is not readable",
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("must not be requested")]);
+
+		await harness.session.prompt("hello");
+
+		expect(harness.faux.state.callCount).toBe(0);
+		expect(getAssistantTexts(harness)).toEqual([]);
+		expect(harness.session.isIdle).toBe(true);
+	});
+
 	it("keeps the run active externally while before_agent_start observes the legacy idle state", async () => {
 		let markHookEntered: (() => void) | undefined;
 		let releaseHook: (() => void) | undefined;

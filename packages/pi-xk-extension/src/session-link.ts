@@ -525,7 +525,7 @@ export function isPiXkGoalDraft(value: unknown): value is PiXkGoalDraft {
 	) {
 		return false;
 	}
-	if (value.state === "requested") return value.proposal === null && value.goalId === null;
+	if (value.state === "requested") return value.goalId === null;
 	if (value.state === "proposed" || value.state === "superseded")
 		return value.proposal !== null && value.goalId === null;
 	if (value.state === "confirming" || value.state === "confirmed")

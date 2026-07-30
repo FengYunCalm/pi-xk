@@ -119,6 +119,8 @@ const buildBuiltinKeybindings = (resolvedKeybindings: KeybindingsConfig): BuiltI
 interface BeforeAgentStartCombinedResult {
 	messages?: NonNullable<BeforeAgentStartEventResult["message"]>[];
 	systemPrompt?: string;
+	cancel?: boolean;
+	reason?: string;
 }
 
 /**
@@ -1140,6 +1142,14 @@ export class ExtensionRunner {
 						if (result.systemPrompt !== undefined) {
 							currentSystemPrompt = result.systemPrompt;
 							systemPromptModified = true;
+						}
+						if (result.cancel) {
+							return {
+								cancel: true,
+								reason: result.reason,
+								messages: messages.length > 0 ? messages : undefined,
+								systemPrompt: systemPromptModified ? currentSystemPrompt : undefined,
+							};
 						}
 					}
 				} catch (err) {

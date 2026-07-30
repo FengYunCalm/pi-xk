@@ -95,6 +95,16 @@ function renderObjective(contract: GoalCurrentContract): string {
 			"Pi-XK continues this Goal while it remains active. A normal assistant response does not end this Goal.",
 			"Call pi_xk_end_goal only after every required acceptance has verified evidence and goal-state.md records the final summary.",
 			"",
+			"## Title",
+			contract.title,
+			"",
+			"## Goal identity",
+			`- Schema: ${contract.schema}`,
+			`- Goal ID: ${contract.goalId}`,
+			`- Owner session: ${contract.ownerSessionId}`,
+			`- Created at: ${contract.createdAt}`,
+			`- Revision: ${contract.revision}`,
+			"",
 			"## Contract revision",
 			String(contract.revision),
 			"",
@@ -119,9 +129,20 @@ function renderObjective(contract: GoalCurrentContract): string {
 			...(contract.nonGoals.length > 0 ? contract.nonGoals.map((nonGoal) => `- ${nonGoal}`) : ["- None declared."]),
 			"",
 			"## Acceptance",
-			...contract.acceptance.map(
-				(item) => `- ${item.id} (${item.required ? "required" : "optional"}): ${item.description}`,
-			),
+			...contract.acceptance.flatMap((item) => [
+				`- ${item.id} (${item.required ? "required" : "optional"}, ${item.kind}): ${item.description}`,
+				...(item.command === undefined ? [] : [`  - Command: ${item.command}`]),
+			]),
+			"",
+			"## Capabilities",
+			`- filesystem: ${contract.capabilities.filesystem}`,
+			`- network: ${contract.capabilities.network}`,
+			`- spawn: ${contract.capabilities.spawn}`,
+			"",
+			"## Budgets",
+			`- tokens: ${contract.budgets.tokens}`,
+			`- costCents: ${contract.budgets.costCents}`,
+			`- wallSeconds: ${contract.budgets.wallSeconds}`,
 			"",
 			"## Done condition",
 			contract.doneCondition,
@@ -134,6 +155,11 @@ function renderObjective(contract: GoalCurrentContract): string {
 			"",
 			"## Execution authorization",
 			contract.executionAuthorization,
+			"",
+			"## Canonical contract JSON",
+			"```json",
+			stableJsonStringify(contract),
+			"```",
 			"",
 		].join("\n");
 	}
@@ -231,7 +257,7 @@ function renderState(contract: GoalCurrentContract): string {
 			"- Record unmet required acceptance IDs, current evidence, incomplete conclusion, user request, and next best action before pausing.",
 			"",
 			"## final_evidence",
-			"- Record verified acceptance IDs, final evidence, and final summary before ending.",
+			'- {"evidence":"","summary":"","verifiedAcceptanceIds":[]}',
 			"",
 		].join("\n");
 	}
@@ -380,6 +406,68 @@ function inspectV3State(
 	if (workLog === undefined) return "state recent_work_log section is missing";
 	const entryCount = workLog.filter((line) => /^[-*]\s+/.test(line)).length;
 	if (entryCount > 20) return `state recent_work_log has ${entryCount} entries; at most 20 are allowed`;
+	return undefined;
+}
+
+export interface GoalCompletionStateEvidence {
+	verifiedAcceptanceIds: string[];
+	finalEvidence: string;
+	finalSummary: string;
+}
+
+export function validateGoalCompletionState(
+	content: string,
+	contract: Extract<GoalCurrentContract, { schemaVersion: 3 }>,
+	evidence: GoalCompletionStateEvidence,
+): string | undefined {
+	const stateError = inspectV3State(content, contract);
+	if (stateError) return stateError;
+	const acceptanceMatrix = sectionLines(content, "acceptance_matrix");
+	if (!acceptanceMatrix) return "state acceptance_matrix section is missing";
+	for (const acceptance of contract.acceptance.filter((item) => item.required)) {
+		const line = acceptanceMatrix.find((candidate) => candidate.startsWith(`- ${acceptance.id}:`));
+		if (!line) return `state acceptance_matrix is missing required acceptance ${acceptance.id}`;
+		const normalized = line.toLowerCase();
+		const evidenceText = normalized.match(/;\s*evidence:\s*(.+)$/u)?.[1]?.trim();
+		if (
+			!/;\s*verified\s*;/u.test(normalized) ||
+			!evidenceText ||
+			evidenceText === "not recorded" ||
+			evidenceText === "none"
+		) {
+			return `state acceptance_matrix does not record verified evidence for ${acceptance.id}`;
+		}
+	}
+	const finalEvidenceLines = sectionLines(content, "final_evidence");
+	if (!finalEvidenceLines || finalEvidenceLines.length !== 1) {
+		return "state final_evidence must contain exactly one JSON object";
+	}
+	const serialized = finalEvidenceLines[0]?.replace(/^[-*]\s+/, "");
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(serialized ?? "");
+	} catch {
+		return "state final_evidence is not valid JSON";
+	}
+	if (!isRecord(parsed) || Object.keys(parsed).sort().join(",") !== "evidence,summary,verifiedAcceptanceIds") {
+		return "state final_evidence has unknown or missing fields";
+	}
+	if (
+		!Array.isArray(parsed.verifiedAcceptanceIds) ||
+		parsed.verifiedAcceptanceIds.some((item) => typeof item !== "string") ||
+		typeof parsed.evidence !== "string" ||
+		typeof parsed.summary !== "string"
+	) {
+		return "state final_evidence has invalid field types";
+	}
+	if (
+		parsed.verifiedAcceptanceIds.length !== evidence.verifiedAcceptanceIds.length ||
+		parsed.verifiedAcceptanceIds.some((id, index) => id !== evidence.verifiedAcceptanceIds[index]) ||
+		parsed.evidence !== evidence.finalEvidence ||
+		parsed.summary !== evidence.finalSummary
+	) {
+		return "state final_evidence does not match the requested Goal ending";
+	}
 	return undefined;
 }
 

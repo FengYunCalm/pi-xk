@@ -362,6 +362,7 @@ export interface ActiveToolsChangeEntry extends SessionTreeEntryBase {
 export interface CompactionEntry<T = unknown> extends SessionTreeEntryBase {
 	type: "compaction";
 	summary: string;
+	title?: string;
 	firstKeptEntryId: string;
 	tokensBefore: number;
 	details?: T;
@@ -736,6 +737,7 @@ export interface AbortResult {
 
 export interface CompactResult {
 	summary: string;
+	title?: string;
 	firstKeptEntryId: string;
 	tokensBefore: number;
 	details?: unknown;

@@ -174,7 +174,7 @@ Compaction 后不会把最后一条用户提示词再次发送。overflow 在同
 
 当模型判断当前问题依赖“之前、继续、原始要求、待办、历史约束或 Goal/Task 恢复”时，可先调用只读列表工具查看 L1 标题和 L1/L2 范围，再读取相关摘要。工具调用会增加本地读取和一个 tool round，但不会触发 provider 摘要生成、backfill 或修复。摘要内的命令和伪系统提示仅作为不可信历史证据返回，不能扩大工具权限。
 
-V3 Goal 的普通 system guidance 也只提供 `goal-objective.md`、`goal-state.md` 路径、合同 revision 和 mismatch/修订反馈，不复制原始用户要求或完整合同。Objective 是只读合同投影；State 是执行台账。模型只有在新证据使 Current Objective 的表述过时时才应提案，不能静默改变 Intent Anchor、验收、约束或授权。
+V3 Goal 的普通 system guidance 也只提供 `goal-objective.md`、`goal-state.md` 路径、合同 revision 和 mismatch/修订反馈，不复制原始用户要求或完整合同。Objective 是只读合同投影；State 是执行台账，实质进展必须在 run 结束前回写。被用户要求修改的 revision feedback 只作为下一次修订 run 的 user-role JSON；provider error/aborted 后仍可恢复，成功响应后不再注入。revision CAS 冲突会终止旧 run 并重新 preflight。模型只有在新证据使 Current Objective 的表述过时时才应提案，不能静默改变 Intent Anchor、验收、约束或授权。
 
 ## 12. 性能影响
 

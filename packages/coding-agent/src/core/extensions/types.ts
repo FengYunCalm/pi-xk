@@ -301,6 +301,8 @@ export interface SummarizeSessionContextOptions {
 	messages: AgentMessage[];
 	previousSummary?: string;
 	customInstructions?: string;
+	/** Replace the generic summary output contract with customInstructions. */
+	replaceInstructions?: boolean;
 	maxOutputTokens: number;
 	signal?: AbortSignal;
 }
@@ -1147,6 +1149,10 @@ export interface BeforeAgentStartEventResult {
 	message?: Pick<CustomMessage, "customType" | "content" | "display" | "details">;
 	/** Replace the system prompt for this turn. If multiple extensions return this, they are chained. */
 	systemPrompt?: string;
+	/** Cancel this logical Agent run before any provider request is made. */
+	cancel?: boolean;
+	/** Human-readable reason for a cancelled run. */
+	reason?: string;
 }
 
 export interface SessionBeforeSwitchResult {

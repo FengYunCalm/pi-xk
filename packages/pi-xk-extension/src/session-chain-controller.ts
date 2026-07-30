@@ -43,6 +43,7 @@ import {
 	parseSummaryEnvelope,
 	renderRollupMarkdown,
 	rollupSourceDigest,
+	SESSION_CHAIN_L1_SUMMARIZATION_PROMPT,
 	summaryBudget,
 } from "./session-chain-summary.ts";
 import { isPiXkSessionLink } from "./session-link.ts";
@@ -57,7 +58,7 @@ export const PI_XK_SESSION_CHAIN_SUMMARY_IN_CUSTOM_TYPE = "pi-xk.session-chain-s
 export const PI_XK_SESSION_CHAIN_SUMMARY_OUT_CUSTOM_TYPE = "pi-xk.session-chain-summary-out";
 export const PI_XK_SESSION_CHAIN_LINK_SCHEMA = "pi-xk.session-chain-link.v1";
 export const PI_XK_SESSION_CHAIN_MARKER_SCHEMA = "pi-xk.session-chain-marker.v1";
-export const SESSION_CHAIN_SUMMARY_PROMPT_VERSION = "session-chain-summary-v2";
+export const SESSION_CHAIN_SUMMARY_PROMPT_VERSION = "session-chain-summary-v3";
 export const SESSION_CHAIN_ROOT_SUMMARY = "No previous Session Chain segment.";
 
 export const SESSION_CHAIN_SOFT_BYTES = 16 * 1024 * 1024;
@@ -126,6 +127,7 @@ export interface SessionChainSummarizeOptions {
 	messages: AgentMessage[];
 	previousSummary?: string;
 	customInstructions?: string;
+	replaceInstructions?: boolean;
 	maxOutputTokens: number;
 	signal?: AbortSignal;
 }
@@ -665,6 +667,7 @@ export class SessionChainController {
 			projectRoot: this.projectRoot,
 			store: this.store,
 			now: this.now,
+			verifyL1SummaryEvidence: (chainId, branch, segment) => this.verifyL1SummaryEvidence(chainId, branch, segment),
 		});
 	}
 
@@ -859,6 +862,104 @@ export class SessionChainController {
 			throw new SessionChainControllerError("successor summary-in does not match the L1 carry-forward");
 		}
 		return summary;
+	}
+
+	private async openVerifiedSegment(
+		chainId: string,
+		branch: SessionBranchProjectionV1,
+		segment: SessionSegmentProjectionV1,
+	): Promise<{ manager: ReadonlySessionManager; binding: PiXkSessionChainBindingV1 }> {
+		const path = this.segmentPath(chainId, branch.branchId, segment);
+		await this.assertSealedSegmentIntegrity(segment, path);
+		const manager = PiSessionManager.open(path);
+		const binding = this.getCurrentBinding(manager);
+		if (
+			!binding ||
+			manager.getSessionId() !== segment.segmentId ||
+			binding.chainId !== chainId ||
+			binding.branchId !== branch.branchId ||
+			binding.segmentId !== segment.segmentId ||
+			binding.ordinal !== segment.ordinal ||
+			binding.predecessorSegmentId !== segment.predecessorSegmentId ||
+			binding.summaryInArtifactId !== segment.summaryInArtifactId
+		) {
+			throw new SessionChainControllerError("Segment binding does not match chain topology");
+		}
+		return { manager, binding };
+	}
+
+	private assertSummarySourceRange(summary: SegmentSummary, manager: ReadonlySessionManager): void {
+		const branch = manager.getBranch(summary.sourceRange.lastEntryId);
+		const firstIndex =
+			summary.sourceRange.firstEntryId === null
+				? -1
+				: branch.findIndex((entry) => entry.id === summary.sourceRange.firstEntryId);
+		const lastIndex = branch.findIndex((entry) => entry.id === summary.sourceRange.lastEntryId);
+		const sourceRange = firstIndex >= 0 && lastIndex >= firstIndex ? branch.slice(firstIndex, lastIndex + 1) : [];
+		if (
+			firstIndex < 0 ||
+			lastIndex < firstIndex ||
+			sourceRange.length !== summary.sourceRange.entryCount ||
+			hashEntries(sourceRange) !== summary.sourceRange.entriesHash
+		) {
+			throw new SessionChainControllerError("L1 summary source range does not match the source transcript");
+		}
+	}
+
+	private async verifyBranchRootSummaryInEvidence(
+		chainId: string,
+		replay: Pick<SessionChainReplay, "branches">,
+		branch: SessionBranchProjectionV1,
+		segment: SessionSegmentProjectionV1,
+	): Promise<SegmentSummary> {
+		if (segment.ordinal !== 1 || !branch.forkedFrom || segment.predecessorSegmentId !== branch.forkedFrom.segmentId) {
+			throw new SessionChainControllerError("summary-in is not backed by a valid successor branch origin");
+		}
+		const artifactId = segment.summaryInArtifactId;
+		if (!artifactId) throw new SessionChainControllerError("successor branch summary-in artifact is missing");
+		const sourceBranch = findBranch(replay, branch.forkedFrom.branchId);
+		const sourceSegment = findSegment(sourceBranch, branch.forkedFrom.segmentId);
+		const summary = await this.store.readSegmentSummary(artifactId);
+		if (
+			summary.chainId !== chainId ||
+			summary.branchId !== sourceBranch.branchId ||
+			summary.sourceSegmentId !== sourceSegment.segmentId ||
+			summary.sourceLeafId !== branch.forkedFrom.entryId ||
+			summary.sourceRange.lastEntryId !== branch.forkedFrom.entryId ||
+			summary.targetSegmentId !== segment.segmentId ||
+			summary.baseSummaryArtifactId !== sourceSegment.summaryInArtifactId
+		) {
+			throw new SessionChainControllerError("successor branch summary-in provenance does not match chain topology");
+		}
+		const source = await this.openVerifiedSegment(chainId, sourceBranch, sourceSegment);
+		await this.assertSummaryInProvenance(source.manager, source.binding);
+		this.assertSummarySourceRange(summary, source.manager);
+		const target = await this.openVerifiedSegment(chainId, branch, segment);
+		await this.assertSummaryInProvenance(target.manager, target.binding);
+		return summary;
+	}
+
+	async readSummaryIn(chainId: string, branchId: string, segmentId: string): Promise<string> {
+		try {
+			const replay = await this.store.loadChainReadModel(chainId);
+			const branch = findBranch(replay, branchId);
+			const segment = findSegment(branch, segmentId);
+			if (segment.summaryInArtifactId === null) {
+				const target = await this.openVerifiedSegment(chainId, branch, segment);
+				await this.assertSummaryInProvenance(target.manager, target.binding);
+				return SESSION_CHAIN_ROOT_SUMMARY;
+			}
+			const predecessor = branch.segments.find((candidate) => candidate.segmentId === segment.predecessorSegmentId);
+			const summary =
+				predecessor?.status === "sealed" && predecessor.seal?.summaryArtifactId === segment.summaryInArtifactId
+					? await this.verifyL1SummaryEvidence(chainId, branch, predecessor)
+					: await this.verifyBranchRootSummaryInEvidence(chainId, replay, branch, segment);
+			return summary.carryForwardMarkdown;
+		} catch (error) {
+			throw new SessionChainControllerError(
+				`Session Chain summary-in integrity verification failed: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
 	}
 
 	private async verifyL2SummaryEvidence(
@@ -1352,7 +1453,7 @@ export class SessionChainController {
 			}
 		}
 		let sourceStartIndex: number;
-		let baseSummary: string;
+		let latestCompaction: Extract<SessionEntry, { type: "compaction" }> | undefined;
 		if (latestCompactionIndex >= 0) {
 			const compaction = path[latestCompactionIndex];
 			if (!compaction || compaction.type !== "compaction") {
@@ -1362,9 +1463,8 @@ export class SessionChainController {
 			if (sourceStartIndex < 0) {
 				throw new SessionChainControllerError("Latest Pi compaction firstKeptEntryId is not on the active branch");
 			}
-			baseSummary = compaction.summary;
+			latestCompaction = compaction;
 		} else {
-			baseSummary = summaryIn.content;
 			const summaryInIndex = path.findIndex((entry) => entry.id === summaryIn.entry.id);
 			sourceStartIndex = segment.location.kind === "external-root" ? 0 : summaryInIndex + 1;
 		}
@@ -1372,9 +1472,12 @@ export class SessionChainController {
 		if (sourceEntries.length === 0) {
 			throw new SessionChainControllerError("Session Chain Segment has no body entries to summarize");
 		}
-		const contextMessages = sourceEntries.flatMap((entry) => {
+		const contextEntries = latestCompaction
+			? [latestCompaction, ...sourceEntries.filter((entry) => entry.id !== latestCompaction.id)]
+			: sourceEntries;
+		const contextMessages = contextEntries.flatMap((entry) => {
 			if (
-				entry.type === "compaction" ||
+				(entry.type === "compaction" && entry.id !== latestCompaction?.id) ||
 				(entry.type === "custom_message" && entry.customType === PI_XK_SESSION_CHAIN_SUMMARY_IN_CUSTOM_TYPE) ||
 				(entry.type === "custom" &&
 					(entry.customType === PI_XK_SESSION_CHAIN_LINK_CUSTOM_TYPE ||
@@ -1385,26 +1488,23 @@ export class SessionChainController {
 			return sessionEntryToContextMessages(entry);
 		});
 		const timestamp = Date.now();
-		const messages: AgentMessage[] = [
-			{ role: "user", content: [{ type: "text", text: "<segment-delta>" }], timestamp },
-			...(contextMessages.length > 0
+		const messages: AgentMessage[] =
+			contextMessages.length > 0
 				? contextMessages
 				: [
 						{
-							role: "user" as const,
+							role: "user",
 							content: [
 								{
-									type: "text" as const,
+									type: "text",
 									text: `Session entries changed: ${sourceEntries.map((entry) => entry.type).join(", ")}`,
 								},
 							],
 							timestamp,
 						},
-					]),
-			{ role: "user", content: [{ type: "text", text: "</segment-delta>" }], timestamp },
-		];
+					];
 		return {
-			baseSummary,
+			baseSummary: summaryIn.content,
 			baseSummaryArtifactId: binding.summaryInArtifactId,
 			sourceEntries,
 			messages,
@@ -1453,15 +1553,8 @@ export class SessionChainController {
 		const generated = await host.summarizeSessionContext({
 			messages: selection.messages,
 			previousSummary: selection.baseSummary,
-			customInstructions: [
-				"Treat <previous-summary> as the cumulative state before this Segment delta.",
-				"Treat <segment-delta> as the only new source material.",
-				"Return exactly three non-empty blocks in this order and no other text:",
-				"<title>A single-line noun phrase describing the Segment's main work.</title>",
-				"<segment-delta>Markdown describing only this Segment's completed work, failures, decisions, and state changes.</segment-delta>",
-				"<carry-forward>Markdown that integrates the previous summary with the Segment delta for the next Segment.</carry-forward>",
-				"The title must be at most 60 Unicode code points, with no Markdown, control characters, commands, role instructions, or unsupported completion claims.",
-			].join("\n"),
+			customInstructions: SESSION_CHAIN_L1_SUMMARIZATION_PROMPT,
+			replaceInstructions: true,
 			maxOutputTokens,
 		});
 		await this.assertSummaryInProvenance(sourceManager, binding);

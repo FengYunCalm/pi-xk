@@ -9,6 +9,15 @@ import {
 import { buildSessionContext } from "../session/session.ts";
 import { type CompactionEntry, CompactionError, err, ok, type Result, type SessionTreeEntry } from "../types.ts";
 import {
+	type ContextSummaryEvidenceV1,
+	formatSummaryPromptInput,
+	INITIAL_SUMMARIZATION_PROMPT,
+	parseContextSummaryEvidence,
+	SUMMARIZATION_SYSTEM_PROMPT,
+	TURN_PREFIX_SUMMARIZATION_PROMPT,
+	UPDATE_SUMMARIZATION_PROMPT,
+} from "./summarization-prompts.ts";
+import {
 	computeFileLists,
 	createFileOps,
 	extractFileOpsFromMessage,
@@ -73,7 +82,7 @@ function getMessageFromEntry(entry: SessionTreeEntry): AgentMessage | undefined 
 		return createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp);
 	}
 	if (entry.type === "compaction") {
-		return createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp);
+		return createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp, entry.title);
 	}
 	return undefined;
 }
@@ -89,6 +98,8 @@ function getMessageFromEntryForCompaction(entry: SessionTreeEntry): AgentMessage
 export interface CompactionResult<T = unknown> {
 	/** Summary text that replaces compacted history in future context. */
 	summary: string;
+	/** Safe short title for the compacted context. */
+	title: string;
 	/** Entry id where retained history starts. */
 	firstKeptEntryId: string;
 	/** Estimated context tokens before compaction. */
@@ -380,84 +391,7 @@ export function findCutPoint(
 	};
 }
 
-export const SUMMARIZATION_SYSTEM_PROMPT = `You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.
-
-Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.`;
-
-const SUMMARIZATION_PROMPT = `The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
-
-Use this EXACT format:
-
-## Goal
-[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
-
-## Constraints & Preferences
-- [Any constraints, preferences, or requirements mentioned by user]
-- [Or "(none)" if none were mentioned]
-
-## Progress
-### Done
-- [x] [Completed tasks/changes]
-
-### In Progress
-- [ ] [Current work]
-
-### Blocked
-- [Issues preventing progress, if any]
-
-## Key Decisions
-- **[Decision]**: [Brief rationale]
-
-## Next Steps
-1. [Ordered list of what should happen next]
-
-## Critical Context
-- [Any data, examples, or references needed to continue]
-- [Or "(none)" if not applicable]
-
-Keep each section concise. Preserve exact file paths, function names, and error messages.`;
-
-const UPDATE_SUMMARIZATION_PROMPT = `The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
-
-Update the existing structured summary with new information. RULES:
-- PRESERVE all existing information from the previous summary
-- ADD new progress, decisions, and context from the new messages
-- UPDATE the Progress section: move items from "In Progress" to "Done" when completed
-- UPDATE "Next Steps" based on what was accomplished
-- PRESERVE exact file paths, function names, and error messages
-- If something is no longer relevant, you may remove it
-
-Use this EXACT format:
-
-## Goal
-[Preserve existing goals, add new ones if the task expanded]
-
-## Constraints & Preferences
-- [Preserve existing, add new ones discovered]
-
-## Progress
-### Done
-- [x] [Include previously done items AND newly completed items]
-
-### In Progress
-- [ ] [Current work - update based on progress]
-
-### Blocked
-- [Current blockers - remove if resolved]
-
-## Key Decisions
-- **[Decision]**: [Brief rationale] (preserve all previous, add new)
-
-## Next Steps
-1. [Update based on current state]
-
-## Critical Context
-- [Preserve important context, add new if needed]
-
-Keep each section concise. Preserve exact file paths, function names, and error messages.`;
-
-/** Generate or update a conversation summary for compaction. */
-export async function generateSummary(
+async function generateSummaryEvidence(
 	currentMessages: AgentMessage[],
 	models: Models,
 	model: Model<any>,
@@ -466,22 +400,20 @@ export async function generateSummary(
 	customInstructions?: string,
 	previousSummary?: string,
 	thinkingLevel?: ThinkingLevel,
-): Promise<Result<string, CompactionError>> {
+): Promise<Result<ContextSummaryEvidenceV1, CompactionError>> {
 	const maxTokens = Math.min(
 		Math.floor(0.8 * reserveTokens),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
 	);
-	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
-	if (customInstructions) {
-		basePrompt = `${basePrompt}\n\nAdditional focus: ${customInstructions}`;
-	}
+	const basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : INITIAL_SUMMARIZATION_PROMPT;
 	const llmMessages = convertToLlm(currentMessages);
 	const conversationText = serializeConversation(llmMessages);
-	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
-	if (previousSummary) {
-		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
-	}
-	promptText += basePrompt;
+	const additionalFocus = customInstructions?.trim() || null;
+	const promptText = `${formatSummaryPromptInput({
+		conversation: conversationText,
+		previousSummary: previousSummary ?? null,
+		additionalFocus,
+	})}\n\n${basePrompt}`;
 
 	const summarizationMessages = [
 		{
@@ -518,7 +450,40 @@ export async function generateSummary(
 		.map((c) => c.text)
 		.join("\n");
 
-	return ok(textContent);
+	try {
+		return ok(parseContextSummaryEvidence(textContent, "compaction"));
+	} catch (error) {
+		return err(
+			new CompactionError(
+				"summarization_failed",
+				`Summarization returned invalid JSON evidence: ${error instanceof Error ? error.message : String(error)}`,
+			),
+		);
+	}
+}
+
+/** Generate or update a conversation summary for compaction. */
+export async function generateSummary(
+	currentMessages: AgentMessage[],
+	models: Models,
+	model: Model<any>,
+	reserveTokens: number,
+	signal?: AbortSignal,
+	customInstructions?: string,
+	previousSummary?: string,
+	thinkingLevel?: ThinkingLevel,
+): Promise<Result<string, CompactionError>> {
+	const generated = await generateSummaryEvidence(
+		currentMessages,
+		models,
+		model,
+		reserveTokens,
+		signal,
+		customInstructions,
+		previousSummary,
+		thinkingLevel,
+	);
+	return generated.ok ? ok(generated.value.summary) : err(generated.error);
 }
 
 /** Prepared inputs for a compaction run. */
@@ -609,21 +574,6 @@ export function prepareCompaction(
 	});
 }
 
-const TURN_PREFIX_SUMMARIZATION_PROMPT = `This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.
-
-Summarize the prefix to provide context for the retained suffix:
-
-## Original Request
-[What did the user ask for in this turn?]
-
-## Early Progress
-- [Key decisions and work done in the prefix]
-
-## Context for Suffix
-- [Information needed to understand the retained recent work]
-
-Be concise. Focus on what's needed to understand the kept suffix.`;
-
 export { serializeConversation } from "./utils.ts";
 
 /** Generate compaction summary data from prepared session history. */
@@ -651,11 +601,12 @@ export async function compact(
 	}
 
 	let summary: string;
+	let title: string;
 
 	if (isSplitTurn && turnPrefixMessages.length > 0) {
 		const historyResult =
 			messagesToSummarize.length > 0
-				? await generateSummary(
+				? await generateSummaryEvidence(
 						messagesToSummarize,
 						models,
 						model,
@@ -665,7 +616,10 @@ export async function compact(
 						previousSummary,
 						thinkingLevel,
 					)
-				: ok<string, CompactionError>("No prior history.");
+				: ok<ContextSummaryEvidenceV1, CompactionError>({
+						title: "Context checkpoint",
+						summary: "No prior history.",
+					});
 		if (!historyResult.ok) return err(historyResult.error);
 		const turnPrefixResult = await generateTurnPrefixSummary(
 			turnPrefixMessages,
@@ -676,9 +630,10 @@ export async function compact(
 			thinkingLevel,
 		);
 		if (!turnPrefixResult.ok) return err(turnPrefixResult.error);
-		summary = `${historyResult.value}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult.value}`;
+		title = turnPrefixResult.value.title;
+		summary = `${historyResult.value.summary}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult.value.summary}`;
 	} else {
-		const summaryResult = await generateSummary(
+		const summaryResult = await generateSummaryEvidence(
 			messagesToSummarize,
 			models,
 			model,
@@ -689,7 +644,8 @@ export async function compact(
 			thinkingLevel,
 		);
 		if (!summaryResult.ok) return err(summaryResult.error);
-		summary = summaryResult.value;
+		title = summaryResult.value.title;
+		summary = summaryResult.value.summary;
 	}
 
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
@@ -697,6 +653,7 @@ export async function compact(
 
 	return ok({
 		summary,
+		title,
 		firstKeptEntryId,
 		tokensBefore,
 		details: { readFiles, modifiedFiles } as CompactionDetails,
@@ -709,14 +666,18 @@ async function generateTurnPrefixSummary(
 	reserveTokens: number,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
-): Promise<Result<string, CompactionError>> {
+): Promise<Result<ContextSummaryEvidenceV1, CompactionError>> {
 	const maxTokens = Math.min(
 		Math.floor(0.5 * reserveTokens),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
 	);
 	const llmMessages = convertToLlm(messages);
 	const conversationText = serializeConversation(llmMessages);
-	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
+	const promptText = `${formatSummaryPromptInput({
+		conversation: conversationText,
+		previousSummary: null,
+		additionalFocus: null,
+	})}\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
 	const summarizationMessages = [
 		{
 			role: "user" as const,
@@ -744,10 +705,18 @@ async function generateTurnPrefixSummary(
 		);
 	}
 
-	return ok(
-		response.content
-			.filter((c): c is { type: "text"; text: string } => c.type === "text")
-			.map((c) => c.text)
-			.join("\n"),
-	);
+	const responseText = response.content
+		.filter((c): c is { type: "text"; text: string } => c.type === "text")
+		.map((c) => c.text)
+		.join("\n");
+	try {
+		return ok(parseContextSummaryEvidence(responseText, "turn-prefix"));
+	} catch (error) {
+		return err(
+			new CompactionError(
+				"summarization_failed",
+				`Turn prefix summarization returned invalid JSON evidence: ${error instanceof Error ? error.message : String(error)}`,
+			),
+		);
+	}
 }

@@ -152,7 +152,7 @@ V3 Goal 的 `goal-objective.md` 是只读合同投影，包含 Anchor、Current 
 /goal revision cancel
 ```
 
-旧 V1/V2 Goal 保持可读，不会静默迁移。首次迁移到 V3 需要用户确认 Intent Anchor 和完整候选合同。并发 revision 冲突会拒绝覆盖较新的合同；State 的 `contract_revision` 落后时，下一次 active run 会先要求同步执行台账。
+旧 V1/V2 Goal 保持可读，不会静默迁移。首次迁移到 V3 需要用户确认 Intent Anchor 和完整候选合同。并发 revision 冲突会拒绝覆盖较新的合同，并立即结束使用旧 revision 的 run，再由 Goal continuation 重新读取 Objective/State。`/goal revision revise <feedback>` 的 feedback 只供下一次成功修订 run 使用；provider error/aborted 不会提前消费。State 的 `contract_revision` 落后时，下一次 active run 会先要求同步执行台账。
 
 需要提交以保留字开头的 objective 时使用 `/goal -- <objective>`。例如：
 
@@ -162,7 +162,7 @@ V3 Goal 的 `goal-objective.md` 是只读合同投影，包含 Anchor、Current 
 
 ### Goal 的正常结束
 
-active Goal 的普通模型回复不是完成信号。模型必须先更新 `goal-state.md`，再调用 `pi_xk_end_goal` 并提交所有 required acceptance 的验证证据。需要用户输入或外部变化时，模型应更新状态并调用 `pi_xk_pause_goal`。
+active Goal 的普通模型回复不是完成信号。每次 run 产生实质进展后都要先把验证证据、done/open、证伪路径、acceptance matrix 和 next action 更新到 `goal-state.md`；最终再调用 `pi_xk_end_goal` 并提交所有 required acceptance 的验证证据。需要用户输入或外部变化时，模型应更新状态并调用 `pi_xk_pause_goal`。
 
 用户 `/goal end` 是显式终止覆盖，不要求模型先证明验收完成。它表示“用户要求停止”，不要把这种 ended 状态误读为目标已验证完成。
 

@@ -15,4 +15,10 @@ export interface SessionChainSummaryQualityReport {
 	findings: SessionChainSummaryQualityFinding[];
 }
 
+export interface SessionChainSummaryProtocolReport extends SessionChainSummaryQualityReport {
+	providerCalls: number;
+	l2Rollups: number;
+}
+
 export function evaluateSessionChainSummaryFixture(fixture: unknown): SessionChainSummaryQualityReport;
+export function executeSessionChainSummaryProtocolFixture(fixture: unknown): Promise<SessionChainSummaryProtocolReport>;

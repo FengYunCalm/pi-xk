@@ -102,6 +102,7 @@ export {
 } from "./contract.ts";
 export {
 	createGoalFiles,
+	type GoalCompletionStateEvidence,
 	GoalFileAlreadyExistsError,
 	type GoalFileDiagnostic,
 	GoalFileError,
@@ -110,6 +111,7 @@ export {
 	type GoalFilesDiagnostic,
 	goalIdentityFingerprint,
 	inspectGoalFiles,
+	validateGoalCompletionState,
 	writeGoalObjectiveProjection,
 } from "./goal-files.ts";
 export {

@@ -2,7 +2,7 @@
  * Shared utilities for compaction and branch summarization.
  */
 
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { type AgentMessage, SUMMARIZATION_SYSTEM_PROMPT } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 
 // ============================================================================
@@ -161,10 +161,4 @@ export function serializeConversation(messages: Message[]): string {
 	return parts.join("\n\n");
 }
 
-// ============================================================================
-// Summarization System Prompt
-// ============================================================================
-
-export const SUMMARIZATION_SYSTEM_PROMPT = `You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.
-
-Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.`;
+export { SUMMARIZATION_SYSTEM_PROMPT };

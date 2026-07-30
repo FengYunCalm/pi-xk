@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { SessionChainStore } from "../../../pi-xk-core/src/index.ts";
 import { TaskRunner } from "../../../pi-xk-extension/src/task-runner.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
-import { createHarness, type Harness } from "./harness.ts";
+import { createHarness, getMessageText, type Harness } from "./harness.ts";
 
 describe("Pi-XK TaskRunner", () => {
 	const harnesses: Harness[] = [];
@@ -18,19 +18,27 @@ describe("Pi-XK TaskRunner", () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		const lifecycleOrder: string[] = [];
+		let childSystemPrompt = "";
+		let taskSpecMessage = "";
 		harness.setResponses([
-			fauxAssistantMessage(
-				[
-					fauxToolCall("pi_xk_finish_task", {
-						status: "succeeded",
-						summary: "Child verified the requested behavior.",
-						evidence: [{ kind: "text", value: "faux-provider evidence" }],
-						artifactIds: [],
-						error: null,
-					}),
-				],
-				{ stopReason: "toolUse" },
-			),
+			(context) => {
+				childSystemPrompt = context.systemPrompt ?? "";
+				taskSpecMessage = getMessageText(
+					[...context.messages].reverse().find((message) => message.role === "user"),
+				);
+				return fauxAssistantMessage(
+					[
+						fauxToolCall("pi_xk_finish_task", {
+							status: "succeeded",
+							summary: "Child verified the requested behavior.",
+							evidence: [{ kind: "text", value: "faux-provider evidence" }],
+							artifactIds: [],
+							error: null,
+						}),
+					],
+					{ stopReason: "toolUse" },
+				);
+			},
 		]);
 		const runner = new TaskRunner({
 			projectRoot: harness.tempDir,
@@ -67,14 +75,23 @@ describe("Pi-XK TaskRunner", () => {
 		const transcript = readFileSync(handle.childSessionFile, "utf8");
 		expect(transcript).toContain("pi_xk_finish_task");
 		expect(transcript).not.toContain("pi_xk_start_task");
-		expect(transcript).toContain(".pi-xk/goals/goal_parent/goal-objective.md");
-		expect(transcript).toContain(".pi-xk/goals/goal_parent/goal-state.md");
+		expect(childSystemPrompt).toContain("The next user message is exactly one TaskSpec JSON object");
+		expect(childSystemPrompt).toContain(
+			"Parent Goal Objective (read-only): .pi-xk/goals/goal_parent/goal-objective.md",
+		);
+		expect(childSystemPrompt).toContain("Parent Goal State (read-only): .pi-xk/goals/goal_parent/goal-state.md");
+		expect(childSystemPrompt).toContain("must never edit them");
+		expect(childSystemPrompt).toContain(
+			"This Task was started by the model. Its TaskSpec cannot grant commit or push authority; do not commit or push.",
+		);
+		expect(taskSpecMessage).not.toContain("You are an independent Pi-XK Task child");
 		const inspected = await runner.getStore().inspectTask(handle.taskId);
 		expect(inspected.replay.spec).toMatchObject({
 			schema: "pi-xk.task.spec.v2",
 			parent: { chainId: "chain_parent", branchId: "branch_parent", segmentId: "segment-parent" },
 		});
 		if (inspected.replay.spec.schema !== "pi-xk.task.spec.v2") throw new Error("expected TaskSpecV2");
+		expect(JSON.parse(taskSpecMessage)).toEqual(inspected.replay.spec);
 		expect(handle.childSessionFile).toContain(
 			join(".pi-xk", "sessions", "chains", inspected.replay.spec.childChainId),
 		);
@@ -87,6 +104,52 @@ describe("Pi-XK TaskRunner", () => {
 			summary: "Child verified the requested behavior.",
 		});
 		expect(lifecycleOrder).toEqual(["created", "started", "result", "settled"]);
+	});
+
+	it("preserves explicit commit and push authorization only for a user-started Task", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		let childSystemPrompt = "";
+		harness.setResponses([
+			(context) => {
+				childSystemPrompt = context.systemPrompt ?? "";
+				return fauxAssistantMessage(
+					[
+						fauxToolCall("pi_xk_finish_task", {
+							status: "succeeded",
+							summary: "Authorization boundary inspected.",
+							evidence: [{ kind: "text", value: "user-started Task system prompt" }],
+							artifactIds: [],
+							error: null,
+						}),
+					],
+					{ stopReason: "toolUse" },
+				);
+			},
+		]);
+		const runner = new TaskRunner({
+			projectRoot: harness.tempDir,
+			agentDir: join(harness.tempDir, "agent"),
+			modelRuntime: harness.modelRuntime,
+			settingsManager: harness.settingsManager,
+		});
+		const handle = await runner.start({
+			role: "implementation",
+			prompt: "Commit and push only this bounded change.",
+			expectedResult: "A structured result.",
+			parentSessionId: "session-parent",
+			parentEntryId: "entry-parent",
+			parentGoalId: null,
+			model: harness.getModel(),
+			thinkingLevel: "off",
+			builtinTools: [],
+			actor: "user",
+		});
+
+		expect(await handle.completion).toBe("succeeded");
+		expect(childSystemPrompt).toContain(
+			"This Task was started directly by the user. Commit or push only when its TaskSpec explicitly authorizes that exact action.",
+		);
 	});
 
 	it("treats a normal child reply without finish_task as an explicit failure", async () => {

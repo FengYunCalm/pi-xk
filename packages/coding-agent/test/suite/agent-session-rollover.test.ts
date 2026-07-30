@@ -106,11 +106,124 @@ describe("extension session context summarization", () => {
 			usage: SUMMARY_USAGE,
 		});
 		expect(capturedContext).toContain("new segment facts");
-		expect(capturedContext).toContain("<previous-summary>");
+		expect(capturedContext).toContain("pi.summary-input.v1");
+		expect(capturedContext).toContain('\\"previousSummary\\":\\"previous segment summary\\"');
+		expect(capturedContext).not.toContain("<previous-summary>");
 		expect(capturedContext).toContain("previous segment summary");
 		expect(capturedMaxTokens).toBe(2048);
 		expect(harness.sessionManager.getEntries()).toEqual(entriesBefore);
 		expect(harness.session.messages).toEqual(messagesBefore);
+	});
+
+	it("replaces the generic summary format when a caller requires structured output", async () => {
+		let capturedContext = "";
+		let capturedSystemPrompt = "";
+		const messages: AgentMessage[] = [
+			{
+				role: "user",
+				content: [{ type: "text", text: "structured source facts" }],
+				timestamp: Date.now(),
+			},
+		];
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.registerCommand("summarize-structured-context", {
+						description: "exercise replacement summarization instructions",
+						handler: async (_args, ctx) => {
+							await ctx.summarizeSessionContext({
+								messages,
+								customInstructions: "Return exactly <structured-summary>JSON</structured-summary>.",
+								replaceInstructions: true,
+								maxOutputTokens: 2048,
+							});
+						},
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		harness.session.agent.streamFn = (model, context) => {
+			capturedContext = JSON.stringify(context);
+			capturedSystemPrompt = context.systemPrompt ?? "";
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => {
+				const message = {
+					...fauxAssistantMessage("<structured-summary>{}</structured-summary>"),
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					usage: SUMMARY_USAGE,
+				};
+				stream.push({ type: "done", reason: "stop", message });
+				stream.end(message);
+			});
+			return stream;
+		};
+
+		await harness.session.prompt("/summarize-structured-context");
+
+		expect(capturedContext).toContain("Return exactly <structured-summary>JSON</structured-summary>.");
+		expect(capturedContext).not.toContain("Use this EXACT format");
+		expect(capturedContext).not.toContain("## Goal");
+		expect(capturedSystemPrompt).not.toContain("Output exactly one JSON object");
+	});
+
+	it("falls back to the default JSON contract for blank replacement instructions", async () => {
+		let capturedPromptText = "";
+		const messages: AgentMessage[] = [
+			{ role: "user", content: [{ type: "text", text: "source facts" }], timestamp: Date.now() },
+		];
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.registerCommand("summarize-blank-replacement", {
+						description: "exercise blank replacement instructions",
+						handler: async (_args, ctx) => {
+							await ctx.summarizeSessionContext({
+								messages,
+								customInstructions: "   ",
+								replaceInstructions: true,
+								maxOutputTokens: 2048,
+							});
+						},
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		harness.session.agent.streamFn = (model, context) => {
+			const inputMessage = context.messages[0];
+			const inputContent = inputMessage?.role === "user" ? inputMessage.content : [];
+			capturedPromptText =
+				Array.isArray(inputContent) && inputContent[0]?.type === "text" ? inputContent[0].text : "";
+			const message = {
+				...fauxAssistantMessage(
+					JSON.stringify({
+						schema: "pi.summary-evidence.v1",
+						kind: "compaction",
+						payload: { title: "Default contract", summary: "## Goal\nPreserve facts." },
+					}),
+				),
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				usage: SUMMARY_USAGE,
+			};
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => {
+				stream.push({ type: "done", reason: "stop", message });
+				stream.end(message);
+			});
+			return stream;
+		};
+
+		await harness.session.prompt("/summarize-blank-replacement");
+
+		expect(capturedPromptText).toContain('Use "compaction" as kind.');
+		expect(capturedPromptText).toContain('"additionalFocus":null');
 	});
 });
 

@@ -23,6 +23,7 @@ import {
 } from "../../../pi-xk-extension/src/index.ts";
 import { type CustomEntry, type SessionEntry, SessionManager } from "../../src/core/session-manager.ts";
 import { createHarness, type Harness } from "./harness.ts";
+import { contextSummaryEvidence } from "./summary-evidence-fixtures.ts";
 
 function isPiXkSessionLinkEntry(entry: SessionEntry): entry is CustomEntry<PiXkSessionLink> {
 	return (
@@ -138,6 +139,15 @@ describe("Pi-XK session link integration", () => {
 		};
 
 		expect(createPiXkGoalDraft(draft).proposal).toEqual(proposal);
+		expect(
+			createPiXkGoalDraft({
+				...draft,
+				state: "requested",
+				objective: "The original user request must remain immutable across draft revisions.",
+				revisionFeedback: "Preserve the original outcome and revise the verification wording.",
+				proposal,
+			}).proposal,
+		).toEqual(proposal);
 		expect(() =>
 			createPiXkGoalDraft({
 				...draft,
@@ -252,8 +262,8 @@ describe("Pi-XK session link integration", () => {
 		});
 		harnesses.push(harness);
 		harness.setResponses([
-			fauxAssistantMessage("<title>Native Pi history</title>\n<summary>native Pi history summary</summary>"),
-			fauxAssistantMessage("<title>Native Pi turn context</title>\n<summary>native Pi turn prefix</summary>"),
+			fauxAssistantMessage(contextSummaryEvidence("compaction", "Native Pi history", "native Pi history summary")),
+			fauxAssistantMessage(contextSummaryEvidence("turn-prefix", "Native Pi turn context", "native Pi turn prefix")),
 		]);
 		harness.sessionManager.appendMessage({
 			role: "user",

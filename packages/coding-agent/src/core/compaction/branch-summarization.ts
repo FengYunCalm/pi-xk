@@ -5,7 +5,14 @@
  * a summary of the branch being left so context isn't lost.
  */
 
-import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
+import {
+	type AgentMessage,
+	BRANCH_SUMMARIZATION_PROMPT,
+	formatSummaryPromptInput,
+	parseContextSummaryEvidence,
+	type StreamFn,
+	SUMMARIZATION_SYSTEM_PROMPT,
+} from "@earendil-works/pi-agent-core";
 import type { Model, SimpleStreamOptions } from "@earendil-works/pi-ai/compat";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import {
@@ -22,7 +29,6 @@ import {
 	extractFileOpsFromMessage,
 	type FileOperations,
 	formatFileOperations,
-	SUMMARIZATION_SYSTEM_PROMPT,
 	serializeConversation,
 } from "./utils.ts";
 
@@ -73,9 +79,9 @@ export interface GenerateBranchSummaryOptions {
 	env?: Record<string, string>;
 	/** Abort signal for cancellation */
 	signal: AbortSignal;
-	/** Optional custom instructions for summarization */
+	/** Optional content focus, or a complete replacement output contract when explicitly enabled */
 	customInstructions?: string;
-	/** If true, customInstructions replaces the default prompt instead of being appended */
+	/** If true, non-blank customInstructions is the complete output contract */
 	replaceInstructions?: boolean;
 	/** Tokens reserved for prompt + LLM response (default 16384) */
 	reserveTokens?: number;
@@ -249,35 +255,6 @@ Summary of that exploration:
 
 `;
 
-const BRANCH_SUMMARY_PROMPT = `Create a structured summary of this conversation branch for context when returning later.
-
-Use this EXACT format:
-
-## Goal
-[What was the user trying to accomplish in this branch?]
-
-## Constraints & Preferences
-- [Any constraints, preferences, or requirements mentioned]
-- [Or "(none)" if none were mentioned]
-
-## Progress
-### Done
-- [x] [Completed tasks/changes]
-
-### In Progress
-- [ ] [Work that was started but not finished]
-
-### Blocked
-- [Issues preventing progress, if any]
-
-## Key Decisions
-- **[Decision]**: [Brief rationale]
-
-## Next Steps
-1. [What should happen next to continue this work]
-
-Keep each section concise. Preserve exact file paths, function names, and error messages.`;
-
 /**
  * Generate a summary of abandoned branch entries.
  *
@@ -314,17 +291,16 @@ export async function generateBranchSummary(
 	// Serialization prevents the model from treating it as a conversation to continue
 	const llmMessages = convertToLlm(messages);
 	const conversationText = serializeConversation(llmMessages);
+	const normalizedInstructions = customInstructions?.trim() || undefined;
+	const usesReplacementContract = replaceInstructions === true && normalizedInstructions !== undefined;
 
 	// Build prompt
-	let instructions: string;
-	if (replaceInstructions && customInstructions) {
-		instructions = customInstructions;
-	} else if (customInstructions) {
-		instructions = `${BRANCH_SUMMARY_PROMPT}\n\nAdditional focus: ${customInstructions}`;
-	} else {
-		instructions = BRANCH_SUMMARY_PROMPT;
-	}
-	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${instructions}`;
+	const instructions = usesReplacementContract ? normalizedInstructions : BRANCH_SUMMARIZATION_PROMPT;
+	const promptText = `${formatSummaryPromptInput({
+		conversation: conversationText,
+		previousSummary: null,
+		additionalFocus: usesReplacementContract ? null : (normalizedInstructions ?? null),
+	})}\n\n${instructions}`;
 
 	const summarizationMessages = [
 		{
@@ -351,10 +327,22 @@ export async function generateBranchSummary(
 		return { error: response.errorMessage || "Summarization failed" };
 	}
 
-	let summary = response.content
+	const responseText = response.content
 		.filter((c): c is { type: "text"; text: string } => c.type === "text")
 		.map((c) => c.text)
 		.join("\n");
+	let summary = responseText.trim();
+	if (!usesReplacementContract) {
+		try {
+			summary = parseContextSummaryEvidence(responseText, "branch").summary;
+		} catch (error) {
+			return {
+				error: `Branch summary returned invalid JSON evidence: ${error instanceof Error ? error.message : String(error)}`,
+			};
+		}
+	} else if (!summary) {
+		return { error: "Branch summary returned an empty response" };
+	}
 
 	// Prepend preamble to provide context about the branch summary
 	summary = BRANCH_SUMMARY_PREAMBLE + summary;

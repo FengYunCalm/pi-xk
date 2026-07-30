@@ -2,7 +2,10 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { evaluateSessionChainSummaryFixture } from "../../../../scripts/evaluate-session-chain-summaries.mjs";
+import {
+	evaluateSessionChainSummaryFixture,
+	executeSessionChainSummaryProtocolFixture,
+} from "../../../../scripts/evaluate-session-chain-summaries.mjs";
 
 const fixturePath = resolve(
 	fileURLToPath(new URL("../fixtures/pi-xk/session-chain-summary-golden.json", import.meta.url)),
@@ -21,9 +24,22 @@ describe("Session Chain summary semantic quality", () => {
 		});
 	});
 
+	it("executes five L1 carry-forward requests and one L2 request through the shared faux protocol", async () => {
+		const fixture = JSON.parse(await readFile(fixturePath, "utf8"));
+		const report = await executeSessionChainSummaryProtocolFixture(fixture);
+
+		expect(report).toMatchObject({
+			providerCalls: 6,
+			l1Summaries: 5,
+			l2Rollups: 1,
+			counts: { omission: 0, reversal: 0, stale: 0, false_completion: 0 },
+			findings: [],
+		});
+	});
+
 	it("classifies omission, reversal, stale carry-forward, and false completion independently", async () => {
 		const fixture = JSON.parse(await readFile(fixturePath, "utf8"));
-		fixture.l1[4].carryForward =
+		fixture.l1[4].carryForwardMarkdown =
 			"The default Rollup interval is 10. TaskSupervisor remains rejected. A temporary provider retry is pending.";
 		fixture.l2.constraints = ["The Policy layer remains out of scope."];
 		fixture.l2.completed.push("Release smoke remains unresolved.");

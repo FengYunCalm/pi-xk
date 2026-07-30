@@ -9,7 +9,13 @@ import {
 } from "../messages.ts";
 import type { BranchSummaryResult, Session, SessionTreeEntry } from "../types.ts";
 import { BranchSummaryError, err, ok, type Result, SessionError } from "../types.ts";
-import { estimateTokens, SUMMARIZATION_SYSTEM_PROMPT } from "./compaction.ts";
+import { estimateTokens } from "./compaction.ts";
+import {
+	BRANCH_SUMMARIZATION_PROMPT,
+	formatSummaryPromptInput,
+	parseContextSummaryEvidence,
+	SUMMARIZATION_SYSTEM_PROMPT,
+} from "./summarization-prompts.ts";
 import {
 	computeFileLists,
 	createFileOps,
@@ -55,9 +61,9 @@ export interface GenerateBranchSummaryOptions {
 	model: Model<any>;
 	/** Abort signal for the summarization request. */
 	signal: AbortSignal;
-	/** Optional instructions appended to or replacing the default prompt. */
+	/** Optional content focus, or a complete replacement output contract when explicitly enabled. */
 	customInstructions?: string;
-	/** Replace the default prompt with custom instructions instead of appending them. */
+	/** Use non-blank custom instructions as the complete output contract. */
 	replaceInstructions?: boolean;
 	/** Tokens reserved for prompt and model output. Defaults to 16384. */
 	reserveTokens?: number;
@@ -107,7 +113,7 @@ function getMessageFromEntry(entry: SessionTreeEntry): AgentMessage | undefined 
 			return createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp);
 
 		case "compaction":
-			return createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp);
+			return createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp, entry.title);
 		case "thinking_level_change":
 		case "model_change":
 		case "active_tools_change":
@@ -166,35 +172,6 @@ Summary of that exploration:
 
 `;
 
-const BRANCH_SUMMARY_PROMPT = `Create a structured summary of this conversation branch for context when returning later.
-
-Use this EXACT format:
-
-## Goal
-[What was the user trying to accomplish in this branch?]
-
-## Constraints & Preferences
-- [Any constraints, preferences, or requirements mentioned]
-- [Or "(none)" if none were mentioned]
-
-## Progress
-### Done
-- [x] [Completed tasks/changes]
-
-### In Progress
-- [ ] [Work that was started but not finished]
-
-### Blocked
-- [Issues preventing progress, if any]
-
-## Key Decisions
-- **[Decision]**: [Brief rationale]
-
-## Next Steps
-1. [What should happen next to continue this work]
-
-Keep each section concise. Preserve exact file paths, function names, and error messages.`;
-
 /** Generate a summary for abandoned branch entries. */
 export async function generateBranchSummary(
 	entries: SessionTreeEntry[],
@@ -211,15 +188,14 @@ export async function generateBranchSummary(
 	}
 	const llmMessages = convertToLlm(messages);
 	const conversationText = serializeConversation(llmMessages);
-	let instructions: string;
-	if (replaceInstructions && customInstructions) {
-		instructions = customInstructions;
-	} else if (customInstructions) {
-		instructions = `${BRANCH_SUMMARY_PROMPT}\n\nAdditional focus: ${customInstructions}`;
-	} else {
-		instructions = BRANCH_SUMMARY_PROMPT;
-	}
-	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${instructions}`;
+	const normalizedInstructions = customInstructions?.trim() || undefined;
+	const usesReplacementContract = replaceInstructions === true && normalizedInstructions !== undefined;
+	const instructions = usesReplacementContract ? normalizedInstructions : BRANCH_SUMMARIZATION_PROMPT;
+	const promptText = `${formatSummaryPromptInput({
+		conversation: conversationText,
+		previousSummary: null,
+		additionalFocus: usesReplacementContract ? null : (normalizedInstructions ?? null),
+	})}\n\n${instructions}`;
 
 	const summarizationMessages = [
 		{
@@ -245,10 +221,25 @@ export async function generateBranchSummary(
 		);
 	}
 
-	let summary = response.content
+	const responseText = response.content
 		.filter((c): c is { type: "text"; text: string } => c.type === "text")
 		.map((c) => c.text)
 		.join("\n");
+	let summary = responseText.trim();
+	if (!usesReplacementContract) {
+		try {
+			summary = parseContextSummaryEvidence(responseText, "branch").summary;
+		} catch (error) {
+			return err(
+				new BranchSummaryError(
+					"summarization_failed",
+					`Branch summary returned invalid JSON evidence: ${error instanceof Error ? error.message : String(error)}`,
+				),
+			);
+		}
+	} else if (!summary) {
+		return err(new BranchSummaryError("summarization_failed", "Branch summary returned an empty response"));
+	}
 	summary = BRANCH_SUMMARY_PREAMBLE + summary;
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
 	summary += formatFileOperations(readFiles, modifiedFiles);

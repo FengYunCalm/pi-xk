@@ -6,6 +6,16 @@
 
 - Added optional titles to compaction summary messages so hosts can preserve and render short historical labels without changing the LLM-facing summary body.
 
+### Changed
+
+- Centralized native, iterative, and branch summarization under strict `pi.summary-input.v1`/`pi.summary-evidence.v1` JSON contracts and now project stored compaction and branch summaries as potentially stale historical evidence rather than instructions.
+- Changed ordinary custom summary instructions to remain untrusted content focus; only an explicit non-blank replacement contract can replace the default JSON response shape.
+
+### Fixed
+
+- Fixed explicit branch-summary replacement contracts being parsed as the default JSON envelope, and made blank replacements fall back to the default contract.
+- Fixed aborted summary generations to retain cancellation semantics instead of being reported as invalid JSON or schema output.
+
 ## [0.80.10] - 2026-07-16
 
 ## [0.80.9] - 2026-07-16

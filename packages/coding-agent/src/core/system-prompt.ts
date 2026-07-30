@@ -42,9 +42,37 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 
 	const contextFiles = providedContextFiles ?? [];
 	const skills = providedSkills ?? [];
+	const tools = selectedTools || ["read", "bash", "edit", "write"];
+	const visibleTools = tools.filter((name) => !!toolSnippets?.[name]);
+	const toolsList =
+		visibleTools.length > 0 ? visibleTools.map((name) => `- ${name}: ${toolSnippets![name]}`).join("\n") : "(none)";
+	const hasBash = tools.includes("bash");
+	const hasGrep = tools.includes("grep");
+	const hasFind = tools.includes("find");
+	const hasLs = tools.includes("ls");
+	const hasRead = tools.includes("read");
+	const toolGuidelines: string[] = [];
+	const toolGuidelineSet = new Set<string>();
+	const addToolGuideline = (guideline: string): void => {
+		if (toolGuidelineSet.has(guideline)) return;
+		toolGuidelineSet.add(guideline);
+		toolGuidelines.push(guideline);
+	};
+
+	if (hasBash && !hasGrep && !hasFind && !hasLs) {
+		addToolGuideline("Use bash for file operations like ls, rg, find");
+	}
+	for (const guideline of promptGuidelines ?? []) {
+		const normalized = guideline.trim();
+		if (normalized.length > 0) addToolGuideline(normalized);
+	}
 
 	if (customPrompt) {
 		let prompt = customPrompt;
+		prompt += `\n\nAvailable tools:\n${toolsList}`;
+		if (toolGuidelines.length > 0) {
+			prompt += `\n\nTool guidelines:\n${toolGuidelines.map((guideline) => `- ${guideline}`).join("\n")}`;
+		}
 
 		if (appendSection) {
 			prompt += appendSection;
@@ -61,8 +89,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		}
 
 		// Append skills section (only if read tool is available)
-		const customPromptHasRead = !selectedTools || selectedTools.includes("read");
-		if (customPromptHasRead && skills.length > 0) {
+		if (hasRead && skills.length > 0) {
 			prompt += formatSkillsForPrompt(skills);
 		}
 
@@ -76,16 +103,9 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	const docsPath = getDocsPath();
 	const examplesPath = getExamplesPath();
 
-	// Build tools list based on selected tools.
-	// A tool appears in Available tools only when the caller provides a one-line snippet.
-	const tools = selectedTools || ["read", "bash", "edit", "write"];
-	const visibleTools = tools.filter((name) => !!toolSnippets?.[name]);
-	const toolsList =
-		visibleTools.length > 0 ? visibleTools.map((name) => `- ${name}: ${toolSnippets![name]}`).join("\n") : "(none)";
-
 	// Build guidelines based on which tools are actually available
-	const guidelinesList: string[] = [];
-	const guidelinesSet = new Set<string>();
+	const guidelinesList = [...toolGuidelines];
+	const guidelinesSet = new Set(toolGuidelines);
 	const addGuideline = (guideline: string): void => {
 		if (guidelinesSet.has(guideline)) {
 			return;
@@ -93,24 +113,6 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		guidelinesSet.add(guideline);
 		guidelinesList.push(guideline);
 	};
-
-	const hasBash = tools.includes("bash");
-	const hasGrep = tools.includes("grep");
-	const hasFind = tools.includes("find");
-	const hasLs = tools.includes("ls");
-	const hasRead = tools.includes("read");
-
-	// File exploration guidelines
-	if (hasBash && !hasGrep && !hasFind && !hasLs) {
-		addGuideline("Use bash for file operations like ls, rg, find");
-	}
-
-	for (const guideline of promptGuidelines ?? []) {
-		const normalized = guideline.trim();
-		if (normalized.length > 0) {
-			addGuideline(normalized);
-		}
-	}
 
 	// Always include these
 	addGuideline("Be concise in your responses");

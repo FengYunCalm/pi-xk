@@ -14,6 +14,8 @@ Session Chain 需要在同一个 Pi runtime 内安全生成摘要并替换物理
 
 能力：复用当前 model、认证、thinking level 和 Pi summarizer，对调用方提供的 messages/previous summary 生成摘要，但不写 session transcript、不触发 compaction、不替换 runtime。
 
+`customInstructions` 默认是内容聚焦数据：trim 后非空时写入不可信的 `pi.summary-input.v1.additionalFocus`，通用 JSON 输出合同仍是唯一 active output contract，聚焦文本不能改变返回形状。只有调用方同时设置 `replaceInstructions: true` 且提供非空 instructions 时，它才成为唯一输出合同；缺失或纯空白 replacement 确定性回退通用合同。replacement 响应按调用方合同原样返回，由调用方验证。Pi-XK 的 L1/L2 `pi.summary-evidence.v1` JSON 合同使用该模式，避免同一次生成收到互斥格式要求。该选项不改变原生 compaction 和 branch summarization 的默认合同。
+
 ### `rolloverSession`
 
 位置：
@@ -72,8 +74,8 @@ rollover 的语义是“同一逻辑会话更换物理承载文件”。它需�
 
 ```bash
 cd packages/coding-agent
-node node_modules/vitest/dist/cli.js --run test/suite/agent-session-rollover.test.ts
-node node_modules/vitest/dist/cli.js --run test/suite/agent-session-queue.test.ts
+node node_modules/vitest/vitest.mjs --run test/suite/agent-session-rollover.test.ts
+node node_modules/vitest/vitest.mjs --run test/suite/agent-session-queue.test.ts
 ```
 
 完整 Pi-XK 验收：
@@ -85,11 +87,14 @@ npm run check
 
 `agent-session-rollover.test.ts` 必须覆盖摘要不改 transcript、成功 replacement、取消、callback/commit 失败、busy/queue gate、事件顺序和 runtime identity。`agent-session-queue.test.ts` 必须覆盖 text/image、顺序、无即时 turn 和 rollover pending 拒绝。
 
+摘要合同回归还必须覆盖普通 focus 不改变返回形状、显式 replacement 不经过默认 JSON parser、空白 replacement 回退默认合同，以及 provider `aborted` 保持取消语义而非 schema error。
+
 ## 5. 上游同步检查单
 
 每次同步 upstream Pi 后逐项检查：
 
 1. `AgentSession` 的 summarizer、model/auth 访问和 compaction API 是否变化。
+   - 复核只有 `replaceInstructions: true` 加非空 instructions 才替换合同；false/省略时 instructions 只进入 `additionalFocus`，空白 replacement 回退默认合同。
 2. `AgentSessionRuntime` 的 replacement、follow-up queue、abort、dispose 和 extension rebind 顺序是否变化。
 3. Extension event 类型、runner dispatch、context actions 和 lifecycle reason 是否新增冲突。
 4. `SessionManager.createAt/open/flushDurable` 是否仍能保证指定 path/identity 和 durable marker。
@@ -108,6 +113,8 @@ npm run check
 - commit 失败后 runtime 已切到未发布 target；
 - rollover 被 Goal 当作真实 session 离开而暂停；
 - summary helper 写入 transcript 或改变 compaction/tree；
+- strict summary replacement 仍混入通用 Markdown 输出合同，导致 L1/L2 同时收到两套互斥格式要求；
+- 普通 focus 能改变输出合同、空白 replacement 绕过默认 parser，或取消被误报为 JSON/schema 错误；
 - queued user message 立即启动 parent、乱序、丢失 image，或能在 rollover pending 时写 source；
 - extension 无法区分取消、失败和成功 commit；
 - Host 定向测试或 Pi-XK 完整测试未通过。

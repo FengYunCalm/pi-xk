@@ -292,7 +292,8 @@ describe("Pi-XK Task extension", () => {
 		expect(childChain.branches[0]?.headSegmentId).toBe(
 			started?.eventType === "task_started" ? started.payload.child.childSessionId : undefined,
 		);
-		expect(taskResultEntries(harness)).toHaveLength(0);
+		await waitFor("the chained user Task result message", () => taskResultEntries(harness).length === 1);
+		expect(taskResultEntries(harness)).toHaveLength(1);
 	});
 
 	it("exposes the parent start tool and child-only finish tool, then resumes the Goal once", async () => {
@@ -675,7 +676,8 @@ describe("Pi-XK Task extension", () => {
 
 		expect(notifications.at(-1)).toContain("status=failed");
 		expect(harness.faux.state.callCount).toBe(1);
-		expect(taskResultEntries(harness)).toHaveLength(0);
+		await waitFor("the failed user Task result message", () => taskResultEntries(harness).length === 1);
+		expect(taskResultEntries(harness)).toHaveLength(1);
 	});
 
 	it("keeps the child model snapshot when the parent switches models", async () => {
@@ -719,7 +721,8 @@ describe("Pi-XK Task extension", () => {
 		expect(childModelId).toBe("faux-parent-one");
 		expect(started?.eventType === "task_started" && started.payload.child.modelId).toBe("faux-parent-one");
 		expect(harness.session.model?.id).toBe("faux-parent-two");
-		expect(taskResultEntries(harness)).toHaveLength(0);
+		await waitFor("the snapshot Task result message", () => taskResultEntries(harness).length === 1);
+		expect(taskResultEntries(harness)).toHaveLength(1);
 		await harness.session.prompt("/task status");
 		expect(notifications.at(-1)).toContain("status=succeeded");
 	});

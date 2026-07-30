@@ -10,6 +10,7 @@ import { AuthStorage } from "../src/core/auth-storage.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { createModelRegistry, getModelRuntime } from "./model-runtime-test-utils.ts";
+import { contextSummaryEvidence } from "./suite/summary-evidence-fixtures.ts";
 import { createTestResourceLoader } from "./utilities.ts";
 
 describe("AgentSession auto-compaction queue resume", () => {
@@ -84,7 +85,8 @@ describe("AgentSession auto-compaction queue resume", () => {
 			timestamp: now - 500,
 		});
 		session.agent.state.messages = sessionManager.buildSessionContext().messages;
-		session.agent.streamFn = (summaryModel) => {
+		session.agent.streamFn = (summaryModel, context) => {
+			const kind = JSON.stringify(context).includes("turn-prefix") ? "turn-prefix" : "compaction";
 			const stream = createAssistantMessageEventStream();
 			queueMicrotask(() => {
 				stream.push({
@@ -92,7 +94,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 					reason: "stop",
 					message: {
 						...fauxAssistantMessage(
-							"<title>Queued message compaction</title>\n<summary>Compacted queue context.</summary>",
+							contextSummaryEvidence(kind, "Queued message compaction", "Compacted queue context."),
 						),
 						api: summaryModel.api,
 						provider: summaryModel.provider,

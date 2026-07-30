@@ -2,6 +2,7 @@ import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import { assistantMsg, userMsg } from "../../utilities.ts";
 import { createHarness, type Harness } from "../harness.ts";
+import { contextSummaryEvidence } from "../summary-evidence-fixtures.ts";
 
 describe("issue #6324 branch summary ambient auth", () => {
 	const harnesses: Harness[] = [];
@@ -27,7 +28,12 @@ describe("issue #6324 branch summary ambient auth", () => {
 				reason: "stop",
 				message: {
 					role: "assistant",
-					content: [{ type: "text", text: "branch summary text" }],
+					content: [
+						{
+							type: "text",
+							text: contextSummaryEvidence("branch", "Branch context", "branch summary text"),
+						},
+					],
 					api: model.api,
 					provider: model.provider,
 					model: model.id,

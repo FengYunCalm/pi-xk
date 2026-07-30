@@ -27,7 +27,7 @@
 		"test:pi-xk": "node scripts/run-pi-xk-tests.mjs",
 		"benchmark:session-chain": "node scripts/benchmark-session-chain.mjs",
 		"benchmark:session-chain-events": "node scripts/benchmark-session-chain-events.mjs",
-		"evaluate:session-chain-summaries": "node scripts/evaluate-session-chain-summaries.mjs packages/coding-agent/test/fixtures/pi-xk/session-chain-summary-golden.json",
+		"evaluate:session-chain-summaries": "node --import tsx scripts/evaluate-session-chain-summaries.mjs packages/coding-agent/test/fixtures/pi-xk/session-chain-summary-golden.json",
 		"generate:models": "npm --prefix packages/ai run generate-models:strict && npm --prefix packages/ai run generate-image-models",
 		"generate:model-catalog": "npm --prefix packages/ai run generate-model-catalog",
 		"diff:model-catalog": "node scripts/diff-model-catalog.mjs",

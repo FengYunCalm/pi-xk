@@ -35,7 +35,11 @@ const mockSummaryResponse: AssistantMessage = {
 	content: [
 		{
 			type: "text",
-			text: "<title>Compaction reasoning options</title>\n<summary>## Goal\nTest summary</summary>",
+			text: JSON.stringify({
+				schema: "pi.summary-evidence.v1",
+				kind: "compaction",
+				payload: { title: "Compaction reasoning options", summary: "## Goal\nTest summary" },
+			}),
 		},
 	],
 	api: "anthropic-messages",
@@ -81,6 +85,38 @@ describe("generateSummary reasoning options", () => {
 		});
 	});
 
+	it("rejects a legacy XML response on the new generation path", async () => {
+		completeSimpleMock.mockResolvedValue({
+			...mockSummaryResponse,
+			content: [{ type: "text", text: "<title>Legacy</title><summary>old</summary>" }],
+		});
+		await expect(generateSummary(messages, createModel(false), 2000, "test-key")).rejects.toThrow(/JSON/i);
+	});
+
+	it("omits blank custom instructions from native compaction summary input", async () => {
+		await generateSummary(messages, createModel(false), 2000, "test-key", undefined, undefined, "   ");
+
+		const context = completeSimpleMock.mock.calls[0]?.[1];
+		const message = context?.messages[0];
+		const content = message?.role === "user" ? message.content : [];
+		const promptText = Array.isArray(content) && content[0]?.type === "text" ? content[0].text : "";
+		expect(promptText).toContain('"additionalFocus":null');
+	});
+
+	it("preserves an aborted summary request as cancellation rather than a schema failure", async () => {
+		completeSimpleMock.mockResolvedValue({
+			...mockSummaryResponse,
+			content: [],
+			stopReason: "aborted",
+			errorMessage: "summary stopped",
+		});
+
+		await expect(generateSummary(messages, createModel(false), 2000, "test-key")).rejects.toMatchObject({
+			name: "AbortError",
+			message: "summary stopped",
+		});
+	});
+
 	it("does not set reasoning when thinking is off", async () => {
 		await generateSummary(
 			messages,
@@ -122,6 +158,19 @@ describe("generateSummary reasoning options", () => {
 	});
 
 	it("clamps compaction summary maxTokens to the model output cap", async () => {
+		completeSimpleMock.mockResolvedValueOnce(mockSummaryResponse).mockResolvedValueOnce({
+			...mockSummaryResponse,
+			content: [
+				{
+					type: "text",
+					text: JSON.stringify({
+						schema: "pi.summary-evidence.v1",
+						kind: "turn-prefix",
+						payload: { title: "Retained turn context", summary: "## Original Request\nTest prefix" },
+					}),
+				},
+			],
+		});
 		const preparation: CompactionPreparation = {
 			firstKeptEntryId: "entry-keep",
 			messagesToSummarize: messages,

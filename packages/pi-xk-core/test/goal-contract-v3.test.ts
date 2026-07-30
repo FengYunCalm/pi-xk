@@ -301,6 +301,17 @@ describe("Goal contract v3 revisions", () => {
 
 		expect(objective).toContain("## Intent Anchor\n");
 		expect(objective).toContain("## Current Objective\n");
+		expect(objective).toContain(`## Title\n${contract.title}`);
+		expect(objective).toContain(`- Goal ID: ${contract.goalId}`);
+		expect(objective).toContain(`- Owner session: ${contract.ownerSessionId}`);
+		expect(objective).toContain("## Capabilities\n");
+		expect(objective).toContain("- filesystem: unrestricted");
+		expect(objective).toContain("## Budgets\n");
+		expect(objective).toContain("- tokens: 0");
+		expect(objective).toContain("- A-1 (required, test): The focused tests pass.");
+		expect(objective).toContain("  - Command: npm run test:pi-xk");
+		expect(objective).toContain("## Canonical contract JSON\n");
+		expect(objective).toContain(stableJsonStringify(contract));
 		expect(objective).toContain("After the same method fails twice");
 		expect(initialState).toContain("## contract_revision\n- 1");
 		expect(initialState).toContain("## acceptance_matrix\n");

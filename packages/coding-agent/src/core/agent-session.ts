@@ -1088,7 +1088,10 @@ export class AgentSession {
 		this.agent.state.systemPrompt = this._baseSystemPrompt;
 	}
 
-	private async _prepareAgentRun(prompt: string, images?: ImageContent[]): Promise<CustomMessage[]> {
+	private async _prepareAgentRun(
+		prompt: string,
+		images?: ImageContent[],
+	): Promise<{ cancelled: boolean; messages: CustomMessage[] }> {
 		this._isBeforeAgentStartHookActive = true;
 		try {
 			const result = await this._extensionRunner.emitBeforeAgentStart(
@@ -1100,14 +1103,17 @@ export class AgentSession {
 			this._runSystemPrompt = result?.systemPrompt ?? this._baseSystemPrompt;
 			this._applyRunSystemPrompt();
 
-			return (result?.messages ?? []).map((message) => ({
-				role: "custom" as const,
-				customType: message.customType,
-				content: message.content ?? [],
-				display: message.display,
-				details: message.details,
-				timestamp: Date.now(),
-			}));
+			return {
+				cancelled: result?.cancel === true,
+				messages: (result?.messages ?? []).map((message) => ({
+					role: "custom" as const,
+					customType: message.customType,
+					content: message.content ?? [],
+					display: message.display,
+					details: message.details,
+					timestamp: Date.now(),
+				})),
+			};
 		} finally {
 			this._isBeforeAgentStartHookActive = false;
 		}
@@ -1119,10 +1125,11 @@ export class AgentSession {
 	): Promise<void> {
 		this._isAgentRunActive = true;
 		try {
-			const extensionMessages = await this._prepareAgentRun(input.prompt, input.images);
+			const prepared = await this._prepareAgentRun(input.prompt, input.images);
+			if (prepared.cancelled) return;
 			const initialMessages = Array.isArray(messages)
-				? [...messages, ...extensionMessages]
-				: [messages, ...extensionMessages];
+				? [...messages, ...prepared.messages]
+				: [messages, ...prepared.messages];
 			await this.agent.prompt(initialMessages);
 			while (await this._handlePostAgentRun()) {
 				this._applyRunSystemPrompt();
@@ -1652,6 +1659,7 @@ export class AgentSession {
 			this.thinkingLevel,
 			this.agent.streamFn,
 			env,
+			options.replaceInstructions,
 		);
 		return {
 			summary: result.summary,

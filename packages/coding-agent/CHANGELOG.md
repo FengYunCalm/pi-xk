@@ -24,6 +24,12 @@
 
 ### Fixed
 
+- Fixed strict extension-driven summaries to replace the generic output contract only when requested with non-blank instructions, so structured generators receive one authoritative format while ordinary focus stays untrusted input and blank replacements fall back to the default contract.
+- Fixed aborted compaction and summary generations to retain cancellation semantics instead of being reported as invalid JSON or schema output.
+- Fixed custom `SYSTEM.md` and `--system-prompt` replacements to retain the active tool inventory and tool-specific guidance without restoring the default Pi identity or documentation block.
+- Fixed stored compaction and branch summary bodies to be marked as potentially stale historical evidence instead of executable instructions when projected into model context.
+- Fixed Pi-XK Goal kickoff messages to carry only a stable continuation signal while full runtime guidance remains in the system prompt, and strengthened Goal Draft/revision prompts to preserve end-to-end acceptance traceability without dropping objective dimensions.
+- Fixed native, iterative, branch, and Session Chain L1/L2 summarizers to use strict `pi.summary-input.v1`/`pi.summary-evidence.v1` JSON contracts, while marking stored summaries and successor `summary-in` content as historical evidence without changing persisted canonical bodies.
 - Fixed local Windows binary packaging under WSL to use PowerShell archive fallbacks when `zip` or `unzip` is unavailable.
 - Fixed `waitForIdle()` to include awaited `agent_settled` extension handlers, preventing session mutation from racing post-run persistence.
 - Fixed mutable Session Chain commands to wait for full settlement and recheck the Task gate before changing Chain state.
@@ -36,6 +42,8 @@
 - Fixed Kimi Coding sessions to show API-equivalent implied costs with the subscription indicator.
 - Fixed OpenAI Responses early stream endings to trigger automatic retry instead of ending the agent run ([#6727](https://github.com/earendil-works/pi/issues/6727)).
 - Fixed Pi-XK Goal revision review bodies and revision state from previous Goal bindings from blocking or leaking into later model context after a revision is shown, superseded, or automatically applied.
+- Fixed Pi-XK superseded revision feedback being reinjected after a successful Goal run, and restart Goal preflight after revision conflicts instead of continuing with a stale contract revision.
+- Fixed Pi-XK summary-list prompt guidance from describing unchecked model-generated L1 titles as trusted metadata.
 - Fixed Pi-XK V3 contracts being writable through the legacy V2 update path, and narrowed summary-title command detection so technical noun phrases are not rejected.
 
 ## [0.80.10] - 2026-07-16

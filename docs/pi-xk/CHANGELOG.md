@@ -11,13 +11,20 @@
 
 - Native compaction now records a safe historical title and adds one-time recovery guidance to the next actual Agent run instead of resending the last user request or creating a second Goal kickoff.
 - Goal runtime guidance now provides Objective/State paths and contract revision diagnostics instead of repeating the original request or complete contract.
+- Goal Draft generation now keeps fixed drafting rules in system context, carries requested/revision data in an untrusted structured input, fails closed outside its sole submission tool, and enforces a closed Intent Anchor, Current Objective, required acceptance, verification evidence, Done Condition, and Final Report traceability chain; automatic Objective refinements must preserve every existing outcome dimension and acceptance coverage.
+- Goal kickoff transcript entries now carry only a fixed continuation signal; complete Goal rules are injected once through the system prompt.
+- Session Chain L1 and L2 generation now replace the generic summary contract with their strict `pi.summary-evidence.v1` JSON contracts, and model-facing `summary-in` content is explicitly historical evidence rather than instructions.
 
 ### Fixed
 
 - Goal revision state is scoped to the current binding's Goal ID and generation, and automatic objective refinement terminates superseded feedback so stale entries cannot block or leak into later Goal runs.
+- Superseded Goal revision feedback is consumed after one successful retry run while remaining available across provider error/abort recovery, and revision conflicts restart Goal preflight instead of continuing under stale contract guidance.
 - Goal revision review content remains visible to the user but is excluded from subsequent model context.
+- Active Goal guidance now requires material progress and acceptance evidence to be returned to `goal-state.md` before each run ends, and summary-list prompt metadata no longer describes unchecked L1 titles as trusted.
 - V3 Goals can no longer start at a later revision or be downgraded through the legacy V2 update/event path.
 - Compaction and L1 title validation now accepts technical noun phrases and pure envelope whitespace without accepting extra response text.
+- Host summarization now keeps ordinary focus inside untrusted input, honors only non-blank explicit replacement contracts, falls back safely for blank replacements, and preserves provider cancellation semantics.
+- Custom Pi system prompts retain the active tool inventory and tool-specific guidance while continuing to replace the default identity and Pi documentation text.
 
 ## [0.1.1]
 

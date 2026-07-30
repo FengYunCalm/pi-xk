@@ -84,6 +84,29 @@ describe("buildSystemPrompt", () => {
 
 			expect(prompt).not.toContain("dynamic_tool");
 		});
+
+		test("preserves active tool capabilities when a custom system prompt replaces the default identity", () => {
+			const prompt = buildSystemPrompt({
+				customPrompt: "You are the project-specific assistant.",
+				selectedTools: ["read", "dynamic_tool"],
+				toolSnippets: {
+					read: "Read file contents",
+					dynamic_tool: "Run dynamic test behavior",
+				},
+				promptGuidelines: ["Use dynamic_tool when the user asks for dynamic behavior tests."],
+				contextFiles: [],
+				skills: [],
+				cwd: process.cwd(),
+			});
+
+			expect(prompt).toContain("You are the project-specific assistant.");
+			expect(prompt).toContain(
+				"Available tools:\n- read: Read file contents\n- dynamic_tool: Run dynamic test behavior",
+			);
+			expect(prompt).toContain("- Use dynamic_tool when the user asks for dynamic behavior tests.");
+			expect(prompt).not.toContain("You are an expert coding assistant operating inside pi");
+			expect(prompt).not.toContain("Pi documentation (read only when the user asks about pi itself");
+		});
 	});
 
 	describe("prompt guidelines", () => {

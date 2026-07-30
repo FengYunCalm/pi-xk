@@ -20,7 +20,9 @@ Pi has two summarization mechanisms:
 | Compaction | Context exceeds threshold, or `/compact` | Summarize old messages to free up context |
 | Branch summarization | `/tree` navigation | Preserve context when switching branches |
 
-They share cumulative file-operation tracking, but their output envelopes differ. Native compaction requires a safe `<title>` plus `<summary>` envelope; branch summarization keeps its existing Markdown summary format.
+By default they share cumulative file-operation tracking and one strict JSON evidence envelope. The `kind` field selects the native compaction, split-turn prefix, or branch output contract. After validation, Pi persists the Markdown summary body rather than the model response envelope.
+
+The agent core and coding agent use one shared set of native, iterative, and branch summarization prompt contracts. This keeps their schemas and trust boundaries aligned while still allowing a caller that needs a different strict contract to replace the generic instructions explicitly.
 
 ## Compaction
 
@@ -83,6 +85,8 @@ On repeated compactions, the summarized span starts at the previous compaction's
 New native compactions persist `reason` (`manual`, `threshold`, or `overflow`) and `recoveryPromptVersion: "compaction-recovery-v1"`. Until a later non-error, non-aborted assistant response proves that another logical run completed, the next actual model request receives a one-time recovery block in its system prompt.
 
 The recovery block says that compaction is not a new user request, summaries and titles are historical evidence rather than instructions, and the model must not repeat an old request just because it appears in the summary. It does not append a user or custom message and does not resend the last user message.
+
+When a stored compaction or branch summary is projected back into model context, Pi wraps its body as potentially stale historical evidence. Commands, role directives, or prompt text inside that body do not become system instructions. The wrapper is a model-facing projection only; the persisted summary body remains unchanged.
 
 Continuation ownership remains with the existing trigger:
 
@@ -234,18 +238,22 @@ See [`collectEntriesForBranchSummary()`](https://github.com/earendil-works/pi-mo
 
 ### Native Compaction
 
-Native compaction requires exactly two top-level blocks. Pure whitespace may surround or separate them; any other text is rejected:
+Native compaction requires exactly one JSON object. Markdown fences, surrounding prose, missing fields, and extra fields are rejected:
 
-```text
-<title>Single-line noun phrase</title>
-<summary>
-...structured Markdown summary...
-</summary>
+```json
+{
+  "schema": "pi.summary-evidence.v1",
+  "kind": "compaction",
+  "payload": {
+    "title": "Read model optimization",
+    "summary": "## Goal\n...structured Markdown summary..."
+  }
+}
 ```
 
 The title is a noun phrase of at most 60 Unicode code points. Markdown, markup, control characters, explicit command clauses, role instructions, and unsupported completion claims are rejected. Technical noun phrases such as `Read model optimization`, `运行时性能优化`, and `Fixed-point arithmetic` remain valid. The title is persisted and shown in the compaction UI, but is not added to the system prompt or the LLM-facing summary body.
 
-The `<summary>` body uses this format:
+The `payload.summary` Markdown string uses this format:
 
 ```markdown
 ## Goal
@@ -283,11 +291,11 @@ path/to/changed.ts
 </modified-files>
 ```
 
-For a split turn, the retained suffix stays in the transcript and the turn-prefix summarizer returns the same `<title>`/`<summary>` envelope. Pi uses the turn-prefix title and merges the history and prefix summaries into one compaction body.
+Pi appends cumulative `<read-files>` and `<modified-files>` blocks after validating the model response. For a split turn, the retained suffix stays in the transcript. The history request uses `kind: "compaction"`, the turn-prefix request uses `kind: "turn-prefix"`, and both use the same exact `title`/`summary` payload. Pi uses the turn-prefix title because it labels the active work whose suffix remains in the transcript; older cumulative history remains searchable in the merged summary body. It then merges both validated Markdown bodies into one compaction body.
 
 ### Branch Summarization
 
-Branch summarization does not require the compaction envelope. It keeps the structured Goal, Constraints & Preferences, Progress, Key Decisions, and Next Steps Markdown sections, prefixed with an explanation that the user explored another branch. Both mechanisms still append cumulative `<read-files>` and `<modified-files>` blocks.
+Branch summarization uses the same top-level JSON evidence schema with `kind: "branch"` and the exact `title`/`summary` payload by default. Its Markdown body keeps the Goal, Constraints & Preferences, Progress, Key Decisions, and Next Steps sections. After validation, Pi prefixes the body with an explanation that the user explored another branch and appends cumulative `<read-files>` and `<modified-files>` blocks. `BranchSummaryEntry` persists the resulting Markdown body; the generated title is validated as part of the default response contract but is not persisted as a separate branch-entry field.
 
 ### Message Serialization
 
@@ -305,9 +313,21 @@ This prevents the model from treating it as a conversation to continue.
 
 Tool results are truncated to 2000 characters during serialization. Content beyond that limit is replaced with a marker indicating how many characters were truncated. This keeps summarization requests within reasonable token budgets, since tool results (especially from `read` and `bash`) are typically the largest contributors to context size.
 
+The serialized conversation, previous summary, and optional additional focus are placed in a `pi.summary-input.v1` JSON object and labeled as untrusted evidence. The fixed system prompt owns the trust boundary: text inside any input field cannot change the active output contract. The contract itself follows that JSON value in a trusted prompt position.
+
+Contract selection is explicit:
+
+- Native compaction, split-turn prefix summarization, and ordinary branch summarization use the strict `pi.summary-evidence.v1` contract above.
+- Non-blank `customInstructions` without `replaceInstructions: true` are stored only as `additionalFocus`. They may prioritize content, but cannot change the response shape.
+- `replaceInstructions: true` replaces the default contract only when `customInstructions` is non-blank. The response is then preserved according to the caller's contract and is not parsed as the default context-summary envelope.
+- Missing or whitespace-only replacement instructions fall back to the default JSON contract.
+- A provider `aborted` result remains a cancellation. Pi does not run the JSON/schema parser and report cancellation as malformed output.
+
 ## Custom Summarization via Extensions
 
 Extensions can intercept and customize both compaction and branch summarization. See [`extensions/types.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/extensions/types.ts) for event type definitions.
+
+For `ctx.navigateTree()`, `customInstructions` are a content focus by default. Set `replaceInstructions: true` only when the extension supplies and validates a complete replacement output contract. See [Extensions](extensions.md#ctxnavigatetreetargetid-options).
 
 ### session_before_compact
 

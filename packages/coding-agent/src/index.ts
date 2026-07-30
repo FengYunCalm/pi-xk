@@ -1,5 +1,12 @@
 // Core session management
 
+export {
+	formatHistoricalEvidence,
+	parseSummaryEvidenceEnvelope,
+	SUMMARY_EVIDENCE_SCHEMA,
+	type SummaryEvidenceKind,
+} from "@earendil-works/pi-agent-core";
+
 export { type Args, parseArgs } from "./cli/args.ts";
 
 // Config paths
