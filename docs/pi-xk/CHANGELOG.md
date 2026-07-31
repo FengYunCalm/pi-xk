@@ -38,6 +38,7 @@
 - Session Chain write locks no longer expose an empty-file creation window, fast catalogs self-repair stale entries, and L2 reads reject mismatched artifact producers.
 - Pi-XK GitHub release builds now require the checkout commit to equal the release tag commit, and binary entrypoints reject incomplete, inconsistent, or extended provenance manifests.
 - Windows and macOS Pi-XK CI smoke now materializes the ignored provider catalog with the strict `pi-ai` build on fresh checkouts, reuses a complete local catalog without a refresh, validates catalog publication with fixture data, launches `npm.cmd` through the Windows command shell, and skips only the 512 MiB session-file stress case that remains covered by the full suite.
+- Native Windows Pi-XK release packaging now invokes the bundled PowerShell zip helper directly, while WSL retains its shell-based fallback.
 
 ## [0.1.1]
 

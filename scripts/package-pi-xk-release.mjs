@@ -16,7 +16,9 @@ const supportedPlatforms = [
 	"windows-x64",
 ];
 const semverPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
-const createZipArchiveScriptPath = join(dirname(fileURLToPath(import.meta.url)), "create-zip-archive.sh");
+const scriptDirectory = dirname(fileURLToPath(import.meta.url));
+const createZipArchiveScriptPath = join(scriptDirectory, "create-zip-archive.sh");
+const createZipArchivePowerShellPath = join(scriptDirectory, "create-zip-archive.ps1");
 
 function usage() {
 	console.log(`Usage: node scripts/package-pi-xk-release.mjs [options]
@@ -108,7 +110,27 @@ async function createArchives(input, platforms) {
 		if (platform.startsWith("windows-")) {
 			const archivePath = join(input, `pi-xk-${platform}.zip`);
 			await rm(archivePath, { force: true });
-			run(createZipArchiveScriptPath, [platformRoot, archivePath], input);
+			if (process.platform === "win32") {
+				run(
+					"powershell.exe",
+					[
+						"-NoLogo",
+						"-NoProfile",
+						"-NonInteractive",
+						"-ExecutionPolicy",
+						"Bypass",
+						"-File",
+						createZipArchivePowerShellPath,
+						"-SourceDirectory",
+						platformRoot,
+						"-DestinationPath",
+						archivePath,
+					],
+					input,
+				);
+			} else {
+				run(createZipArchiveScriptPath, [platformRoot, archivePath], input);
+			}
 			archives.push(archivePath);
 			continue;
 		}

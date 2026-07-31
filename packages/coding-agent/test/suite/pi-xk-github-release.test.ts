@@ -186,7 +186,8 @@ describe("Pi-XK GitHub release packaging", () => {
 		}
 	});
 
-	it("falls back to PowerShell when zip is unavailable in WSL", async () => {
+	// These two cases exercise Linux-side WSL command discovery. Native Windows is covered below.
+	it.skipIf(process.platform === "win32")("falls back to PowerShell when zip is unavailable in WSL", async () => {
 		const root = await mkdtemp(join(tmpdir(), "pi-xk-zip-fallback-"));
 		temporaryDirectories.push(root);
 		const sourceDirectory = join(root, "source");
@@ -232,7 +233,7 @@ describe("Pi-XK GitHub release packaging", () => {
 		expect((await readFile(capturePath, "utf8")).trim().split("\n")).toEqual([sourceDirectory, archivePath]);
 	});
 
-	it("falls back to PowerShell when unzip is unavailable in WSL", async () => {
+	it.skipIf(process.platform === "win32")("falls back to PowerShell when unzip is unavailable in WSL", async () => {
 		const root = await mkdtemp(join(tmpdir(), "pi-xk-unzip-fallback-"));
 		temporaryDirectories.push(root);
 		const archivePath = join(root, "release.zip");
@@ -281,7 +282,7 @@ describe("Pi-XK GitHub release packaging", () => {
 		expect((await readFile(capturePath, "utf8")).trim().split("\n")).toEqual([archivePath, destinationDirectory]);
 	});
 
-	it("packages Windows Pi-XK releases through the WSL PowerShell zip fallback", async () => {
+	it("packages Windows Pi-XK releases through the platform zip helper", async () => {
 		const fixture = await createReleaseFixture();
 		const platformRoot = join(fixture.binaryRoot, "windows-x64");
 		await mkdir(platformRoot);
@@ -290,33 +291,38 @@ describe("Pi-XK GitHub release packaging", () => {
 			writeFile(join(platformRoot, "pi-xk.exe"), "pi-xk binary\n"),
 		]);
 
-		const fakeBin = join(dirname(fixture.binaryRoot), "bin");
-		const capturePath = join(dirname(fixture.binaryRoot), "powershell-args.txt");
-		await mkdir(fakeBin);
-		const bashLookup = spawnSync("bash", ["-lc", "command -v bash"], { encoding: "utf8" });
-		expect(bashLookup.status, `${bashLookup.stdout}${bashLookup.stderr}`).toBe(0);
-		await symlink(bashLookup.stdout.trim(), join(fakeBin, "bash"));
-		const fakeWslPath = join(fakeBin, "wslpath");
-		await writeFile(fakeWslPath, '#!/bin/bash\n[[ "$1" == "-w" ]] || exit 2\nprintf "%s\\n" "$2"\n');
-		const fakePowerShell = join(fakeBin, "powershell.exe");
-		await writeFile(
-			fakePowerShell,
-			[
-				"#!/bin/bash",
-				'capture="$' + '{PI_XK_TEST_CAPTURE:?}"',
-				'destination_path=""',
-				"while (($#)); do",
-				'\tif [[ "$1" == "-DestinationPath" ]]; then destination_path="$2"; shift 2; else shift; fi',
-				"done",
-				'printf "%s\\n" "$destination_path" > "$capture"',
-				': > "$destination_path"',
-				"",
-			].join("\n"),
-		);
-		await Promise.all([chmod(fakeWslPath, 0o755), chmod(fakePowerShell, 0o755)]);
+		let packagerEnvironment = process.env;
+		let capturePath: string | undefined;
+		if (process.platform !== "win32") {
+			const fakeBin = join(dirname(fixture.binaryRoot), "bin");
+			capturePath = join(dirname(fixture.binaryRoot), "powershell-args.txt");
+			await mkdir(fakeBin);
+			const bashLookup = spawnSync("bash", ["-lc", "command -v bash"], { encoding: "utf8" });
+			expect(bashLookup.status, `${bashLookup.stdout}${bashLookup.stderr}`).toBe(0);
+			await symlink(bashLookup.stdout.trim(), join(fakeBin, "bash"));
+			const fakeWslPath = join(fakeBin, "wslpath");
+			await writeFile(fakeWslPath, '#!/bin/bash\n[[ "$1" == "-w" ]] || exit 2\nprintf "%s\\n" "$2"\n');
+			const fakePowerShell = join(fakeBin, "powershell.exe");
+			await writeFile(
+				fakePowerShell,
+				[
+					"#!/bin/bash",
+					'capture="$' + '{PI_XK_TEST_CAPTURE:?}"',
+					'destination_path=""',
+					"while (($#)); do",
+					'\tif [[ "$1" == "-DestinationPath" ]]; then destination_path="$2"; shift 2; else shift; fi',
+					"done",
+					'printf "%s\\n" "$destination_path" > "$capture"',
+					': > "$destination_path"',
+					"",
+				].join("\n"),
+			);
+			await Promise.all([chmod(fakeWslPath, 0o755), chmod(fakePowerShell, 0o755)]);
+			packagerEnvironment = { ...process.env, PATH: fakeBin, PI_XK_TEST_CAPTURE: capturePath };
+		}
 
 		const result = runPackager(fixture, "pi-xk-v0.1.0", {
-			env: { ...process.env, PATH: fakeBin, PI_XK_TEST_CAPTURE: capturePath },
+			env: packagerEnvironment,
 			platform: "windows-x64",
 			stageOnly: false,
 		});
@@ -324,7 +330,8 @@ describe("Pi-XK GitHub release packaging", () => {
 		expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
 		const archivePath = join(fixture.binaryRoot, "pi-xk-windows-x64.zip");
 		expect(existsSync(archivePath)).toBe(true);
-		expect((await readFile(capturePath, "utf8")).trim()).toBe(archivePath);
+		if (capturePath) expect((await readFile(capturePath, "utf8")).trim()).toBe(archivePath);
+		expect(await readFile(join(fixture.binaryRoot, "SHA256SUMS"), "utf8")).toContain("pi-xk-windows-x64.zip");
 	});
 
 	it("rejects a mismatched local release tag before replacing existing output", async () => {
