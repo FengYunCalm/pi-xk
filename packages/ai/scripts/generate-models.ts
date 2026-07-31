@@ -1,6 +1,19 @@
 #!/usr/bin/env node
 
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "fs";
+import { randomUUID } from "node:crypto";
+import {
+	closeSync,
+	cpSync,
+	existsSync,
+	fsyncSync,
+	mkdirSync,
+	mkdtempSync,
+	openSync,
+	readdirSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+} from "fs";
 import { dirname, join, resolve } from "path";
 import { fileURLToPath } from "url";
 import {
@@ -1874,63 +1887,80 @@ function removeGeneratedCatalog(packageRoot: string): void {
 	rmSync(join(packageRoot, "src", "models.generated.ts"), { force: true });
 }
 
-function copyGeneratedCatalog(sourceRoot: string, targetRoot: string): void {
-	const sourceProvidersDir = join(sourceRoot, "src", "providers");
-	const targetProvidersDir = join(targetRoot, "src", "providers");
-	mkdirSync(targetProvidersDir, { recursive: true });
-	if (existsSync(sourceProvidersDir)) {
-		for (const entry of readdirSync(sourceProvidersDir)) {
-			if (entry.endsWith(".models.ts")) {
-				cpSync(join(sourceProvidersDir, entry), join(targetProvidersDir, entry));
-			}
+function syncDirectoryPath(directory: string): void {
+	let descriptor: number | undefined;
+	try {
+		descriptor = openSync(directory, "r");
+		fsyncSync(descriptor);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		const unsupportedOnWindows =
+			process.platform === "win32" &&
+			(code === "EACCES" || code === "EINVAL" || code === "ENOTSUP" || code === "EPERM" || code === "EISDIR");
+		if (!unsupportedOnWindows) throw error;
+	} finally {
+		if (descriptor !== undefined) closeSync(descriptor);
+	}
+}
+
+function syncDirectoryTree(directory: string): void {
+	for (const entry of readdirSync(directory, { withFileTypes: true })) {
+		const path = join(directory, entry.name);
+		if (entry.isDirectory()) {
+			syncDirectoryTree(path);
+			continue;
 		}
-		const sourceDataDir = join(sourceProvidersDir, "data");
-		if (existsSync(sourceDataDir)) {
-			cpSync(sourceDataDir, join(targetProvidersDir, "data"), { recursive: true });
+		if (!entry.isFile()) continue;
+		const descriptor = openSync(path, "r");
+		try {
+			fsyncSync(descriptor);
+		} finally {
+			closeSync(descriptor);
 		}
 	}
-	const sourceAggregator = join(sourceRoot, "src", "models.generated.ts");
-	if (existsSync(sourceAggregator)) {
-		mkdirSync(join(targetRoot, "src"), { recursive: true });
-		cpSync(sourceAggregator, join(targetRoot, "src", "models.generated.ts"));
+	syncDirectoryPath(directory);
+}
+
+function publishDirectory(stagedDirectory: string, targetDirectory: string, backupPrefix: string): void {
+	const targetParent = dirname(targetDirectory);
+	mkdirSync(targetParent, { recursive: true });
+	const backupDirectory = join(targetParent, `${backupPrefix}${randomUUID()}`);
+	let targetBackedUp = false;
+	let stagedPublished = false;
+	try {
+		syncDirectoryTree(stagedDirectory);
+		if (existsSync(targetDirectory)) {
+			renameSync(targetDirectory, backupDirectory);
+			targetBackedUp = true;
+			syncDirectoryPath(targetParent);
+		}
+		if (process.env.PI_TEST_MODEL_CATALOG_PUBLISH_FAILURE === "after-target-backup") {
+			throw new Error("injected model catalog publication failure");
+		}
+		renameSync(stagedDirectory, targetDirectory);
+		stagedPublished = true;
+		syncDirectoryPath(targetParent);
+		if (targetBackedUp) {
+			rmSync(backupDirectory, { recursive: true });
+			targetBackedUp = false;
+			syncDirectoryPath(targetParent);
+		}
+	} catch (error) {
+		if (stagedPublished && existsSync(targetDirectory)) {
+			rmSync(targetDirectory, { recursive: true });
+			stagedPublished = false;
+		}
+		if (targetBackedUp && existsSync(backupDirectory)) {
+			renameSync(backupDirectory, targetDirectory);
+			targetBackedUp = false;
+			syncDirectoryPath(targetParent);
+		}
+		throw error;
 	}
 }
 
 function publishGeneratedCatalog(stagedRoot: string, packageRoot: string): void {
-	const backupRoot = mkdtempSync(join(packageRoot, ".pi-model-catalog-backup-"));
-	try {
-		copyGeneratedCatalog(packageRoot, backupRoot);
-		removeGeneratedCatalog(packageRoot);
-		try {
-			copyGeneratedCatalog(stagedRoot, packageRoot);
-		} catch (error) {
-			removeGeneratedCatalog(packageRoot);
-			copyGeneratedCatalog(backupRoot, packageRoot);
-			throw error;
-		}
-	} finally {
-		rmSync(backupRoot, { recursive: true, force: true });
-	}
-}
-
-function publishDirectory(stagedDirectory: string, targetDirectory: string): void {
-	const targetParent = dirname(targetDirectory);
-	mkdirSync(targetParent, { recursive: true });
-	const backupRoot = mkdtempSync(join(targetParent, ".pi-model-catalog-json-backup-"));
-	const backupDirectory = join(backupRoot, "catalog");
-	try {
-		if (existsSync(targetDirectory)) cpSync(targetDirectory, backupDirectory, { recursive: true });
-		rmSync(targetDirectory, { recursive: true, force: true });
-		try {
-			cpSync(stagedDirectory, targetDirectory, { recursive: true });
-		} catch (error) {
-			rmSync(targetDirectory, { recursive: true, force: true });
-			if (existsSync(backupDirectory)) cpSync(backupDirectory, targetDirectory, { recursive: true });
-			throw error;
-		}
-	} finally {
-		rmSync(backupRoot, { recursive: true, force: true });
-	}
+	publishDirectory(join(stagedRoot, "src"), join(packageRoot, "src"), ".pi-model-catalog-src-backup-");
 }
 
 async function generateModels(context: ModelGeneratorContext) {
@@ -2441,6 +2471,8 @@ async function generateModels(context: ModelGeneratorContext) {
 			`${providerId.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_MODELS`;
 		const stagingRoot = mkdtempSync(join(context.packageRoot, ".pi-model-catalog-stage-"));
 		const stagedPackageRoot = join(stagingRoot, "package");
+		cpSync(join(context.packageRoot, "src"), join(stagedPackageRoot, "src"), { recursive: true });
+		removeGeneratedCatalog(stagedPackageRoot);
 		const providersDir = join(stagedPackageRoot, "src/providers");
 		const dataDir = join(providersDir, "data");
 
@@ -2500,7 +2532,7 @@ async function generateModels(context: ModelGeneratorContext) {
 			for (const providerId of sortedProviderIds) {
 				writeJson(join(providerOutputDir, `${providerId}.json`), jsonProviders[providerId]);
 			}
-			publishDirectory(stagedOutputDir, context.options.jsonOutputDir);
+			publishDirectory(stagedOutputDir, context.options.jsonOutputDir, ".pi-model-catalog-json-backup-");
 		} finally {
 			rmSync(stagingRoot, { recursive: true, force: true });
 		}

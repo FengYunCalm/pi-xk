@@ -1250,6 +1250,87 @@ describe("SessionChainController rollover", () => {
 		}
 	});
 
+	it("deduplicates repeated resume requests for one in-flight Rollup window", async () => {
+		const projectRoot = await createTempDir();
+		const source = createPersistedSession(projectRoot, "rollup-repeat-resume-source");
+		const initial = new SessionChainController({ projectRoot });
+		await initial.setRollupConfig({ enabled: true, interval: 1 });
+		const binding = await initial.adoptExternalRoot(source);
+		appendTurn(source, "prepare repeated resume", "L1 remains valid");
+		const failedHost = createHost(source, {
+			responses: [
+				sessionChainL1Evidence("Repeated resume source", "L1 delta.", "L1 carry."),
+				"invalid first response",
+			],
+		});
+		await initial.rollover(failedHost.host, { reason: "prepare retryable publication" });
+		await initial.waitForRollupPublications(binding.chainId, binding.branchId);
+
+		let providerCalls = 0;
+		let releaseProvider: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			releaseProvider = resolve;
+		});
+		const resumed = new SessionChainController({ projectRoot });
+		const resumedHost = createHost(failedHost.getCurrentManager(), {
+			responseFactory: async () => {
+				providerCalls += 1;
+				if (providerCalls === 1) await gate;
+				return "invalid repeated response";
+			},
+		});
+		await Promise.all(
+			Array.from({ length: 5 }, () =>
+				resumed.resumeRollupPublications(resumedHost.host, binding.chainId, binding.branchId),
+			),
+		);
+		for (let attempt = 0; attempt < 100 && providerCalls === 0; attempt++) {
+			await new Promise<void>((resolve) => setTimeout(resolve, 10));
+		}
+		releaseProvider?.();
+		await resumed.waitForRollupPublications(binding.chainId, binding.branchId);
+
+		expect(providerCalls).toBe(1);
+		expect(await resumed.getRollupPublication(binding.chainId, binding.branchId, 1)).toMatchObject({
+			status: "failed",
+			attempt: 2,
+		});
+	});
+
+	it("retries Rollup failure diagnostics after a concurrent event changes the head", async () => {
+		const projectRoot = await createTempDir();
+		const source = createPersistedSession(projectRoot, "rollup-failure-cas-source");
+		const store = new SessionChainStore(projectRoot);
+		const controller = new SessionChainController({ projectRoot, store });
+		await controller.setRollupConfig({ enabled: true, interval: 1 });
+		const binding = await controller.adoptExternalRoot(source);
+		appendTurn(source, "race the Rollup diagnostic", "the failure must remain visible");
+		const appendFailure = store.appendRollupFailed.bind(store);
+		vi.spyOn(store, "appendRollupFailed").mockImplementationOnce(async (...args) => {
+			const replay = await store.replayChain(binding.chainId);
+			await store.appendMetadataUpdated(
+				binding.chainId,
+				{ title: "Concurrent metadata event" },
+				{
+					eventId: "event-concurrent-rollup-failure",
+					idempotencyKey: "metadata:concurrent-rollup-failure",
+					expectedHead: replay.head,
+				},
+			);
+			return await appendFailure(...args);
+		});
+		const { host } = createHost(source, {
+			responses: [sessionChainL1Evidence("Failure CAS source", "L1 delta.", "L1 carry."), "invalid L2"],
+		});
+
+		await controller.rollover(host, { reason: "diagnostic CAS retry" });
+		await controller.waitForRollupPublications(binding.chainId, binding.branchId);
+
+		expect((await store.replayChain(binding.chainId)).branches[0]?.rollupFailures).toEqual([
+			expect.objectContaining({ windowIndex: 1, attempt: 1, errorCode: "rollup_invalid_response" }),
+		]);
+	});
+
 	it("persists a retryable L2 failure and resumes the same window after restart", async () => {
 		const projectRoot = await createTempDir();
 		const source = createPersistedSession(projectRoot, "rollup-provider-failure-source");
@@ -1517,6 +1598,56 @@ describe("SessionChainController rollover", () => {
 		expect((await controller.getStore().replayChain(binding.chainId)).branches[0]?.rollups).toEqual([
 			expect.objectContaining({ windowIndex: 1, startOrdinal: 1, endOrdinal: 1 }),
 		]);
+	});
+
+	it("recovers an orphaned artifact when a generating job lost its artifactId", async () => {
+		const projectRoot = await createTempDir();
+		const source = createPersistedSession(projectRoot, "rollup-generating-orphan-source");
+		const store = new SessionChainStore(projectRoot);
+		vi.spyOn(store, "appendRollupPublished").mockRejectedValueOnce(new Error("simulated event outage"));
+		const controller = new SessionChainController({ projectRoot, store });
+		await controller.setRollupConfig({ enabled: true, interval: 1 });
+		const binding = await controller.adoptExternalRoot(source);
+		appendTurn(source, "orphan after generation", "reuse the content-addressed artifact");
+		const initialHost = createHost(source, {
+			responses: [
+				sessionChainL1Evidence("Generating orphan source", "L1 delta.", "L1 carry."),
+				sessionChainL2Evidence({
+					state: "Generated before crash.",
+					decisions: [],
+					constraints: [],
+					completed: [],
+					unresolved: ["Publish the event."],
+					nextActions: [],
+				}),
+			],
+		});
+		await controller.rollover(initialHost.host, { reason: "create recoverable orphan" });
+		await controller.waitForRollupPublications(binding.chainId, binding.branchId);
+		const rollupDirectory = join(
+			projectRoot,
+			".pi-xk",
+			"sessions",
+			"chains",
+			binding.chainId,
+			"branches",
+			binding.branchId,
+			"rollups",
+		);
+		const jobPath = join(rollupDirectory, "000001.job.json");
+		const job = JSON.parse(await readFile(jobPath, "utf8")) as Record<string, unknown>;
+		await writeFile(jobPath, `${JSON.stringify({ ...job, status: "generating", artifactId: null })}\n`);
+		await rm(join(rollupDirectory, "000001.pending.json"), { force: true });
+
+		const restarted = new SessionChainController({ projectRoot });
+		const unusedHost = createHost(initialHost.getCurrentManager(), {
+			responses: ["a second model call must not occur"],
+		});
+		await restarted.resumeRollupPublications(unusedHost.host, binding.chainId, binding.branchId);
+		await restarted.waitForRollupPublications(binding.chainId, binding.branchId);
+
+		expect(unusedHost.summarizeSessionContext).not.toHaveBeenCalled();
+		expect((await restarted.getStore().replayChain(binding.chainId)).branches[0]?.rollups).toHaveLength(1);
 	});
 
 	it("diagnoses and rebuilds a missing derived Rollup Markdown projection", async () => {

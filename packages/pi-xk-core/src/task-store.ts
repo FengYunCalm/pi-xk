@@ -25,7 +25,12 @@ import {
 	validateTaskResultEnvelopeV1,
 	validateTaskSpec,
 } from "./task-contract.ts";
-import { buildTaskReadModel, sameTaskReadModel, TaskReadModelStaleError } from "./task-read-model.ts";
+import {
+	assertTaskArtifactReferences,
+	buildTaskReadModel,
+	sameTaskReadModel,
+	TaskReadModelStaleError,
+} from "./task-read-model.ts";
 import {
 	type FileWriteLockOptions,
 	inspectFileWriteLock,
@@ -571,6 +576,7 @@ export class TaskStore {
 		if (result.status !== "succeeded" && result.status !== "failed") {
 			throw new TaskValidationError("appendTaskResult only accepts succeeded or failed results");
 		}
+		await assertTaskArtifactReferences(result.artifactIds, this.artifacts);
 		const artifact = await this.artifacts.put({
 			contentType: "application/json",
 			value: result,
@@ -777,6 +783,14 @@ export class TaskStore {
 		const replay = await this.replayTask(taskId);
 		const readModel = await buildTaskReadModel(replay, this.artifacts);
 		if (!replay.resultArtifactId) return { replay, readModel, result: null, resultDiagnostic: "none" };
+		if (readModel.result?.artifactStatus === "missing" || readModel.result?.artifactStatus === "corrupt") {
+			return {
+				replay,
+				readModel,
+				result: null,
+				resultDiagnostic: readModel.result.artifactStatus,
+			};
+		}
 		try {
 			const stored = await this.artifacts.read(replay.resultArtifactId);
 			return {

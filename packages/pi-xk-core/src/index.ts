@@ -232,6 +232,7 @@ export {
 	type SessionChainReplay,
 	SessionChainStore,
 	SessionChainStoreError,
+	type SessionChainStoreOptions,
 	type SessionChainTailDiagnostic,
 	type SessionChainWriteLockDiagnostic,
 	type SessionChainWriteResult,

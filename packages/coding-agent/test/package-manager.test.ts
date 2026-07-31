@@ -1101,17 +1101,19 @@ Content`,
 		it("should emit progress events on install attempt", async () => {
 			const events: ProgressEvent[] = [];
 			packageManager.setProgressCallback((event) => events.push(event));
+			const managerWithInternals = packageManager as unknown as PackageManagerInternals;
+			const runCommandSpy = vi
+				.spyOn(managerWithInternals, "runCommand")
+				.mockRejectedValue(new Error("simulated install failure"));
 
-			// Use public install method which emits progress events
 			try {
 				await packageManager.install("npm:nonexistent-package@1.0.0");
 			} catch {
-				// Expected to fail - package doesn't exist
+				// Expected simulated install failure.
 			}
 
-			// Should have emitted start event before failure
+			expect(runCommandSpy).toHaveBeenCalledOnce();
 			expect(events.some((e) => e.type === "start" && e.action === "install")).toBe(true);
-			// Should have emitted error event
 			expect(events.some((e) => e.type === "error")).toBe(true);
 		});
 

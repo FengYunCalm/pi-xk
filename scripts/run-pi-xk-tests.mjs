@@ -10,11 +10,45 @@ const testTempDir =
 		? "/tmp"
 		: inheritedTempDir;
 const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
-const commands = [
+const args = process.argv.slice(2);
+if (args.some((arg) => arg !== "--platform-smoke")) {
+	throw new Error(`Unknown argument: ${args.find((arg) => arg !== "--platform-smoke")}`);
+}
+const platformSmoke = args.includes("--platform-smoke");
+const buildCommands = [
 	["--workspace", "@earendil-works/pi-agent-core", "run", "build"],
 	["--workspace", "@earendil-works/pi-coding-agent", "run", "build"],
 	["--workspace", "pi-xk-core", "run", "build"],
 	["--workspace", "pi-xk-extension", "run", "build"],
+];
+const commands = platformSmoke
+	? [
+			...buildCommands,
+			[
+				"--workspace",
+				"pi-xk-core",
+				"run",
+				"test",
+				"--",
+				"test/sync-directory.test.ts",
+				"test/artifact-store.test.ts",
+				"test/goal-store.test.ts",
+				"test/task-store.test.ts",
+				"test/session-chain-store.test.ts",
+			],
+			[
+				"--workspace",
+				"@earendil-works/pi-coding-agent",
+				"run",
+				"test",
+				"--",
+				"test/session-manager/file-operations.test.ts",
+				"test/suite/pi-xk-package-install.test.ts",
+				"test/suite/pi-xk-github-release.test.ts",
+			],
+		]
+	: [
+			...buildCommands,
 	[
 		"--workspace",
 		"pi-xk-core",
@@ -34,6 +68,7 @@ const commands = [
 		"test/session-chain-store.test.ts",
 		"test/session-chain-read-model.test.ts",
 		"test/session-chain-summary-v2.test.ts",
+		"test/sync-directory.test.ts",
 	],
 	[
 		"--workspace",
@@ -57,7 +92,7 @@ const commands = [
 		"test/suite/pi-xk-github-release.test.ts",
 		"test/suite/pi-xk-session-chain-summary-quality.test.ts",
 	],
-];
+		];
 
 for (const args of commands) {
 	const result = spawnSync(npmCommand, args, {

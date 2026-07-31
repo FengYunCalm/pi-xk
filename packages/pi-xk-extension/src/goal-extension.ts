@@ -2642,6 +2642,8 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 							`active Goal filesystem capabilities are insufficient: cannot ${missingCapabilities.join(" or ")}`,
 						);
 					}
+					lastGoalRunOutcome = "aborted";
+					await startGoalRun(ctx, storeFor, options);
 				}
 				const revision = findCurrentGoalRevision(ctx);
 				const revisionFeedback = currentGoalRevisionFeedback(ctx, revision, files.contractRevision);
@@ -2726,14 +2728,6 @@ export function createPiXkGoalExtension(options: PiXkGoalExtensionOptions = {}):
 				return message;
 			});
 			if (messages.some((message, index) => message !== event.messages[index])) return { messages };
-		});
-		pi.on("agent_start", async (_event, ctx) => {
-			try {
-				lastGoalRunOutcome = "aborted";
-				await startGoalRun(ctx, storeFor, options);
-			} catch (error) {
-				notifyGoalError(ctx, options, error);
-			}
 		});
 		pi.on("agent_end", (event, ctx) => {
 			if (isOutstandingGoalDraft(findCurrentGoalDraft(ctx)) || !findCurrentGoalBinding(ctx)) return;

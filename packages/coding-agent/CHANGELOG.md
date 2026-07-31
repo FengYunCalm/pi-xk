@@ -49,6 +49,10 @@
 - Fixed critical context failures being reduced to ordinary assistant errors, Goal Draft runs exposing unrelated tools, Task children accepting unsupported success without evidence, and Rollup status surfaces repeating historical failures or exhausting transient retries at the invalid-output limit.
 - Fixed critical handler scope, prevented per-run tool projections from enabling inactive tools, aligned strict Goal State ledger guidance with its parser, accepted contract-defined acceptance IDs in State projections, and cleared stale Rollup queue errors after successful recovery.
 - Fixed Session Chain manifests to avoid repeating active summary-tool workflow and trust guidance on every run, and aligned the L2 Rollup prompt with the actual serialized `[User]: {source JSON}` input shape.
+- Fixed Pi session rewrites to fsync and atomically replace complete JSONL files without joining trailing partial records to later entries.
+- Fixed Pi-XK Goal runs to persist their run-start fact before provider execution, Task results to verify every referenced artifact, and Session Chain append to avoid routine full event-log replay while preserving exact idempotency recovery.
+- Fixed Pi-XK Rollup queue duplication and publication crash recovery, write-lock empty-file races, stale fast catalogs, and L2 artifact producer validation.
+- Fixed Pi-XK GitHub release recovery to build only the tagged commit and made the binary entrypoint validate the complete provenance manifest contract.
 
 ## [0.80.10] - 2026-07-16
 

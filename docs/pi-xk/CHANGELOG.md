@@ -15,6 +15,7 @@
 - Goal kickoff transcript entries now carry only a fixed continuation signal; complete Goal rules are injected once through the system prompt.
 - Session Chain L1 and L2 generation now replace the generic summary contract with their strict `pi.summary-evidence.v1` JSON contracts, and model-facing `summary-in` content is explicitly historical evidence rather than instructions.
 - Goal revision feedback is explicitly user-role candidate data rather than contract authority, Task success requires concrete evidence, and compaction recovery follows the current logical trigger without inventing a user request from a Goal kickoff.
+- Session Chain append now uses a revisioned read-model checkpoint with an exact idempotency-key index, avoiding full event-log replay for ordinary head-matched writes while retaining full replay for retries, conflicts, recovery, and old checkpoints.
 
 ### Fixed
 
@@ -31,6 +32,11 @@
 - Goal Draft and Task terminal prompts now distinguish rejected tool attempts from the single recorded result; Goal State guidance matches the enforced evidence/reconsideration grammar and accepts contract-defined acceptance IDs.
 - Critical extension handlers remain scoped to their registered event, per-run tool projections cannot re-enable inactive tools, and recovered Rollup publication queues no longer retain stale in-memory errors or hide diagnostics from another window.
 - Session Chain manifests no longer repeat summary-tool workflow and trust rules already supplied by active tool metadata, and the L2 Rollup prompt now describes its serialized `[User]: {source JSON}` input exactly.
+- Pi session rewrites now publish durable temporary files atomically and keep trailing partial JSONL records from merging with later entries.
+- Goal runs now persist `goal_run_started` before provider execution, and Task terminal events reject missing or corrupt referenced artifacts before publication.
+- Rollup recovery now deduplicates branch queues, rechecks terminal publication under its generation lock, persists artifact ownership before publication, and retains failure events through bounded CAS recovery.
+- Session Chain write locks no longer expose an empty-file creation window, fast catalogs self-repair stale entries, and L2 reads reject mismatched artifact producers.
+- Pi-XK GitHub release builds now require the checkout commit to equal the release tag commit, and binary entrypoints reject incomplete, inconsistent, or extended provenance manifests.
 
 ## [0.1.1]
 

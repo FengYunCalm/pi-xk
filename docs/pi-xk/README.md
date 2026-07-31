@@ -83,4 +83,4 @@ flowchart LR
 
 ## 版本基线
 
-当前文档对应 2026-07-28 的 Pi-XK Goal V3、compaction recovery、Session Chain L1 V2 标题与既有 GitHub-only 发行实现。修正后的 `npm run test:pi-xk` 覆盖 Core `93/93`、Pi/Host 与 Extension `241 passed / 2 skipped`；旧的 `42/97`、`55/119`、`63/157` 都不再是完整验收证据。发布前还必须运行 `npm run check`、`./test.sh`、两组 Session Chain benchmark、摘要质量评估、单平台归档 smoke 和 `git diff --check`。
+当前文档对应 2026-07-31 的 Pi-XK Goal V3、compaction recovery、Session Chain L1 V2 标题、增量 append checkpoint 与既有 GitHub-only 发行实现。完整验收以当前 commit 实际执行 `npm run test:pi-xk` 的输出为准，不再在长期文档中固化会随回归测试增长而过期的计数；旧的 `42/97`、`55/119`、`63/157`、`93/241` 都不是当前完整证据。发布前还必须运行 `npm run check`、`./test.sh`、两组 Session Chain benchmark、摘要质量评估、隔离归档 smoke、Windows/macOS 定向 CI 和 `git diff --check`。

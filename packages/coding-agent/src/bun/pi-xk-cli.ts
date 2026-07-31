@@ -2,6 +2,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { VERSION } from "../config.ts";
+import { validatePiXkReleaseManifest } from "./pi-xk-release-manifest.ts";
 import { runBunCli } from "./run-cli.ts";
 
 const executableDirectory = dirname(process.execPath);
@@ -21,29 +22,15 @@ try {
 	console.error("Pi-XK release manifest is invalid. Extract the archive again and verify SHA256SUMS.");
 	process.exit(1);
 }
-if (
-	!parsedManifest ||
-	typeof parsedManifest !== "object" ||
-	!("schema" in parsedManifest) ||
-	parsedManifest.schema !== "pi-xk.github-release.v1" ||
-	!("version" in parsedManifest) ||
-	typeof parsedManifest.version !== "string" ||
-	!("piBaseVersion" in parsedManifest) ||
-	typeof parsedManifest.piBaseVersion !== "string"
-) {
+const manifest = validatePiXkReleaseManifest(parsedManifest, VERSION);
+if (!manifest) {
 	console.error("Pi-XK release manifest is invalid. Extract the archive again and verify SHA256SUMS.");
-	process.exit(1);
-}
-if (parsedManifest.piBaseVersion !== VERSION) {
-	console.error(
-		`Pi-XK release expects Pi ${parsedManifest.piBaseVersion}, but the executable contains Pi ${VERSION}.`,
-	);
 	process.exit(1);
 }
 
 const args = process.argv.slice(2);
 if (args.includes("--version") || args.includes("-v")) {
-	console.log(`pi-xk ${parsedManifest.version} (pi ${VERSION})`);
+	console.log(`pi-xk ${manifest.version} (pi ${VERSION})`);
 	process.exit(0);
 }
 

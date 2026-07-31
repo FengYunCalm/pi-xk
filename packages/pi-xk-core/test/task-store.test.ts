@@ -3,6 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+	ArtifactCorruptionError,
+	ArtifactNotFoundError,
+	ArtifactStore,
 	type TaskChildInfoV1,
 	TaskHeadConflictError,
 	TaskIdempotencyConflictError,
@@ -193,6 +196,67 @@ describe("TaskStore", () => {
 			}),
 		).rejects.toBeInstanceOf(TaskLifecycleTransitionError);
 	});
+
+	it.each([
+		["missing", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ArtifactNotFoundError],
+		["corrupt", null, ArtifactCorruptionError],
+	] as const)(
+		"rejects a %s referenced artifact before appending a terminal event",
+		async (_kind, artifactId, errorType) => {
+			const { store, projectRoot } = await createStore();
+			const spec = createSpec(`task_${_kind}_evidence`);
+			const created = await store.createTask(spec, {
+				eventId: `evt-${_kind}-created`,
+				idempotencyKey: `create:${_kind}`,
+			});
+			const started = await store.appendTaskStarted(
+				spec.taskId,
+				{
+					childSessionId: `child-${_kind}`,
+					childSessionFile: `child-${_kind}.jsonl`,
+					provider: "faux",
+					modelId: "faux",
+					thinkingLevel: "medium",
+					builtinTools: [],
+					attempt: 1,
+				},
+				{
+					eventId: `evt-${_kind}-started`,
+					idempotencyKey: `start:${_kind}`,
+					expectedHead: created.head,
+				},
+			);
+			let referencedArtifactId: string;
+			if (artifactId === null) {
+				const metadata = await new ArtifactStore(projectRoot).put({
+					contentType: "text/plain",
+					text: "task evidence",
+					producer: "pi-xk.test.v1",
+					sensitivity: "internal",
+					sourceIds: [spec.taskId],
+					createdAt: "2026-07-22T00:00:01.000Z",
+				});
+				referencedArtifactId = metadata.artifactId;
+				const digest = metadata.artifactId.slice("sha256:".length);
+				await writeFile(
+					join(projectRoot, ".pi-xk", "artifacts", "objects", digest.slice(0, 2), `${digest}.data`),
+					"tampered",
+				);
+			} else {
+				referencedArtifactId = artifactId;
+			}
+			const result = { ...createResult(spec.taskId), artifactIds: [referencedArtifactId] };
+
+			await expect(
+				store.appendTaskResult(spec.taskId, result, {
+					eventId: `evt-${_kind}-terminal`,
+					idempotencyKey: `terminal:${_kind}`,
+					expectedHead: started.head,
+				}),
+			).rejects.toBeInstanceOf(errorType);
+			await expect(store.replayTask(spec.taskId)).resolves.toMatchObject({ status: "running", head: started.head });
+		},
+	);
 
 	it("diagnoses and repairs a trailing partial event", async () => {
 		const { store, projectRoot } = await createStore();

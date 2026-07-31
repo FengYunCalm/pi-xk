@@ -1,8 +1,14 @@
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { TaskReadModelStaleError, type TaskResultEnvelopeV1, type TaskSpecV1, TaskStore } from "../src/index.ts";
+import {
+	ArtifactStore,
+	TaskReadModelStaleError,
+	type TaskResultEnvelopeV1,
+	type TaskSpecV1,
+	TaskStore,
+} from "../src/index.ts";
 
 const tempDirs: string[] = [];
 
@@ -22,7 +28,7 @@ function createSpec(taskId: string): TaskSpecV1 {
 	};
 }
 
-async function createCompletedTask(store: TaskStore, taskId: string): Promise<string> {
+async function createCompletedTask(store: TaskStore, taskId: string, artifactIds: string[] = []): Promise<string> {
 	const spec = createSpec(taskId);
 	const created = await store.createTask(spec, { eventId: `${taskId}:created`, idempotencyKey: `${taskId}:created` });
 	const started = await store.appendTaskStarted(
@@ -45,7 +51,7 @@ async function createCompletedTask(store: TaskStore, taskId: string): Promise<st
 		attempt: 1,
 		summary: "Reviewed.",
 		evidence: [{ kind: "text", value: "No blocking findings." }],
-		artifactIds: [],
+		artifactIds,
 		childSessionId: `${taskId}:child`,
 		childSessionFile: `${taskId}.jsonl`,
 		startedAt: "2026-07-22T00:00:01.000Z",
@@ -100,4 +106,39 @@ describe("Task read model", () => {
 		const rebuilt = await store.rebuildTaskReadModel("task_missing_artifact");
 		expect(rebuilt.result?.artifactStatus).toBe("missing");
 	});
+
+	it.each(["missing", "corrupt"] as const)(
+		"marks historical terminal evidence %s when an attached artifact is unavailable",
+		async (failure) => {
+			const projectRoot = join(tmpdir(), `pi-xk-task-read-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+			await mkdir(projectRoot, { recursive: true });
+			tempDirs.push(projectRoot);
+			const artifacts = new ArtifactStore(projectRoot);
+			const evidence = await artifacts.put({
+				contentType: "text/plain",
+				text: "referenced task evidence",
+				producer: "pi-xk.test.v1",
+				sensitivity: "internal",
+				sourceIds: ["task_attached_evidence"],
+				createdAt: "2026-07-22T00:00:01.000Z",
+			});
+			const store = new TaskStore(projectRoot);
+			await createCompletedTask(store, `task_attached_${failure}`, [evidence.artifactId]);
+			const digest = evidence.artifactId.slice("sha256:".length);
+			const dataPath = join(projectRoot, ".pi-xk", "artifacts", "objects", digest.slice(0, 2), `${digest}.data`);
+			if (failure === "missing") {
+				await rm(dataPath);
+				await rm(dataPath.replace(/\.data$/, ".json"));
+			} else await writeFile(dataPath, "tampered");
+
+			await expect(store.loadTaskReadModel(`task_attached_${failure}`)).rejects.toBeInstanceOf(
+				TaskReadModelStaleError,
+			);
+			const rebuilt = await store.rebuildTaskReadModel(`task_attached_${failure}`);
+			expect(rebuilt.result?.artifactStatus).toBe(failure);
+			const inspected = await store.inspectTask(`task_attached_${failure}`);
+			expect(inspected.result).toBeNull();
+			expect(inspected.resultDiagnostic).toBe(failure);
+		},
+	);
 });

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { type FileHandle, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
 	assertSessionBranchId,
@@ -8,6 +8,7 @@ import {
 	CHAIN_ROLLUP_SCHEMA,
 	type SegmentSummary,
 	type SessionBranchProjectionV1,
+	SessionChainHeadConflictError,
 	SessionChainLockedError,
 	type SessionChainRollupV1,
 	type SessionChainStore,
@@ -129,6 +130,44 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isHeadConflict(error: unknown): boolean {
+	return (
+		error instanceof SessionChainHeadConflictError ||
+		(error instanceof Error && error.name === "SessionChainHeadConflictError")
+	);
+}
+
+async function syncDerivedDirectory(directory: string): Promise<void> {
+	let handle: FileHandle;
+	try {
+		handle = await open(directory, "r");
+	} catch (error) {
+		if (
+			process.platform === "win32" &&
+			isRecord(error) &&
+			["EPERM", "EACCES", "EINVAL", "ENOTSUP"].includes(String(error.code))
+		) {
+			return;
+		}
+		throw error;
+	}
+	try {
+		await handle.sync();
+	} catch (error) {
+		if (
+			!(
+				process.platform === "win32" &&
+				isRecord(error) &&
+				["EPERM", "EACCES", "EINVAL", "ENOTSUP"].includes(String(error.code))
+			)
+		) {
+			throw error;
+		}
+	} finally {
+		await handle.close();
+	}
+}
+
 function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
 	const actual = Object.keys(value).sort();
 	const expected = [...keys].sort();
@@ -207,6 +246,7 @@ export class SessionChainRollupManager {
 		}
 		this.publicationErrors.delete(key);
 		if (!job || job.status === "published" || (job.status === "failed" && job.retryable === false)) return;
+		if (this.publicationQueues.has(key)) return;
 		this.enqueuePublication(host, job);
 	}
 
@@ -314,8 +354,15 @@ export class SessionChainRollupManager {
 		await mkdir(directory, { recursive: true });
 		const temporary = join(directory, `.${randomUUID()}.tmp`);
 		try {
-			await writeFile(temporary, content, { mode: 0o600 });
+			const handle = await open(temporary, "wx", 0o600);
+			try {
+				await handle.writeFile(content, "utf8");
+				await handle.sync();
+			} finally {
+				await handle.close();
+			}
 			await rename(temporary, path);
+			await syncDerivedDirectory(directory);
 		} finally {
 			await rm(temporary, { force: true });
 		}
@@ -746,34 +793,37 @@ export class SessionChainRollupManager {
 		stage: string,
 		error: unknown,
 	): Promise<void> {
-		try {
-			const classification = classifyRollupFailure(stage, error);
+		const classification = classifyRollupFailure(stage, error);
+		for (let conflictAttempt = 0; conflictAttempt < 3; conflictAttempt++) {
 			const replay = await this.store.replayChain(window.chainId);
 			const branch = findBranch(replay, window.branchId);
 			const attempt =
 				branch.rollupFailures.filter((failure) => failure.windowIndex === window.windowIndex).length + 1;
-			await this.store.appendRollupFailed(
-				window.chainId,
-				{
-					branchId: window.branchId,
-					windowIndex: window.windowIndex,
-					startOrdinal: window.startOrdinal,
-					endOrdinal: window.endOrdinal,
-					stage,
-					errorCode: classification.errorCode,
-					retryable: classification.retryable,
-					attempt,
-				},
-				{
-					eventId: `${window.chainId}:${window.branchId}:rollup:${window.windowIndex}:failed:${attempt}`,
-					idempotencyKey: `${window.chainId}:${window.branchId}:rollup:${window.windowIndex}:failed:${attempt}`,
-					expectedHead: replay.head,
-					actor: "runtime",
-					timestamp: this.now(),
-				},
-			);
-		} catch {
-			// Rollover is already committed; a secondary diagnostic failure must not invalidate it.
+			try {
+				await this.store.appendRollupFailed(
+					window.chainId,
+					{
+						branchId: window.branchId,
+						windowIndex: window.windowIndex,
+						startOrdinal: window.startOrdinal,
+						endOrdinal: window.endOrdinal,
+						stage,
+						errorCode: classification.errorCode,
+						retryable: classification.retryable,
+						attempt,
+					},
+					{
+						eventId: `${window.chainId}:${window.branchId}:rollup:${window.windowIndex}:failed:${attempt}`,
+						idempotencyKey: `${window.chainId}:${window.branchId}:rollup:${window.windowIndex}:failed:${attempt}`,
+						expectedHead: replay.head,
+						actor: "runtime",
+						timestamp: this.now(),
+					},
+				);
+				return;
+			} catch (appendError) {
+				if (!isHeadConflict(appendError) || conflictAttempt === 2) throw appendError;
+			}
 		}
 	}
 
@@ -814,6 +864,8 @@ export class SessionChainRollupManager {
 		scheduled: SessionChainRollupPublicationV1,
 	): Promise<void> {
 		let job = (await this.getPublication(scheduled.chainId, scheduled.branchId, scheduled.windowIndex)) ?? scheduled;
+		if (job.status === "published" || (job.status === "failed" && job.retryable === false)) return;
+		const recoverOrphan = job.status === "generating";
 		let replay = await this.store.replayChain(job.chainId);
 		let branch = findBranch(replay, job.branchId);
 		const existing = branch.rollups.find(
@@ -845,15 +897,23 @@ export class SessionChainRollupManager {
 			updatedAt: this.now(),
 		};
 		await this.writePublication(job);
-		await this.publishNext(host, job.chainId, job.branchId, "auto", job, async (artifactId) => {
-			job = {
-				...job,
-				status: "artifact_ready",
-				artifactId,
-				updatedAt: this.now(),
-			};
-			await this.writePublication(job);
-		});
+		await this.publishNext(
+			host,
+			job.chainId,
+			job.branchId,
+			"auto",
+			job,
+			async (artifactId) => {
+				job = {
+					...job,
+					status: "artifact_ready",
+					artifactId,
+					updatedAt: this.now(),
+				};
+				await this.writePublication(job);
+			},
+			recoverOrphan,
+		);
 		replay = await this.store.replayChain(job.chainId);
 		branch = findBranch(replay, job.branchId);
 		const published = branch.rollups.find(
@@ -895,6 +955,7 @@ export class SessionChainRollupManager {
 		mode: "auto" | "backfill" = "auto",
 		publication?: SessionChainRollupPublicationV1,
 		onArtifactReady?: (artifactId: string) => Promise<void>,
+		recoverOrphan = false,
 	): Promise<boolean> {
 		const config = await this.getConfig();
 		if (!config.enabled && mode === "auto") return false;
@@ -948,18 +1009,21 @@ export class SessionChainRollupManager {
 					: await this.nextWindow(chainId, branchId, config.interval);
 			if (!pending && !configuredWindow && mode === "auto") return false;
 			const orphaned =
-				pending || publication
+				pending || publicationArtifact || (!recoverOrphan && mode !== "backfill")
 					? null
 					: await this.readOrphanedRollup(chainId, branchId, expectedWindow.windowIndex);
 			const window = pending?.window ?? publicationArtifact?.window ?? orphaned?.window ?? configuredWindow;
 			if (!window) return false;
 			stage = "artifact_generation";
 			let artifactId = pending?.artifactId ?? publicationArtifact?.artifactId ?? orphaned?.artifactId ?? null;
+			let pendingWritten = false;
 			if (!artifactId) {
 				artifactId = await this.generateArtifact(host, window);
+				await this.writePending(window, artifactId);
+				pendingWritten = true;
 				await onArtifactReady?.(artifactId);
 			}
-			if (!pending) {
+			if (!pending && !pendingWritten) {
 				await this.writePending(window, artifactId);
 			}
 			stage = "event_publication";

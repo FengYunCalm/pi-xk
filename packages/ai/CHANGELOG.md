@@ -10,6 +10,7 @@
 
 - Fixed OpenCode Zen Go models configured for the OpenAI Responses API to dispatch through the Responses endpoint.
 - Fixed model catalog generation to preserve the last complete catalog when any required remote source is unavailable or returns an empty/invalid catalog, stage complete outputs before replacement, and require strict generation for build and release paths while allowing dynamic lookup of provider-specific model IDs.
+- Fixed generated model catalog publication to fsync complete staged trees and replace catalog directories as a unit, restoring the previous catalog when publication fails after the target is moved.
 - Updated Kimi Coding catalog references to the canonical `kimi-for-coding` model ID.
 - Fixed GitHub Copilot long-context pricing tiers in generated model metadata ([#6668](https://github.com/earendil-works/pi/issues/6668)).
 - Fixed Kimi Coding subscription models to report API-equivalent implied costs when models.dev reports zero pricing.

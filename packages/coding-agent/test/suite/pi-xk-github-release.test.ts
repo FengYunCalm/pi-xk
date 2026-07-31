@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { validatePiXkReleaseManifest } from "../../src/bun/pi-xk-release-manifest.ts";
 
 const suiteDirectory = dirname(fileURLToPath(import.meta.url));
 const workspaceRoot = resolve(suiteDirectory, "../../../..");
@@ -114,6 +115,34 @@ describe("Pi-XK GitHub release packaging", () => {
 		expect(workflow).toContain("SHA256SUMS");
 		expect(workflow).not.toContain("publish-npm");
 		expect(workflow).not.toContain("npm publish");
+		expect(workflow).toContain(`tag_commit="$(git rev-parse "\${RELEASE_TAG}^{commit}")"`);
+		expect(workflow).toContain(`if [[ "\${head_commit}" != "\${tag_commit}" ]]`);
+	});
+
+	it("validates the complete release manifest identity without accepting extra fields", () => {
+		const manifest = {
+			schema: "pi-xk.github-release.v1",
+			version: "0.1.0",
+			tag: "pi-xk-v0.1.0",
+			sourceCommit,
+			piBaseVersion: "0.80.10",
+			entrypoint: "pi-xk",
+			extension: "pi-xk-extension/dist/extension.js",
+		};
+
+		expect(validatePiXkReleaseManifest(manifest, "0.80.10")).toEqual(manifest);
+		for (const invalid of [
+			{ ...manifest, tag: "pi-xk-v0.2.0" },
+			{ ...manifest, sourceCommit: sourceCommit.toUpperCase() },
+			{ ...manifest, piBaseVersion: "0.80.9" },
+			{ ...manifest, entrypoint: "pi" },
+			{ ...manifest, extension: "other.js" },
+			{ ...manifest, unexpected: true },
+		]) {
+			expect(validatePiXkReleaseManifest(invalid, "0.80.10")).toBeUndefined();
+		}
+		const { extension: _extension, ...missingExtension } = manifest;
+		expect(validatePiXkReleaseManifest(missingExtension, "0.80.10")).toBeUndefined();
 	});
 
 	it("keeps Pi-XK release tags intact when normalizing changelog links", async () => {

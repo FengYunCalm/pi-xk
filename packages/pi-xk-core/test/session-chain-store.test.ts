@@ -2,6 +2,7 @@ import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { ArtifactStore } from "../src/artifact-store.ts";
 import {
 	CHAIN_ROLLUP_SCHEMA,
 	SEGMENT_SUMMARY_SCHEMA,
@@ -116,6 +117,25 @@ afterEach(async () => {
 });
 
 describe("SessionChainStore", () => {
+	it("rejects an L2 artifact whose stored producer does not match its schema", async () => {
+		const { store, projectRoot } = await createStore();
+		const chainId = "chain_rollup_wrong_producer";
+		const summaryArtifactId = await store.putSegmentSummary(createSummary(chainId));
+		const rollup = createRollup(chainId, summaryArtifactId);
+		const metadata = await new ArtifactStore(projectRoot).put({
+			contentType: "application/json",
+			value: rollup,
+			producer: "pi-xk.unrelated.v1",
+			sensitivity: "internal",
+			sourceIds: [chainId],
+			createdAt: rollup.provenance.generatedAt,
+		});
+
+		await expect(store.readChainRollup(metadata.artifactId)).rejects.toThrow(
+			"Rollup artifact producer does not match its schema",
+		);
+	});
+
 	it("prepares and commits one hash-chained rollover", async () => {
 		const { store } = await createStore();
 		const spec = createSpec("chain_happy_path");
@@ -747,6 +767,60 @@ describe("SessionChainStore", () => {
 			},
 		);
 	});
+
+	it("maintains an exact idempotency checkpoint across sequential fast appends", async () => {
+		const { projectRoot } = await createStore();
+		let fullReplayCount = 0;
+		const store = new SessionChainStore(projectRoot, { onFullReplay: () => fullReplayCount++ });
+		const spec = createSpec("chain_fast_append_checkpoint");
+		let current = await store.createChain(spec, {
+			eventId: "event-created",
+			idempotencyKey: "create:fast-append",
+		});
+		const createdHead = current.head;
+		fullReplayCount = 0;
+		let firstAppend: Awaited<ReturnType<SessionChainStore["appendMetadataUpdated"]>> | undefined;
+		for (let index = 1; index <= 10; index++) {
+			const appended = await store.appendMetadataUpdated(
+				spec.chainId,
+				{ title: `Fast append ${index}` },
+				{
+					eventId: `event-fast-${index}`,
+					idempotencyKey: `metadata:fast:${index}`,
+					expectedHead: current.head,
+					timestamp: `2026-07-22T00:05:${String(index).padStart(2, "0")}.000Z`,
+				},
+			);
+			firstAppend ??= appended;
+			current = appended;
+		}
+
+		const chainDirectory = join(projectRoot, ".pi-xk", "sessions", "chains", spec.chainId);
+		const checkpoint = JSON.parse(
+			await readFile(join(chainDirectory, "chain-read-model.checkpoint.json"), "utf8"),
+		) as { schema: string; sequence: number; idempotencyKeys: string[] };
+		expect(checkpoint).toMatchObject({
+			schema: "pi-xk.session-chain-read-model-checkpoint.v2",
+			sequence: 11,
+		});
+		expect(checkpoint.idempotencyKeys).toHaveLength(11);
+		expect(new Set(checkpoint.idempotencyKeys).size).toBe(11);
+		expect(fullReplayCount).toBe(0);
+
+		const retried = await store.appendMetadataUpdated(
+			spec.chainId,
+			{ title: "Fast append 1" },
+			{
+				eventId: "event-fast-1-retry",
+				idempotencyKey: "metadata:fast:1",
+				expectedHead: createdHead,
+				timestamp: "2026-07-22T00:05:01.000Z",
+			},
+		);
+		expect(retried).toEqual(firstAppend);
+		expect(fullReplayCount).toBe(1);
+		expect((await store.replayChain(spec.chainId)).events).toHaveLength(11);
+	}, 30_000);
 
 	it("diagnoses and repairs a trailing partial event", async () => {
 		const { store, projectRoot } = await createStore();

@@ -41,7 +41,7 @@ function snapshotGeneratedFiles(root: string): Record<string, string> {
 
 function runGenerator(
 	packageRoot: string,
-	options: { failUrl?: string; emptyUrl?: string } = {},
+	options: { failUrl?: string; emptyUrl?: string; publishFailure?: string } = {},
 ): ReturnType<typeof spawnSync> {
 	const preloaderPath = join(packageRoot, "fetch-fixture.mjs");
 	writeFileSync(
@@ -122,6 +122,7 @@ globalThis.fetch = async (input) => {
 				...process.env,
 				PI_TEST_FAIL_URL: options.failUrl ?? "",
 				PI_TEST_EMPTY_URL: options.emptyUrl ?? "",
+				PI_TEST_MODEL_CATALOG_PUBLISH_FAILURE: options.publishFailure ?? "",
 			},
 		},
 	);
@@ -180,5 +181,16 @@ describe("model catalog generation", () => {
 		expect(snapshot["src/providers/data/openrouter.json"]).toContain("openrouter/fusion");
 		expect(snapshot).not.toHaveProperty("src/providers/sentinel.models.ts");
 		expect(snapshot).not.toHaveProperty("src/providers/data/sentinel.json");
+	});
+
+	it("restores the previous catalog when directory publication fails after moving the target", () => {
+		const packageRoot = createPackageRoot();
+		const before = snapshotGeneratedFiles(packageRoot);
+
+		const result = runGenerator(packageRoot, { publishFailure: "after-target-backup" });
+
+		expect(result.status).not.toBe(0);
+		expect(snapshotGeneratedFiles(packageRoot)).toEqual(before);
+		expect(readdirSync(packageRoot).filter((entry) => entry.startsWith(".pi-model-catalog-"))).toEqual([]);
 	});
 });

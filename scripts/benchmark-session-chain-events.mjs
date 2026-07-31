@@ -1,14 +1,8 @@
-import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import { release, tmpdir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
-import {
-	SESSION_CHAIN_EVENT_SCHEMA,
-	SESSION_CHAIN_SPEC_SCHEMA,
-	SessionChainStore,
-} from "../packages/pi-xk-core/dist/index.js";
-import { stableJsonStringify } from "../packages/pi-xk-core/dist/stable-json.js";
+import { SESSION_CHAIN_SPEC_SCHEMA, SessionChainStore } from "../packages/pi-xk-core/dist/index.js";
 
 const DEFAULT_COUNTS = [100, 1000];
 const DEFAULT_RUNS = 3;
@@ -55,7 +49,8 @@ function median(values) {
 }
 
 async function generateChain(projectRoot, eventCount) {
-	const store = new SessionChainStore(projectRoot);
+	let fullReplayCount = 0;
+	const store = new SessionChainStore(projectRoot, { onFullReplay: () => fullReplayCount++ });
 	const chainId = `chain_benchmark_${eventCount}`;
 	const startedAt = performance.now();
 	const spec = {
@@ -74,32 +69,26 @@ async function generateChain(projectRoot, eventCount) {
 		},
 		createdAt: "2026-07-25T00:00:00.000Z",
 	};
-	const events = [];
-	let previousHash = null;
-	for (let sequence = 1; sequence <= eventCount; sequence++) {
-		const eventWithoutHash = {
-			schema: SESSION_CHAIN_EVENT_SCHEMA,
-			eventId: `event-${sequence}`,
+	let current = await store.createChain(spec, { eventId: "event-1", idempotencyKey: "benchmark:1" });
+	fullReplayCount = 0;
+	for (let sequence = 2; sequence <= eventCount; sequence++) {
+		current = await store.appendMetadataUpdated(
 			chainId,
-			sequence,
-			eventType: sequence === 1 ? "chain_created" : "chain_metadata_updated",
-			actor: "runtime",
-			timestamp: new Date(Date.UTC(2026, 6, 25, 0, 0, sequence - 1)).toISOString(),
-			prevHash: previousHash,
-			payload: sequence === 1 ? { spec } : { title: `Benchmark ${sequence}` },
-			schemaVersion: 1,
-			idempotencyKey: `benchmark:${sequence}`,
-		};
-		const hash = `sha256:${createHash("sha256").update(stableJsonStringify(eventWithoutHash)).digest("hex")}`;
-		events.push({ ...eventWithoutHash, hash });
-		previousHash = hash;
+			{ title: `Benchmark ${sequence}` },
+			{
+				eventId: `event-${sequence}`,
+				idempotencyKey: `benchmark:${sequence}`,
+				expectedHead: current.head,
+				timestamp: new Date(Date.UTC(2026, 6, 25, 0, 0, sequence - 1)).toISOString(),
+			},
+		);
 	}
 	const eventsPath = join(projectRoot, ".pi-xk", "sessions", "chains", chainId, "events.jsonl");
-	await mkdir(join(projectRoot, ".pi-xk", "sessions", "chains", chainId), { recursive: true });
-	await writeFile(eventsPath, `${events.map((event) => stableJsonStringify(event)).join("\n")}\n`);
-	await store.rebuildChainReadModel(chainId);
+	if (fullReplayCount !== 0) {
+		throw new Error(`${eventCount}-event sequential append performed ${fullReplayCount} full event-log replays`);
+	}
 	const generationMs = performance.now() - startedAt;
-	return { store, chainId, generationMs, eventBytes: (await stat(eventsPath)).size };
+	return { store, chainId, generationMs, eventBytes: (await stat(eventsPath)).size, fullReplayCount };
 }
 
 function markdown(results, environment) {
@@ -107,11 +96,11 @@ function markdown(results, environment) {
 		"Session Chain event/read-model benchmark",
 		`Environment: ${environment.platform} ${environment.release} · Node ${environment.node}`,
 		"",
-		"| Events | Event log | Generate | Median status | Bytes read | Mode | Peak RSS |",
-		"| ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+		"| Events | Event log | Sequential append | Full replays | Median status | Bytes read | Mode | Peak RSS |",
+		"| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
 		...results.map(
 			(result) =>
-				`| ${result.eventCount} | ${result.eventBytes} B | ${Math.round(result.generationMs)} ms | ${result.medianLoadMs.toFixed(3)} ms | ${result.maxBytesRead} B | ${result.modes.join(",")} | ${result.peakRssMiB.toFixed(1)} MiB |`,
+				`| ${result.eventCount} | ${result.eventBytes} B | ${Math.round(result.generationMs)} ms | ${result.fullReplayCount} | ${result.medianLoadMs.toFixed(3)} ms | ${result.maxBytesRead} B | ${result.modes.join(",")} | ${result.peakRssMiB.toFixed(1)} MiB |`,
 		),
 	].join("\n");
 }
@@ -146,6 +135,7 @@ try {
 			eventCount,
 			eventBytes: generated.eventBytes,
 			generationMs: generated.generationMs,
+			fullReplayCount: generated.fullReplayCount,
 			medianLoadMs: median(runs.map((run) => run.elapsedMs)),
 			maxBytesRead: Math.max(...runs.map((run) => run.bytesRead)),
 			modes: [...new Set(runs.map((run) => run.mode))],

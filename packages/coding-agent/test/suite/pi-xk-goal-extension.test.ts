@@ -418,6 +418,45 @@ afterEach(() => {
 });
 
 describe("Pi-XK Goal extension", () => {
+	it("fails closed before the provider when goal_run_started cannot be persisted", async () => {
+		class FailingRunStartGoalStore extends GoalStore {
+			override async appendLifecycleEvent(
+				...args: Parameters<GoalStore["appendLifecycleEvent"]>
+			): Promise<GoalWriteResult> {
+				if (args[1].eventType === "goal_run_started") throw new Error("injected goal run-start failure");
+				return await super.appendLifecycleEvent(...args);
+			}
+		}
+
+		let failingStore: FailingRunStartGoalStore | undefined;
+		const goalErrors: string[] = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				createPiXkGoalExtension({
+					createGoalStore: (projectRoot) => {
+						failingStore ??= new FailingRunStartGoalStore(projectRoot);
+						return failingStore;
+					},
+					onGoalError: (error) => goalErrors.push(error.message),
+					shouldDeferGoalContinuation: () => true,
+				}),
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const store = await createActiveGoal(harness, "goal_run_start_fail_closed");
+		harness.setResponses([fauxAssistantMessage("This response must never run.")]);
+
+		await harness.session.prompt("Continue the active Goal.");
+		await waitForAgent(harness);
+
+		expect(harness.faux.state.callCount).toBe(0);
+		expect(goalErrors).toContain("injected goal run-start failure");
+		expect((await store.replayGoal("goal_run_start_fail_closed")).events).not.toEqual(
+			expect.arrayContaining([expect.objectContaining({ eventType: "goal_run_started" })]),
+		);
+	});
+
 	it("reports and explicitly repairs an abandoned Goal write lock", async () => {
 		const notifications: string[] = [];
 		const harness = await createHarness({

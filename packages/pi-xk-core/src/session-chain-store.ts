@@ -153,14 +153,24 @@ interface SessionChainPaths {
 	lockPath: string;
 }
 
-interface SessionChainReadModelCheckpointV1 {
-	schema: "pi-xk.session-chain-read-model-checkpoint.v1";
+interface SessionChainReadModelCheckpointBase {
 	headEventOffset: number;
 	byteOffset: number;
 	sequence: number;
 	headHash: string;
 	readModelDigest: string;
 }
+
+interface SessionChainReadModelCheckpointV1 extends SessionChainReadModelCheckpointBase {
+	schema: "pi-xk.session-chain-read-model-checkpoint.v1";
+}
+
+interface SessionChainReadModelCheckpointV2 extends SessionChainReadModelCheckpointBase {
+	schema: "pi-xk.session-chain-read-model-checkpoint.v2";
+	idempotencyKeys: string[];
+}
+
+type SessionChainReadModelCheckpoint = SessionChainReadModelCheckpointV1 | SessionChainReadModelCheckpointV2;
 
 export interface SessionChainReadModelLoadDiagnostic {
 	mode: "fast" | "tail" | "full";
@@ -205,6 +215,11 @@ export interface SessionChainWriteResult {
 	head: SessionChainHead;
 }
 
+export interface SessionChainStoreOptions {
+	/** Test and benchmark observer for verified full event-log replay. */
+	onFullReplay?: (chainId: string) => void;
+}
+
 interface SessionChainEventWithoutHash {
 	schema:
 		| typeof SESSION_CHAIN_EVENT_SCHEMA
@@ -238,14 +253,24 @@ function readModelDigest(readModel: SessionChainReadModelV1): string {
 	return contentHash(stableJsonStringify(readModel));
 }
 
-function validateReadModelCheckpoint(value: unknown): SessionChainReadModelCheckpointV1 {
+function validateReadModelCheckpoint(value: unknown): SessionChainReadModelCheckpoint {
 	if (!isSessionChainRecord(value)) throw new SessionChainValidationError("Read model checkpoint must be an object");
+	const isV1 = value.schema === "pi-xk.session-chain-read-model-checkpoint.v1";
+	const isV2 = value.schema === "pi-xk.session-chain-read-model-checkpoint.v2";
 	validateSessionChainExactKeys(
 		value,
-		["schema", "headEventOffset", "byteOffset", "sequence", "headHash", "readModelDigest"],
+		[
+			"schema",
+			"headEventOffset",
+			"byteOffset",
+			"sequence",
+			"headHash",
+			"readModelDigest",
+			...(isV2 ? ["idempotencyKeys"] : []),
+		],
 		"Read model checkpoint",
 	);
-	if (value.schema !== "pi-xk.session-chain-read-model-checkpoint.v1") {
+	if (!isV1 && !isV2) {
 		throw new SessionChainValidationError("Read model checkpoint schema is unsupported");
 	}
 	const headEventOffset = validateSessionChainNonNegativeInteger(
@@ -256,14 +281,24 @@ function validateReadModelCheckpoint(value: unknown): SessionChainReadModelCheck
 	if (headEventOffset >= byteOffset) {
 		throw new SessionChainValidationError("Read model checkpoint head event range is invalid");
 	}
-	return {
-		schema: "pi-xk.session-chain-read-model-checkpoint.v1",
+	const common = {
 		headEventOffset,
 		byteOffset,
 		sequence: validateSessionChainNonNegativeInteger(value.sequence, "Read model checkpoint sequence"),
 		headHash: assertSessionChainHash(value.headHash, "Read model checkpoint headHash"),
 		readModelDigest: assertSessionChainHash(value.readModelDigest, "Read model checkpoint readModelDigest"),
 	};
+	if (isV1) return { schema: "pi-xk.session-chain-read-model-checkpoint.v1", ...common };
+	if (!Array.isArray(value.idempotencyKeys)) {
+		throw new SessionChainValidationError("Read model checkpoint idempotencyKeys must be an array");
+	}
+	const idempotencyKeys = value.idempotencyKeys.map((key) =>
+		validateSessionChainNonEmptyString(key, "Read model checkpoint idempotency key"),
+	);
+	if (idempotencyKeys.length !== common.sequence || new Set(idempotencyKeys).size !== idempotencyKeys.length) {
+		throw new SessionChainValidationError("Read model checkpoint idempotencyKeys do not match its sequence");
+	}
+	return { schema: "pi-xk.session-chain-read-model-checkpoint.v2", ...common, idempotencyKeys };
 }
 
 function validateCatalogEntry(value: unknown): SessionChainCatalogEntryV1 {
@@ -965,14 +1000,16 @@ export class SessionChainStore {
 	private readonly catalogPath: string;
 	private readonly catalogLocksDirectory: string;
 	private readonly artifacts: ArtifactStore;
+	private readonly onFullReplay: ((chainId: string) => void) | undefined;
 
-	constructor(projectRoot: string) {
+	constructor(projectRoot: string, options: SessionChainStoreOptions = {}) {
 		this.projectRoot = resolve(projectRoot);
 		this.sessionsDirectory = join(this.projectRoot, ".pi-xk", "sessions");
 		this.chainsDirectory = join(this.sessionsDirectory, "chains");
 		this.catalogPath = join(this.sessionsDirectory, "catalog.json");
 		this.catalogLocksDirectory = join(this.sessionsDirectory, "locks");
 		this.artifacts = new ArtifactStore(this.projectRoot);
+		this.onFullReplay = options.onFullReplay;
 	}
 
 	private paths(chainId: string): SessionChainPaths {
@@ -1067,6 +1104,7 @@ export class SessionChainStore {
 	}
 
 	private async readReplay(paths: SessionChainPaths, chainId: string): Promise<SessionChainReplay> {
+		this.onFullReplay?.(chainId);
 		try {
 			return replayRaw(chainId, await readFile(paths.eventsPath, "utf8"));
 		} catch (error) {
@@ -1080,7 +1118,12 @@ export class SessionChainStore {
 		replay: SessionChainReplay,
 	): Promise<SessionChainReadModelV1> {
 		const readModel = buildSessionChainReadModel(replay);
-		await this.writeReadModelProjection(paths, readModel, (await stat(paths.eventsPath)).size);
+		await this.writeReadModelProjection(
+			paths,
+			readModel,
+			(await stat(paths.eventsPath)).size,
+			replay.events.map((event) => event.idempotencyKey),
+		);
 		return readModel;
 	}
 
@@ -1088,25 +1131,33 @@ export class SessionChainStore {
 		paths: SessionChainPaths,
 		readModel: SessionChainReadModelV1,
 		byteOffset: number,
+		idempotencyKeys?: readonly string[],
 	): Promise<void> {
 		await this.replaceFile(paths.readModelPath, paths.chainDirectory, `${JSON.stringify(readModel, null, "\t")}\n`);
-		await this.writeReadModelCheckpoint(paths, readModel, byteOffset);
+		await this.writeReadModelCheckpoint(paths, readModel, byteOffset, idempotencyKeys);
 	}
 
 	private async writeReadModelCheckpoint(
 		paths: SessionChainPaths,
 		readModel: SessionChainReadModelV1,
 		byteOffset: number,
+		idempotencyKeys?: readonly string[],
 	): Promise<void> {
 		const headEventOffset = await this.findHeadEventOffset(paths, byteOffset);
-		const checkpoint: SessionChainReadModelCheckpointV1 = {
-			schema: "pi-xk.session-chain-read-model-checkpoint.v1",
+		const common: SessionChainReadModelCheckpointBase = {
 			headEventOffset,
 			byteOffset,
 			sequence: readModel.sequence,
 			headHash: readModel.baseHash,
 			readModelDigest: readModelDigest(readModel),
 		};
+		const checkpoint: SessionChainReadModelCheckpoint = idempotencyKeys
+			? {
+					schema: "pi-xk.session-chain-read-model-checkpoint.v2",
+					...common,
+					idempotencyKeys: [...idempotencyKeys],
+				}
+			: { schema: "pi-xk.session-chain-read-model-checkpoint.v1", ...common };
 		await this.replaceFile(
 			paths.readModelCheckpointPath,
 			paths.chainDirectory,
@@ -1157,7 +1208,7 @@ export class SessionChainStore {
 
 	private async readStoredReadModelCheckpoint(
 		paths: SessionChainPaths,
-	): Promise<SessionChainReadModelCheckpointV1 | undefined> {
+	): Promise<SessionChainReadModelCheckpoint | undefined> {
 		try {
 			return validateReadModelCheckpoint(
 				JSON.parse(await readFile(paths.readModelCheckpointPath, "utf8")) as unknown,
@@ -1190,7 +1241,7 @@ export class SessionChainStore {
 		}
 	}
 
-	private verifyCheckpointHead(chainId: string, checkpoint: SessionChainReadModelCheckpointV1, raw: string): boolean {
+	private verifyCheckpointHead(chainId: string, checkpoint: SessionChainReadModelCheckpoint, raw: string): boolean {
 		if (!raw.endsWith("\n")) return false;
 		const lines = raw.split("\n").filter((line) => line.length > 0);
 		if (lines.length !== 1 || !lines[0]) return false;
@@ -1207,7 +1258,10 @@ export class SessionChainStore {
 	private async inspectReadModelFastPath(
 		paths: SessionChainPaths,
 		chainId: string,
-	): Promise<(SessionChainReadModelLoadResult & { byteOffset: number }) | undefined> {
+	): Promise<
+		| (SessionChainReadModelLoadResult & { byteOffset: number; checkpoint: SessionChainReadModelCheckpoint })
+		| undefined
+	> {
 		const readModel = await this.readStoredReadModel(paths, chainId);
 		const checkpoint = await this.readStoredReadModelCheckpoint(paths);
 		if (
@@ -1230,6 +1284,7 @@ export class SessionChainStore {
 				readModel,
 				diagnostic: { mode: "fast", bytesRead: proofLength },
 				byteOffset: checkpoint.byteOffset,
+				checkpoint,
 			};
 		}
 		try {
@@ -1237,6 +1292,7 @@ export class SessionChainStore {
 				readModel: applyEventTail(chainId, readModel, tailRaw),
 				diagnostic: { mode: "tail", bytesRead: eventBytes.bytes.length },
 				byteOffset: eventBytes.fileSize,
+				checkpoint,
 			};
 		} catch {
 			return undefined;
@@ -1339,7 +1395,11 @@ export class SessionChainStore {
 		assertSessionChainArtifactId(artifactId, "artifactId");
 		const stored = await this.artifacts.read(artifactId);
 		try {
-			return validateSessionChainRollupV1(JSON.parse(stored.content) as unknown);
+			const rollup = validateSessionChainRollupV1(JSON.parse(stored.content) as unknown);
+			if (stored.metadata.producer !== rollup.schema) {
+				throw new SessionChainValidationError("Rollup artifact producer does not match its schema");
+			}
+			return rollup;
 		} catch (error) {
 			throw new SessionChainCorruptionError(
 				`Session Chain Rollup artifact is invalid: ${error instanceof Error ? error.message : artifactId}`,
@@ -1539,6 +1599,45 @@ export class SessionChainStore {
 	): Promise<SessionChainWriteResult> {
 		const paths = this.paths(chainId);
 		return await this.withFileLock(paths.lockPath, paths.locksDirectory, chainId, async () => {
+			const meta = this.mutationMeta(chainId, options);
+			let fast: Awaited<ReturnType<SessionChainStore["inspectReadModelFastPath"]>>;
+			try {
+				fast = await this.inspectReadModelFastPath(paths, chainId);
+			} catch (error) {
+				if (!(error instanceof SessionChainReadModelStaleError)) throw error;
+			}
+			if (
+				fast?.diagnostic.mode === "fast" &&
+				fast.checkpoint.schema === "pi-xk.session-chain-read-model-checkpoint.v2" &&
+				options.expectedHead.sequence === fast.readModel.sequence &&
+				options.expectedHead.hash === fast.readModel.baseHash &&
+				!fast.checkpoint.idempotencyKeys.includes(meta.idempotencyKey)
+			) {
+				const event = createEvent({
+					schema:
+						schemaVersion === 3
+							? SESSION_CHAIN_EVENT_V3_SCHEMA
+							: schemaVersion === 2
+								? SESSION_CHAIN_EVENT_V2_SCHEMA
+								: SESSION_CHAIN_EVENT_SCHEMA,
+					...meta,
+					sequence: fast.readModel.sequence + 1,
+					eventType,
+					prevHash: fast.readModel.baseHash,
+					payload,
+					schemaVersion,
+				});
+				const serialized = `${stableJsonStringify(event)}\n`;
+				const nextReadModel = applyEventTail(chainId, fast.readModel, serialized);
+				await this.appendEvent(paths, event);
+				await this.writeReadModelProjection(paths, nextReadModel, fast.byteOffset + Buffer.byteLength(serialized), [
+					...fast.checkpoint.idempotencyKeys,
+					meta.idempotencyKey,
+				]);
+				await this.updateCatalogEntry(nextReadModel);
+				return { event, head: headFor(event) };
+			}
+
 			const replay = await this.readReplay(paths, chainId);
 			if (replay.tailDiagnostic) throw new SessionChainRecoveryRequiredError(chainId);
 			const event = createEvent({
@@ -1548,7 +1647,7 @@ export class SessionChainStore {
 						: schemaVersion === 2
 							? SESSION_CHAIN_EVENT_V2_SCHEMA
 							: SESSION_CHAIN_EVENT_SCHEMA,
-				...this.mutationMeta(chainId, options),
+				...meta,
 				sequence: replay.head.sequence + 1,
 				eventType,
 				prevHash: replay.head.hash,
@@ -1637,6 +1736,7 @@ export class SessionChainStore {
 		const paths = this.paths(chainId);
 		const initial = await this.inspectReadModelFastPath(paths, chainId);
 		if (initial?.diagnostic.mode === "fast") {
+			await this.ensureCatalogEntry(initial.readModel);
 			return { readModel: initial.readModel, diagnostic: initial.diagnostic };
 		}
 		return await this.withFileLock(paths.lockPath, paths.locksDirectory, chainId, async () => {
@@ -1769,6 +1869,15 @@ export class SessionChainStore {
 			await this.replaceFile(this.catalogPath, this.sessionsDirectory, `${JSON.stringify(next, null, "\t")}\n`);
 			return next;
 		});
+	}
+
+	private async ensureCatalogEntry(readModel: SessionChainReadModelV1): Promise<void> {
+		const expected = catalogEntryFromReadModel(readModel);
+		const catalog = await this.loadCatalog();
+		const current = catalog.chains.find((entry) => entry.chainId === readModel.chainId);
+		if (!current || stableJsonStringify(current) !== stableJsonStringify(expected)) {
+			await this.updateCatalogEntry(readModel);
+		}
 	}
 
 	private async refreshCatalog(): Promise<SessionChainCatalogV1> {

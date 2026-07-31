@@ -157,6 +157,31 @@ describe("Session Chain read models", () => {
 		expect(fast.diagnostic.bytesRead).toBeLessThan((await stat(eventsPath)).size);
 	});
 
+	it("repairs a stale catalog entry while serving a valid fast read model", async () => {
+		const { store, projectRoot } = await storeForTest();
+		const chain = spec("chain_catalog_fast_repair");
+		const created = await store.createChain(chain, {
+			eventId: "event-created",
+			idempotencyKey: "create:catalog-fast-repair",
+		});
+		const catalogPath = join(projectRoot, ".pi-xk", "sessions", "catalog.json");
+		const staleCatalog = await readFile(catalogPath, "utf8");
+		await store.appendMetadataUpdated(
+			chain.chainId,
+			{ title: "Current title" },
+			{
+				eventId: "event-current-title",
+				idempotencyKey: "metadata:current-title",
+				expectedHead: created.head,
+			},
+		);
+		await writeFile(catalogPath, staleCatalog);
+
+		const loaded = await store.loadChainReadModelSnapshot(chain.chainId);
+		expect(loaded.diagnostic.mode).toBe("fast");
+		expect((await store.listChains())[0]).toMatchObject({ title: "Current title", sequence: 2 });
+	});
+
 	it("rejects an in-place mutation of the checkpoint head event", async () => {
 		const { store, projectRoot } = await storeForTest();
 		const chain = spec("chain_checkpoint_head_tamper");

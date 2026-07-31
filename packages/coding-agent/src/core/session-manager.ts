@@ -11,11 +11,13 @@ import {
 	openSync,
 	readdirSync,
 	readSync,
+	renameSync,
+	rmSync,
 	statSync,
 	writeFileSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
-import { dirname, join, resolve } from "path";
+import { basename, dirname, join, resolve } from "path";
 import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
@@ -526,12 +528,46 @@ export function getDefaultSessionDir(cwd: string, agentDir: string = getDefaultA
 const SESSION_READ_BUFFER_SIZE = 1024 * 1024;
 
 function parseSessionEntryLine(line: string): FileEntry | null {
-	if (!line.trim()) return null;
+	let contentStart = 0;
+	while (contentStart < line.length) {
+		const code = line.charCodeAt(contentStart);
+		if (code !== 0x09 && code !== 0x0d && code !== 0x20) break;
+		contentStart++;
+	}
+	if (contentStart === line.length || line.charCodeAt(contentStart) !== 0x7b) return null;
 	try {
 		return JSON.parse(line) as FileEntry;
 	} catch {
 		// Skip malformed lines
 		return null;
+	}
+}
+
+function fileEndsWithNewline(filePath: string): boolean {
+	const size = statSync(filePath).size;
+	if (size === 0) return false;
+	const fd = openSync(filePath, "r");
+	try {
+		const byte = Buffer.allocUnsafe(1);
+		return readSync(fd, byte, 0, 1, size - 1) === 1 && byte[0] === 0x0a;
+	} finally {
+		closeSync(fd);
+	}
+}
+
+function syncDirectoryPath(directory: string): void {
+	let directoryFd: number | undefined;
+	try {
+		directoryFd = openSync(directory, "r");
+		fsyncSync(directoryFd);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		const unsupportedOnWindows =
+			process.platform === "win32" &&
+			(code === "EINVAL" || code === "ENOTSUP" || code === "EPERM" || code === "EISDIR");
+		if (!unsupportedOnWindows) throw error;
+	} finally {
+		if (directoryFd !== undefined) closeSync(directoryFd);
 	}
 }
 
@@ -834,6 +870,7 @@ export class SessionManager {
 	private cwd: string;
 	private persist: boolean;
 	private flushed: boolean = false;
+	private appendNeedsNewline: boolean = false;
 	private fileEntries: FileEntry[] = [];
 	private byId: Map<string, SessionEntry> = new Map();
 	private labelsById: Map<string, string> = new Map();
@@ -865,6 +902,7 @@ export class SessionManager {
 	setSessionFile(sessionFile: string): void {
 		this.sessionFile = resolvePath(sessionFile);
 		if (existsSync(this.sessionFile)) {
+			this.appendNeedsNewline = statSync(this.sessionFile).size > 0 && !fileEndsWithNewline(this.sessionFile);
 			this.fileEntries = loadEntriesFromFile(this.sessionFile);
 
 			// If file was empty, initialize it with a valid session header. If it was
@@ -917,6 +955,7 @@ export class SessionManager {
 		this.labelTimestampsById.clear();
 		this.leafId = null;
 		this.flushed = false;
+		this.appendNeedsNewline = false;
 
 		if (this.persist) {
 			const fileTimestamp = timestamp.replace(/[:.]/g, "-");
@@ -948,13 +987,23 @@ export class SessionManager {
 
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
-		const fd = openSync(this.sessionFile, "w");
+		const directory = dirname(this.sessionFile);
+		const temporary = join(directory, `.${basename(this.sessionFile)}-${randomUUID()}.tmp`);
+		let fd: number | undefined;
 		try {
+			fd = openSync(temporary, "wx", 0o600);
 			for (const entry of this.fileEntries) {
 				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
 			}
-		} finally {
+			fsyncSync(fd);
 			closeSync(fd);
+			fd = undefined;
+			renameSync(temporary, this.sessionFile);
+			syncDirectoryPath(directory);
+			this.appendNeedsNewline = false;
+		} finally {
+			if (fd !== undefined) closeSync(fd);
+			rmSync(temporary, { force: true });
 		}
 	}
 
@@ -1019,23 +1068,13 @@ export class SessionManager {
 			}
 		}
 
-		let directoryFd: number | undefined;
-		try {
-			directoryFd = openSync(dirname(this.sessionFile), "r");
-			fsyncSync(directoryFd);
-		} catch (error) {
-			const code = (error as NodeJS.ErrnoException).code;
-			const unsupportedOnWindows =
-				process.platform === "win32" &&
-				(code === "EINVAL" || code === "ENOTSUP" || code === "EPERM" || code === "EISDIR");
-			if (!unsupportedOnWindows) {
-				throw error;
-			}
-		} finally {
-			if (directoryFd !== undefined) {
-				closeSync(directoryFd);
-			}
-		}
+		syncDirectoryPath(dirname(this.sessionFile));
+	}
+
+	private _appendSerializedEntry(entry: SessionEntry): void {
+		if (!this.sessionFile) return;
+		appendFileSync(this.sessionFile, `${this.appendNeedsNewline ? "\n" : ""}${JSON.stringify(entry)}\n`);
+		this.appendNeedsNewline = false;
 	}
 
 	_persist(entry: SessionEntry): void {
@@ -1044,7 +1083,7 @@ export class SessionManager {
 		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
 		if (!hasAssistant) {
 			if (this.flushed) {
-				appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+				this._appendSerializedEntry(entry);
 			} else {
 				// Mark as not flushed so when assistant arrives, all entries get written
 				this.flushed = false;
@@ -1063,7 +1102,7 @@ export class SessionManager {
 			}
 			this.flushed = true;
 		} else {
-			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			this._appendSerializedEntry(entry);
 		}
 	}
 

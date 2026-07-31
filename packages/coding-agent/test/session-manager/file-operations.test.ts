@@ -65,6 +65,23 @@ describe("loadEntriesFromFile", () => {
 		expect(entries).toHaveLength(2);
 	});
 
+	it("keeps future messages readable after a trailing partial line", () => {
+		const file = join(tempDir, "partial-tail.jsonl");
+		writeFileSync(
+			file,
+			'{"type":"session","version":3,"id":"abc","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n' +
+				'{"type":"message","id":"partial"',
+		);
+
+		const sessionManager = SessionManager.open(file, tempDir);
+		sessionManager.appendMessage({ role: "user", content: "survives", timestamp: 1 });
+
+		const entries = loadEntriesFromFile(file);
+		expect(entries).toHaveLength(2);
+		expect(entries[1]).toMatchObject({ type: "message", message: { role: "user", content: "survives" } });
+		expect(readFileSync(file, "utf8")).toContain('{"type":"message","id":"partial"\n{"type":"message"');
+	});
+
 	it("opens session files larger than Node's max string length", () => {
 		const file = join(tempDir, "large.jsonl");
 		writeFileSync(

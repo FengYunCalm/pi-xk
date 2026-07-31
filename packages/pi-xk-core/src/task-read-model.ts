@@ -15,6 +15,30 @@ export class TaskReadModelStaleError extends Error {
 	}
 }
 
+export async function assertTaskArtifactReferences(
+	artifactIds: readonly string[],
+	artifacts: ArtifactStore,
+): Promise<void> {
+	for (const artifactId of new Set(artifactIds)) await artifacts.read(artifactId);
+}
+
+async function artifactStatusFor(
+	artifactIds: readonly string[],
+	artifacts: ArtifactStore,
+): Promise<"valid" | "missing" | "corrupt"> {
+	let missing = false;
+	for (const artifactId of new Set(artifactIds)) {
+		try {
+			await artifacts.read(artifactId);
+		} catch (error) {
+			if (error instanceof ArtifactCorruptionError) return "corrupt";
+			if (error instanceof ArtifactNotFoundError) missing = true;
+			else throw error;
+		}
+	}
+	return missing ? "missing" : "valid";
+}
+
 function statusForTerminal(event: TaskEvent): TaskTerminalStatus {
 	switch (event.eventType) {
 		case "task_succeeded":
@@ -41,14 +65,10 @@ export async function buildTaskReadModel(replay: TaskReplay, artifacts: Artifact
 	);
 	let artifactStatus: "valid" | "missing" | "corrupt" | undefined;
 	if (terminal) {
-		try {
-			await artifacts.read(terminal.payload.resultArtifactId);
-			artifactStatus = "valid";
-		} catch (error) {
-			if (error instanceof ArtifactNotFoundError) artifactStatus = "missing";
-			else if (error instanceof ArtifactCorruptionError) artifactStatus = "corrupt";
-			else throw error;
-		}
+		artifactStatus = await artifactStatusFor(
+			[terminal.payload.resultArtifactId, ...terminal.payload.artifactIds],
+			artifacts,
+		);
 	}
 	return {
 		schema: TASK_READ_MODEL_SCHEMA,

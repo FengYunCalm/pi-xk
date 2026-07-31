@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { type FileHandle, mkdir, open, readFile, unlink } from "node:fs/promises";
+import { type FileHandle, link, mkdir, open, readFile, rm, unlink } from "node:fs/promises";
+import { basename, join } from "node:path";
 
 const LOCK_RETRY_LIMIT = 100;
 const LOCK_RETRY_DELAY_MS = 10;
@@ -87,6 +88,28 @@ export async function inspectFileWriteLock(lockPath: string): Promise<WriteLockD
 	};
 }
 
+async function publishStoredWriteLock(directory: string, lockPath: string, lock: StoredWriteLock): Promise<boolean> {
+	const temporary = join(directory, `.${basename(lockPath)}-${lock.nonce}.tmp`);
+	let handle: FileHandle | undefined;
+	try {
+		handle = await open(temporary, "wx", 0o600);
+		await handle.writeFile(`${JSON.stringify(lock)}\n`, "utf8");
+		await handle.sync();
+		await handle.close();
+		handle = undefined;
+		try {
+			await link(temporary, lockPath);
+			return true;
+		} catch (error) {
+			if (isErrno(error, "EEXIST")) return false;
+			throw error;
+		}
+	} finally {
+		await handle?.close().catch(() => {});
+		await rm(temporary, { force: true });
+	}
+}
+
 export async function withFileWriteLock<TResult>(
 	options: FileWriteLockOptions,
 	action: () => Promise<TResult>,
@@ -94,24 +117,15 @@ export async function withFileWriteLock<TResult>(
 	await mkdir(options.directory, { recursive: true });
 	const lock: StoredWriteLock = { pid: process.pid, nonce: randomUUID(), createdAt: new Date().toISOString() };
 	for (let attempt = 0; attempt < LOCK_RETRY_LIMIT; attempt++) {
-		let handle: FileHandle | undefined;
 		let ownsLock = false;
 		try {
-			try {
-				handle = await open(options.lockPath, "wx", 0o600);
-				ownsLock = true;
-			} catch (error) {
-				if (!isErrno(error, "EEXIST")) throw error;
+			if (!(await publishStoredWriteLock(options.directory, options.lockPath, lock))) {
 				await wait(LOCK_RETRY_DELAY_MS);
 				continue;
 			}
-			await handle.writeFile(`${JSON.stringify(lock)}\n`, "utf8");
-			await handle.sync();
-			await handle.close();
-			handle = undefined;
+			ownsLock = true;
 			return await action();
 		} finally {
-			await handle?.close().catch(() => {});
 			if (ownsLock) await unlink(options.lockPath).catch(() => {});
 		}
 	}
@@ -128,18 +142,12 @@ export async function repairAbandonedFileWriteLock(
 		nonce: randomUUID(),
 		createdAt: new Date().toISOString(),
 	};
-	let handle: FileHandle | undefined;
 	let ownsRecoveryLock = false;
 	try {
-		try {
-			handle = await open(options.recoveryLockPath, "wx", 0o600);
-			ownsRecoveryLock = true;
-		} catch (error) {
-			if (isErrno(error, "EEXIST")) throw options.error({ kind: "recovery-locked" });
-			throw error;
+		if (!(await publishStoredWriteLock(options.directory, options.recoveryLockPath, recoveryLock))) {
+			throw options.error({ kind: "recovery-locked" });
 		}
-		await handle.writeFile(`${JSON.stringify(recoveryLock)}\n`, "utf8");
-		await handle.sync();
+		ownsRecoveryLock = true;
 		const diagnostic = await inspectFileWriteLock(options.lockPath);
 		if (!diagnostic) return false;
 		if (diagnostic.malformed || !diagnostic.nonce) throw options.error({ kind: "malformed" });
@@ -150,7 +158,6 @@ export async function repairAbandonedFileWriteLock(
 		await unlink(options.lockPath);
 		return true;
 	} finally {
-		await handle?.close().catch(() => {});
 		if (ownsRecoveryLock) await unlink(options.recoveryLockPath).catch(() => {});
 	}
 }

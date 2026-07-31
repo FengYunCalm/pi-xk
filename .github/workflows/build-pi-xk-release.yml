@@ -34,6 +34,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.SOURCE_REF }}
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Setup Bun
@@ -65,11 +66,17 @@ jobs:
             echo "::error::Release tag ${RELEASE_TAG} does not match ${expected_tag}."
             exit 1
           fi
+          head_commit="$(git rev-parse HEAD)"
+          tag_commit="$(git rev-parse "${RELEASE_TAG}^{commit}")"
+          if [[ "${head_commit}" != "${tag_commit}" ]]; then
+            echo "::error::Checked out source ${head_commit} does not match ${RELEASE_TAG} commit ${tag_commit}."
+            exit 1
+          fi
           if ! rg -Fq "## [${version}]" docs/pi-xk/CHANGELOG.md; then
             echo "::error::Pi-XK changelog does not contain a ${version} release section."
             exit 1
           fi
-          git rev-parse HEAD > /tmp/pi-xk-source-sha
+          printf '%s\n' "${head_commit}" > /tmp/pi-xk-source-sha
 
       - name: Build
         run: npm run build
