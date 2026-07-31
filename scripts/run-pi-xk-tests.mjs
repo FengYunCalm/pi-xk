@@ -16,6 +16,10 @@ if (args.some((arg) => arg !== "--platform-smoke")) {
 }
 const platformSmoke = args.includes("--platform-smoke");
 const buildCommands = [
+	["--workspace", "@earendil-works/pi-tui", "run", "build"],
+	["exec", "--workspace", "@earendil-works/pi-ai", "--", "tsgo", "-p", "tsconfig.build.json"],
+	["exec", "--workspace", "@earendil-works/pi-ai", "--", "shx", "rm", "-rf", "dist/providers/data"],
+	["exec", "--workspace", "@earendil-works/pi-ai", "--", "shx", "cp", "-r", "src/providers/data", "dist/providers/data"],
 	["--workspace", "@earendil-works/pi-agent-core", "run", "build"],
 	["--workspace", "@earendil-works/pi-coding-agent", "run", "build"],
 	["--workspace", "pi-xk-core", "run", "build"],
@@ -99,6 +103,8 @@ for (const args of commands) {
 		cwd: workspaceRoot,
 		stdio: "inherit",
 		env: { ...process.env, TEMP: testTempDir, TMP: testTempDir, TMPDIR: testTempDir },
+		shell: process.platform === "win32",
+		windowsHide: process.platform === "win32",
 	});
 	if (result.error) throw result.error;
 	if (result.status !== 0) process.exit(result.status ?? 1);
