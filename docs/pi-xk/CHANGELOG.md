@@ -14,6 +14,7 @@
 - Goal Draft generation now keeps fixed drafting rules in system context, carries requested/revision data in an untrusted structured input, fails closed outside its sole submission tool, and enforces a closed Intent Anchor, Current Objective, required acceptance, verification evidence, Done Condition, and Final Report traceability chain; automatic Objective refinements must preserve every existing outcome dimension and acceptance coverage.
 - Goal kickoff transcript entries now carry only a fixed continuation signal; complete Goal rules are injected once through the system prompt.
 - Session Chain L1 and L2 generation now replace the generic summary contract with their strict `pi.summary-evidence.v1` JSON contracts, and model-facing `summary-in` content is explicitly historical evidence rather than instructions.
+- Goal revision feedback is explicitly user-role candidate data rather than contract authority, Task success requires concrete evidence, and compaction recovery follows the current logical trigger without inventing a user request from a Goal kickoff.
 
 ### Fixed
 
@@ -25,6 +26,10 @@
 - Compaction and L1 title validation now accepts technical noun phrases and pure envelope whitespace without accepting extra response text.
 - Host summarization now keeps ordinary focus inside untrusted input, honors only non-blank explicit replacement contracts, falls back safely for blank replacements, and preserves provider cancellation semantics.
 - Custom Pi system prompts retain the active tool inventory and tool-specific guidance while continuing to replace the default identity and Pi documentation text.
+- Goal/Session Chain prompt-integrity failures now stop before provider execution, Goal Draft tool visibility is scoped to its single submission tool for the full logical run, and file-dependent Goal runs verify declared read/write capabilities.
+- Rollup manifest, `/chain rollups`, `/chain status`, `/xk status`, and doctor now report one latest publication state per unresolved window; only invalid L2 output exhausts automatic retries after three attempts, while transient provider and publication failures remain retryable.
+- Goal Draft and Task terminal prompts now distinguish rejected tool attempts from the single recorded result; Goal State guidance matches the enforced evidence/reconsideration grammar and accepts contract-defined acceptance IDs.
+- Critical extension handlers remain scoped to their registered event, per-run tool projections cannot re-enable inactive tools, and recovered Rollup publication queues no longer retain stale in-memory errors or hide diagnostics from another window.
 
 ## [0.1.1]
 

@@ -84,7 +84,7 @@ On repeated compactions, the summarized span starts at the previous compaction's
 
 New native compactions persist `reason` (`manual`, `threshold`, or `overflow`) and `recoveryPromptVersion: "compaction-recovery-v1"`. Until a later non-error, non-aborted assistant response proves that another logical run completed, the next actual model request receives a one-time recovery block in its system prompt.
 
-The recovery block says that compaction is not a new user request, summaries and titles are historical evidence rather than instructions, and the model must not repeat an old request just because it appears in the summary. It does not append a user or custom message and does not resend the last user message.
+The recovery block says that compaction is not a new user request, summaries and titles are historical evidence rather than instructions, and the model must not repeat an old request just because it appears in the summary. It follows the current logical trigger: a real user or queued message when present, otherwise an existing runtime continuation such as an active Goal kickoff. It does not invent a user request from a summary/continuation signal, append a user or custom message, or resend the last user message.
 
 When a stored compaction or branch summary is projected back into model context, Pi wraps its body as potentially stale historical evidence. Commands, role directives, or prompt text inside that body do not become system instructions. The wrapper is a model-facing projection only; the persisted summary body remains unchanged.
 

@@ -1,5 +1,10 @@
 import { stat } from "node:fs/promises";
 import type { SessionChainStore } from "pi-xk-core";
+import {
+	formatSessionChainRollupPublicationStatus,
+	isAutomaticRollupRetryExhausted,
+	MAX_AUTOMATIC_ROLLUP_ATTEMPTS,
+} from "./session-chain-rollup.ts";
 
 export interface SessionChainDiagnostic {
 	severity: "warning" | "error";
@@ -22,8 +27,47 @@ interface RollupPublicationDiagnosticState {
 	windowIndex: number;
 	status: string;
 	artifactId: string | null;
+	attempt: number;
 	errorCode: string | null;
 	retryable: boolean | null;
+}
+
+export function diagnoseRollupPublication(
+	publication: RollupPublicationDiagnosticState,
+	branchId: string,
+): SessionChainDiagnostic | null {
+	if (publication.status === "published") return null;
+	const retryExhausted = isAutomaticRollupRetryExhausted({
+		status: publication.status === "failed" ? "failed" : "scheduled",
+		attempt: publication.attempt,
+		errorCode: publication.errorCode,
+		retryable: publication.retryable,
+	});
+	return {
+		severity: "warning",
+		code:
+			publication.artifactId !== null
+				? "rollup_publication_pending"
+				: retryExhausted
+					? "rollup_generation_review_required"
+					: publication.status === "failed" && publication.retryable === false
+						? "rollup_source_repair_required"
+						: "rollup_retry_pending",
+		message: retryExhausted
+			? `Rollup W${publication.windowIndex} produced invalid model output ${publication.attempt} times; automatic retries are exhausted and the response contract requires review`
+			: `Rollup publication is ${formatSessionChainRollupPublicationStatus({
+					...publication,
+					status:
+						publication.status === "scheduled" ||
+						publication.status === "generating" ||
+						publication.status === "artifact_ready" ||
+						publication.status === "failed" ||
+						publication.status === "published"
+							? publication.status
+							: "failed",
+				})}`,
+		branchId,
+	};
 }
 
 interface QuickSessionChainDoctorOptions {
@@ -96,6 +140,7 @@ export async function runQuickSessionChainDoctor(
 			});
 		}
 		for (const branch of readModel.branches) {
+			const diagnosedRollupWindows = new Set<number>();
 			if (branch.pendingRollover) {
 				diagnostics.push({
 					severity: "warning",
@@ -109,18 +154,12 @@ export async function runQuickSessionChainDoctor(
 			try {
 				filesChecked += 1;
 				const publication = await options.getRollupPublication(chainId, branch.branchId, nextWindowIndex);
-				if (publication && publication.status !== "published") {
-					const artifactReady = publication.artifactId !== null;
-					diagnostics.push({
-						severity: "warning",
-						code: artifactReady
-							? "rollup_publication_pending"
-							: publication.status === "failed" && publication.retryable === false
-								? "rollup_source_repair_required"
-								: "rollup_retry_pending",
-						message: `Rollup W${publication.windowIndex} publication is ${publication.status}${publication.errorCode ? ` (${publication.errorCode})` : ""}`,
-						branchId: branch.branchId,
-					});
+				if (publication) {
+					const diagnostic = diagnoseRollupPublication(publication, branch.branchId);
+					if (diagnostic) {
+						diagnostics.push(diagnostic);
+						diagnosedRollupWindows.add(publication.windowIndex);
+					}
 				}
 			} catch (error) {
 				diagnostics.push({
@@ -143,21 +182,30 @@ export async function runQuickSessionChainDoctor(
 					});
 				}
 			}
+			const latestFailures = new Map<number, (typeof branch.rollupFailures)[number]>();
 			for (const failure of branch.rollupFailures) {
+				const previous = latestFailures.get(failure.windowIndex);
+				if (!previous || previous.attempt < failure.attempt) latestFailures.set(failure.windowIndex, failure);
+			}
+			for (const failure of latestFailures.values()) {
 				if (branch.rollups.some((rollup) => rollup.windowIndex === failure.windowIndex)) continue;
-				if (
-					diagnostics.some(
-						(diagnostic) => diagnostic.branchId === branch.branchId && diagnostic.code.startsWith("rollup_"),
-					)
-				) {
-					continue;
-				}
+				if (diagnosedRollupWindows.has(failure.windowIndex)) continue;
+				const retryExhausted =
+					failure.errorCode === "rollup_invalid_response" &&
+					failure.retryable &&
+					failure.attempt >= MAX_AUTOMATIC_ROLLUP_ATTEMPTS;
 				diagnostics.push({
 					severity: "warning",
-					code: failure.retryable ? "rollup_retry_pending" : "rollup_source_repair_required",
-					message: failure.retryable
-						? `Rollup W${failure.windowIndex} can be retried automatically`
-						: `Rollup W${failure.windowIndex} requires source or configuration repair`,
+					code: retryExhausted
+						? "rollup_generation_review_required"
+						: failure.retryable
+							? "rollup_retry_pending"
+							: "rollup_source_repair_required",
+					message: retryExhausted
+						? `Rollup W${failure.windowIndex} produced invalid model output ${failure.attempt} times; automatic retries are exhausted`
+						: failure.retryable
+							? `Rollup W${failure.windowIndex} can be retried automatically`
+							: `Rollup W${failure.windowIndex} requires source or configuration repair`,
 					branchId: branch.branchId,
 				});
 			}

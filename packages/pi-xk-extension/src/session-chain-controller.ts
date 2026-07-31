@@ -26,6 +26,7 @@ import {
 	type SessionSegmentProjectionV1,
 } from "pi-xk-core";
 import {
+	diagnoseRollupPublication,
 	runQuickSessionChainDoctor,
 	type SessionChainDiagnostic,
 	type SessionChainDoctorReport,
@@ -33,6 +34,8 @@ import {
 import { SessionChainControllerError } from "./session-chain-errors.ts";
 import {
 	DEFAULT_SESSION_CHAIN_ROLLUP_INTERVAL,
+	formatSessionChainRollupPublicationStatus,
+	MAX_AUTOMATIC_ROLLUP_ATTEMPTS,
 	SESSION_CHAIN_ROLLUP_PROMPT_VERSION,
 	type SessionChainRollupConfig,
 	SessionChainRollupManager,
@@ -50,7 +53,11 @@ import { isPiXkSessionLink } from "./session-link.ts";
 
 export type { SessionChainDiagnostic, SessionChainDoctorReport } from "./session-chain-doctor.ts";
 export { SessionChainControllerError } from "./session-chain-errors.ts";
-export { DEFAULT_SESSION_CHAIN_ROLLUP_INTERVAL, SESSION_CHAIN_ROLLUP_PROMPT_VERSION };
+export {
+	DEFAULT_SESSION_CHAIN_ROLLUP_INTERVAL,
+	formatSessionChainRollupPublicationStatus,
+	SESSION_CHAIN_ROLLUP_PROMPT_VERSION,
+};
 export type { SessionChainRollupConfig, SessionChainRollupPublicationState, SessionChainRollupPublicationV1 };
 
 export const PI_XK_SESSION_CHAIN_LINK_CUSTOM_TYPE = "pi-xk.session-chain-link";
@@ -2485,9 +2492,27 @@ export class SessionChainController {
 				});
 			}
 			const nextRollupWindowIndex = (branch.rollups.at(-1)?.windowIndex ?? 0) + 1;
+			let diagnosedRollupWindow: number | undefined;
+			try {
+				const publication = await this.getRollupPublication(chainId, branch.branchId, nextRollupWindowIndex);
+				if (publication) {
+					const diagnostic = diagnoseRollupPublication(publication, branch.branchId);
+					if (diagnostic) {
+						diagnostics.push(diagnostic);
+						diagnosedRollupWindow = publication.windowIndex;
+					}
+				}
+			} catch (error) {
+				diagnostics.push({
+					severity: "error",
+					code: "rollup_publication_state_invalid",
+					message: error instanceof Error ? error.message : String(error),
+					branchId: branch.branchId,
+				});
+			}
 			try {
 				const pendingRollup = await this.readPendingRollup(chainId, branch.branchId, nextRollupWindowIndex);
-				if (pendingRollup) {
+				if (pendingRollup && diagnosedRollupWindow !== nextRollupWindowIndex) {
 					diagnostics.push({
 						severity: "warning",
 						code: "rollup_publication_pending",
@@ -2662,14 +2687,30 @@ export class SessionChainController {
 					});
 				}
 			}
+			const latestFailures = new Map<number, (typeof branch.rollupFailures)[number]>();
 			for (const failure of branch.rollupFailures) {
+				const previous = latestFailures.get(failure.windowIndex);
+				if (!previous || previous.attempt < failure.attempt) latestFailures.set(failure.windowIndex, failure);
+			}
+			for (const failure of latestFailures.values()) {
 				if (branch.rollups.some((rollup) => rollup.windowIndex === failure.windowIndex)) continue;
+				if (diagnosedRollupWindow === failure.windowIndex) continue;
+				const retryExhausted =
+					failure.errorCode === "rollup_invalid_response" &&
+					failure.retryable &&
+					failure.attempt >= MAX_AUTOMATIC_ROLLUP_ATTEMPTS;
 				diagnostics.push({
 					severity: "warning",
-					code: failure.retryable ? "rollup_retry_pending" : "rollup_source_repair_required",
-					message: failure.retryable
-						? `Rollup W${failure.windowIndex} failed at ${failure.stage} and remains retryable`
-						: `Rollup W${failure.windowIndex} failed at ${failure.stage} and requires source or configuration repair`,
+					code: retryExhausted
+						? "rollup_generation_review_required"
+						: failure.retryable
+							? "rollup_retry_pending"
+							: "rollup_source_repair_required",
+					message: retryExhausted
+						? `Rollup W${failure.windowIndex} produced invalid model output ${failure.attempt} times; automatic retries are exhausted`
+						: failure.retryable
+							? `Rollup W${failure.windowIndex} failed at ${failure.stage} and remains retryable`
+							: `Rollup W${failure.windowIndex} failed at ${failure.stage} and requires source or configuration repair`,
 					branchId: branch.branchId,
 				});
 			}

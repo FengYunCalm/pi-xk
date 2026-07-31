@@ -128,7 +128,7 @@ V3 State 的 `recent_work_log` 最多保留 20 条重要记录。`tried_and_reje
 
 - `running` 是否有 live child；
 - terminal status 是 succeeded、failed、cancelled 还是 orphaned；
-- result artifact 与 evidence 是否存在；
+- succeeded result 是否至少包含一条能证明 expected result 的非空 evidence；
 - parent result 是否已经 delivered。
 
 `orphaned` 表示 runtime 无法确认 child 正常收束，不表示 child 的进程或副作用已回滚。需要结合进程、workspace diff 和任务证据继续审计。
@@ -208,6 +208,8 @@ Rollup 发布的故障边界与 rollover 分开：
 5. artifact、sourceDigest 或 event identity 损坏：doctor 报 error，不自动重写事实源。
 
 后台 publication 每个 branch 串行执行，并由 branch/window generation lock 防止多个进程重复调用模型。状态依次为 `scheduled`、`generating`、`artifact_ready`、`published`，失败为 `failed`。进程退出后，下次启动根据 job/pending/artifact 恢复；非重试型 provenance/schema/config 错误必须先修来源。
+
+无效 L2 响应最多自动尝试 3 次，之后显示 `automatic retries exhausted`，需要审查 prompt/响应合同；provider timeout、临时 I/O 或 event publication 错误不使用该上限。`/chain rollups` 只展示每个窗口的最新 publication，历史失败 attempt 继续留在 event log，不会重复显示成多个当前窗口。
 
 关闭自动 Rollup 不会禁用 doctor 或只读摘要工具。
 
@@ -306,7 +308,7 @@ Pi-XK 在 provider 调用前尝试 rollover。失败时输入被明确保留在�
 
 ### Rollup 一直显示 retry pending
 
-先运行 `/chain rollups` 和 `/chain doctor`。确认 L1 artifact 完整、当前 model 可用、配置 interval 未改变来源预期，并检查 `.pi-xk/sessions/chains/<chain>/branches/<branch>/rollups/` 是否存在 pending publication。不要删除 artifact 或修改 event；可使用 `/chain rollup backfill` 重试最早缺失窗口。
+先运行 `/chain rollups` 和 `/chain doctor`。输出中的 attempt 是同一窗口的最新 publication 状态，不是多个窗口。确认 L1 artifact 完整、当前 model 可用、配置 interval 未改变来源预期，并检查 `.pi-xk/sessions/chains/<chain>/branches/<branch>/rollups/` 是否存在 pending publication。不要删除 artifact 或修改 event；可使用 `/chain rollup backfill` 重试最早缺失窗口。若显示 `automatic retries exhausted`，先审查 L2 输出合同或模型兼容性，不要继续机械重试无效响应。
 
 ### doctor 报 abandoned write lock
 

@@ -375,6 +375,110 @@ describe("AgentSession model and extension characterization", () => {
 		expect(harness.session.isIdle).toBe(true);
 	});
 
+	it("restores a per-run tool projection when a later hook cancels the run", async () => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", async () => ({ activeTools: ["read"] }));
+					pi.on("before_agent_start", async () => ({ cancel: true, reason: "cancel after projection" }));
+				},
+			],
+		});
+		harnesses.push(harness);
+		const activeTools = harness.session.getActiveToolNames();
+		harness.setResponses([fauxAssistantMessage("must not be requested")]);
+
+		await harness.session.prompt("hello");
+
+		expect(harness.faux.state.callCount).toBe(0);
+		expect(harness.session.getActiveToolNames()).toEqual(activeTools);
+	});
+
+	it("rejects a per-run projection that would enable an inactive tool", async () => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.registerTool({
+						name: "inactive_tool",
+						label: "inactive_tool",
+						description: "Must remain inactive",
+						parameters: Type.Object({}),
+						execute: async () => ({ content: [{ type: "text", text: "inactive" }], details: {} }),
+					});
+					pi.on("before_agent_start", async () => ({ activeTools: ["inactive_tool"] }));
+				},
+			],
+		});
+		harnesses.push(harness);
+		const activeTools = harness.session.getActiveToolNames().filter((name) => name !== "inactive_tool");
+		harness.session.setActiveToolsByName(activeTools);
+		harness.setResponses([fauxAssistantMessage("must not be requested")]);
+
+		await expect(harness.session.prompt("hello")).rejects.toThrow(
+			"before_agent_start activeTools may only restrict the current active tool set; unavailable: inactive_tool",
+		);
+
+		expect(harness.faux.state.callCount).toBe(0);
+		expect(harness.session.getActiveToolNames()).toEqual(activeTools);
+		expect(harness.session.isIdle).toBe(true);
+	});
+
+	it("fails before the provider and restores projected tools when critical context construction fails", async () => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", async () => ({ activeTools: ["read"] }));
+					pi.onCritical("context", async () => {
+						throw new Error("critical context unavailable");
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		const activeTools = harness.session.getActiveToolNames();
+		harness.setResponses([fauxAssistantMessage("must not be requested")]);
+
+		await expect(harness.session.prompt("hello")).rejects.toThrow("critical context unavailable");
+
+		expect(harness.faux.state.callCount).toBe(0);
+		expect(harness.session.getActiveToolNames()).toEqual(activeTools);
+		expect(harness.session.isIdle).toBe(true);
+	});
+
+	it("keeps a per-run tool projection narrow across reload and restores the reloaded tool set", async () => {
+		const registerExtension = (pi: ExtensionAPI): void => {
+			for (const name of ["projected_tool", "other_tool"]) {
+				pi.registerTool({
+					name,
+					label: name,
+					description: name,
+					parameters: Type.Object({}),
+					execute: async () => ({ content: [{ type: "text", text: name }], details: {} }),
+				});
+			}
+			pi.on("before_agent_start", async () => ({ activeTools: ["projected_tool"] }));
+		};
+		const harness = await createHarness({ extensionFactories: [registerExtension] });
+		harnesses.push(harness);
+		const activeTools = harness.session.getActiveToolNames();
+		let providerTools: string[] = [];
+		let toolsAfterReload: string[] = [];
+		harness.setResponses([
+			async (context) => {
+				providerTools = context.tools?.map((tool) => tool.name) ?? [];
+				await harness.session.reload();
+				toolsAfterReload = harness.session.getActiveToolNames();
+				return fauxAssistantMessage("done");
+			},
+		]);
+
+		await harness.session.prompt("hello");
+
+		expect(providerTools).toEqual(["projected_tool"]);
+		expect(toolsAfterReload).toEqual(["projected_tool"]);
+		expect(harness.session.getActiveToolNames()).toEqual(activeTools);
+	});
+
 	it("keeps the run active externally while before_agent_start observes the legacy idle state", async () => {
 		let markHookEntered: (() => void) | undefined;
 		let releaseHook: (() => void) | undefined;

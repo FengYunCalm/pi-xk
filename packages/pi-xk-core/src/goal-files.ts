@@ -214,6 +214,7 @@ function renderState(contract: GoalCurrentContract): string {
 			"# Goal State",
 			"",
 			"Maintain this execution ledger with native file tools. Preserve the identity header, keep contract_revision current, and retain at most 20 important recent_work_log entries.",
+			"Keep every required section and JSON field unchanged. Non-placeholder done entries must end with `evidence: <concrete evidence>`; non-placeholder tried_and_rejected entries must end with `reconsider_when: <specific condition>`.",
 			"",
 			"## contract_revision",
 			`- ${contract.revision}`,
@@ -222,7 +223,7 @@ function renderState(contract: GoalCurrentContract): string {
 			"- Goal created; execution evidence has not been audited yet.",
 			"",
 			"## done",
-			"- None yet. Record evidence with every completed item.",
+			"- None yet.",
 			"",
 			"## open",
 			"- Audit required acceptance and choose the highest-value next action.",
@@ -231,7 +232,7 @@ function renderState(contract: GoalCurrentContract): string {
 			"- None yet.",
 			"",
 			"## tried_and_rejected",
-			"- None yet. Every rejected path must include reconsider_when.",
+			"- None yet.",
 			"",
 			"## assumptions",
 			"- None recorded.",
@@ -247,14 +248,14 @@ function renderState(contract: GoalCurrentContract): string {
 			"",
 			"## acceptance_matrix",
 			...contract.acceptance.map(
-				(item) => `- ${item.id}: ${item.required ? "required" : "optional"}; unverified; evidence not recorded.`,
+				(item) => `- ${item.id}: ${item.required ? "required" : "optional"}; unverified; evidence: not recorded.`,
 			),
 			"",
 			"## recent_work_log",
 			"- Goal initialized.",
 			"",
 			"## pause_audit",
-			"- Record unmet required acceptance IDs, current evidence, incomplete conclusion, user request, and next best action before pausing.",
+			'- {"unmetRequiredAcceptanceIds":[],"currentEvidence":"","incompleteConclusion":"","userRequest":null,"nextBestAction":""}',
 			"",
 			"## final_evidence",
 			'- {"evidence":"","summary":"","verifiedAcceptanceIds":[]}',
@@ -379,34 +380,289 @@ function parseHeader(content: string): GoalFileHeader | undefined {
 	}
 }
 
-function sectionLines(content: string, section: string): string[] | undefined {
-	const lines = content.split(/\r?\n/);
-	const heading = `## ${section}`.toLowerCase();
-	const start = lines.findIndex((line) => line.trim().toLowerCase() === heading);
-	if (start < 0) return undefined;
-	const result: string[] = [];
-	for (const line of lines.slice(start + 1)) {
-		if (/^##\s+/.test(line.trim())) break;
-		if (line.trim().length > 0) result.push(line.trim());
+const V3_STATE_SECTIONS = [
+	"contract_revision",
+	"current_snapshot",
+	"done",
+	"open",
+	"decisions",
+	"tried_and_rejected",
+	"assumptions",
+	"latest_evidence",
+	"blocked_on",
+	"next_best_action",
+	"acceptance_matrix",
+	"recent_work_log",
+	"pause_audit",
+	"final_evidence",
+] as const;
+
+export interface GoalStateAcceptanceEntry {
+	id: string;
+	required: boolean;
+	status: "verified" | "unverified";
+	evidence: string;
+}
+
+export interface GoalPauseStateEvidence {
+	unmetRequiredAcceptanceIds: string[];
+	currentEvidence: string;
+	incompleteConclusion: string;
+	userRequest: string | null;
+	nextBestAction: string;
+}
+
+export interface GoalStateProjectionV3 {
+	contractRevision: number;
+	sections: Record<(typeof V3_STATE_SECTIONS)[number], string[]>;
+	acceptanceMatrix: GoalStateAcceptanceEntry[];
+	recentWorkLog: string[];
+	pauseAudit: GoalPauseStateEvidence;
+	finalEvidence: GoalCompletionStateEvidence;
+}
+
+function parseSingleJsonBullet(lines: string[], section: string): Record<string, unknown> {
+	if (lines.length !== 1 || !/^[-*]\s+/.test(lines[0] ?? "")) {
+		throw new GoalFileError(`state ${section} must contain exactly one JSON object`);
 	}
-	return result;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse((lines[0] ?? "").replace(/^[-*]\s+/, "")) as unknown;
+	} catch {
+		throw new GoalFileError(`state ${section} is not valid JSON`);
+	}
+	if (!isRecord(parsed)) throw new GoalFileError(`state ${section} must contain a JSON object`);
+	return parsed;
+}
+
+function validateExactKeys(value: Record<string, unknown>, keys: readonly string[], section: string): void {
+	if (Object.keys(value).sort().join(",") !== [...keys].sort().join(",")) {
+		throw new GoalFileError(`state ${section} has unknown or missing fields`);
+	}
+}
+
+function isMissingEvidence(value: string): boolean {
+	return /^(?:not recorded|none)\.?$/iu.test(value.trim());
+}
+
+function validateStructuredLedgerSection(
+	lines: string[],
+	section: "done" | "tried_and_rejected",
+	field: "evidence" | "reconsider_when",
+): void {
+	const values = lines.map((line) => line.replace(/^[-*]\s+/, ""));
+	const placeholders = values.filter((value) => value === "None yet.");
+	if (placeholders.length > 0) {
+		if (placeholders.length !== 1 || values.length !== 1) {
+			throw new GoalFileError(`state ${section} placeholder must be the only entry`);
+		}
+		return;
+	}
+	for (const value of values) {
+		const match = new RegExp(`\\b${field}\\s*:\\s*(.+)$`, "iu").exec(value);
+		if (!match?.[1]?.trim() || isMissingEvidence(match[1])) {
+			throw new GoalFileError(`state ${section} entries must include concrete ${field}`);
+		}
+	}
+}
+
+export function parseGoalStateProjection(
+	content: string,
+	contract: Extract<GoalCurrentContract, { schemaVersion: 3 }>,
+): GoalStateProjectionV3 {
+	const lines = content.split(/\r?\n/);
+	const headingIndexes = new Map<string, number[]>();
+	for (const [index, line] of lines.entries()) {
+		const match = /^##\s+(.+?)\s*$/.exec(line.trim());
+		if (!match?.[1]) continue;
+		const name = match[1].toLowerCase();
+		headingIndexes.set(name, [...(headingIndexes.get(name) ?? []), index]);
+	}
+	const allowedSections = new Set<string>(V3_STATE_SECTIONS);
+	for (const section of headingIndexes.keys()) {
+		if (!allowedSections.has(section)) throw new GoalFileError(`state contains unknown section ${section}`);
+	}
+	for (const section of V3_STATE_SECTIONS) {
+		if ((headingIndexes.get(section)?.length ?? 0) !== 1) {
+			throw new GoalFileError(`state ${section} section must appear exactly once`);
+		}
+	}
+	const sections = {} as Record<(typeof V3_STATE_SECTIONS)[number], string[]>;
+	for (const section of V3_STATE_SECTIONS) {
+		const start = headingIndexes.get(section)?.[0];
+		if (start === undefined) throw new GoalFileError(`state ${section} section is missing`);
+		const endOffset = lines.slice(start + 1).findIndex((line) => /^##\s+/.test(line.trim()));
+		const end = endOffset < 0 ? lines.length : start + 1 + endOffset;
+		const values = lines
+			.slice(start + 1, end)
+			.map((line) => line.trim())
+			.filter((line) => line.length > 0);
+		if (values.length === 0) throw new GoalFileError(`state ${section} section must be non-empty`);
+		sections[section] = values;
+	}
+
+	const revisionLines = sections.contract_revision;
+	const revisionValue =
+		revisionLines.length === 1 && /^[-*]\s+\d+$/.test(revisionLines[0] ?? "")
+			? revisionLines[0]?.replace(/^[-*]\s+/, "")
+			: undefined;
+	const revision = revisionValue !== undefined && /^\d+$/.test(revisionValue) ? Number(revisionValue) : undefined;
+	if (revision === undefined || revision !== contract.revision) {
+		throw new GoalFileError(
+			`state contract revision ${revision ?? "missing"} does not match current revision ${contract.revision}`,
+		);
+	}
+
+	const bulletSections = V3_STATE_SECTIONS.filter(
+		(section) => section !== "contract_revision" && section !== "acceptance_matrix",
+	);
+	for (const section of bulletSections) {
+		if (sections[section].some((line) => !/^[-*]\s+/.test(line))) {
+			throw new GoalFileError(`state ${section} entries must be Markdown bullets`);
+		}
+	}
+	validateStructuredLedgerSection(sections.done, "done", "evidence");
+	validateStructuredLedgerSection(sections.tried_and_rejected, "tried_and_rejected", "reconsider_when");
+
+	const recentWorkLog = sections.recent_work_log.map((line) => line.replace(/^[-*]\s+/, ""));
+	if (recentWorkLog.length > 20) {
+		throw new GoalFileError(`state recent_work_log has ${recentWorkLog.length} entries; at most 20 are allowed`);
+	}
+
+	const acceptanceMatrix: GoalStateAcceptanceEntry[] = [];
+	for (const line of sections.acceptance_matrix) {
+		const body = /^[-*]\s+(.+)$/u.exec(line)?.[1];
+		const matches = body
+			? contract.acceptance.flatMap((acceptance) => {
+					if (!body.startsWith(acceptance.id)) return [];
+					const match = /^:\s+(required|optional);\s+(verified|unverified);\s+evidence:\s*(.+)$/iu.exec(
+						body.slice(acceptance.id.length),
+					);
+					return match?.[1] && match[2] && match[3]?.trim() ? [{ acceptance, match }] : [];
+				})
+			: [];
+		if (matches.length !== 1) {
+			throw new GoalFileError("state acceptance_matrix entries have an invalid format");
+		}
+		const [{ acceptance, match }] = matches;
+		if (acceptanceMatrix.some((entry) => entry.id === acceptance.id)) {
+			throw new GoalFileError(`state acceptance_matrix repeats acceptance ${acceptance.id}`);
+		}
+		acceptanceMatrix.push({
+			id: acceptance.id,
+			required: match[1].toLowerCase() === "required",
+			status: match[2].toLowerCase() as "verified" | "unverified",
+			evidence: match[3].trim(),
+		});
+	}
+	if (acceptanceMatrix.length !== contract.acceptance.length) {
+		throw new GoalFileError("state acceptance_matrix does not contain exactly the contract acceptance entries");
+	}
+	for (const acceptance of contract.acceptance) {
+		const entry = acceptanceMatrix.find((candidate) => candidate.id === acceptance.id);
+		if (!entry) throw new GoalFileError(`state acceptance_matrix is missing acceptance ${acceptance.id}`);
+		if (entry.required !== acceptance.required) {
+			throw new GoalFileError(
+				`state acceptance_matrix ${acceptance.id} required classification does not match the contract`,
+			);
+		}
+		if (entry.status === "verified" && isMissingEvidence(entry.evidence)) {
+			throw new GoalFileError(`state verified acceptance ${acceptance.id} requires concrete evidence`);
+		}
+	}
+
+	const pauseAuditValue = parseSingleJsonBullet(sections.pause_audit, "pause_audit");
+	validateExactKeys(
+		pauseAuditValue,
+		["unmetRequiredAcceptanceIds", "currentEvidence", "incompleteConclusion", "userRequest", "nextBestAction"],
+		"pause_audit",
+	);
+	if (
+		!Array.isArray(pauseAuditValue.unmetRequiredAcceptanceIds) ||
+		pauseAuditValue.unmetRequiredAcceptanceIds.some((id) => typeof id !== "string") ||
+		typeof pauseAuditValue.currentEvidence !== "string" ||
+		typeof pauseAuditValue.incompleteConclusion !== "string" ||
+		(pauseAuditValue.userRequest !== null && typeof pauseAuditValue.userRequest !== "string") ||
+		typeof pauseAuditValue.nextBestAction !== "string"
+	) {
+		throw new GoalFileError("state pause_audit has invalid field types");
+	}
+	const requiredAcceptanceIds = new Set(contract.acceptance.filter((item) => item.required).map((item) => item.id));
+	const unmetRequiredAcceptanceIds = pauseAuditValue.unmetRequiredAcceptanceIds as string[];
+	if (
+		new Set(unmetRequiredAcceptanceIds).size !== unmetRequiredAcceptanceIds.length ||
+		unmetRequiredAcceptanceIds.some((id) => !requiredAcceptanceIds.has(id))
+	) {
+		throw new GoalFileError("state pause_audit contains duplicate or ineligible acceptance IDs");
+	}
+	for (const acceptanceId of unmetRequiredAcceptanceIds) {
+		if (acceptanceMatrix.find((entry) => entry.id === acceptanceId)?.status === "verified") {
+			throw new GoalFileError(`state pause_audit marks verified acceptance ${acceptanceId} as unmet`);
+		}
+	}
+
+	const finalEvidenceValue = parseSingleJsonBullet(sections.final_evidence, "final_evidence");
+	validateExactKeys(finalEvidenceValue, ["evidence", "summary", "verifiedAcceptanceIds"], "final_evidence");
+	if (
+		!Array.isArray(finalEvidenceValue.verifiedAcceptanceIds) ||
+		finalEvidenceValue.verifiedAcceptanceIds.some((id) => typeof id !== "string") ||
+		typeof finalEvidenceValue.evidence !== "string" ||
+		typeof finalEvidenceValue.summary !== "string"
+	) {
+		throw new GoalFileError("state final_evidence has invalid field types");
+	}
+	const verifiedAcceptanceIds = finalEvidenceValue.verifiedAcceptanceIds as string[];
+	const acceptanceIds = new Set(contract.acceptance.map((item) => item.id));
+	if (new Set(verifiedAcceptanceIds).size !== verifiedAcceptanceIds.length) {
+		throw new GoalFileError("state final_evidence contains duplicate acceptance IDs");
+	}
+	for (const acceptanceId of verifiedAcceptanceIds) {
+		if (!acceptanceIds.has(acceptanceId)) {
+			throw new GoalFileError(`state final_evidence contains unknown acceptance ${acceptanceId}`);
+		}
+		if (acceptanceMatrix.find((entry) => entry.id === acceptanceId)?.status !== "verified") {
+			throw new GoalFileError(
+				`state final_evidence acceptance ${acceptanceId} is not verified in acceptance_matrix`,
+			);
+		}
+	}
+	if (
+		verifiedAcceptanceIds.length > 0 &&
+		(!finalEvidenceValue.evidence.trim() || !finalEvidenceValue.summary.trim())
+	) {
+		throw new GoalFileError("state final_evidence requires evidence and summary when acceptance IDs are recorded");
+	}
+
+	return {
+		contractRevision: revision,
+		sections,
+		acceptanceMatrix,
+		recentWorkLog,
+		pauseAudit: {
+			unmetRequiredAcceptanceIds,
+			currentEvidence: pauseAuditValue.currentEvidence,
+			incompleteConclusion: pauseAuditValue.incompleteConclusion,
+			userRequest: pauseAuditValue.userRequest,
+			nextBestAction: pauseAuditValue.nextBestAction,
+		},
+		finalEvidence: {
+			verifiedAcceptanceIds,
+			finalEvidence: finalEvidenceValue.evidence,
+			finalSummary: finalEvidenceValue.summary,
+		},
+	};
 }
 
 function inspectV3State(
 	content: string,
 	contract: Extract<GoalCurrentContract, { schemaVersion: 3 }>,
 ): string | undefined {
-	const revisionLines = sectionLines(content, "contract_revision");
-	const revisionValue = revisionLines?.length === 1 ? revisionLines[0]?.replace(/^[-*]\s+/, "") : undefined;
-	const revision = revisionValue !== undefined && /^\d+$/.test(revisionValue) ? Number(revisionValue) : undefined;
-	if (revision === undefined || revision !== contract.revision) {
-		return `state contract revision ${revision ?? "missing"} does not match current revision ${contract.revision}`;
+	try {
+		parseGoalStateProjection(content, contract);
+		return undefined;
+	} catch (error) {
+		return error instanceof Error ? error.message : String(error);
 	}
-	const workLog = sectionLines(content, "recent_work_log");
-	if (workLog === undefined) return "state recent_work_log section is missing";
-	const entryCount = workLog.filter((line) => /^[-*]\s+/.test(line)).length;
-	if (entryCount > 20) return `state recent_work_log has ${entryCount} entries; at most 20 are allowed`;
-	return undefined;
 }
 
 export interface GoalCompletionStateEvidence {
@@ -415,56 +671,76 @@ export interface GoalCompletionStateEvidence {
 	finalSummary: string;
 }
 
+export function validateGoalPauseState(
+	content: string,
+	contract: Extract<GoalCurrentContract, { schemaVersion: 3 }>,
+	evidence: GoalPauseStateEvidence,
+): string | undefined {
+	let state: GoalStateProjectionV3;
+	try {
+		state = parseGoalStateProjection(content, contract);
+	} catch (error) {
+		return error instanceof Error ? error.message : String(error);
+	}
+	const unverifiedRequiredAcceptanceIds = contract.acceptance
+		.filter(
+			(acceptance) =>
+				acceptance.required &&
+				state.acceptanceMatrix.find((entry) => entry.id === acceptance.id)?.status === "unverified",
+		)
+		.map((acceptance) => acceptance.id);
+	if (
+		state.pauseAudit.unmetRequiredAcceptanceIds.length !== unverifiedRequiredAcceptanceIds.length ||
+		state.pauseAudit.unmetRequiredAcceptanceIds.some((id, index) => id !== unverifiedRequiredAcceptanceIds[index])
+	) {
+		return "state pause_audit must list every unverified required acceptance in contract order";
+	}
+	if (
+		state.pauseAudit.unmetRequiredAcceptanceIds.length !== evidence.unmetRequiredAcceptanceIds.length ||
+		state.pauseAudit.unmetRequiredAcceptanceIds.some(
+			(id, index) => id !== evidence.unmetRequiredAcceptanceIds[index],
+		) ||
+		state.pauseAudit.currentEvidence !== evidence.currentEvidence ||
+		state.pauseAudit.incompleteConclusion !== evidence.incompleteConclusion ||
+		state.pauseAudit.userRequest !== evidence.userRequest ||
+		state.pauseAudit.nextBestAction !== evidence.nextBestAction
+	) {
+		return "state pause_audit does not match the requested Goal pause";
+	}
+	return undefined;
+}
+
 export function validateGoalCompletionState(
 	content: string,
 	contract: Extract<GoalCurrentContract, { schemaVersion: 3 }>,
 	evidence: GoalCompletionStateEvidence,
 ): string | undefined {
-	const stateError = inspectV3State(content, contract);
-	if (stateError) return stateError;
-	const acceptanceMatrix = sectionLines(content, "acceptance_matrix");
-	if (!acceptanceMatrix) return "state acceptance_matrix section is missing";
+	let state: GoalStateProjectionV3;
+	try {
+		state = parseGoalStateProjection(content, contract);
+	} catch (error) {
+		return error instanceof Error ? error.message : String(error);
+	}
 	for (const acceptance of contract.acceptance.filter((item) => item.required)) {
-		const line = acceptanceMatrix.find((candidate) => candidate.startsWith(`- ${acceptance.id}:`));
-		if (!line) return `state acceptance_matrix is missing required acceptance ${acceptance.id}`;
-		const normalized = line.toLowerCase();
-		const evidenceText = normalized.match(/;\s*evidence:\s*(.+)$/u)?.[1]?.trim();
-		if (
-			!/;\s*verified\s*;/u.test(normalized) ||
-			!evidenceText ||
-			evidenceText === "not recorded" ||
-			evidenceText === "none"
-		) {
+		const entry = state.acceptanceMatrix.find((candidate) => candidate.id === acceptance.id);
+		if (entry?.status !== "verified" || !entry.evidence || isMissingEvidence(entry.evidence)) {
 			return `state acceptance_matrix does not record verified evidence for ${acceptance.id}`;
 		}
 	}
-	const finalEvidenceLines = sectionLines(content, "final_evidence");
-	if (!finalEvidenceLines || finalEvidenceLines.length !== 1) {
-		return "state final_evidence must contain exactly one JSON object";
-	}
-	const serialized = finalEvidenceLines[0]?.replace(/^[-*]\s+/, "");
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(serialized ?? "");
-	} catch {
-		return "state final_evidence is not valid JSON";
-	}
-	if (!isRecord(parsed) || Object.keys(parsed).sort().join(",") !== "evidence,summary,verifiedAcceptanceIds") {
-		return "state final_evidence has unknown or missing fields";
-	}
 	if (
-		!Array.isArray(parsed.verifiedAcceptanceIds) ||
-		parsed.verifiedAcceptanceIds.some((item) => typeof item !== "string") ||
-		typeof parsed.evidence !== "string" ||
-		typeof parsed.summary !== "string"
+		state.pauseAudit.unmetRequiredAcceptanceIds.length > 0 ||
+		state.pauseAudit.currentEvidence.trim() ||
+		state.pauseAudit.incompleteConclusion.trim() ||
+		state.pauseAudit.userRequest !== null ||
+		state.pauseAudit.nextBestAction.trim()
 	) {
-		return "state final_evidence has invalid field types";
+		return "state pause_audit must be cleared before ending the Goal";
 	}
 	if (
-		parsed.verifiedAcceptanceIds.length !== evidence.verifiedAcceptanceIds.length ||
-		parsed.verifiedAcceptanceIds.some((id, index) => id !== evidence.verifiedAcceptanceIds[index]) ||
-		parsed.evidence !== evidence.finalEvidence ||
-		parsed.summary !== evidence.finalSummary
+		state.finalEvidence.verifiedAcceptanceIds.length !== evidence.verifiedAcceptanceIds.length ||
+		state.finalEvidence.verifiedAcceptanceIds.some((id, index) => id !== evidence.verifiedAcceptanceIds[index]) ||
+		state.finalEvidence.finalEvidence !== evidence.finalEvidence ||
+		state.finalEvidence.finalSummary !== evidence.finalSummary
 	) {
 		return "state final_evidence does not match the requested Goal ending";
 	}

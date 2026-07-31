@@ -219,7 +219,7 @@ export function classifyRollupFailure(stage: string, error: unknown): RollupFail
 	if (error instanceof SessionChainControllerError) {
 		return {
 			errorCode: error.message.includes("Rollup response") ? "rollup_invalid_response" : "rollup_generation_invalid",
-			retryable: false,
+			retryable: error.message.includes("Rollup response"),
 		};
 	}
 	return { errorCode: "rollup_provider_failed", retryable: true };

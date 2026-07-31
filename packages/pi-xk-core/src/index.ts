@@ -109,9 +109,14 @@ export {
 	type GoalFileKind,
 	type GoalFileStatus,
 	type GoalFilesDiagnostic,
+	type GoalPauseStateEvidence,
+	type GoalStateAcceptanceEntry,
+	type GoalStateProjectionV3,
 	goalIdentityFingerprint,
 	inspectGoalFiles,
+	parseGoalStateProjection,
 	validateGoalCompletionState,
+	validateGoalPauseState,
 	writeGoalObjectiveProjection,
 } from "./goal-files.ts";
 export {

@@ -66,7 +66,7 @@ child 使用 Pi 公共 `createAgentSession`、`DefaultResourceLoader` 和 `Sessi
 - `noExtensions: true`，不加载 Pi-XK Goal/Task 扩展，禁止 nested spawn。
 - 保留项目 Skills、AGENTS/context 文件和获准的 Pi 内置工具。
 - 绑定 Goal 时，kickoff 明确提供该 Goal 的 `goal-objective.md` 和 `goal-state.md` 路径，不复制父 transcript。
-- child 只能以一次 `pi_xk_finish_task` 提交成功或失败；普通文本结束不代表成功。
+- child 最终只能成功记录一次 `pi_xk_finish_task` 成功或失败结果；普通文本结束不代表成功。`succeeded` 必须证明 TaskSpec 的 `expectedResult` 已满足并至少提交一条非空结构化 evidence，否则工具拒绝该次调用且不记录终态，child 必须修正后重提。
 - 除非 TaskSpec 或父 Goal 明确授权，child 不自动 commit 或 push。
 
 ### session 生命周期

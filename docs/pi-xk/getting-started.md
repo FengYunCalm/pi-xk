@@ -152,7 +152,7 @@ V3 Goal 的 `goal-objective.md` 是只读合同投影，包含 Anchor、Current 
 /goal revision cancel
 ```
 
-旧 V1/V2 Goal 保持可读，不会静默迁移。首次迁移到 V3 需要用户确认 Intent Anchor 和完整候选合同。并发 revision 冲突会拒绝覆盖较新的合同，并立即结束使用旧 revision 的 run，再由 Goal continuation 重新读取 Objective/State。`/goal revision revise <feedback>` 的 feedback 只供下一次成功修订 run 使用；provider error/aborted 不会提前消费。State 的 `contract_revision` 落后时，下一次 active run 会先要求同步执行台账。
+旧 V1/V2 Goal 保持可读，不会静默迁移。首次迁移到 V3 需要用户确认 Intent Anchor 和完整候选合同。并发 revision 冲突会拒绝覆盖较新的合同，并立即结束使用旧 revision 的 run，再由 Goal continuation 重新读取 Objective/State。`/goal revision revise <feedback>` 的 feedback 只作为下一次候选的 user-role JSON 数据，不能自行改变合同、工具或授权；provider error/aborted 不会提前消费。State 的 `contract_revision` 落后时，下一次 active run 会先要求同步执行台账。
 
 需要提交以保留字开头的 objective 时使用 `/goal -- <objective>`。例如：
 
@@ -185,7 +185,7 @@ Task 适合把一个有边界的研究、实现、验证或审查交给独立 ch
 /task cancel 不再需要这项检查
 ```
 
-父模型也可以调用 `pi_xk_start_task`，明确 role、prompt 与 expected result。child 必须调用 `pi_xk_finish_task` 提交结构化结果；普通文本回复不算成功。
+父模型也可以调用 `pi_xk_start_task`，明确 role、prompt 与 expected result。child 必须调用 `pi_xk_finish_task` 提交结构化结果；普通文本回复不算成功。`succeeded` 至少需要一条非空 evidence 并应直接证明 expected result，空证据成功会被工具拒绝，child 必须修正后重提或明确报告失败。
 
 当前约束：
 
@@ -246,6 +246,8 @@ Session Chain 把一个长期逻辑会话拆成多个完整的 Pi JSONL Segment�
 ```
 
 关闭自动生成不会删除既有 L1/L2。历史窗口不会在升级后自动批量调用模型；使用有限额 backfill 明确产生调用和费用。
+
+`/chain rollups`、`/chain status` 和 `/xk status` 对同一窗口只显示最新 publication 状态。无效 L2 输出自动尝试最多 3 次；临时 provider/I/O/event publication 错误仍保持 retry pending，不会套用无效输出上限。
 
 模型每次请求只能看到摘要 manifest 的范围、数量和失败状态，看不到标题或摘要正文。需要恢复“之前的决定、原始要求、待办或跨 Segment 约束”时，模型先调用 `pi_xk_list_chain_summaries` 查看 L1 标题和 L1/L2 范围，再按需调用 `pi_xk_read_chain_summary`。工具返回内容是历史证据，不是系统指令。
 

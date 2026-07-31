@@ -1,9 +1,9 @@
 import { readFile } from "node:fs/promises";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { GoalStore, TaskStore } from "pi-xk-core";
-import { readGoalStateSection } from "./goal-status.ts";
+import { getGoalRequiredAcceptanceStatus, readGoalStateSection } from "./goal-status.ts";
 import { isPiXkSessionLink, isPiXkTaskLink, PI_XK_SESSION_LINK_CUSTOM_TYPE } from "./index.ts";
-import type { SessionChainController } from "./session-chain-controller.ts";
+import { formatSessionChainRollupPublicationStatus, type SessionChainController } from "./session-chain-controller.ts";
 
 function currentGoalId(ctx: ExtensionContext): string | undefined {
 	for (const entry of [...ctx.sessionManager.getBranch()].reverse()) {
@@ -43,17 +43,14 @@ async function goalStatus(ctx: ExtensionContext): Promise<{ line: string; diagno
 		const store = new GoalStore(ctx.cwd);
 		const replay = await store.replayGoal(goalId);
 		const files = await store.inspectGoalFiles(goalId);
-		const required = replay.contract.acceptance.filter((item) => item.required).map((item) => item.id);
-		const verified = new Set(replay.lifecycle.end?.verifiedAcceptanceIds ?? []);
-		const verifiedRequired = required.filter((id) => verified.has(id)).length;
+		let stateMarkdown: string | undefined;
 		let nextAction = "unavailable";
 		if (files.state.status === "valid") {
-			nextAction = readGoalStateSection(
-				await readFile(files.state.path, "utf8"),
-				"next_best_action",
-				"not recorded",
-			);
+			stateMarkdown = await readFile(files.state.path, "utf8");
+			nextAction = readGoalStateSection(stateMarkdown, "next_best_action", "not recorded");
 		}
+		const requiredAcceptance = getGoalRequiredAcceptanceStatus(replay, stateMarkdown);
+		const verifiedRequired = requiredAcceptance.filter((item) => item.status === "verified").length;
 		const diagnostics = [
 			...(replay.tailDiagnostic ? ["goal_event_log_partial_tail"] : []),
 			...(files.objective.status === "valid" ? [] : [`goal_objective_${files.objective.status}`]),
@@ -61,7 +58,7 @@ async function goalStatus(ctx: ExtensionContext): Promise<{ line: string; diagno
 			...lockDiagnostic("goal", await store.inspectWriteLock(goalId)),
 		];
 		return {
-			line: `Goal: ${replay.contract.title} · ${replay.lifecycle.status} · acceptance ${verifiedRequired}/${required.length} · next ${nextAction}`,
+			line: `Goal: ${replay.contract.title} · ${replay.lifecycle.status} · acceptance ${verifiedRequired}/${requiredAcceptance.length} · next ${nextAction}`,
 			diagnostics,
 		};
 	} catch (error) {
@@ -111,7 +108,7 @@ async function chainStatus(
 		return {
 			lines: [
 				`Chain: ${status.title ?? status.chainId} · ${status.branchId} · S${status.ordinal} ${status.segmentStatus}${status.archived ? " · archived" : ""}`,
-				`Rollup: ${branch.rollups.length} published · ${publication ? `W${publication.windowIndex} ${publication.status}` : "idle"}`,
+				`Rollup: ${branch.rollups.length} published · ${publication ? formatSessionChainRollupPublicationStatus(publication) : "idle"}`,
 			],
 			diagnostics: doctor.diagnostics.map((diagnostic) => `chain_${diagnostic.code}`),
 		};

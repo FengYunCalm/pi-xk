@@ -574,6 +574,70 @@ describe("ExtensionRunner", () => {
 			expect(errors[0].error).toContain("Handler error!");
 			expect(errors[0].event).toBe("context");
 		});
+
+		it("fails closed when a critical context handler throws", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.onCritical("context", async () => {
+						throw new Error("Critical context failure");
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "critical-context.ts"), extCode);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const errors: string[] = [];
+			runner.onError((error) => errors.push(error.error));
+
+			await expect(runner.emitContext([])).rejects.toThrow("Critical context failure");
+			expect(errors).toEqual(["Critical context failure"]);
+		});
+
+		it("fails closed when a critical before-agent-start handler throws", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.onCritical("before_agent_start", async () => {
+						throw new Error("Critical prompt failure");
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "critical-prompt.ts"), extCode);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const errors: string[] = [];
+			runner.onError((error) => errors.push(error.error));
+
+			await expect(runner.emitBeforeAgentStart("hello", undefined, "base", { cwd: tempDir })).rejects.toThrow(
+				"Critical prompt failure",
+			);
+			expect(errors).toEqual(["Critical prompt failure"]);
+		});
+
+		it("scopes critical failure handling to the registered event", async () => {
+			const extCode = `
+				export default function(pi) {
+					const sharedHandler = async () => {
+						throw new Error("Shared handler failure");
+					};
+					pi.on("context", sharedHandler);
+					pi.onCritical("before_agent_start", sharedHandler);
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "critical-event-scope.ts"), extCode);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const errors: string[] = [];
+			runner.onError((error) => errors.push(`${error.event}:${error.error}`));
+
+			await expect(runner.emitContext([])).resolves.toEqual([]);
+			await expect(runner.emitBeforeAgentStart("hello", undefined, "base", { cwd: tempDir })).rejects.toThrow(
+				"Shared handler failure",
+			);
+			expect(errors).toEqual(["context:Shared handler failure", "before_agent_start:Shared handler failure"]);
+		});
 	});
 
 	describe("message and entry renderers", () => {

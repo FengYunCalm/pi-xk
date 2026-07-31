@@ -243,6 +243,18 @@ function createExtensionAPI(
 			extension.handlers.set(event, list);
 		},
 
+		onCritical(event: string, handler: HandlerFn): void {
+			runtime.assertActive();
+			if (event !== "context" && event !== "before_agent_start") {
+				throw new Error("Critical extension handlers are only supported for context and before_agent_start");
+			}
+			const criticalHandler: HandlerFn = (...args) => handler(...args);
+			const list = extension.handlers.get(event) ?? [];
+			list.push(criticalHandler);
+			extension.handlers.set(event, list);
+			extension.criticalHandlers.add(criticalHandler);
+		},
+
 		registerTool(tool: ToolDefinition): void {
 			runtime.assertActive();
 			extension.tools.set(tool.name, {
@@ -448,6 +460,7 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 		resolvedPath,
 		sourceInfo: createSyntheticSourceInfo(extensionPath, { source, baseDir }),
 		handlers: new Map(),
+		criticalHandlers: new Set(),
 		tools: new Map(),
 		messageRenderers: new Map(),
 		entryRenderers: new Map(),

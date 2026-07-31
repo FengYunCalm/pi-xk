@@ -119,6 +119,7 @@ flowchart TD
 - 第 N 次 rollover 的同步等待不包含 L2 provider latency；每个 branch 的 publication job 串行执行。
 - branch/window generation lock 防止多进程重复付费调用；`generating` 进程退出后恢复为可重试 scheduled。
 - 失败追加 `rollup_failed` v2 诊断，按 provider timeout/rate limit、临时 I/O、L1 provenance/schema/sourceDigest、配置、event conflict 和 Markdown projection 分类，包含 stage、errorCode、retryable 和 attempt，不保存 provider 原始响应或凭据。
+- 只有 `rollup_invalid_response` 使用 3 次自动尝试上限；达到上限后 publication 显示 `automatic retries exhausted` 并等待人工审查摘要输出合同。provider、临时 I/O 和 event publication 等可重试错误不会因 attempt=3 被错误改成不可重试。
 - artifact 已写且 pending publication 已落盘时，事件重试复用同一 artifact 和原始窗口范围，不再次调用模型；其间修改 interval 只影响该窗口之后的窗口。
 - 如果进程在 artifact 发布后、pending 文件写入前退出，Controller 会按 chain、branch、window 和 artifact 内的 sourceDigest 发现孤儿 L2，验证其有序 L1 来源后继续发布，不再次调用模型。
 - event 已发布但 read model 缺失或陈旧时，Store 的 replay/rebuild 路径从混合 v1/v2 日志恢复。
@@ -141,7 +142,7 @@ flowchart TD
 - 两个只读工具的名称和读取条件。
 - 列表工具可提供 L1 标题和 L1/L2 范围的能力说明。
 
-manifest 从 checkpointed `chain-read-model.json` 加载。投影记录已消费 event 的字节 offset、sequence 和 head hash；event 文件未缩短且 head 连续时只读取新增 tail。offset 异常、文件缩短或 head 不匹配时退回完整 replay；无法建立可信投影时本次请求不注入 manifest，并报告 `manifest_read_model_inconsistent`。
+manifest 从 checkpointed `chain-read-model.json` 加载。投影记录已消费 event 的字节 offset、sequence 和 head hash；event 文件未缩短且 head 连续时只读取新增 tail。offset 异常、文件缩短或 head 不匹配时退回完整 replay。若仍无法建立可信投影，本次请求只注入不含错误详情、范围或历史正文的 bounded degraded manifest，明确所有历史范围未知且不能推断为空，同时报告 `manifest_read_model_inconsistent`；摘要工具若无法独立读取可信 read model 会正常失败。
 
 manifest 不包含：
 
@@ -188,6 +189,8 @@ manifest 不包含：
 ```
 
 `backfill` 默认只尝试最早缺失的一个完整窗口；`limit` 是本次最多发布数量。关闭自动 Rollup 后，既有 L1/L2 仍可通过命令和模型工具读取。
+
+`/chain rollups` 对每个未解决窗口只显示最新 publication 状态。`rollup_failed` 历史事件仍完整保留，但不会在命令输出中把同一窗口的第 1、2、3 次失败重复列成三个当前故障；manifest、`/chain status` 和 `/xk status` 使用同一格式。
 
 ## 9. Doctor 检查
 

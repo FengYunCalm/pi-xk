@@ -158,6 +158,17 @@ interface GoalEndToolInput {
 	finalSummary: string;
 }
 
+interface GoalPauseToolInput {
+	reason: string;
+	userRequest: string | null;
+	nextBestAction: string;
+	audit: {
+		unmetRequiredAcceptanceIds: string[];
+		currentEvidence: string;
+		incompleteConclusion: string;
+	};
+}
+
 function replaceGoalStateSection(content: string, section: string, lines: string[]): string {
 	const heading = `## ${section}`;
 	const start = content.indexOf(`${heading}\n`);
@@ -185,6 +196,15 @@ async function recordV3GoalCompletionState(harness: Harness, input: GoalEndToolI
 				: `- ${acceptance.id}: ${acceptance.required ? "required" : "optional"}; unverified; evidence: not recorded`,
 		),
 	);
+	state = replaceGoalStateSection(state, "pause_audit", [
+		`- ${JSON.stringify({
+			unmetRequiredAcceptanceIds: [],
+			currentEvidence: "",
+			incompleteConclusion: "",
+			userRequest: null,
+			nextBestAction: "",
+		})}`,
+	]);
 	state = replaceGoalStateSection(state, "final_evidence", [
 		`- ${JSON.stringify({
 			evidence: input.finalEvidence,
@@ -193,6 +213,36 @@ async function recordV3GoalCompletionState(harness: Harness, input: GoalEndToolI
 		})}`,
 	]);
 	await writeFile(statePath, state);
+}
+
+async function recordV3GoalPauseState(harness: Harness, input: GoalPauseToolInput): Promise<void> {
+	const goalId = getCurrentGoalId(harness);
+	if (!goalId) throw new Error("No Goal is bound while recording pause State");
+	const replay = await new GoalStore(harness.tempDir).replayGoal(goalId);
+	if (replay.contract.schema !== "pi-xk.goal.contract.v3") return;
+	const statePath = join(harness.tempDir, ".pi-xk", "goals", goalId, "goal-state.md");
+	let state = await readFile(statePath, "utf8");
+	state = replaceGoalStateSection(state, "contract_revision", [`- ${replay.contract.revision}`]);
+	state = replaceGoalStateSection(state, "pause_audit", [
+		`- ${JSON.stringify({
+			unmetRequiredAcceptanceIds: input.audit.unmetRequiredAcceptanceIds,
+			currentEvidence: input.audit.currentEvidence,
+			incompleteConclusion: input.audit.incompleteConclusion,
+			userRequest: input.userRequest,
+			nextBestAction: input.nextBestAction,
+		})}`,
+	]);
+	await writeFile(statePath, state);
+}
+
+function successfulV3GoalPauseResponse(
+	harness: Harness,
+	input: GoalPauseToolInput,
+): () => Promise<ReturnType<typeof fauxAssistantMessage>> {
+	return async () => {
+		await recordV3GoalPauseState(harness, input);
+		return fauxAssistantMessage([fauxToolCall("pi_xk_pause_goal", input)], { stopReason: "toolUse" });
+	};
 }
 
 function successfulV3GoalEndResponse(harness: Harness, input: GoalEndToolInput): FauxResponseFactory {
@@ -410,10 +460,18 @@ describe("Pi-XK Goal extension", () => {
 		await createActiveV3Goal(harness, goalId);
 
 		await harness.session.prompt("/goal status");
-		expect(notifications.at(-1)).toContain("Acceptance ledger: A-1: required; unverified; evidence not recorded.");
+		expect(notifications.at(-1)).toContain("Acceptance ledger: A-1: required; unverified; evidence: not recorded.");
 
 		const statePath = join(harness.tempDir, ".pi-xk", "goals", goalId, "goal-state.md");
-		const state = await readFile(statePath, "utf8");
+		let state = await readFile(statePath, "utf8");
+		state = state.replace(
+			"- A-1: required; unverified; evidence: not recorded.",
+			"- A-1: required; verified; evidence: focused verification passed.",
+		);
+		await writeFile(statePath, state);
+		await harness.session.prompt("/goal status");
+		expect(notifications.at(-1)).toContain("Required acceptance: A-1=verified");
+
 		await writeFile(statePath, state.replace("## contract_revision\n- 1", "## contract_revision\n- 0"));
 
 		await harness.session.prompt("/goal doctor");
@@ -597,7 +655,19 @@ describe("Pi-XK Goal extension", () => {
 		};
 		const harness = await createHarness({
 			tools: [waitTool],
-			extensionFactories: [createPiXkGoalExtension()],
+			extensionFactories: [
+				(pi) => {
+					pi.registerTool({
+						name: "test_goal_state_access",
+						label: "Test Goal State Access",
+						description: "Declare the State read/write capability required by an active Goal test run.",
+						capabilities: { filesystem: { read: true, write: true } },
+						parameters: Type.Object({}),
+						execute: async () => ({ content: [{ type: "text", text: "unused" }], details: {} }),
+					});
+				},
+				createPiXkGoalExtension(),
+			],
 		});
 		harnesses.push(harness);
 		await harness.session.bindExtensions({});
@@ -932,21 +1002,16 @@ describe("Pi-XK Goal extension", () => {
 			},
 			(context) => {
 				requestTexts.push(context.messages.map((message) => getMessageText(message)).join("\n"));
-				return fauxAssistantMessage(
-					[
-						fauxToolCall("pi_xk_pause_goal", {
-							reason: "kickoff recognition verified",
-							userRequest: null,
-							nextBestAction: "Resume after the focused test.",
-							audit: {
-								unmetRequiredAcceptanceIds: ["A-1"],
-								currentEvidence: "Both kickoff messages reached the model.",
-								incompleteConclusion: "The test Goal remains intentionally paused.",
-							},
-						}),
-					],
-					{ stopReason: "toolUse" },
-				);
+				return successfulV3GoalPauseResponse(harness, {
+					reason: "kickoff recognition verified",
+					userRequest: null,
+					nextBestAction: "Resume after the focused test.",
+					audit: {
+						unmetRequiredAcceptanceIds: ["A-1"],
+						currentEvidence: "Both kickoff messages reached the model.",
+						incompleteConclusion: "The test Goal remains intentionally paused.",
+					},
+				})();
 			},
 		]);
 
@@ -993,6 +1058,61 @@ describe("Pi-XK Goal extension", () => {
 		});
 	});
 
+	it("projects only the draft submission tool for a Goal draft run and restores the tool set", async () => {
+		const harness = await createHarness({ extensionFactories: [createPiXkGoalExtension()] });
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const activeTools = harness.session.getActiveToolNames();
+		let providerTools: string[] = [];
+		let providerSystemPrompt = "";
+		harness.setResponses([
+			(context) => {
+				providerTools = context.tools?.map((tool) => tool.name) ?? [];
+				providerSystemPrompt = context.systemPrompt ?? "";
+				return draftResponse("Project only the draft submission tool.");
+			},
+		]);
+
+		await harness.session.prompt("/goal Limit the Goal draft provider tool projection.");
+		await waitForAgent(harness);
+
+		expect(providerTools).toEqual(["pi_xk_submit_goal_draft"]);
+		expect(providerSystemPrompt).toContain("Successfully submit exactly one draft");
+		expect(providerSystemPrompt).toContain("If a submission is rejected, correct its arguments and retry");
+		expect(harness.session.getActiveToolNames()).toEqual(activeTools);
+	});
+
+	it("fails Goal preflight when active tools cannot read and update the State projection", async () => {
+		const notifications: string[] = [];
+		const harness = await createHarness({ extensionFactories: [createPiXkGoalExtension()] });
+		harnesses.push(harness);
+		await harness.session.bindExtensions({
+			uiContext: createUiContext({ notify: (message) => notifications.push(message) }),
+		});
+		harness.setResponses([draftResponse("Require filesystem capabilities."), fauxAssistantMessage("must not run")]);
+
+		await harness.session.prompt("/goal Verify active Goal filesystem capabilities.");
+		await waitForAgent(harness);
+		const lifecycleTools = harness.session.getActiveToolNames().filter((name) => name.startsWith("pi_xk_"));
+		harness.session.setActiveToolsByName(lifecycleTools);
+		await harness.session.prompt("/goal confirm");
+		await waitForAgent(harness);
+
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(notifications.join("\n")).toContain("filesystem capabilities");
+		expect(notifications.join("\n")).toContain("read Goal projections");
+		expect(notifications.join("\n")).toContain("update goal-state.md");
+
+		notifications.length = 0;
+		harness.session.setActiveToolsByName([...lifecycleTools, "find", "write"]);
+		await harness.session.prompt("/goal retry");
+		await waitForAgent(harness);
+
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(notifications.join("\n")).toContain("read Goal projections");
+		expect(notifications.join("\n")).not.toContain("update goal-state.md");
+	});
+
 	it("applies an objective-only V3 revision automatically and reports stale state to the next run", async () => {
 		const prompts: string[] = [];
 		const goalErrors: string[] = [];
@@ -1002,9 +1122,13 @@ describe("Pi-XK Goal extension", () => {
 		harnesses.push(harness);
 		await harness.session.bindExtensions({});
 		const { store, contract } = await createActiveV3Goal(harness, "goal_auto_revision");
+		const objectiveReplacement = {
+			oldText: "for goal_auto_revision",
+			newText: "through the corrected implementation path for goal_auto_revision",
+		};
 		const candidate = {
 			...contract,
-			objective: `${contract.objective} Use the corrected implementation path while preserving the confirmed outcome.`,
+			objective: contract.objective.replace(objectiveReplacement.oldText, objectiveReplacement.newText),
 			revision: 2,
 		};
 		harness.setResponses([
@@ -1016,6 +1140,7 @@ describe("Pi-XK Goal extension", () => {
 							expectedRevision: 1,
 							reason: "Repository evidence invalidated the old path wording.",
 							evidence: "The implementation now lives under the corrected module.",
+							objectiveReplacement,
 							candidate,
 						}),
 					],
@@ -1051,9 +1176,10 @@ describe("Pi-XK Goal extension", () => {
 		expect(prompts[1]).toContain("contract_revision is 2");
 		expect(prompts[1]).toContain("State synchronization required");
 		expect(prompts[0]).toContain("must not narrow, drop, or rewrite away any existing outcome dimension");
+		expect(prompts[0]).toContain("exact unique oldText and its evidence-backed newText");
 	});
 
-	it("automatically replaces stale objective wording while preserving the protected contract", async () => {
+	it("requires confirmation for a non-provable whole-Objective rewrite", async () => {
 		const harness = await createHarness({ extensionFactories: [createPiXkGoalExtension()] });
 		harnesses.push(harness);
 		await harness.session.bindExtensions({});
@@ -1075,34 +1201,15 @@ describe("Pi-XK Goal extension", () => {
 				],
 				{ stopReason: "toolUse" },
 			),
-			fauxAssistantMessage(
-				[
-					fauxToolCall("pi_xk_pause_goal", {
-						reason: "objective replacement behavior verified",
-						userRequest: null,
-						nextBestAction: "Resume after the focused regression test.",
-						audit: {
-							unmetRequiredAcceptanceIds: ["A-1"],
-							currentEvidence: "The stale Objective wording was replaced without changing protected fields.",
-							incompleteConclusion: "The test Goal remains intentionally paused.",
-						},
-					}),
-				],
-				{ stopReason: "toolUse" },
-			),
 		]);
 
 		await harness.session.prompt("Replace the stale module path without changing the Goal contract.");
 		await waitForAgent(harness);
 
 		const replay = await store.replayGoal(contract.goalId);
-		expect(replay.contract).toEqual(candidate);
-		expect(replay.lifecycle.status).toBe("paused");
-		expect(replay.events.find((event) => event.eventType === "goal_contract_updated")).toMatchObject({
-			actor: "model",
-			payload: { mode: "automatic-objective-refinement", changedFields: ["objective"] },
-		});
-		expect(getCurrentGoalRevision(harness)).toMatchObject({ state: "confirmed", candidate });
+		expect(replay.contract).toEqual(contract);
+		expect(replay.events.some((event) => event.eventType === "goal_contract_updated")).toBe(false);
+		expect(getCurrentGoalRevision(harness)).toMatchObject({ state: "proposed", candidate });
 	});
 
 	it("restarts Goal preflight after a revision conflict instead of continuing the stale run", async () => {
@@ -1128,21 +1235,16 @@ describe("Pi-XK Goal extension", () => {
 			),
 			(context) => {
 				continuationMessages = context.messages.map((message) => getMessageText(message)).join("\n");
-				return fauxAssistantMessage(
-					[
-						fauxToolCall("pi_xk_pause_goal", {
-							reason: "revision conflict restart verified",
-							userRequest: null,
-							nextBestAction: "Resume after the focused regression test.",
-							audit: {
-								unmetRequiredAcceptanceIds: ["A-1"],
-								currentEvidence: "The stale run terminated before continuation.",
-								incompleteConclusion: "The test Goal remains intentionally paused.",
-							},
-						}),
-					],
-					{ stopReason: "toolUse" },
-				);
+				return successfulV3GoalPauseResponse(harness, {
+					reason: "revision conflict restart verified",
+					userRequest: null,
+					nextBestAction: "Resume after the focused regression test.",
+					audit: {
+						unmetRequiredAcceptanceIds: ["A-1"],
+						currentEvidence: "The stale run terminated before continuation.",
+						incompleteConclusion: "The test Goal remains intentionally paused.",
+					},
+				})();
 			},
 		]);
 
@@ -1167,9 +1269,13 @@ describe("Pi-XK Goal extension", () => {
 			constraints: [...contract.constraints, "Require an obsolete implementation path."],
 			revision: 2,
 		};
+		const objectiveReplacement = {
+			oldText: "for goal_revision_feedback",
+			newText: "through the verified replacement path for goal_revision_feedback",
+		};
 		const objectiveCandidate = {
 			...contract,
-			objective: `${contract.objective} Use the verified replacement path while preserving the confirmed outcome.`,
+			objective: contract.objective.replace(objectiveReplacement.oldText, objectiveReplacement.newText),
 			revision: 2,
 		};
 		harness.setResponses([
@@ -1193,6 +1299,7 @@ describe("Pi-XK Goal extension", () => {
 							expectedRevision: 1,
 							reason: "Verified repository evidence invalidated the obsolete path.",
 							evidence: "The replacement module is the active implementation.",
+							objectiveReplacement,
 							candidate: objectiveCandidate,
 						}),
 					],
@@ -1266,21 +1373,16 @@ describe("Pi-XK Goal extension", () => {
 			},
 			(context) => {
 				providerMessages.push(context.messages.map((message) => getMessageText(message)).join("\n"));
-				return fauxAssistantMessage(
-					[
-						fauxToolCall("pi_xk_pause_goal", {
-							reason: "one-shot feedback behavior verified",
-							userRequest: null,
-							nextBestAction: "Resume after the focused regression test.",
-							audit: {
-								unmetRequiredAcceptanceIds: ["A-1"],
-								currentEvidence: "The feedback was visible for exactly one successful Goal run.",
-								incompleteConclusion: "The test Goal remains intentionally paused.",
-							},
-						}),
-					],
-					{ stopReason: "toolUse" },
-				);
+				return successfulV3GoalPauseResponse(harness, {
+					reason: "one-shot feedback behavior verified",
+					userRequest: null,
+					nextBestAction: "Resume after the focused regression test.",
+					audit: {
+						unmetRequiredAcceptanceIds: ["A-1"],
+						currentEvidence: "The feedback was visible for exactly one successful Goal run.",
+						incompleteConclusion: "The test Goal remains intentionally paused.",
+					},
+				})();
 			},
 		]);
 
@@ -1335,21 +1437,16 @@ describe("Pi-XK Goal extension", () => {
 			},
 			(context) => {
 				providerMessages.push(context.messages.map((message) => getMessageText(message)).join("\n"));
-				return fauxAssistantMessage(
-					[
-						fauxToolCall("pi_xk_pause_goal", {
-							reason: "feedback retry behavior verified",
-							userRequest: null,
-							nextBestAction: "Resume after the focused regression test.",
-							audit: {
-								unmetRequiredAcceptanceIds: ["A-1"],
-								currentEvidence: "Provider failure retained one feedback message until recovery.",
-								incompleteConclusion: "The test Goal remains intentionally paused.",
-							},
-						}),
-					],
-					{ stopReason: "toolUse" },
-				);
+				return successfulV3GoalPauseResponse(harness, {
+					reason: "feedback retry behavior verified",
+					userRequest: null,
+					nextBestAction: "Resume after the focused regression test.",
+					audit: {
+						unmetRequiredAcceptanceIds: ["A-1"],
+						currentEvidence: "Provider failure retained one feedback message until recovery.",
+						incompleteConclusion: "The test Goal remains intentionally paused.",
+					},
+				})();
 			},
 		]);
 
@@ -1984,11 +2081,7 @@ describe("Pi-XK Goal extension", () => {
 			harness.session.messages
 				.filter((message) => message.role === "toolResult")
 				.map((message) => getMessageText(message)),
-		).toEqual([
-			"A Goal draft kickoff only permits pi_xk_submit_goal_draft.",
-			"A Goal draft kickoff only permits pi_xk_submit_goal_draft.",
-			"Goal draft submitted for user review.",
-		]);
+		).toEqual(["Tool pi_xk_pause_goal not found", "Tool bash not found", "Goal draft submitted for user review."]);
 		expect(getCurrentGoalDraft(harness)).toMatchObject({ state: "proposed", goalId: null });
 		expect(existsSync(join(harness.tempDir, ".pi-xk", "goals"))).toBe(false);
 	});
@@ -2166,6 +2259,8 @@ describe("Pi-XK Goal extension", () => {
 			expect(systemPrompt).toContain("A normal assistant response does not end this Goal");
 			expect(systemPrompt).toContain("Do not repeat work already recorded as done");
 			expect(systemPrompt).toContain("After material progress, update goal-state.md");
+			expect(systemPrompt).toContain("done entry with `evidence: <concrete evidence>`");
+			expect(systemPrompt).toContain("tried_and_rejected entry with `reconsider_when: <specific condition>`");
 			expect(systemPrompt).toContain("pi_xk_end_goal");
 		}
 		const goalId = getCurrentGoalId(harness);
@@ -2242,21 +2337,16 @@ describe("Pi-XK Goal extension", () => {
 			},
 			(context) => {
 				activeTurnText = context.messages.map((message) => getMessageText(message)).join("\n");
-				return fauxAssistantMessage(
-					[
-						fauxToolCall("pi_xk_pause_goal", {
-							reason: "verify the injected contract",
-							userRequest: null,
-							nextBestAction: "Resume after the contract review.",
-							audit: {
-								unmetRequiredAcceptanceIds: ["A-1"],
-								currentEvidence: "The injected contract still needs review.",
-								incompleteConclusion: "Acceptance A-1 remains open.",
-							},
-						}),
-					],
-					{ stopReason: "toolUse" },
-				);
+				return successfulV3GoalPauseResponse(harness, {
+					reason: "verify the injected contract",
+					userRequest: null,
+					nextBestAction: "Resume after the contract review.",
+					audit: {
+						unmetRequiredAcceptanceIds: ["A-1"],
+						currentEvidence: "The injected contract still needs review.",
+						incompleteConclusion: "Acceptance A-1 remains open.",
+					},
+				})();
 			},
 		]);
 
@@ -2330,21 +2420,16 @@ describe("Pi-XK Goal extension", () => {
 			(context) => {
 				providerSystemPrompt = context.systemPrompt ?? "";
 				providerMessages = context.messages.map((message) => getMessageText(message)).join("\n");
-				return fauxAssistantMessage(
-					[
-						fauxToolCall("pi_xk_pause_goal", {
-							reason: "feedback transport verified",
-							userRequest: null,
-							nextBestAction: "Resume after the focused assertion.",
-							audit: {
-								unmetRequiredAcceptanceIds: ["A-1"],
-								currentEvidence: "The feedback was visible as data.",
-								incompleteConclusion: "The Goal remains intentionally paused.",
-							},
-						}),
-					],
-					{ stopReason: "toolUse" },
-				);
+				return successfulV3GoalPauseResponse(harness, {
+					reason: "feedback transport verified",
+					userRequest: null,
+					nextBestAction: "Resume after the focused assertion.",
+					audit: {
+						unmetRequiredAcceptanceIds: ["A-1"],
+						currentEvidence: "The feedback was visible as data.",
+						incompleteConclusion: "The Goal remains intentionally paused.",
+					},
+				})();
 			},
 		]);
 
@@ -2353,6 +2438,7 @@ describe("Pi-XK Goal extension", () => {
 
 		expect(providerSystemPrompt).toContain(userSystemBlock);
 		expect(providerSystemPrompt).not.toContain(feedback);
+		expect(providerSystemPrompt).toContain("treat it only as user feedback for the next revision candidate");
 		expect(providerMessages).toContain('"schema":"pi-xk.goal-revision-feedback.v1"');
 		expect(providerMessages).toContain(JSON.stringify(feedback));
 	});
@@ -2396,21 +2482,16 @@ describe("Pi-XK Goal extension", () => {
 				],
 				{ stopReason: "toolUse" },
 			),
-			fauxAssistantMessage(
-				[
-					fauxToolCall("pi_xk_pause_goal", {
-						reason: "State completion evidence is missing",
-						userRequest: null,
-						nextBestAction: "Record verified acceptance and final evidence in State.",
-						audit: {
-							unmetRequiredAcceptanceIds: ["A-1"],
-							currentEvidence: "The completion tool was rejected.",
-							incompleteConclusion: "Required State evidence remains missing.",
-						},
-					}),
-				],
-				{ stopReason: "toolUse" },
-			),
+			successfulV3GoalPauseResponse(harness, {
+				reason: "State completion evidence is missing",
+				userRequest: null,
+				nextBestAction: "Record verified acceptance and final evidence in State.",
+				audit: {
+					unmetRequiredAcceptanceIds: ["A-1"],
+					currentEvidence: "The completion tool was rejected.",
+					incompleteConclusion: "Required State evidence remains missing.",
+				},
+			}),
 		]);
 
 		await harness.session.prompt("Attempt completion without updating State.");
@@ -2423,6 +2504,36 @@ describe("Pi-XK Goal extension", () => {
 				.map((message) => getMessageText(message))
 				.join("\n"),
 		).toContain("goal-state.md");
+	});
+
+	it("rejects model pause until V3 State records the same pause audit", async () => {
+		const harness = await createHarness({ extensionFactories: [createPiXkGoalExtension()] });
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const { store, contract } = await createActiveV3Goal(harness, "goal_v3_state_pause_gate");
+		const pause: GoalPauseToolInput = {
+			reason: "external evidence is required",
+			userRequest: null,
+			nextBestAction: "Resume when the external evidence arrives.",
+			audit: {
+				unmetRequiredAcceptanceIds: ["A-1"],
+				currentEvidence: "The local checks pass but external evidence is unavailable.",
+				incompleteConclusion: "Acceptance A-1 remains unverified.",
+			},
+		};
+		harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("pi_xk_pause_goal", pause)], { stopReason: "toolUse" }),
+			successfulV3GoalPauseResponse(harness, pause),
+		]);
+
+		await harness.session.prompt("Pause only after synchronizing the execution ledger.");
+		await waitForAgent(harness);
+
+		const toolResults = harness.session.messages.filter((message) => message.role === "toolResult");
+		expect(toolResults.map((message) => message.isError)).toEqual([true, false]);
+		expect(harness.faux.state.callCount).toBe(2);
+		expect(getMessageText(toolResults[0]!)).toContain("pause_audit");
+		expect((await store.replayGoal(contract.goalId)).lifecycle.status).toBe("paused");
 	});
 
 	it("cancels capture, supports reserved-word objectives, and replaces only the branch binding", async () => {
@@ -2506,21 +2617,18 @@ describe("Pi-XK Goal extension", () => {
 			requestSystemPrompts.push(context.systemPrompt ?? "");
 			if (!pauseRequested) {
 				pauseRequested = true;
-				return fauxAssistantMessage(
-					[
-						fauxToolCall("pi_xk_pause_goal", {
-							reason: "inspect state",
-							userRequest: null,
-							nextBestAction: "resume after review",
-							audit: {
-								unmetRequiredAcceptanceIds: ["A-1"],
-								currentEvidence: "The state review has not finished.",
-								incompleteConclusion: "Acceptance A-1 remains open.",
-							},
-						}),
-					],
-					{ stopReason: "toolUse" },
-				);
+				const pause: GoalPauseToolInput = {
+					reason: "inspect state",
+					userRequest: null,
+					nextBestAction: "resume after review",
+					audit: {
+						unmetRequiredAcceptanceIds: ["A-1"],
+						currentEvidence: "The state review has not finished.",
+						incompleteConclusion: "Acceptance A-1 remains open.",
+					},
+				};
+				await recordV3GoalPauseState(harness, pause);
+				return fauxAssistantMessage([fauxToolCall("pi_xk_pause_goal", pause)], { stopReason: "toolUse" });
 			}
 			if (resumed && !endRequested) {
 				endRequested = true;
@@ -2596,21 +2704,16 @@ describe("Pi-XK Goal extension", () => {
 		harnesses.push(harness);
 		harness.setResponses([
 			draftResponse("Pause through the model tool."),
-			fauxAssistantMessage(
-				[
-					fauxToolCall("pi_xk_pause_goal", {
-						reason: "need review",
-						userRequest: null,
-						nextBestAction: "inspect evidence",
-						audit: {
-							unmetRequiredAcceptanceIds: ["A-1"],
-							currentEvidence: "The required evidence still needs review.",
-							incompleteConclusion: "Acceptance A-1 remains open.",
-						},
-					}),
-				],
-				{ stopReason: "toolUse" },
-			),
+			successfulV3GoalPauseResponse(harness, {
+				reason: "need review",
+				userRequest: null,
+				nextBestAction: "inspect evidence",
+				audit: {
+					unmetRequiredAcceptanceIds: ["A-1"],
+					currentEvidence: "The required evidence still needs review.",
+					incompleteConclusion: "Acceptance A-1 remains open.",
+				},
+			}),
 			fauxAssistantMessage("ordinary paused response"),
 		]);
 
@@ -2643,21 +2746,16 @@ describe("Pi-XK Goal extension", () => {
 		harnesses.push(harness);
 		harness.setResponses([
 			draftResponse("Pause until external evidence is available."),
-			fauxAssistantMessage(
-				[
-					fauxToolCall("pi_xk_pause_goal", {
-						reason: "need external evidence",
-						userRequest: null,
-						nextBestAction: "Resume after the evidence arrives.",
-						audit: {
-							unmetRequiredAcceptanceIds: ["A-1"],
-							currentEvidence: "The required evidence is unavailable.",
-							incompleteConclusion: "Acceptance A-1 remains open.",
-						},
-					}),
-				],
-				{ stopReason: "toolUse" },
-			),
+			successfulV3GoalPauseResponse(harness, {
+				reason: "need external evidence",
+				userRequest: null,
+				nextBestAction: "Resume after the evidence arrives.",
+				audit: {
+					unmetRequiredAcceptanceIds: ["A-1"],
+					currentEvidence: "The required evidence is unavailable.",
+					incompleteConclusion: "Acceptance A-1 remains open.",
+				},
+			}),
 			(context) => {
 				requestTexts.push(context.messages.map((message) => getMessageText(message)).join("\n"));
 				requestSystemPrompts.push(context.systemPrompt ?? "");
@@ -2768,16 +2866,14 @@ describe("Pi-XK Goal extension", () => {
 		await harness.session.prompt("Try to restart the ended Goal.");
 		await waitForAgent(harness);
 
-		expect(
-			harness.session.messages
-				.filter((message) => message.role === "toolResult")
-				.map((message) => getMessageText(message)),
-		).toEqual([
+		const toolResults = harness.session.messages.filter((message) => message.role === "toolResult");
+		expect(toolResults.map((message) => getMessageText(message))).toEqual([
 			"Goal draft submitted for user review.",
 			"Goal start failed: only a paused Goal can be started",
 			"Goal end requested.",
 			"Goal start failed: only a paused Goal can be started",
 		]);
+		expect(toolResults.map((message) => message.isError)).toEqual([false, true, false, true]);
 		const replayed = await new GoalStore(harness.tempDir).replayGoal(goalId!);
 		expect(replayed.lifecycle.status).toBe("ended");
 		expect(replayed.events.filter((event) => event.eventType === "goal_resumed")).toHaveLength(0);
@@ -2893,16 +2989,14 @@ describe("Pi-XK Goal extension", () => {
 		await harness.session.bindExtensions({});
 		await requestAndConfirmGoal(harness, "Reject unknown lifecycle acceptance IDs");
 
-		expect(
-			harness.session.messages
-				.filter((message) => message.role === "toolResult")
-				.map((message) => getMessageText(message)),
-		).toEqual([
+		const toolResults = harness.session.messages.filter((message) => message.role === "toolResult");
+		expect(toolResults.map((message) => getMessageText(message))).toEqual([
 			"Goal draft submitted for user review.",
 			"Goal pause failed: goal_paused.audit.unmetRequiredAcceptanceIds contains an unknown or ineligible acceptance ID: A-unknown",
 			"Goal end failed: goal_ended.verifiedAcceptanceIds contains an unknown or ineligible acceptance ID: A-unknown",
 			"Goal end requested.",
 		]);
+		expect(toolResults.map((message) => message.isError)).toEqual([false, true, true, false]);
 		const goalId = getCurrentGoalId(harness);
 		const replayed = await new GoalStore(harness.tempDir).replayGoal(goalId!);
 		expect(replayed.lifecycle.status).toBe("ended");

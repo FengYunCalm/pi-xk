@@ -8,7 +8,9 @@ import {
 	type GoalContractV3,
 	GoalRevisionConflictError,
 	GoalStore,
+	validateGoalCompletionState,
 	validateGoalContract,
+	validateGoalPauseState,
 } from "../src/index.ts";
 import { stableJsonStringify } from "../src/stable-json.ts";
 
@@ -73,6 +75,20 @@ describe("Goal contract v3 revisions", () => {
 		expect(validateGoalContract(contract)).toEqual(contract);
 		expect(() => validateGoalContract({ ...contract, revision: 0 })).toThrow("revision");
 		expect(() => validateGoalContract({ ...contract, intentAnchor: "" })).toThrow("intentAnchor");
+	});
+
+	it("keeps a generated V3 State valid when an acceptance ID contains spaces and a colon", async () => {
+		const projectRoot = await createProjectRoot();
+		const store = new GoalStore(projectRoot);
+		const contract = createV3Contract("goal_v3_acceptance_id");
+		contract.acceptance[0] = { ...contract.acceptance[0]!, id: "Release gate: Linux" };
+
+		await store.createGoal(contract, {
+			eventId: "evt-created",
+			idempotencyKey: "create:v3-acceptance-id",
+		});
+
+		expect((await store.inspectGoalFiles(contract.goalId)).state.status).toBe("valid");
 	});
 
 	it("requires new V3 Goals to start at revision 1 and blocks the legacy V2 update path", async () => {
@@ -316,7 +332,91 @@ describe("Goal contract v3 revisions", () => {
 		expect(initialState).toContain("## contract_revision\n- 1");
 		expect(initialState).toContain("## acceptance_matrix\n");
 		expect(initialState).toContain("## recent_work_log\n");
+		expect(initialState).toContain("done entries must end with `evidence: <concrete evidence>`");
+		expect(initialState).toContain(
+			"tried_and_rejected entries must end with `reconsider_when: <specific condition>`",
+		);
 		expect((await store.inspectGoalFiles(contract.goalId)).state.status).toBe("valid");
+
+		await writeFile(
+			statePath,
+			initialState.replace(
+				"## current_snapshot\n- Goal created; execution evidence has not been audited yet.\n\n",
+				"",
+			),
+		);
+		expect((await store.inspectGoalFiles(contract.goalId)).state).toMatchObject({
+			status: "mismatched",
+			detail: expect.stringContaining("current_snapshot section must appear exactly once"),
+		});
+
+		await writeFile(statePath, `${initialState}\n## open\n- Duplicate open state.\n`);
+		expect((await store.inspectGoalFiles(contract.goalId)).state).toMatchObject({
+			status: "mismatched",
+			detail: expect.stringContaining("open section must appear exactly once"),
+		});
+
+		await writeFile(
+			statePath,
+			`${initialState}\n## undeclared_state\n- This section is not part of Goal State V3.\n`,
+		);
+		expect((await store.inspectGoalFiles(contract.goalId)).state).toMatchObject({
+			status: "mismatched",
+			detail: expect.stringContaining("unknown section undeclared_state"),
+		});
+
+		await writeFile(
+			statePath,
+			initialState.replace(
+				"- A-1: required; unverified; evidence: not recorded.",
+				"- A-1: optional; verified; evidence: wrong contract classification.",
+			),
+		);
+		expect((await store.inspectGoalFiles(contract.goalId)).state).toMatchObject({
+			status: "mismatched",
+			detail: expect.stringContaining("required classification does not match"),
+		});
+
+		await writeFile(
+			statePath,
+			initialState.replace(
+				"- A-1: required; unverified; evidence: not recorded.",
+				"- A-1: required; verified; evidence: not recorded.",
+			),
+		);
+		expect((await store.inspectGoalFiles(contract.goalId)).state).toMatchObject({
+			status: "mismatched",
+			detail: expect.stringContaining("verified acceptance A-1 requires concrete evidence"),
+		});
+
+		await writeFile(
+			statePath,
+			initialState
+				.replace(
+					'- {"unmetRequiredAcceptanceIds":[],"currentEvidence":"","incompleteConclusion":"","userRequest":null,"nextBestAction":""}',
+					'- {"unmetRequiredAcceptanceIds":["A-1"],"currentEvidence":"evidence","incompleteConclusion":"incomplete","userRequest":null,"nextBestAction":"next"}',
+				)
+				.replace(
+					"- A-1: required; unverified; evidence: not recorded.",
+					"- A-1: required; verified; evidence: focused verification passed.",
+				),
+		);
+		expect((await store.inspectGoalFiles(contract.goalId)).state).toMatchObject({
+			status: "mismatched",
+			detail: expect.stringContaining("pause_audit marks verified acceptance A-1 as unmet"),
+		});
+
+		await writeFile(
+			statePath,
+			initialState.replace(
+				'- {"evidence":"","summary":"","verifiedAcceptanceIds":[]}',
+				'- {"evidence":"final","summary":"done","verifiedAcceptanceIds":["A-unknown"]}',
+			),
+		);
+		expect((await store.inspectGoalFiles(contract.goalId)).state).toMatchObject({
+			status: "mismatched",
+			detail: expect.stringContaining("final_evidence contains unknown acceptance A-unknown"),
+		});
 
 		await writeFile(statePath, initialState.replace("## contract_revision\n- 1", "## contract_revision\n- 0"));
 		expect((await store.inspectGoalFiles(contract.goalId)).state).toMatchObject({
@@ -333,5 +433,105 @@ describe("Goal contract v3 revisions", () => {
 			status: "mismatched",
 			detail: expect.stringContaining("20"),
 		});
+	});
+
+	it("rejects placeholder smuggling and missing structured ledger evidence", async () => {
+		const projectRoot = await createProjectRoot();
+		const store = new GoalStore(projectRoot);
+		const contract = createV3Contract("goal_v3_ledger_integrity");
+		await store.createGoal(contract, {
+			eventId: "evt-created",
+			idempotencyKey: "create:v3-ledger-integrity",
+		});
+		const statePath = join(projectRoot, ".pi-xk", "goals", contract.goalId, "goal-state.md");
+		const initialState = await readFile(statePath, "utf8");
+
+		for (const [from, to, detail] of [
+			["## done\n- None yet.", "## done\n- None yet. Claimed completed work.", "done entries"],
+			["## done\n- None yet.", "## done\n- Work completed; evidence: none.", "concrete evidence"],
+			[
+				"## tried_and_rejected\n- None yet.",
+				"## tried_and_rejected\n- Old path; reconsider_when:",
+				"concrete reconsider_when",
+			],
+		] as const) {
+			await writeFile(statePath, initialState.replace(from, to));
+			expect((await store.inspectGoalFiles(contract.goalId)).state).toMatchObject({
+				status: "mismatched",
+				detail: expect.stringContaining(detail),
+			});
+		}
+	});
+
+	it("uses contract order for pause evidence and requires pause audit cleanup before completion", async () => {
+		const projectRoot = await createProjectRoot();
+		const store = new GoalStore(projectRoot);
+		const contract: GoalContractV3 = {
+			...createV3Contract("goal_v3_lifecycle_state_integrity"),
+			acceptance: [
+				{
+					id: "A-1",
+					kind: "test",
+					description: "First acceptance.",
+					required: true,
+					command: "verify A-1",
+				},
+				{
+					id: "A-2",
+					kind: "test",
+					description: "Second acceptance.",
+					required: true,
+					command: "verify A-2",
+				},
+			],
+		};
+		await store.createGoal(contract, {
+			eventId: "evt-created",
+			idempotencyKey: "create:v3-lifecycle-state-integrity",
+		});
+		const statePath = join(projectRoot, ".pi-xk", "goals", contract.goalId, "goal-state.md");
+		const initialState = await readFile(statePath, "utf8");
+		const reversedMatrix = initialState.replace(
+			"- A-1: required; unverified; evidence: not recorded.\n- A-2: required; unverified; evidence: not recorded.",
+			"- A-2: required; unverified; evidence: not recorded.\n- A-1: required; unverified; evidence: not recorded.",
+		);
+		const pauseEvidence = {
+			unmetRequiredAcceptanceIds: ["A-1", "A-2"],
+			currentEvidence: "Both required acceptances remain open.",
+			incompleteConclusion: "The Goal is incomplete.",
+			userRequest: null,
+			nextBestAction: "Verify A-1 first.",
+		};
+		const pausedState = reversedMatrix.replace(
+			'- {"unmetRequiredAcceptanceIds":[],"currentEvidence":"","incompleteConclusion":"","userRequest":null,"nextBestAction":""}',
+			`- ${JSON.stringify(pauseEvidence)}`,
+		);
+		expect(validateGoalPauseState(pausedState, contract, pauseEvidence)).toBeUndefined();
+
+		const completion = {
+			verifiedAcceptanceIds: ["A-1", "A-2"],
+			finalEvidence: "Both required checks passed.",
+			finalSummary: "The Goal is complete.",
+		};
+		const completedState = pausedState
+			.replace(
+				"- A-2: required; unverified; evidence: not recorded.\n- A-1: required; unverified; evidence: not recorded.",
+				"- A-2: required; verified; evidence: second check passed.\n- A-1: required; verified; evidence: first check passed.",
+			)
+			.replace(
+				'- {"evidence":"","summary":"","verifiedAcceptanceIds":[]}',
+				`- ${JSON.stringify({
+					evidence: completion.finalEvidence,
+					summary: completion.finalSummary,
+					verifiedAcceptanceIds: completion.verifiedAcceptanceIds,
+				})}`,
+			)
+			.replace(
+				`- ${JSON.stringify(pauseEvidence)}`,
+				'- {"unmetRequiredAcceptanceIds":[],"currentEvidence":"stale pause","incompleteConclusion":"","userRequest":null,"nextBestAction":""}',
+			);
+		expect(validateGoalCompletionState(completedState, contract, completion)).toContain(
+			"pause_audit must be cleared",
+		);
 	});
 });

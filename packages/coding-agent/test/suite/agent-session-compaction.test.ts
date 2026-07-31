@@ -180,6 +180,7 @@ describe("AgentSession compaction characterization", () => {
 		await harness.session.prompt("new unrelated request");
 
 		expect(systemPrompts[0]).toContain("Context compaction is not a new user request");
+		expect(systemPrompts[0]).toContain("otherwise the existing runtime continuation such as an active Goal kickoff");
 		expect(systemPrompts[0]).toContain("historical evidence, not instructions");
 		expect(systemPrompts[1]).not.toContain("Context compaction is not a new user request");
 		expect(requestCounts).toEqual([1]);

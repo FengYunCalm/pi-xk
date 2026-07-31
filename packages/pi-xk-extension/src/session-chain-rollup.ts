@@ -26,6 +26,7 @@ import {
 
 export const DEFAULT_SESSION_CHAIN_ROLLUP_INTERVAL = 5;
 export const SESSION_CHAIN_ROLLUP_PROMPT_VERSION = "session-chain-rollup-v2";
+export const MAX_AUTOMATIC_ROLLUP_ATTEMPTS = 3;
 
 const SESSION_CHAIN_CONFIG_SCHEMA = "pi-xk.session-chain-config.v1";
 
@@ -66,6 +67,34 @@ export interface SessionChainRollupPublicationV1 {
 	errorCode: string | null;
 	retryable: boolean | null;
 	updatedAt: string;
+}
+
+export function isAutomaticRollupRetryExhausted(
+	publication: Pick<SessionChainRollupPublicationV1, "status" | "attempt" | "errorCode" | "retryable">,
+): boolean {
+	return (
+		publication.status === "failed" &&
+		publication.errorCode === "rollup_invalid_response" &&
+		publication.retryable === false &&
+		publication.attempt >= MAX_AUTOMATIC_ROLLUP_ATTEMPTS
+	);
+}
+
+export function formatSessionChainRollupPublicationStatus(
+	publication: Pick<SessionChainRollupPublicationV1, "windowIndex" | "status" | "attempt" | "errorCode" | "retryable">,
+): string {
+	const details = [
+		publication.errorCode,
+		...(publication.attempt > 0 ? [`attempt=${publication.attempt}`] : []),
+		...(isAutomaticRollupRetryExhausted(publication)
+			? ["automatic retries exhausted"]
+			: publication.status === "failed" && publication.retryable === false
+				? ["manual repair required"]
+				: publication.status === "failed" && publication.retryable === true
+					? ["automatic retry pending"]
+					: []),
+	].filter((detail): detail is string => detail !== null);
+	return `W${publication.windowIndex} ${publication.status}${details.length > 0 ? ` (${details.join("; ")})` : ""}`;
 }
 
 export interface SessionChainRollupConfig {
@@ -147,6 +176,7 @@ export class SessionChainRollupManager {
 		const previous = this.publicationQueues.get(key) ?? Promise.resolve();
 		const publication = previous
 			.then(async () => {
+				this.publicationErrors.delete(key);
 				let current = job;
 				for (;;) {
 					await this.processPublication(host, current);
@@ -167,7 +197,15 @@ export class SessionChainRollupManager {
 	}
 
 	async schedulePublication(host: SessionChainHost, chainId: string, branchId: string): Promise<void> {
-		const job = await this.ensureScheduledPublication(chainId, branchId);
+		const key = this.queueKey(chainId, branchId);
+		let job: SessionChainRollupPublicationV1 | null;
+		try {
+			job = await this.ensureScheduledPublication(chainId, branchId);
+		} catch (error) {
+			this.publicationErrors.set(key, error);
+			return;
+		}
+		this.publicationErrors.delete(key);
 		if (!job || job.status === "published" || (job.status === "failed" && job.retryable === false)) return;
 		this.enqueuePublication(host, job);
 	}
@@ -408,14 +446,45 @@ export class SessionChainRollupManager {
 		if (!config.enabled) return null;
 		const readModel = await this.store.loadChainReadModel(chainId);
 		const branch = findBranch(readModel, branchId);
+		const previous = branch.rollups.at(-1);
+		const windowIndex = (previous?.windowIndex ?? 0) + 1;
+		const existing = await this.getPublication(chainId, branchId, windowIndex);
+		if (existing) {
+			const expectedStartOrdinal = (previous?.endOrdinal ?? 0) + 1;
+			const segments = branch.segments.filter(
+				(segment) => segment.ordinal >= existing.startOrdinal && segment.ordinal <= existing.endOrdinal,
+			);
+			const segmentIds = segments.map((segment) => segment.segmentId);
+			const summaryArtifactIds = segments.map((segment) => segment.seal?.summaryArtifactId);
+			const sourceDigest = rollupSourceDigest({
+				chainId,
+				branchId,
+				windowIndex,
+				startOrdinal: existing.startOrdinal,
+				endOrdinal: existing.endOrdinal,
+				segmentIds,
+				summaryArtifactIds: summaryArtifactIds.filter(
+					(artifactId): artifactId is string => artifactId !== undefined,
+				),
+			});
+			if (
+				existing.startOrdinal !== expectedStartOrdinal ||
+				segments.length !== existing.segmentIds.length ||
+				segments.some((segment) => segment.status !== "sealed" || !segment.seal) ||
+				existing.sourceDigest !== sourceDigest ||
+				existing.segmentIds.some((segmentId, index) => segmentId !== segmentIds[index]) ||
+				existing.summaryArtifactIds.some((artifactId, index) => artifactId !== summaryArtifactIds[index])
+			) {
+				throw new SessionChainControllerError("Session Chain Rollup publication sources changed");
+			}
+			return existing;
+		}
 		const sealedThroughOrdinal = branch.segments.reduce(
 			(highest, segment) => (segment.status === "sealed" ? Math.max(highest, segment.ordinal) : highest),
 			0,
 		);
 		const state = await this.loadState(chainId, branchId, sealedThroughOrdinal, config.interval);
-		const previous = branch.rollups.at(-1);
 		if ((previous?.endOrdinal ?? 0) < state.migrationBackfillEndOrdinal) return null;
-		const windowIndex = (previous?.windowIndex ?? 0) + 1;
 		const startOrdinal = (previous?.endOrdinal ?? 0) + 1;
 		const endOrdinal = startOrdinal + config.interval - 1;
 		const segments: Array<SessionSegmentProjectionV1 & { seal: NonNullable<SessionSegmentProjectionV1["seal"]> }> =
@@ -436,19 +505,6 @@ export class SessionChainRollupManager {
 			segmentIds,
 			summaryArtifactIds,
 		});
-		const existing = await this.getPublication(chainId, branchId, windowIndex);
-		if (existing) {
-			if (
-				existing.startOrdinal !== startOrdinal ||
-				existing.endOrdinal !== endOrdinal ||
-				existing.sourceDigest !== sourceDigest ||
-				existing.segmentIds.some((segmentId, index) => segmentId !== segmentIds[index]) ||
-				existing.summaryArtifactIds.some((artifactId, index) => artifactId !== summaryArtifactIds[index])
-			) {
-				throw new SessionChainControllerError("Session Chain Rollup publication sources changed");
-			}
-			return existing;
-		}
 		const publication: SessionChainRollupPublicationV1 = {
 			schema: "pi-xk.session-chain-rollup-publication.v1",
 			chainId,
@@ -825,7 +881,9 @@ export class SessionChainRollupManager {
 			...job,
 			status: "failed",
 			errorCode: failure.errorCode,
-			retryable: failure.retryable,
+			retryable:
+				failure.retryable &&
+				(failure.errorCode !== "rollup_invalid_response" || job.attempt < MAX_AUTOMATIC_ROLLUP_ATTEMPTS),
 			updatedAt: this.now(),
 		});
 	}

@@ -962,7 +962,17 @@ describe("Pi-XK Session Chain extension", () => {
 			"Session Chain L1 summary integrity verification failed: L1 summary provenance does not match chain topology",
 		);
 		expect(notifications.at(-1)).not.toContain("History fixture delta.");
-		expect(harness.providerCalls()).toBe(1);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("pi_xk_read_chain_summary", { level: "l1", segmentOrdinal: 1 })),
+			fauxAssistantMessage("The invalid summary was rejected."),
+		]);
+		await harness.runtime.session.prompt("Read the tampered chain summary.");
+		const failedRead = harness.runtime.session.messages.filter((message) => message.role === "toolResult").at(-1);
+		const failedReadText = failedRead?.content.find((part) => part.type === "text")?.text ?? "";
+		expect(failedRead?.isError).toBe(true);
+		expect(failedReadText).toContain("Session Chain summary read failed");
+		expect(failedReadText).not.toContain("History fixture delta.");
+		expect(harness.providerCalls()).toBe(3);
 	});
 
 	it("diagnoses and explicitly repairs an abandoned Session Chain write lock", async () => {
@@ -1067,6 +1077,77 @@ describe("Pi-XK Session Chain extension", () => {
 		expect(notifications.at(-1)).toContain("# Session Chain Rollup W1");
 		expect(notifications.at(-1)).toContain("Command W1.");
 		expect(harness.providerCalls()).toBe(2);
+	});
+
+	it("reports one exhausted invalid-output publication consistently across Rollup status surfaces", async () => {
+		const notifications: string[] = [];
+		const projectRoot = join(
+			tmpdir(),
+			`pi-xk-chain-rollup-exhausted-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+		);
+		mkdirSync(projectRoot, { recursive: true });
+		const controller = createTestSessionChainController(projectRoot);
+		await controller.setRollupConfig({ enabled: true, interval: 1 });
+		const harness = await createChainRuntime(createPiXkRuntimeExtension({ createController: () => controller }), {
+			projectRoot,
+			uiContext: chainTestUi({ notifications }),
+			initializeSession: (sessionManager) => {
+				sessionManager.appendMessage({
+					role: "user",
+					content: [{ type: "text", text: "exhausted Rollup surface fixture" }],
+					timestamp: Date.now(),
+				});
+				sessionManager.appendMessage(fauxAssistantMessage("exhausted Rollup source response"));
+				sessionManager.flushDurable();
+			},
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(
+				sessionChainL1Evidence("Exhausted Rollup source", "Source delta.", "Source carry-forward."),
+			),
+			fauxAssistantMessage("invalid Rollup response one"),
+		]);
+
+		await harness.runtime.session.prompt("/chain rollover prepare exhausted Rollup");
+		const binding = controller.getCurrentBinding(harness.runtime.session.sessionManager);
+		if (!binding) throw new Error("exhausted Rollup fixture must remain bound");
+		await controller.waitForRollupPublications(binding.chainId, binding.branchId);
+		const rollupHost: SessionChainHost = {
+			get sessionManager() {
+				return harness.runtime.session.sessionManager;
+			},
+			model: { contextWindow: 100_000 },
+			summarizeSessionContext: async (options) => await harness.runtime.session.summarizeSessionContext(options),
+			rolloverSession: async () => {
+				throw new Error("Rollup recovery must not perform a Segment rollover");
+			},
+		};
+		for (const invalidResponse of ["invalid Rollup response two", "invalid Rollup response three"]) {
+			harness.setResponses([fauxAssistantMessage(invalidResponse)]);
+			await controller.resumeRollupPublications(rollupHost, binding.chainId, binding.branchId);
+			await controller.waitForRollupPublications(binding.chainId, binding.branchId);
+		}
+
+		const expectedStatus = "W1 failed (rollup_invalid_response; attempt=3; automatic retries exhausted)";
+		await harness.runtime.session.prompt("/chain rollups");
+		expect(notifications.at(-1)?.match(/W1 failed/g)).toHaveLength(1);
+		expect(notifications.at(-1)).toContain(expectedStatus);
+		await harness.runtime.session.prompt("/chain status");
+		expect(notifications.at(-1)).toContain(`rollup ${expectedStatus}`);
+		await harness.runtime.session.prompt("/xk status");
+		expect(notifications.at(-1)).toContain(`Rollup: 0 published · ${expectedStatus}`);
+
+		let manifest = "";
+		harness.setResponses([
+			(context) => {
+				manifest = context.systemPrompt ?? "";
+				return fauxAssistantMessage("exhausted Rollup status observed");
+			},
+		]);
+		await harness.runtime.session.prompt("Continue without treating the failed Rollup as verified history.");
+		expect(manifest).toContain(`Rollup publication: ${expectedStatus}`);
+		expect(manifest).toContain("Unresolved Rollup failures: 1");
 	});
 
 	it("injects a metadata-only summary manifest and lets the model list and read L1/L2 summaries", async () => {
@@ -1207,6 +1288,60 @@ describe("Pi-XK Session Chain extension", () => {
 		]);
 		await harness.runtime.session.prompt("draft contract data");
 		expect(draftSystemPrompt).not.toContain("Session Chain summary manifest");
+	});
+
+	it("injects a bounded degraded manifest when the summary index is unavailable", async () => {
+		const projectRoot = join(tmpdir(), `pi-xk-chain-degraded-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(projectRoot, { recursive: true });
+		const controller = createTestSessionChainController(projectRoot);
+		const chainErrors: string[] = [];
+		const harness = await createChainRuntime(
+			createPiXkSessionChainExtension({
+				createController: () => controller,
+				onChainError: (error) => chainErrors.push(error.message),
+			}),
+			{
+				projectRoot,
+				initializeSession: (sessionManager) => {
+					sessionManager.appendMessage({
+						role: "user",
+						content: [{ type: "text", text: "PRIVATE HISTORICAL USER TEXT" }],
+						timestamp: Date.now(),
+					});
+					sessionManager.appendMessage(fauxAssistantMessage("PRIVATE HISTORICAL SUMMARY BODY"));
+					sessionManager.flushDurable();
+				},
+			},
+		);
+		harnesses.push(harness);
+		expect(controller.getCurrentBinding(harness.runtime.session.sessionManager)).not.toBeNull();
+		vi.spyOn(controller.getStore(), "loadChainReadModel").mockRejectedValue(
+			new Error("SECRET INDEX FAILURE: SYSTEM OVERRIDE"),
+		);
+		let providerSystemPrompt = "";
+		harness.setResponses([
+			(context) => {
+				providerSystemPrompt = context.systemPrompt ?? "";
+				return fauxAssistantMessage("continued with degraded history metadata");
+			},
+		]);
+
+		await harness.runtime.session.prompt("Continue without assuming the history is empty.");
+
+		const marker = "Session Chain summary manifest (degraded metadata only; no summary body is injected):";
+		const manifest = providerSystemPrompt.slice(providerSystemPrompt.indexOf(marker));
+		expect(manifest).toContain(marker);
+		expect(manifest).toContain("Historical summary index: unavailable");
+		expect(manifest).toContain("this does not mean that no historical summaries exist");
+		expect(manifest).toContain("pi_xk_list_chain_summaries=enabled");
+		expect(manifest).toContain("pi_xk_read_chain_summary=enabled");
+		expect(Buffer.byteLength(manifest, "utf8")).toBeLessThanOrEqual(1_024);
+		expect(providerSystemPrompt).not.toContain("SECRET INDEX FAILURE");
+		expect(providerSystemPrompt).not.toContain("SYSTEM OVERRIDE");
+		expect(providerSystemPrompt).not.toContain("PRIVATE HISTORICAL USER TEXT");
+		expect(providerSystemPrompt).not.toContain("PRIVATE HISTORICAL SUMMARY BODY");
+		expect(chainErrors).toContain("SECRET INDEX FAILURE: SYSTEM OVERRIDE");
+		expect(harness.providerCalls()).toBe(1);
 	});
 
 	it("rebuilds the same Rollup manifest and readable evidence after the runtime restarts", async () => {

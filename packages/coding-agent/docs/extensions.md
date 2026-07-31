@@ -513,7 +513,7 @@ pi.on("session_shutdown", async (event, ctx) => {
 
 #### before_agent_start
 
-Fired after user submits prompt, before agent loop. Can inject a message and/or modify the system prompt.
+Fired after user submits prompt, before agent loop. Can inject a message, modify the system prompt, and restrict the provider-visible tools for this logical Agent run.
 
 ```typescript
 pi.on("before_agent_start", async (event, ctx) => {
@@ -540,6 +540,8 @@ pi.on("before_agent_start", async (event, ctx) => {
     },
     // Replace the system prompt for this turn (chained across extensions)
     systemPrompt: event.systemPrompt + "\n\nExtra instructions for this turn...",
+    // Optional per-run allowlist. Multiple handlers intersect their lists.
+    activeTools: ["read", "my_tool"],
   };
 });
 ```
@@ -547,6 +549,8 @@ pi.on("before_agent_start", async (event, ctx) => {
 The `systemPromptOptions` field gives extensions access to the same structured data Pi uses to build the system prompt. This lets you inspect what Pi has loaded — custom prompts, guidelines, tool snippets, context files, skills — without re-discovering resources or re-parsing flags. Use it when your extension needs to make deep, informed changes to the system prompt while respecting user-provided configuration.
 
 Inside `before_agent_start`, `event.systemPrompt` and `ctx.getSystemPrompt()` both reflect the chained system prompt as of the current handler. Later `before_agent_start` handlers can still modify it again.
+
+`activeTools` is a temporary projection, not a persistent settings change. It must be a subset of the tools that are active when the logical run starts; unknown or currently inactive names reject the run before the provider, so a projection cannot override the user's disabled-tool choices. Pi rebuilds the run system prompt and provider tool schemas from that allowlist, keeps it across retries, overflow continuation, and reload during the same logical run, then restores the previous active set at settlement. Use it for narrow workflows such as a draft turn that must expose exactly one submission tool; use `pi.setActiveTools()` for persistent session changes.
 
 #### agent_start / agent_end / agent_settled
 
@@ -649,6 +653,8 @@ pi.on("context", async (event, ctx) => {
   return { messages: filtered };
 });
 ```
+
+Ordinary handler failures are reported as extension errors and Pi continues with the last valid message projection. If the transform is an integrity prerequisite and sending the untransformed context would be incorrect, register it with `pi.onCritical("context", handler)` instead. A critical failure aborts the logical Agent request before provider work can be accepted.
 
 #### before_provider_headers
 
@@ -1325,6 +1331,23 @@ export default function (pi: ExtensionAPI) {
 
 Subscribe to events. See [Events](#events) for event types and return values.
 
+### pi.onCritical(event, handler)
+
+Register a fail-closed handler for `before_agent_start` or `context`. Unlike ordinary extension handlers, a thrown error cancels the current logical Agent request and is propagated to the caller instead of being reduced to a diagnostic while provider execution continues. Critical behavior is scoped to this event registration; reusing the same function in `pi.on()` for another event does not make that ordinary registration fail closed.
+
+Use this only when the handler establishes a required prompt, tool, or context integrity invariant. Optional metadata, UI decoration, telemetry, and best-effort context enrichment should keep using `pi.on()`.
+
+```typescript
+pi.onCritical("before_agent_start", async (event) => {
+  const state = await loadRequiredState();
+  if (!state.valid) throw new Error("required state is invalid");
+  return {
+    systemPrompt: `${event.systemPrompt}\n\nUse the verified state projection.`,
+    activeTools: ["read", "state_submit"],
+  };
+});
+```
+
 ### pi.registerTool(definition)
 
 Register a custom tool callable by the LLM. See [Custom Tools](#custom-tools) for full details.
@@ -1334,6 +1357,8 @@ Register a custom tool callable by the LLM. See [Custom Tools](#custom-tools) fo
 Use `pi.setActiveTools()` to enable or disable tools (including dynamically added tools) at runtime.
 
 Use `promptSnippet` to opt a custom tool into a one-line entry in `Available tools`, and `promptGuidelines` to append tool-specific bullets to the default `Guidelines` section when the tool is active.
+
+The optional `capabilities.filesystem.read/write` metadata lets workflow extensions preflight whether the current tool set can read or update required files. It is a declaration for coordination, not permission enforcement or a sandbox; declare only behavior the tool actually provides.
 
 **Important:** `promptGuidelines` bullets are appended flat to the `Guidelines` section with no tool name prefix. Each guideline must name the tool it refers to — avoid "Use this tool when..." because the LLM cannot tell which tool "this" means. Write "Use my_tool when..." instead.
 
@@ -1349,6 +1374,7 @@ pi.registerTool({
   description: "What this tool does",
   promptSnippet: "Summarize or transform text according to action",
   promptGuidelines: ["Use my_tool when the user asks to summarize previously generated text."],
+  capabilities: { filesystem: { read: true } },
   parameters: Type.Object({
     action: StringEnum(["list", "add"] as const),
     text: Type.Optional(Type.String()),
@@ -1624,6 +1650,7 @@ const all = pi.getAllTools();
 //   description: "Read file contents...",
 //   parameters: ...,
 //   promptGuidelines: ["Use read to examine files instead of cat or sed."],
+//   capabilities: { filesystem: { read: true } },
 //   sourceInfo: { path: "<builtin:read>", source: "builtin", scope: "temporary", origin: "top-level" }
 // }, ...]
 const builtinTools = all.filter((t) => t.sourceInfo.source === "builtin");
@@ -1632,7 +1659,7 @@ pi.setActiveTools([...new Set([...active, "my_custom_tool"])]); // Keep current 
 pi.setActiveTools(["read", "bash"]); // Switch to read-only
 ```
 
-`pi.getAllTools()` returns `name`, `description`, `parameters`, `promptGuidelines`, and `sourceInfo`.
+`pi.getAllTools()` returns `name`, `description`, `parameters`, `promptGuidelines`, `capabilities`, and `sourceInfo`.
 
 Typical `sourceInfo.source` values:
 - `builtin` for built-in tools
@@ -1900,6 +1927,7 @@ pi.registerTool({
   promptGuidelines: [
     "Use my_tool for todo planning instead of direct file edits when the user asks for a task list."
   ],
+  capabilities: { filesystem: { read: true, write: true } },
   parameters: Type.Object({
     action: StringEnum(["list", "add"] as const),  // Use StringEnum for Google compatibility
     text: Type.Optional(Type.String()),
@@ -2842,6 +2870,7 @@ const highlighted = highlightCode(code, lang, theme);
 ## Error Handling
 
 - Extension errors are logged, agent continues
+- `pi.onCritical("before_agent_start" | "context", ...)` errors abort the logical Agent request and propagate to the caller
 - `tool_call` errors block the tool (fail-safe)
 - Tool `execute` errors must be signaled by throwing; the thrown error is caught, reported to the LLM with `isError: true`, and execution continues
 

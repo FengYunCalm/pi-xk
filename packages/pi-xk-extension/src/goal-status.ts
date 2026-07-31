@@ -1,4 +1,9 @@
-import type { GoalFilesDiagnostic, GoalLifecycleStatus, GoalReplay } from "pi-xk-core";
+import {
+	type GoalFilesDiagnostic,
+	type GoalLifecycleStatus,
+	type GoalReplay,
+	parseGoalStateProjection,
+} from "pi-xk-core";
 
 export function formatDuration(milliseconds: number): string {
 	const seconds = Math.max(0, Math.floor(milliseconds / 1000));
@@ -37,6 +42,37 @@ export function readGoalStateSection(markdown: string, section: string, fallback
 	return values.join(" ") || fallback;
 }
 
+export interface GoalRequiredAcceptanceStatus {
+	id: string;
+	status: "verified" | "missing" | "unverified";
+}
+
+export function getGoalRequiredAcceptanceStatus(
+	replay: GoalReplay,
+	stateMarkdown?: string,
+): GoalRequiredAcceptanceStatus[] {
+	const stateAcceptance =
+		replay.contract.schema === "pi-xk.goal.contract.v3" && stateMarkdown
+			? parseGoalStateProjection(stateMarkdown, replay.contract).acceptanceMatrix
+			: [];
+	const verifiedAcceptanceIds = new Set(replay.lifecycle.end?.verifiedAcceptanceIds ?? []);
+	const missingAcceptanceIds = new Set(replay.lifecycle.lastPause?.audit.unmetRequiredAcceptanceIds ?? []);
+	return replay.contract.acceptance
+		.filter((acceptance) => acceptance.required)
+		.map((acceptance) => {
+			const stateEntry = stateAcceptance.find((entry) => entry.id === acceptance.id);
+			return {
+				id: acceptance.id,
+				status:
+					verifiedAcceptanceIds.has(acceptance.id) || stateEntry?.status === "verified"
+						? "verified"
+						: missingAcceptanceIds.has(acceptance.id)
+							? "missing"
+							: "unverified",
+			};
+		});
+}
+
 export function renderGoalStatus(
 	goalId: string,
 	replay: GoalReplay,
@@ -49,17 +85,8 @@ export function renderGoalStatus(
 	const acceptanceLedger = stateMarkdown
 		? readGoalStateSection(stateMarkdown, "acceptance_matrix", readGoalStateSection(stateMarkdown, "acceptance_gaps"))
 		: unavailable;
-	const requiredAcceptanceIds = replay.contract.acceptance
-		.filter((acceptance) => acceptance.required)
-		.map((acceptance) => acceptance.id);
-	const verifiedAcceptanceIds = new Set(replay.lifecycle.end?.verifiedAcceptanceIds ?? []);
-	const missingAcceptanceIds = new Set(replay.lifecycle.lastPause?.audit.unmetRequiredAcceptanceIds ?? []);
-	const acceptanceStatus = requiredAcceptanceIds.map((id) =>
-		verifiedAcceptanceIds.has(id)
-			? `${id}=verified`
-			: missingAcceptanceIds.has(id)
-				? `${id}=missing`
-				: `${id}=unverified`,
+	const acceptanceStatus = getGoalRequiredAcceptanceStatus(replay, stateMarkdown).map(
+		(acceptance) => `${acceptance.id}=${acceptance.status}`,
 	);
 	const latestCheckpoint = [...replay.events].reverse().find((event) => event.eventType === "goal_checkpointed");
 	const latestRun = replay.lifecycle.runs.at(-1);

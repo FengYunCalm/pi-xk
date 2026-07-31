@@ -80,7 +80,7 @@ L1 generator 通过 Host `summarizeSessionContext({ replaceInstructions: true })
 
 L2 输入只包括窗口内有序且 provenance 校验通过的 L1 artifacts，不扫描 transcript。结构化 `pi-xk.session-chain-rollup.v1` artifact 保存 state、decisions、constraints、completed、unresolved、nextActions、来源 IDs、`sourceDigest` 和生成 provenance。Artifact Store ID 是正文 SHA-256，因此正文不递归包含自己的 artifact ID；该 ID 保存在 published event、read model 和读取包装中。
 
-rollover commit 后持久化 `scheduled` publication job 并立即返回 successor Segment。每个 branch 在进程内串行 drain publication job，并以 branch/window generation lock 做跨进程去重；一个窗口发布后会重新检查下一个完整窗口，因此慢 W1 期间继续完成 W2 来源也不会丢失调度。失败 job 不在同一次 drain 中无限重试。第 N 次 rollover 不等待 L2 provider latency。L2 失败不回滚 rollover；`rollup_failed` 按 provider、I/O、provenance/schema/digest、event conflict 和 projection 分类表达 stage、errorCode 与 retryable。artifact 已生成但 event 未发布时，pending publication 允许重试复用 artifact。event 发布后，read model 可由日志重建；Markdown 仅是可重建的人类投影，缺失或陈旧不阻断已验证结构化 L2 的读取，doctor 继续报告并可重建投影。
+rollover commit 后持久化 `scheduled` publication job 并立即返回 successor Segment。每个 branch 在进程内串行 drain publication job，并以 branch/window generation lock 做跨进程去重；一个窗口发布后会重新检查下一个完整窗口，因此慢 W1 期间继续完成 W2 来源也不会丢失调度。失败 job 不在同一次 drain 中无限重试。第 N 次 rollover 不等待 L2 provider latency。L2 失败不回滚 rollover；`rollup_failed` 按 provider、I/O、provenance/schema/digest、event conflict 和 projection 分类表达 stage、errorCode 与 retryable。无效 L2 响应最多自动尝试 3 次，随后要求人工审查输出合同；provider timeout、临时 I/O 和 event publication 等临时错误不套用该无效响应上限，仍在后续恢复时保持可重试。artifact 已生成但 event 未发布时，pending publication 允许重试复用 artifact。event 发布后，read model 可由日志重建；Markdown 仅是可重建的人类投影，缺失或陈旧不阻断已验证结构化 L2 的读取，doctor 继续报告并可重建投影。
 
 旧 chain 不自动批量生成历史 L2。升级时记录历史 backfill 边界，只有 `/chain rollup backfill [limit]` 显式、有限额调用模型。关闭自动 Rollup 不删除既有 L1/L2，也不禁用读取。
 
@@ -100,6 +100,8 @@ rollover commit 后持久化 `scheduled` publication job 并立即返回 success
 首条有效用户输入确定性生成截断标题，不调用模型；`/chain rename` 修改标题。archive 使用 v3 `chain_archive_updated` event，只影响默认 list/picker，不删除任何事实。replay 支持 v1/v2/v3 混合日志。
 
 `/chain doctor` 是 event/read-model head、拓扑、锁、publication 和 projection metadata 的快速检查；`/chain doctor deep` 完整 replay、hash Segment 并验证全部 L1/L2；`/chain doctor repair-projections` 只重建 read model、catalog 和 Markdown。事实损坏始终只报告。统一 PID/nonce/createdAt 写锁仅允许按 doctor 给出的 exact nonce 显式恢复死亡 owner。
+
+`/chain rollups`、`/chain status`、`/xk status` 和 manifest 都以每个未解决窗口最新的 durable publication job 为当前状态，不逐条重复历史 `rollup_failed` 事件；event log 仍保留每次失败以供审计。
 
 rollover 只允许在 agent fully settled、输入队列为空、无运行或待交付 Task、无 Goal draft、无待确认 Goal revision 和未结算 lifecycle intent 时执行。目标 JSONL 与源 `summary-out` durable 后才能提交领域事件。prepared 崩溃恢复必须根据两端 marker 幂等 commit、重建目标或 abort，不能伪造完成。
 

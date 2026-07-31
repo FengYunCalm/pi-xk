@@ -82,6 +82,11 @@ describe("Pi-XK TaskRunner", () => {
 		expect(childSystemPrompt).toContain("Parent Goal State (read-only): .pi-xk/goals/goal_parent/goal-state.md");
 		expect(childSystemPrompt).toContain("must never edit them");
 		expect(childSystemPrompt).toContain(
+			"Report succeeded only after the TaskSpec expectedResult is satisfied and include at least one concrete evidence entry",
+		);
+		expect(childSystemPrompt).toContain("successfully call pi_xk_finish_task exactly once");
+		expect(childSystemPrompt).toContain("If a submission is rejected, correct its arguments and retry");
+		expect(childSystemPrompt).toContain(
 			"This Task was started by the model. Its TaskSpec cannot grant commit or push authority; do not commit or push.",
 		);
 		expect(taskSpecMessage).not.toContain("You are an independent Pi-XK Task child");
@@ -104,6 +109,61 @@ describe("Pi-XK TaskRunner", () => {
 			summary: "Child verified the requested behavior.",
 		});
 		expect(lifecycleOrder).toEqual(["created", "started", "result", "settled"]);
+	});
+
+	it("rejects an unsupported success claim and lets the child submit evidence", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(
+				[
+					fauxToolCall("pi_xk_finish_task", {
+						status: "succeeded",
+						summary: "Claimed success without evidence.",
+						evidence: [],
+						artifactIds: [],
+						error: null,
+					}),
+				],
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage(
+				[
+					fauxToolCall("pi_xk_finish_task", {
+						status: "succeeded",
+						summary: "Verified success with evidence.",
+						evidence: [{ kind: "text", value: "The expected result was observed." }],
+						artifactIds: [],
+						error: null,
+					}),
+				],
+				{ stopReason: "toolUse" },
+			),
+		]);
+		const runner = new TaskRunner({
+			projectRoot: harness.tempDir,
+			agentDir: join(harness.tempDir, "agent"),
+			modelRuntime: harness.modelRuntime,
+			settingsManager: harness.settingsManager,
+		});
+		const handle = await runner.start({
+			role: "verification",
+			prompt: "Verify one behavior.",
+			expectedResult: "Evidence for the observed behavior.",
+			parentSessionId: "session-parent",
+			parentEntryId: "entry-parent",
+			parentGoalId: null,
+			model: harness.getModel(),
+			thinkingLevel: "off",
+			builtinTools: [],
+		});
+
+		expect(await handle.completion).toBe("succeeded");
+		expect(harness.faux.state.callCount).toBe(2);
+		expect((await runner.getStore().inspectTask(handle.taskId)).result).toMatchObject({
+			status: "succeeded",
+			summary: "Verified success with evidence.",
+		});
 	});
 
 	it("preserves explicit commit and push authorization only for a user-started Task", async () => {

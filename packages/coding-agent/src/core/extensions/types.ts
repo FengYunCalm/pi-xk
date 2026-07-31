@@ -503,6 +503,13 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	promptSnippet?: string;
 	/** Optional guideline bullets appended to the default system prompt Guidelines section when this tool is active. */
 	promptGuidelines?: string[];
+	/** Optional host-declared capabilities used for workflow preflight checks. */
+	capabilities?: {
+		filesystem?: {
+			read?: boolean;
+			write?: boolean;
+		};
+	};
 	/** Parameter schema (TypeBox) */
 	parameters: TParams;
 	/** Controls whether ToolExecutionComponent renders the standard colored shell or the tool renders its own framing. */
@@ -1149,6 +1156,8 @@ export interface BeforeAgentStartEventResult {
 	message?: Pick<CustomMessage, "customType" | "content" | "display" | "details">;
 	/** Replace the system prompt for this turn. If multiple extensions return this, they are chained. */
 	systemPrompt?: string;
+	/** Restrict provider-visible tool schemas for this logical Agent run. The prior active set is restored afterward. */
+	activeTools?: string[];
 	/** Cancel this logical Agent run before any provider request is made. */
 	cancel?: boolean;
 	/** Human-readable reason for a cancelled run. */
@@ -1289,6 +1298,13 @@ export interface ExtensionAPI {
 	on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): void;
 	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): void;
 	on(event: "input", handler: ExtensionHandler<InputEvent, InputEventResult>): void;
+
+	/** Register a prompt-integrity handler whose failure aborts the Agent request. */
+	onCritical(event: "context", handler: ExtensionHandler<ContextEvent, ContextEventResult>): void;
+	onCritical(
+		event: "before_agent_start",
+		handler: ExtensionHandler<BeforeAgentStartEvent, BeforeAgentStartEventResult>,
+	): void;
 
 	// =========================================================================
 	// Tool Registration
@@ -1614,7 +1630,10 @@ export type GetSessionNameHandler = () => string | undefined;
 export type GetActiveToolsHandler = () => string[];
 
 /** Tool info with name, description, parameter schema, prompt guidelines, and source metadata. */
-export type ToolInfo = Pick<ToolDefinition, "name" | "description" | "parameters" | "promptGuidelines"> & {
+export type ToolInfo = Pick<
+	ToolDefinition,
+	"name" | "description" | "parameters" | "promptGuidelines" | "capabilities"
+> & {
 	sourceInfo: SourceInfo;
 };
 
@@ -1741,6 +1760,7 @@ export interface Extension {
 	hidden?: boolean;
 	sourceInfo: SourceInfo;
 	handlers: Map<string, HandlerFn[]>;
+	criticalHandlers: Set<HandlerFn>;
 	tools: Map<string, RegisteredTool>;
 	messageRenderers: Map<string, MessageRenderer>;
 	entryRenderers?: Map<string, EntryRenderer>;

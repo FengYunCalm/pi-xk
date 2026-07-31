@@ -12,6 +12,7 @@ import {
 } from "../../../pi-xk-core/src/index.ts";
 import {
 	evaluateSessionChainThreshold,
+	formatSessionChainRollupPublicationStatus,
 	isPiXkSessionChainBinding,
 	PI_XK_SESSION_CHAIN_LINK_CUSTOM_TYPE,
 	PI_XK_SESSION_CHAIN_SUMMARY_IN_CUSTOM_TYPE,
@@ -865,6 +866,136 @@ describe("SessionChainController rollover", () => {
 		expect((await controller.getStore().replayChain(binding.chainId)).branches[0]?.rollups).toHaveLength(1);
 	});
 
+	it("keeps a committed rollover successful when post-commit Rollup scheduling fails", async () => {
+		const projectRoot = await createTempDir();
+		const source = createPersistedSession(projectRoot, "rollup-scheduling-failure-source");
+		const controller = new SessionChainController({ projectRoot });
+		const binding = await controller.adoptExternalRoot(source);
+		appendTurn(source, "commit before scheduling failure", "the successor must remain active");
+		const { host, getCurrentManager } = createHost(source, {
+			responses: [sessionChainL1Evidence("Committed Segment", "Committed delta.", "Committed carry-forward.")],
+		});
+		await mkdir(join(projectRoot, ".pi-xk"), { recursive: true });
+		await writeFile(join(projectRoot, ".pi-xk", "session-chain.json"), "{ invalid config\n", "utf8");
+
+		await expect(controller.rollover(host, { reason: "post-commit scheduling failure" })).resolves.toMatchObject({
+			cancelled: false,
+			sourceSegmentId: binding.segmentId,
+		});
+		expect(controller.getCurrentBinding(getCurrentManager())?.ordinal).toBe(2);
+		expect(
+			(await controller.getStore().replayChain(binding.chainId)).branches[0]?.segments.map(
+				(segment) => segment.status,
+			),
+		).toEqual(["sealed", "active"]);
+		await expect(controller.waitForRollupPublications(binding.chainId, binding.branchId)).rejects.toThrow(
+			"config is unreadable",
+		);
+	});
+
+	it("clears a stale scheduling error after the same controller successfully retries", async () => {
+		const projectRoot = await createTempDir();
+		const source = createPersistedSession(projectRoot, "rollup-scheduling-recovery-source");
+		const controller = new SessionChainController({ projectRoot });
+		const binding = await controller.adoptExternalRoot(source);
+		appendTurn(source, "commit before recoverable scheduling failure", "the successor remains usable");
+		const { host } = createHost(source, {
+			responses: [
+				sessionChainL1Evidence("Recoverable scheduling source", "Scheduling delta.", "Scheduling carry."),
+				sessionChainL2Evidence({
+					state: "Scheduling recovered.",
+					decisions: [],
+					constraints: [],
+					completed: ["Published after config repair."],
+					unresolved: [],
+					nextActions: [],
+				}),
+			],
+		});
+		await mkdir(join(projectRoot, ".pi-xk"), { recursive: true });
+		await writeFile(join(projectRoot, ".pi-xk", "session-chain.json"), "{ invalid config\n", "utf8");
+
+		await controller.rollover(host, { reason: "cache recoverable scheduling failure" });
+		await controller.setRollupConfig({ enabled: true, interval: 1 });
+		await controller.resumeRollupPublications(host, binding.chainId, binding.branchId);
+
+		await expect(controller.waitForRollupPublications(binding.chainId, binding.branchId)).resolves.toBeUndefined();
+		expect((await controller.getStore().replayChain(binding.chainId)).branches[0]?.rollups).toEqual([
+			expect.objectContaining({ windowIndex: 1, startOrdinal: 1, endOrdinal: 1 }),
+		]);
+	});
+
+	it("keeps an already scheduled window stable when the interval changes during generation", async () => {
+		const projectRoot = await createTempDir();
+		const source = createPersistedSession(projectRoot, "rollup-stable-window-source");
+		const controller = new SessionChainController({ projectRoot });
+		await controller.setRollupConfig({ enabled: true, interval: 1 });
+		const binding = await controller.adoptExternalRoot(source);
+		appendTurn(source, "first window source", "first window result");
+		let l2Calls = 0;
+		let releaseFirstRollup: (() => void) | undefined;
+		let markFirstRollupStarted: (() => void) | undefined;
+		const firstRollupStarted = new Promise<void>((resolve) => {
+			markFirstRollupStarted = resolve;
+		});
+		const firstRollupGate = new Promise<void>((resolve) => {
+			releaseFirstRollup = resolve;
+		});
+		const { host, getCurrentManager } = createHost(source, {
+			responseFactory: async (_callIndex, request) => {
+				if (!request.customInstructions?.includes("session-chain-l2")) {
+					return sessionChainL1Evidence("Stable window source", "Segment delta.", "Segment carry-forward.");
+				}
+				l2Calls += 1;
+				if (l2Calls === 1) {
+					markFirstRollupStarted?.();
+					await firstRollupGate;
+				}
+				return sessionChainL2Evidence({
+					state: `Published window ${l2Calls}.`,
+					decisions: [],
+					constraints: [],
+					completed: [`W${l2Calls}.`],
+					unresolved: [],
+					nextActions: [],
+				});
+			},
+		});
+
+		await controller.rollover(host, { reason: "schedule W1 with interval one" });
+		await firstRollupStarted;
+		await controller.setRollupConfig({ enabled: true, interval: 2 });
+		const restarted = new SessionChainController({ projectRoot });
+		let resumeError: unknown;
+		try {
+			await restarted.resumeRollupPublications(host, binding.chainId, binding.branchId);
+		} catch (error) {
+			resumeError = error;
+		} finally {
+			releaseFirstRollup?.();
+		}
+		expect(resumeError).toBeUndefined();
+		await Promise.all([
+			controller.waitForRollupPublications(binding.chainId, binding.branchId),
+			restarted.waitForRollupPublications(binding.chainId, binding.branchId),
+		]);
+		expect((await controller.getStore().replayChain(binding.chainId)).branches[0]?.rollups).toEqual([
+			expect.objectContaining({ windowIndex: 1, startOrdinal: 1, endOrdinal: 1 }),
+		]);
+
+		appendTurn(getCurrentManager(), "second window first Segment", "second Segment result");
+		await controller.rollover(host, { reason: "collect S2 for interval two" });
+		await controller.waitForRollupPublications(binding.chainId, binding.branchId);
+		appendTurn(getCurrentManager(), "second window second Segment", "third Segment result");
+		await controller.rollover(host, { reason: "publish W2 with interval two" });
+		await controller.waitForRollupPublications(binding.chainId, binding.branchId);
+		expect((await controller.getStore().replayChain(binding.chainId)).branches[0]?.rollups).toEqual([
+			expect.objectContaining({ windowIndex: 1, startOrdinal: 1, endOrdinal: 1 }),
+			expect.objectContaining({ windowIndex: 2, startOrdinal: 2, endOrdinal: 3 }),
+		]);
+		expect(l2Calls).toBe(2);
+	});
+
 	it("uses the default five-Segment interval and publishes two non-overlapping windows after ten rollovers", async () => {
 		const projectRoot = await createTempDir();
 		const controller = new SessionChainController({
@@ -992,7 +1123,7 @@ describe("SessionChainController rollover", () => {
 		]);
 	});
 
-	it("keeps a committed rollover usable when L2 output is invalid and records a non-retryable diagnostic", async () => {
+	it("keeps a committed rollover usable and retries invalid L2 output", async () => {
 		const projectRoot = await createTempDir();
 		const source = createPersistedSession(projectRoot, "rollup-failure-source");
 		const controller = new SessionChainController({ projectRoot });
@@ -1019,9 +1150,104 @@ describe("SessionChainController rollover", () => {
 				windowIndex: 1,
 				stage: "artifact_generation",
 				errorCode: "rollup_invalid_response",
-				retryable: false,
+				retryable: true,
 			}),
 		]);
+		expect(await controller.getRollupPublication(binding.chainId, binding.branchId, 1)).toMatchObject({
+			status: "failed",
+			errorCode: "rollup_invalid_response",
+			retryable: true,
+			attempt: 1,
+		});
+
+		const resumed = new SessionChainController({ projectRoot });
+		const resumedHost = createHost(getCurrentManager(), {
+			responses: [
+				sessionChainL2Evidence({
+					state: "Recovered after invalid model output.",
+					decisions: [],
+					constraints: [],
+					completed: ["Published W1."],
+					unresolved: [],
+					nextActions: [],
+				}),
+			],
+		});
+		await resumed.resumeRollupPublications(resumedHost.host, binding.chainId, binding.branchId);
+		await resumed.waitForRollupPublications(binding.chainId, binding.branchId);
+		expect(resumedHost.summarizeSessionContext).toHaveBeenCalledTimes(1);
+		expect((await resumed.getStore().replayChain(binding.chainId)).branches[0]?.rollups).toEqual([
+			expect.objectContaining({ windowIndex: 1, startOrdinal: 1, endOrdinal: 1 }),
+		]);
+	});
+
+	it("stops automatic Rollup retries after three invalid model responses", async () => {
+		const projectRoot = await createTempDir();
+		const source = createPersistedSession(projectRoot, "rollup-invalid-response-limit-source");
+		const controller = new SessionChainController({ projectRoot });
+		await controller.setRollupConfig({ enabled: true, interval: 1 });
+		const binding = await controller.adoptExternalRoot(source);
+		appendTurn(source, "commit before repeated invalid L2 responses", "L1 remains valid");
+		const initialHost = createHost(source, {
+			responses: [
+				sessionChainL1Evidence("Repeated invalid Rollup source", "L1 delta.", "L1 carry-forward."),
+				"invalid rollup response one",
+			],
+		});
+
+		await controller.rollover(initialHost.host, { reason: "first invalid Rollup response" });
+		await controller.waitForRollupPublications(binding.chainId, binding.branchId);
+		const currentManager = initialHost.getCurrentManager();
+		for (const invalidResponse of ["invalid rollup response two", "invalid rollup response three"]) {
+			const resumed = new SessionChainController({ projectRoot });
+			const resumedHost = createHost(currentManager, { responses: [invalidResponse] });
+			await resumed.resumeRollupPublications(resumedHost.host, binding.chainId, binding.branchId);
+			await resumed.waitForRollupPublications(binding.chainId, binding.branchId);
+			expect(resumedHost.summarizeSessionContext).toHaveBeenCalledTimes(1);
+		}
+
+		const exhausted = new SessionChainController({ projectRoot });
+		const unusedHost = createHost(currentManager, {
+			responses: [
+				sessionChainL2Evidence({
+					state: "This response must not be requested.",
+					decisions: [],
+					constraints: [],
+					completed: [],
+					unresolved: [],
+					nextActions: [],
+				}),
+			],
+		});
+		await exhausted.resumeRollupPublications(unusedHost.host, binding.chainId, binding.branchId);
+		await exhausted.waitForRollupPublications(binding.chainId, binding.branchId);
+
+		expect(unusedHost.summarizeSessionContext).not.toHaveBeenCalled();
+		const exhaustedPublication = await exhausted.getRollupPublication(binding.chainId, binding.branchId, 1);
+		expect(exhaustedPublication).toMatchObject({
+			status: "failed",
+			errorCode: "rollup_invalid_response",
+			retryable: false,
+			attempt: 3,
+		});
+		if (!exhaustedPublication) throw new Error("exhausted Rollup publication is missing");
+		expect(formatSessionChainRollupPublicationStatus(exhaustedPublication)).toBe(
+			"W1 failed (rollup_invalid_response; attempt=3; automatic retries exhausted)",
+		);
+		const replay = await exhausted.getStore().replayChain(binding.chainId);
+		expect(replay.branches[0]?.rollups).toEqual([]);
+		expect(replay.branches[0]?.rollupFailures).toEqual([
+			expect.objectContaining({ attempt: 1, errorCode: "rollup_invalid_response", retryable: true }),
+			expect.objectContaining({ attempt: 2, errorCode: "rollup_invalid_response", retryable: true }),
+			expect.objectContaining({ attempt: 3, errorCode: "rollup_invalid_response", retryable: true }),
+		]);
+		for (const mode of ["quick", "deep"] as const) {
+			const report = await exhausted.doctor(binding.chainId, mode);
+			expect(
+				report.diagnostics.filter((diagnostic) => diagnostic.code === "rollup_generation_review_required"),
+			).toHaveLength(1);
+			expect(report.diagnostics.some((diagnostic) => diagnostic.code === "rollup_retry_pending")).toBe(false);
+		}
 	});
 
 	it("persists a retryable L2 failure and resumes the same window after restart", async () => {
@@ -1079,6 +1305,64 @@ describe("SessionChainController rollover", () => {
 		expect(await restarted.getRollupPublication(binding.chainId, binding.branchId, 1)).toMatchObject({
 			status: "published",
 			attempt: 2,
+		});
+	});
+
+	it("keeps transient provider failures retryable beyond the invalid-response attempt limit", async () => {
+		const projectRoot = await createTempDir();
+		const source = createPersistedSession(projectRoot, "rollup-provider-retry-limit-source");
+		const initial = new SessionChainController({ projectRoot });
+		await initial.setRollupConfig({ enabled: true, interval: 1 });
+		const binding = await initial.adoptExternalRoot(source);
+		appendTurn(source, "commit before repeated provider failures", "L1 remains valid");
+		const initialHost = createHost(source, {
+			responses: [sessionChainL1Evidence("Provider retry source", "L1 delta.", "L1 carry-forward.")],
+			failAtCall: 1,
+			failure: new Error("provider timeout one"),
+		});
+
+		await initial.rollover(initialHost.host, { reason: "first transient Rollup provider failure" });
+		await initial.waitForRollupPublications(binding.chainId, binding.branchId);
+		for (const message of ["provider timeout two", "provider timeout three"]) {
+			const resumed = new SessionChainController({ projectRoot });
+			const failedHost = createHost(initialHost.getCurrentManager(), {
+				failAtCall: 0,
+				failure: new Error(message),
+			});
+			await resumed.resumeRollupPublications(failedHost.host, binding.chainId, binding.branchId);
+			await resumed.waitForRollupPublications(binding.chainId, binding.branchId);
+		}
+
+		const afterThree = new SessionChainController({ projectRoot });
+		const publication = await afterThree.getRollupPublication(binding.chainId, binding.branchId, 1);
+		expect(publication).toMatchObject({
+			status: "failed",
+			errorCode: "rollup_provider_failed",
+			retryable: true,
+			attempt: 3,
+		});
+		if (!publication) throw new Error("provider failure publication is missing");
+		expect(formatSessionChainRollupPublicationStatus(publication)).toBe(
+			"W1 failed (rollup_provider_failed; attempt=3; automatic retry pending)",
+		);
+
+		const recoveredHost = createHost(initialHost.getCurrentManager(), {
+			responses: [
+				sessionChainL2Evidence({
+					state: "Recovered after repeated provider timeouts.",
+					decisions: [],
+					constraints: [],
+					completed: ["Published W1."],
+					unresolved: [],
+					nextActions: [],
+				}),
+			],
+		});
+		await afterThree.resumeRollupPublications(recoveredHost.host, binding.chainId, binding.branchId);
+		await afterThree.waitForRollupPublications(binding.chainId, binding.branchId);
+		expect(await afterThree.getRollupPublication(binding.chainId, binding.branchId, 1)).toMatchObject({
+			status: "published",
+			attempt: 4,
 		});
 	});
 
@@ -1279,6 +1563,57 @@ describe("SessionChainController rollover", () => {
 		expect(await readFile(markdownPath, "utf8")).toContain("# Session Chain Rollup W1");
 		expect((await controller.doctor(binding.chainId)).diagnostics).not.toContainEqual(
 			expect.objectContaining({ code: "rollup_markdown_missing" }),
+		);
+	});
+
+	it("reports projection and generation diagnostics for their separate Rollup windows", async () => {
+		const projectRoot = await createTempDir();
+		const source = createPersistedSession(projectRoot, "rollup-multi-window-diagnostics-source");
+		const controller = new SessionChainController({ projectRoot });
+		await controller.setRollupConfig({ enabled: true, interval: 1 });
+		const binding = await controller.adoptExternalRoot(source);
+		appendTurn(source, "first diagnostic source", "first diagnostic result");
+		const { host, getCurrentManager } = createHost(source, {
+			responses: [
+				sessionChainL1Evidence("First diagnostic window", "First delta.", "First carry-forward."),
+				sessionChainL2Evidence({
+					state: "First window state.",
+					decisions: [],
+					constraints: [],
+					completed: ["Published W1."],
+					unresolved: [],
+					nextActions: [],
+				}),
+				sessionChainL1Evidence("Second diagnostic window", "Second delta.", "Second carry-forward."),
+				"invalid second window rollup",
+			],
+		});
+
+		await controller.rollover(host, { reason: "publish first diagnostic window" });
+		await controller.waitForRollupPublications(binding.chainId, binding.branchId);
+		await rm(
+			join(
+				projectRoot,
+				".pi-xk",
+				"sessions",
+				"chains",
+				binding.chainId,
+				"branches",
+				binding.branchId,
+				"rollups",
+				"000001.md",
+			),
+		);
+		appendTurn(getCurrentManager(), "second diagnostic source", "second diagnostic result");
+		await controller.rollover(host, { reason: "fail second diagnostic window" });
+		await controller.waitForRollupPublications(binding.chainId, binding.branchId);
+
+		const diagnostics = (await controller.doctor(binding.chainId)).diagnostics;
+		expect(diagnostics).toContainEqual(
+			expect.objectContaining({ code: "rollup_markdown_missing", branchId: binding.branchId }),
+		);
+		expect(diagnostics).toContainEqual(
+			expect.objectContaining({ code: "rollup_retry_pending", branchId: binding.branchId }),
 		);
 	});
 

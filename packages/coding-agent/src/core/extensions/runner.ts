@@ -119,6 +119,7 @@ const buildBuiltinKeybindings = (resolvedKeybindings: KeybindingsConfig): BuiltI
 interface BeforeAgentStartCombinedResult {
 	messages?: NonNullable<BeforeAgentStartEventResult["message"]>[];
 	systemPrompt?: string;
+	activeTools?: string[];
 	cancel?: boolean;
 	reason?: string;
 }
@@ -320,6 +321,7 @@ export class ExtensionRunner {
 	private shortcutDiagnostics: ResourceDiagnostic[] = [];
 	private commandDiagnostics: ResourceDiagnostic[] = [];
 	private staleMessage: string | undefined;
+	private pendingCriticalContextError: unknown;
 
 	constructor(
 		extensions: Extension[],
@@ -334,6 +336,12 @@ export class ExtensionRunner {
 		this.cwd = cwd;
 		this.sessionManager = sessionManager;
 		this.modelRegistry = modelRegistry;
+	}
+
+	takeCriticalContextError(): unknown {
+		const error = this.pendingCriticalContextError;
+		this.pendingCriticalContextError = undefined;
+		return error;
 	}
 
 	bindCore(
@@ -1029,6 +1037,10 @@ export class ExtensionRunner {
 						error: message,
 						stack,
 					});
+					if (ext.criticalHandlers.has(handler)) {
+						this.pendingCriticalContextError = err;
+						throw err;
+					}
 				}
 			}
 		}
@@ -1118,6 +1130,7 @@ export class ExtensionRunner {
 		};
 		const messages: NonNullable<BeforeAgentStartEventResult["message"]>[] = [];
 		let systemPromptModified = false;
+		let activeTools: string[] | undefined;
 
 		for (const ext of this.extensions) {
 			const handlers = ext.handlers.get("before_agent_start");
@@ -1143,12 +1156,18 @@ export class ExtensionRunner {
 							currentSystemPrompt = result.systemPrompt;
 							systemPromptModified = true;
 						}
+						if (result.activeTools !== undefined) {
+							activeTools = activeTools
+								? activeTools.filter((toolName) => result.activeTools?.includes(toolName))
+								: [...new Set(result.activeTools)];
+						}
 						if (result.cancel) {
 							return {
 								cancel: true,
 								reason: result.reason,
 								messages: messages.length > 0 ? messages : undefined,
 								systemPrompt: systemPromptModified ? currentSystemPrompt : undefined,
+								activeTools,
 							};
 						}
 					}
@@ -1161,14 +1180,16 @@ export class ExtensionRunner {
 						error: message,
 						stack,
 					});
+					if (ext.criticalHandlers.has(handler)) throw err;
 				}
 			}
 		}
 
-		if (messages.length > 0 || systemPromptModified) {
+		if (messages.length > 0 || systemPromptModified || activeTools !== undefined) {
 			return {
 				messages: messages.length > 0 ? messages : undefined,
 				systemPrompt: systemPromptModified ? currentSystemPrompt : undefined,
+				activeTools,
 			};
 		}
 

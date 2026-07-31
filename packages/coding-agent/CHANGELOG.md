@@ -21,6 +21,7 @@
 - Added validated compaction titles plus persisted trigger/recovery metadata for manual, threshold, and overflow compactions; the next actual Agent run receives one-time recovery system context without duplicating the last user message.
 - Added Pi-XK Goal V3 revisions with objective-only automatic refinement, protected-field review commands, state revision diagnostics, and read-only Objective projections.
 - Added Session Chain L1 V2 titles to summary list/read results while keeping L1 V1 artifacts readable with `title: null`.
+- Added per-run `before_agent_start.activeTools` projections, fail-closed `onCritical` prompt/context hooks, and declarative filesystem capability metadata for workflow preflight.
 
 ### Fixed
 
@@ -45,6 +46,8 @@
 - Fixed Pi-XK superseded revision feedback being reinjected after a successful Goal run, and restart Goal preflight after revision conflicts instead of continuing with a stale contract revision.
 - Fixed Pi-XK summary-list prompt guidance from describing unchecked model-generated L1 titles as trusted metadata.
 - Fixed Pi-XK V3 contracts being writable through the legacy V2 update path, and narrowed summary-title command detection so technical noun phrases are not rejected.
+- Fixed critical context failures being reduced to ordinary assistant errors, Goal Draft runs exposing unrelated tools, Task children accepting unsupported success without evidence, and Rollup status surfaces repeating historical failures or exhausting transient retries at the invalid-output limit.
+- Fixed critical handler scope, prevented per-run tool projections from enabling inactive tools, aligned strict Goal State ledger guidance with its parser, accepted contract-defined acceptance IDs in State projections, and cleared stale Rollup queue errors after successful recovery.
 
 ## [0.80.10] - 2026-07-16
 
