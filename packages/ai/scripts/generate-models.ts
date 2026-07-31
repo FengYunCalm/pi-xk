@@ -1911,7 +1911,7 @@ function syncDirectoryTree(directory: string): void {
 			continue;
 		}
 		if (!entry.isFile()) continue;
-		const descriptor = openSync(path, "r");
+		const descriptor = openSync(path, "r+");
 		try {
 			fsyncSync(descriptor);
 		} finally {

@@ -43,6 +43,14 @@ const commands = platformSmoke
 			...buildCommands,
 			[
 				"--workspace",
+				"@earendil-works/pi-ai",
+				"run",
+				"test",
+				"--",
+				"test/generate-models.test.ts",
+			],
+			[
+				"--workspace",
 				"pi-xk-core",
 				"run",
 				"test",
