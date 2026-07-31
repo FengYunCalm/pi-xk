@@ -25,7 +25,7 @@ import {
 } from "./session-chain-summary.ts";
 
 export const DEFAULT_SESSION_CHAIN_ROLLUP_INTERVAL = 5;
-export const SESSION_CHAIN_ROLLUP_PROMPT_VERSION = "session-chain-rollup-v2";
+export const SESSION_CHAIN_ROLLUP_PROMPT_VERSION = "session-chain-rollup-v3";
 export const MAX_AUTOMATIC_ROLLUP_ATTEMPTS = 3;
 
 const SESSION_CHAIN_CONFIG_SCHEMA = "pi-xk.session-chain-config.v1";

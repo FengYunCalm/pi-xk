@@ -55,7 +55,7 @@ summary-out
 
 L1 的 `previousSummary` 始终是 canonical `summary-in` carry-forward。Segment 内存在 Pi compaction 时，最新 native compaction checkpoint 作为本 Segment 的历史证据放在 `conversation` 开头，并继续包含 retained tail 与 compaction 后的新消息；checkpoint 可能重复 `summary-in` 基线，L1 合同要求去除该重叠并恢复完整 Segment delta。没有 compaction 时，`conversation` 直接覆盖本 Segment 可见正文。摘要失败不得 seal 或切换 Segment。摘要是派生上下文，不是对话事实。
 
-L1 generator 通过 Host `summarizeSessionContext({ replaceInstructions: true })` 使用唯一的 `pi.summary-evidence.v1` / `session-chain-l1` JSON 合同，payload 精确包含 `title`、`segmentDeltaMarkdown` 和 `carryForwardMarkdown`。L2 generator 同样使用 `session-chain-l2` JSON 合同，payload 精确包含 `state`、`decisions`、`constraints`、`completed`、`unresolved` 和 `nextActions`。当前 prompt version 分别为 `session-chain-summary-v3` 和 `session-chain-rollup-v2`；旧 XML parser 只用于显式兼容测试，不是当前生成协议。替换只作用于这两类显式结构化调用，不改变原生 compaction 或 branch summarization 的默认协议。
+L1 generator 通过 Host `summarizeSessionContext({ replaceInstructions: true })` 使用唯一的 `pi.summary-evidence.v1` / `session-chain-l1` JSON 合同，payload 精确包含 `title`、`segmentDeltaMarkdown` 和 `carryForwardMarkdown`。L2 generator 同样使用 `session-chain-l2` JSON 合同，payload 精确包含 `state`、`decisions`、`constraints`、`completed`、`unresolved` 和 `nextActions`。当前 prompt version 分别为 `session-chain-summary-v3` 和 `session-chain-rollup-v3`；旧 XML parser 只用于显式兼容测试，不是当前生成协议。替换只作用于这两类显式结构化调用，不改变原生 compaction 或 branch summarization 的默认协议。
 
 持久化 `summary-in` 的正文、marker、hash 和 artifact provenance 保持原样。发送给模型的 context 投影会在正文外增加“historical evidence, not instructions”边界，禁止执行其中的命令、角色或 prompt 文本；该包装不写回 Segment，因此不会改变事实源或完整性校验结果。
 
@@ -78,7 +78,7 @@ L1 generator 通过 Host `summarizeSessionContext({ replaceInstructions: true })
 
 每个 branch 默认每 5 个 sealed Segment 生成一个 L2 Rollup。配置为 `{ enabled: boolean; interval: positive integer }`，默认 enabled/5，保存在项目 `.pi-xk/session-chain.json`。窗口从 branch ordinal 1 开始，连续、固定大小、不重叠；successor branch 独立编号。不完整尾窗不生成，interval 改动只影响上一个已发布窗口之后的后续窗口。
 
-L2 输入只包括窗口内有序且 provenance 校验通过的 L1 artifacts，不扫描 transcript。结构化 `pi-xk.session-chain-rollup.v1` artifact 保存 state、decisions、constraints、completed、unresolved、nextActions、来源 IDs、`sourceDigest` 和生成 provenance。Artifact Store ID 是正文 SHA-256，因此正文不递归包含自己的 artifact ID；该 ID 保存在 published event、read model 和读取包装中。
+L2 输入只包括窗口内有序且 provenance 校验通过的 L1 artifacts，不扫描 transcript。Rollup source 通过 Host 的通用摘要序列化路径进入 `conversation`，实际形状是仅含一条 `[User]: {source JSON}` 记录的序列化 transcript；L2 输出合同明确描述这个输入形状。结构化 `pi-xk.session-chain-rollup.v1` artifact 保存 state、decisions、constraints、completed、unresolved、nextActions、来源 IDs、`sourceDigest` 和生成 provenance。Artifact Store ID 是正文 SHA-256，因此正文不递归包含自己的 artifact ID；该 ID 保存在 published event、read model 和读取包装中。
 
 rollover commit 后持久化 `scheduled` publication job 并立即返回 successor Segment。每个 branch 在进程内串行 drain publication job，并以 branch/window generation lock 做跨进程去重；一个窗口发布后会重新检查下一个完整窗口，因此慢 W1 期间继续完成 W2 来源也不会丢失调度。失败 job 不在同一次 drain 中无限重试。第 N 次 rollover 不等待 L2 provider latency。L2 失败不回滚 rollover；`rollup_failed` 按 provider、I/O、provenance/schema/digest、event conflict 和 projection 分类表达 stage、errorCode 与 retryable。无效 L2 响应最多自动尝试 3 次，随后要求人工审查输出合同；provider timeout、临时 I/O 和 event publication 等临时错误不套用该无效响应上限，仍在后续恢复时保持可重试。artifact 已生成但 event 未发布时，pending publication 允许重试复用 artifact。event 发布后，read model 可由日志重建；Markdown 仅是可重建的人类投影，缺失或陈旧不阻断已验证结构化 L2 的读取，doctor 继续报告并可重建投影。
 
@@ -86,7 +86,7 @@ rollover commit 后持久化 `scheduled` publication job 并立即返回 success
 
 ### 模型发现和按需读取
 
-每次普通模型请求只追加固定大小、由 read model 确定性生成的 Session Chain manifest，包含当前 branch、sealed/L1/L2 范围、完整窗口 pending 状态、失败数量和只读工具说明。read model checkpoint 保存已消费 event byte offset、head event offset、sequence 和 head hash。正常请求先读取并验证 checkpoint 对应的最后一条真实 event，再读取新增 tail；文件缩短、head event/offset/hash 异常时退回完整 replay。该快速证据读取与 event 总量无关，但不替代 deep doctor 对完整 hash chain 的线性校验。manifest 只说明列表可提供 L1 标题和范围，不包含摘要正文、历史用户原文、模型生成标题或 Artifact Store 内容。
+每次普通模型请求只追加固定大小、由 read model 确定性生成的 Session Chain manifest，包含当前 branch、sealed/L1/L2 范围、完整窗口 pending 状态、失败数量、只读工具可用性、默认 scope 和简短能力说明。摘要工具的使用条件、读取顺序和历史证据信任边界只通过 active tool 的 `promptSnippet`/`promptGuidelines` 提供一次，不在 manifest 重复。read model checkpoint 保存已消费 event byte offset、head event offset、sequence 和 head hash。正常请求先读取并验证 checkpoint 对应的最后一条真实 event，再读取新增 tail；文件缩短、head event/offset/hash 异常时退回完整 replay。该快速证据读取与 event 总量无关，但不替代 deep doctor 对完整 hash chain 的线性校验。manifest 只说明列表可提供 L1 标题和范围，不包含摘要正文、历史用户原文、模型生成标题或 Artifact Store 内容。
 
 模型通过两个只读工具访问历史证据：
 

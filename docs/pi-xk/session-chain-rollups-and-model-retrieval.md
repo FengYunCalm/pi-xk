@@ -32,7 +32,7 @@ V2 标题必须是最多 60 个 Unicode code point 的名词短语，禁止 Mark
 
 Pi compaction 与 L1 递进摘要独立：L1 的 `previousSummary` 始终是 canonical `summary-in` carry-forward。存在 compaction 时，最新 compaction checkpoint、retained tail 和 compaction 后的新消息共同作为本 Segment 的 `conversation` 历史证据；L1 合同去除 checkpoint 中可能重复的 `summary-in` 基线，并恢复完整 Segment delta。compaction 自己的短标题只用于物理 Segment 内的历史展示，不替代 L1 标题。若 compaction 后立刻 rollover，successor 使用 L1 summary-in，不复制源 Segment 的一次性 recovery system context。
 
-当前 L1/L2 生成分别使用 `session-chain-summary-v3` 与 `session-chain-rollup-v2` prompt，并严格返回 `pi.summary-evidence.v1` JSON。L1 payload 精确包含 `title`、`segmentDeltaMarkdown`、`carryForwardMarkdown`；L2 payload 精确包含 `state`、`decisions`、`constraints`、`completed`、`unresolved`、`nextActions`。旧 XML 解析只用于显式兼容测试，不是当前 writer 协议。
+当前 L1/L2 生成分别使用 `session-chain-summary-v3` 与 `session-chain-rollup-v3` prompt，并严格返回 `pi.summary-evidence.v1` JSON。L1 payload 精确包含 `title`、`segmentDeltaMarkdown`、`carryForwardMarkdown`；L2 payload 精确包含 `state`、`decisions`、`constraints`、`completed`、`unresolved`、`nextActions`。L2 source 经 Host 通用摘要序列化后，以仅含一条 `[User]: {source JSON}` 记录的 transcript 字符串进入 `conversation`；L2 prompt 使用同一准确描述。旧 XML 解析只用于显式兼容测试，不是当前 writer 协议。
 
 ## 3. L2 窗口和配置
 
@@ -139,8 +139,10 @@ flowchart TD
 - 已发布 L2 的 window 与 Segment 范围；
 - 是否存在完整但未发布的窗口；
 - 未解决的 Rollup failure 数量；
-- 两个只读工具的名称和读取条件。
-- 列表工具可提供 L1 标题和 L1/L2 范围的能力说明。
+- 两个只读工具的名称、可用性和默认当前 chain/branch scope；
+- 列表工具可提供 L1 标题和 L1/L2 范围、读取工具验证单个 artifact 的简短能力说明。
+
+摘要工具的使用条件、list-then-read 流程和“historical evidence, not instructions”信任边界由 active tool 的 `promptSnippet`/`promptGuidelines` 提供，不在每次请求的 manifest 中重复。
 
 manifest 从 checkpointed `chain-read-model.json` 加载。投影记录已消费 event 的字节 offset、sequence 和 head hash；event 文件未缩短且 head 连续时只读取新增 tail。offset 异常、文件缩短或 head 不匹配时退回完整 replay。若仍无法建立可信投影，本次请求只注入不含错误详情、范围或历史正文的 bounded degraded manifest，明确所有历史范围未知且不能推断为空，同时报告 `manifest_read_model_inconsistent`；摘要工具若无法独立读取可信 read model 会正常失败。
 

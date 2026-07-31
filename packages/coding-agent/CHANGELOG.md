@@ -48,6 +48,7 @@
 - Fixed Pi-XK V3 contracts being writable through the legacy V2 update path, and narrowed summary-title command detection so technical noun phrases are not rejected.
 - Fixed critical context failures being reduced to ordinary assistant errors, Goal Draft runs exposing unrelated tools, Task children accepting unsupported success without evidence, and Rollup status surfaces repeating historical failures or exhausting transient retries at the invalid-output limit.
 - Fixed critical handler scope, prevented per-run tool projections from enabling inactive tools, aligned strict Goal State ledger guidance with its parser, accepted contract-defined acceptance IDs in State projections, and cleared stale Rollup queue errors after successful recovery.
+- Fixed Session Chain manifests to avoid repeating active summary-tool workflow and trust guidance on every run, and aligned the L2 Rollup prompt with the actual serialized `[User]: {source JSON}` input shape.
 
 ## [0.80.10] - 2026-07-16
 

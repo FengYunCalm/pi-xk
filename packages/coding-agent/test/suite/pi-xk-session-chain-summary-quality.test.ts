@@ -6,12 +6,19 @@ import {
 	evaluateSessionChainSummaryFixture,
 	executeSessionChainSummaryProtocolFixture,
 } from "../../../../scripts/evaluate-session-chain-summaries.mjs";
+import { SESSION_CHAIN_L2_SUMMARIZATION_PROMPT } from "../../../pi-xk-extension/src/session-chain-summary.ts";
 
 const fixturePath = resolve(
 	fileURLToPath(new URL("../fixtures/pi-xk/session-chain-summary-golden.json", import.meta.url)),
 );
 
 describe("Session Chain summary semantic quality", () => {
+	it("describes the serialized L2 source shape exactly", () => {
+		expect(SESSION_CHAIN_L2_SUMMARIZATION_PROMPT).toContain(
+			'serialized transcript with exactly one "[User]: " record whose payload is a pi-xk.session-chain-rollup-source.v1 JSON object',
+		);
+	});
+
 	it("preserves golden decisions, constraints, rejections, and unresolved work across L1 and L2", async () => {
 		const fixture = JSON.parse(await readFile(fixturePath, "utf8"));
 		const report = evaluateSessionChainSummaryFixture(fixture);

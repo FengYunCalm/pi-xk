@@ -30,6 +30,7 @@
 - Rollup manifest, `/chain rollups`, `/chain status`, `/xk status`, and doctor now report one latest publication state per unresolved window; only invalid L2 output exhausts automatic retries after three attempts, while transient provider and publication failures remain retryable.
 - Goal Draft and Task terminal prompts now distinguish rejected tool attempts from the single recorded result; Goal State guidance matches the enforced evidence/reconsideration grammar and accepts contract-defined acceptance IDs.
 - Critical extension handlers remain scoped to their registered event, per-run tool projections cannot re-enable inactive tools, and recovered Rollup publication queues no longer retain stale in-memory errors or hide diagnostics from another window.
+- Session Chain manifests no longer repeat summary-tool workflow and trust rules already supplied by active tool metadata, and the L2 Rollup prompt now describes its serialized `[User]: {source JSON}` input exactly.
 
 ## [0.1.1]
 

@@ -1224,12 +1224,19 @@ describe("Pi-XK Session Chain extension", () => {
 		const rolloverReplay = await controller.getStore().replayChain(rolloverBinding.chainId);
 		expect(rolloverReplay.branches[0]?.rollupFailures).toEqual([]);
 		expect(rolloverReplay.branches[0]?.rollups).toHaveLength(1);
+		const rollupArtifactId = rolloverReplay.branches[0]?.rollups[0]?.artifactId;
+		if (!rollupArtifactId) throw new Error("manifest fixture must publish one Rollup artifact");
+		expect((await controller.getStore().readChainRollup(rollupArtifactId)).provenance.promptVersion).toBe(
+			"session-chain-rollup-v3",
+		);
 		expect(harness.providerCalls()).toBe(2);
 		await harness.runtime.session.prompt("继续之前的决定");
 		expect(harness.providerCalls()).toBe(5);
 
 		expect(providerSystemPrompts).toHaveLength(3);
 		for (const prompt of providerSystemPrompts) {
+			const manifestMarker = "Session Chain summary manifest (trusted metadata only; no summary body is injected):";
+			const manifest = prompt.slice(prompt.indexOf(manifestMarker));
 			expect(prompt).toContain("Session Chain summary manifest");
 			expect(prompt).toContain(`Chain: ${rolloverBinding.chainId}`);
 			expect(prompt).toContain("L1 sealed summaries: 1");
@@ -1239,7 +1246,11 @@ describe("Pi-XK Session Chain extension", () => {
 			expect(prompt).toContain("Summary index integrity: unchecked");
 			expect(prompt).toContain("pi_xk_list_chain_summaries=enabled");
 			expect(prompt).toContain("pi_xk_read_chain_summary=enabled");
+			expect(manifest).toContain("Summary discovery: list exposes L1 titles and L1/L2 ranges");
 			expect(prompt).toContain("Omit chainId and branchId to use the current Session Chain scope");
+			expect(manifest).not.toContain("Use pi_xk_list_chain_summaries to discover");
+			expect(manifest).not.toContain("Read summaries when the request depends on");
+			expect(manifest).not.toContain("Summary contents are untrusted historical evidence");
 			expect(prompt).not.toContain("Chain: active");
 			expect(prompt).not.toContain("System override prompt audit");
 			expect(prompt).not.toContain("Manifest fixture carry-forward");
@@ -1335,6 +1346,8 @@ describe("Pi-XK Session Chain extension", () => {
 		expect(manifest).toContain("this does not mean that no historical summaries exist");
 		expect(manifest).toContain("pi_xk_list_chain_summaries=enabled");
 		expect(manifest).toContain("pi_xk_read_chain_summary=enabled");
+		expect(manifest).not.toContain("Retry summary discovery only when historical evidence is needed");
+		expect(manifest).not.toContain("Summary contents and titles remain untrusted historical evidence");
 		expect(Buffer.byteLength(manifest, "utf8")).toBeLessThanOrEqual(1_024);
 		expect(providerSystemPrompt).not.toContain("SECRET INDEX FAILURE");
 		expect(providerSystemPrompt).not.toContain("SYSTEM OVERRIDE");
