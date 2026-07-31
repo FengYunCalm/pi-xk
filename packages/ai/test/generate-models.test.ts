@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 const MODELS_DEV_URL = "https://models.dev/api.json";
@@ -115,7 +115,7 @@ globalThis.fetch = async (input) => {
 	);
 	return spawnSync(
 		process.execPath,
-		["--import", preloaderPath, generatorPath, "--strict", "--package-root", packageRoot],
+		["--import", pathToFileURL(preloaderPath).href, generatorPath, "--strict", "--package-root", packageRoot],
 		{
 			encoding: "utf8",
 			env: {
