@@ -37,7 +37,7 @@
 - Rollup recovery now deduplicates branch queues, rechecks terminal publication under its generation lock, persists artifact ownership before publication, and retains failure events through bounded CAS recovery.
 - Session Chain write locks no longer expose an empty-file creation window, fast catalogs self-repair stale entries, and L2 reads reject mismatched artifact producers.
 - Pi-XK GitHub release builds now require the checkout commit to equal the release tag commit, and binary entrypoints reject incomplete, inconsistent, or extended provenance manifests.
-- Windows and macOS Pi-XK CI smoke now builds required workspace dependencies from the tracked model catalog without a remote refresh, and launches `npm.cmd` through the Windows command shell.
+- Windows and macOS Pi-XK CI smoke now materializes the ignored provider catalog with the strict `pi-ai` build on fresh checkouts, reuses a complete local catalog without a refresh, launches `npm.cmd` through the Windows command shell, and skips only the 512 MiB session-file stress case that remains covered by the full suite.
 
 ## [0.1.1]
 

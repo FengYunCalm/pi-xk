@@ -82,34 +82,38 @@ describe("loadEntriesFromFile", () => {
 		expect(readFileSync(file, "utf8")).toContain('{"type":"message","id":"partial"\n{"type":"message"');
 	});
 
-	it("opens session files larger than Node's max string length", () => {
-		const file = join(tempDir, "large.jsonl");
-		writeFileSync(
-			file,
-			'{"type":"session","version":3,"id":"abc","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n',
-		);
+	it.skipIf(process.env.PI_XK_PLATFORM_SMOKE === "1")(
+		"opens session files larger than Node's max string length",
+		() => {
+			const file = join(tempDir, "large.jsonl");
+			writeFileSync(
+				file,
+				'{"type":"session","version":3,"id":"abc","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n',
+			);
 
-		const fd = openSync(file, "r+");
-		try {
-			const newline = Buffer.from("\n");
-			const stride = 16 * 1024 * 1024;
-			for (let offset = stride; offset <= bufferConstants.MAX_STRING_LENGTH + stride; offset += stride) {
-				writeSync(fd, newline, 0, newline.length, offset);
+			const fd = openSync(file, "r+");
+			try {
+				const newline = Buffer.from("\n");
+				const stride = 16 * 1024 * 1024;
+				for (let offset = stride; offset <= bufferConstants.MAX_STRING_LENGTH + stride; offset += stride) {
+					writeSync(fd, newline, 0, newline.length, offset);
+				}
+			} finally {
+				closeSync(fd);
 			}
-		} finally {
-			closeSync(fd);
-		}
 
-		appendFileSync(
-			file,
-			'{"type":"message","id":"1","parentId":null,"timestamp":"2025-01-01T00:00:01Z","message":{"role":"user","content":"hi","timestamp":1}}\n',
-		);
+			appendFileSync(
+				file,
+				'{"type":"message","id":"1","parentId":null,"timestamp":"2025-01-01T00:00:01Z","message":{"role":"user","content":"hi","timestamp":1}}\n',
+			);
 
-		const sessionManager = SessionManager.open(file, tempDir);
-		expect(sessionManager.getSessionId()).toBe("abc");
-		expect(sessionManager.getEntries()).toHaveLength(1);
-		expect(sessionManager.buildSessionContext().messages).toEqual([{ role: "user", content: "hi", timestamp: 1 }]);
-	}, 60_000);
+			const sessionManager = SessionManager.open(file, tempDir);
+			expect(sessionManager.getSessionId()).toBe("abc");
+			expect(sessionManager.getEntries()).toHaveLength(1);
+			expect(sessionManager.buildSessionContext().messages).toEqual([{ role: "user", content: "hi", timestamp: 1 }]);
+		},
+		60_000,
+	);
 });
 
 describe("findMostRecentSession", () => {

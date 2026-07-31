@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -15,11 +15,24 @@ if (args.some((arg) => arg !== "--platform-smoke")) {
 	throw new Error(`Unknown argument: ${args.find((arg) => arg !== "--platform-smoke")}`);
 }
 const platformSmoke = args.includes("--platform-smoke");
+const aiSourceRoot = resolve(workspaceRoot, "packages/ai/src");
+const aiProviderDataDir = resolve(aiSourceRoot, "providers/data");
+const requiredAiProviderData = readdirSync(resolve(aiSourceRoot, "providers"), { withFileTypes: true })
+	.filter((entry) => entry.isFile() && entry.name.endsWith(".models.ts"))
+	.map((entry) => entry.name.replace(/\.models\.ts$/, ".json"));
+const hasCompleteAiProviderData =
+	existsSync(aiProviderDataDir) &&
+	requiredAiProviderData.every((entry) => existsSync(resolve(aiProviderDataDir, entry)));
+const aiBuildCommands = hasCompleteAiProviderData
+	? [
+			["exec", "--workspace", "@earendil-works/pi-ai", "--", "tsgo", "-p", "tsconfig.build.json"],
+			["exec", "--workspace", "@earendil-works/pi-ai", "--", "shx", "rm", "-rf", "dist/providers/data"],
+			["exec", "--workspace", "@earendil-works/pi-ai", "--", "shx", "cp", "-r", "src/providers/data", "dist/providers/data"],
+		]
+	: [["--workspace", "@earendil-works/pi-ai", "run", "build"]];
 const buildCommands = [
 	["--workspace", "@earendil-works/pi-tui", "run", "build"],
-	["exec", "--workspace", "@earendil-works/pi-ai", "--", "tsgo", "-p", "tsconfig.build.json"],
-	["exec", "--workspace", "@earendil-works/pi-ai", "--", "shx", "rm", "-rf", "dist/providers/data"],
-	["exec", "--workspace", "@earendil-works/pi-ai", "--", "shx", "cp", "-r", "src/providers/data", "dist/providers/data"],
+	...aiBuildCommands,
 	["--workspace", "@earendil-works/pi-agent-core", "run", "build"],
 	["--workspace", "@earendil-works/pi-coding-agent", "run", "build"],
 	["--workspace", "pi-xk-core", "run", "build"],
@@ -99,10 +112,12 @@ const commands = platformSmoke
 		];
 
 for (const args of commands) {
+	const env = { ...process.env, TEMP: testTempDir, TMP: testTempDir, TMPDIR: testTempDir };
+	if (platformSmoke) env.PI_XK_PLATFORM_SMOKE = "1";
 	const result = spawnSync(npmCommand, args, {
 		cwd: workspaceRoot,
 		stdio: "inherit",
-		env: { ...process.env, TEMP: testTempDir, TMP: testTempDir, TMPDIR: testTempDir },
+		env,
 		shell: process.platform === "win32",
 		windowsHide: process.platform === "win32",
 	});
