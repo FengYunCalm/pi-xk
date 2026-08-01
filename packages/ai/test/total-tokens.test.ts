@@ -401,10 +401,10 @@ describe("totalTokens field", () => {
 
 	describe.skipIf(!process.env.ZAI_API_KEY)("z.ai", () => {
 		it(
-			"glm-4.5-air - should return totalTokens equal to sum of components",
+			"glm-5-turbo - should return totalTokens equal to sum of components",
 			{ retry: 3, timeout: 60000 },
 			async () => {
-				const llm = getModel("zai", "glm-4.5-air");
+				const llm = getModel("zai", "glm-5-turbo");
 
 				console.log(`\nz.ai / ${llm.id}:`);
 				const { first, second } = await testTotalTokensWithCache(llm, { apiKey: process.env.ZAI_API_KEY });

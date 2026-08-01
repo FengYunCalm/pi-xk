@@ -5,6 +5,7 @@
 ### Changed
 
 - Refreshed generated Cloudflare AI Gateway, Fireworks, and NVIDIA catalogs to add Claude Opus 5 and remove four model entries no longer returned by their upstream providers.
+- Refreshed generated provider catalogs from current upstream sources, including current Z.AI coding-plan IDs and newly available Kimi K3, NVIDIA, OpenRouter, and Vercel AI Gateway entries.
 
 ### Fixed
 
