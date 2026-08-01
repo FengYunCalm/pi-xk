@@ -9,7 +9,7 @@ Pi-XK 解决的是长期 Agent 工作中的可验证状态问题：目标如何�
 它不重新实现 Pi 的核心运行时。当前原则是：
 
 1. Pi 继续拥有 provider、Agent loop、tool transcript、原生 session tree、model 配置、TUI 和 compaction。
-2. Pi-XK 只为 Goal、Task、Session Chain 和 Artifact 建立独立领域事实源。
+2. Pi-XK 只为 Goal、Task、Session Chain、Memory 和 Artifact 建立独立领域事实源。
 3. 领域间通过不可变 ID、event reference 和 artifact reference 连接，不复制另一事实域的完整正文。
 4. 所有 read model、catalog 和 cache 都可从事实源重建，不能参与最终裁决。
 5. 运行时失败应留下可诊断状态，不通过静默重写历史来伪装成功。
@@ -23,10 +23,12 @@ Pi-XK 解决的是长期 Agent 工作中的可验证状态问题：目标如何�
 | SessionChain | Pi-XK | 把多个 Segment 组织成长期逻辑会话与 branch | 不是 Pi session tree 的替代品 |
 | L1 Segment Summary | Pi-XK Artifact Store | 保存单个 sealed Segment 的增量与 carry-forward | 不是 transcript 或系统指令 |
 | L2 Chain Rollup | Pi-XK Artifact Store | 汇总一个 branch 固定窗口内的有序 L1 evidence | 不是通用长期 memory |
+| Project Memory | Pi-XK Memory event log + Artifact Store | 保存跨 Goal、Task、branch 和重启的项目级证据图 | 不是 Goal State、摘要、第二 transcript 或跨项目知识库 |
+| Memory Cue/Edge | Pi-XK Memory event log + Artifact Store | 提供规范化关键词和有向、多关系关联 | 标题和热度都不能单独升级为可信事实 |
 | Compaction | Pi | 在同一个物理 session 内压缩送给 provider 的上下文，并为下一次真实 run 提供一次性恢复上下文 | 不是 rollover、新用户请求或独立续跑器 |
 | Goal | Pi-XK | 保存稳定 Intent Anchor、可受控演进的 Current Objective、约束、验收、生命周期和执行状态 | 不是 prompt、摘要或 Task 列表 |
 | Task | Pi-XK | 执行一个有边界的 child 工作并返回结构化结果 | 不是并发调度框架或 Goal 的物理分段 |
-| Artifact | Pi-XK | 保存内容寻址、带 provenance 的不可变小型结果 | 不是 transcript、memory 或通用 blob store |
+| Artifact | Pi-XK | 保存内容寻址、带 provenance 的不可变小型结果 | 不是 transcript、Memory 事件域或通用 blob store |
 | Read model/catalog | Pi-XK | 以 event offset、sequence 和 head hash 加速状态和拓扑查询 | 不是事实源，删除后应可重建 |
 
 ### 2.1 关系
@@ -44,6 +46,10 @@ flowchart TD
     TaskRef --> Task["Task event log"]
     Task --> Child["Independent child SessionChain"]
     Task --> Result["Result artifact"]
+    Goal --> Memory["Memory stable-source capture"]
+    Rollup --> Memory
+    Memory --> MemoryArtifact["Memory revision / Cue / Edge artifacts"]
+    Memory --> MemoryIndex["SQLite / read model / Markdown projections"]
 ```
 
 一个 Task 可以从普通 session 或 active Goal 中启动。Task V2 记录 parent 的 `chainId/branchId/segmentId/entryId`，并创建独立 child chain。它不会把 child transcript 复制回 parent；parent 只得到小型 link 和最终 result envelope。
@@ -56,6 +62,7 @@ flowchart TD
 | Goal | `.pi-xk/goals/<goalId>/events.jsonl` | `goal-state.md` | `contract.json`、`goal-objective.md`、`goal-read-model.json` |
 | Task | `.pi-xk/tasks/<taskId>/events.jsonl` | 无 | `task-read-model.json` |
 | Session Chain | `.pi-xk/sessions/chains/<chainId>/events.jsonl` + Segment JSONL + L1/L2 artifacts | 当前 writable head Segment | `chain-read-model.json`、catalog、Rollup Markdown、pending/runtime state |
+| Memory | `.pi-xk/memory/events.jsonl` + Memory/Cue/Edge/proposal/source artifacts | `memory-config.json` 只控制 enabled/off | `memory-read-model*.json`、`index.sqlite`、History Cue、source cursor、Markdown |
 | Artifact | `.pi-xk/artifacts/objects/...` 的内容寻址对象 | 无 | manifest/index 类视图 |
 
 Goal event log 裁决合同 revision 与 lifecycle；`goal-objective.md` 是只读合同投影；`goal-state.md` 是模型执行进度的可变权威文件。Objective 保存 Intent Anchor、Current Objective 和受保护合同字段，State 保存证据、完成/未决项、失败路径、阻塞和下一动作。模型必须在完成或暂停前更新 state，再由 runtime 把 lifecycle intent 与 checkpoint evidence 关联。
@@ -201,7 +208,40 @@ Chain 的确定性首条用户输入标题、`/chain rename`、archive 与 `/cha
 
 完整契约见[Session Chain Rollup 与模型检索](session-chain-rollups-and-model-retrieval.md)。
 
-## 8. Artifact 边界
+## 8. Memory v1 设计边界
+
+Memory v1 是当前项目内的长期证据层。它使用有类型、有方向、带时间与 provenance 的多重图，并把以下三维状态分开处理：
+
+- trust：`verified`、`model_inferred`、`disputed`；
+- freshness：`current`、`stale`、`unknown`，根据来源和相关 Git path 动态计算；
+- lifecycle：`active`、`superseded`、`invalidated`、`archived`。
+
+`verified` 只来自用户显式保存或 Host 可确定验证的事实。Goal checkpoint、L2 Rollup 和 artifact 自身完整，只证明来源可用；模型从中提炼的新结论仍是 inferred 或 disputed。冲突通过新 revision 和 `contradicts` 关系保留，不能静默覆盖旧事实。
+
+### 稳定边界与发布
+
+当前自动 source bridge 只捕获最新 Goal turn-end checkpoint、Goal completion 和已发布且完整验证的 L2 Rollup。普通聊天、未完成局部工作、L1/compaction 标题和访问热度不会直接创建正式 Memory。`/memory remember <text>` 不调用模型，直接保存用户确认的 verified 项目事实；历史捕获必须显式 `/memory backfill [limit]`，默认一个、最多 20 个。
+
+Capture 使用确定性 identity、Artifact Store canonical read-back、event/revision CAS 和 generation lock。`generation_started` 后没有结果 artifact 时状态为 indeterminate，不自动重复未知付费调用；已有结果或 proposal artifact 时恢复只完成 publication，不再次调用 provider。事实事件已提交但 SQLite/Markdown 失败时，事实仍然有效，由 doctor 重建投影。
+
+### 模型检索与权限
+
+Memory 采用渐进式披露：
+
+1. D0 system manifest 最多 2 KiB，只含状态计数、capture 诊断和工具可用性；
+2. D1 `pi_xk_search_memory` 返回标题、kind、三维状态、关系提示、History Cue 和分页，不返回 statement；
+3. D2 `pi_xk_read_memory` 一次读取最多 5 条完整验证 Memory；
+4. D3 `pi_xk_expand_memory_evidence` 为一条 Memory 展开最多 3 个来源。
+
+所有 D2/D3 内容都是不可信历史证据，不是系统指令。`pi_xk_propose_memory_change` 只记录 CAS 保护的 proposal，不直接 apply；修改既有事实、verified 状态、生命周期、evidence detach 和 purge 都需要用户显式确认或命令。Memory 与 active Goal 冲突时，只能走现有 Goal revision 流程。
+
+### 检索投影和限制
+
+Node 使用 `node:sqlite` worker，Bun 使用 `bun:sqlite` worker；两者共享 FTS5/图 schema。D1 以 FTS5 和一至二跳邻接候选做 RRF 融合，候选池最多 200。heat 只做至多 10% 的排序修正，不能改变事实状态或删除数据。SQLite、read model、History Cue 和 Markdown 都可重建；v1 不启用 embedding/vector。
+
+Memory v1 只在当前项目内工作，不提供跨项目/用户级知识库、通用 context budget controller、自动 Task result 扫描、Observation/Resource 自修改、自动 retention/GC 或新的安全权限。完整使用和恢复契约见 [Memory v1](memory-v1.md)与 [ADR-0007](../adr/0007-memory-v1.md)。
+
+## 9. Artifact 边界
 
 Artifact store 保存 checkpoint provenance、Task result、Session Chain summary 等不可变内容。当前单个 artifact 上限为 64 KiB。它不会复制：
 
@@ -213,7 +253,7 @@ Artifact store 保存 checkpoint provenance、Task result、Session Chain summar
 
 需要保存大型报告、日志或二进制时，应把它们保留在项目自己的产物目录，再由 evidence 记录稳定路径和 hash。不要把 64 KiB artifact store 描述为通用对象存储。
 
-## 9. 权限与安全边界
+## 10. 权限与安全边界
 
 当前实现针对个人本机 full-access profile。Extension 和 Task child 都继承 Pi 进程权限：
 
@@ -226,38 +266,40 @@ Artifact store 保存 checkpoint provenance、Task result、Session Chain summar
 
 因此，“Goal 可持续执行”和“Task 可独立执行”是可靠性能力，不是权限隔离能力。需要更强边界时，应先使用 Pi 的容器化方案，并把 Policy/沙箱阶段视为未完成，而不是仅依赖提示词。
 
-## 10. 第三方生态边界
+## 11. 第三方生态边界
 
 当前核心不引入第三方 Pi runtime package。选择候选前必须重新核验[生态研究地图](../research/pi-ecosystem-forum-map.md)中的版本、许可证、peer dependency、安装脚本和实际入口。
 
 固定边界：
 
 - Pi 原生 session 与 Pi-XK Goal/Task/Chain 事件域保持分离；
-- 不叠装多个 context/memory 主机制；
+- Pi-XK Memory 已是当前 profile 的 context/memory 主机制，不与第三方同类机制叠装；
 - `pi-mcp-adapter`、`pi-subagents`、`pi-observational-memory` 等只能先在隔离 profile 实验；
 - model gateway、GUI、Telegram bridge 和搜索工具是外围 adapter，不成为核心事实源；
 - 不允许两个 UI/进程并行写同一个 Pi JSONL session。
 
-## 11. Schema 与兼容策略
+## 12. Schema 与兼容策略
 
 事件和合同使用显式 schema version、stable JSON、hash chain、idempotency key 与 expected head。当前兼容承诺是：
 
 - Goal V1/V2 可读，不重写历史 hash；新 writer 使用 V3，Goal event v1/v2 可混合 replay；
 - Task V1 facts 可读，runtime upcast 为当前视图，不迁移原始事件；
 - Session Chain v1 marker、v1/v2/v3 event、L1 V1/V2 和 L2 artifact schema 需严格校验；
+- Memory event v1、revision/cue/edge/proposal/source artifact 与 projection checkpoint 需严格校验；未知事件版本拒绝 replay；
 - unknown、损坏或 hash 不一致时失败并给出诊断，不猜测修复；
 - read model 缺失可重建，但事实源损坏不能靠删除投影解决。
 
 这不是通用向后兼容承诺。未来破坏性 schema 变化需要新的 ADR、迁移策略和验证，不应通过宽松解析静默接受。
 
-## 12. 当前非目标
+## 13. 当前非目标
 
 以下能力尚未交付，不能从现有测试或命令推断存在：
 
 - 细粒度 Policy、审批和沙箱；
 - 多 Task 并发、DAG、retry、deadline、budget、worktree 和 RPC child；
 - 通用跨域 L0/L1/L2 Context controller；Session Chain 专用 L1/L2 已实现；
-- 长期 memory、Observation store、memory-derived 自动反省或跨域 proposal；
+- 跨项目/用户级知识库、vector/embedding 检索和通用 context budget controller；项目级 Memory v1 已实现；
+- Observation/Resource 自修改、memory-derived 自动反省或跨域 proposal；Memory proposal 只管理 Memory 事实；
 - artifact retention/GC 和正式备份工具；
 - 多机调度、共享写入、高可用或远程服务；
 - 发布级 npm package、稳定跨版本迁移和无人值守 SLA。

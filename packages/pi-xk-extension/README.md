@@ -1,6 +1,6 @@
-# Pi-XK Goal, Task, And Session Chain Extension
+# Pi-XK Goal, Task, Session Chain, And Memory Extension
 
-Pi-XK adds durable Goal, single-child Task, and Session Chain workflows to Pi without changing Pi's agent loop, provider, or native message format. Pi keeps each physical JSONL transcript; Pi-XK keeps Goal/Task/chain events, checkpoint evidence, artifacts, derived read models, and child transcripts under the project `.pi-xk` directory.
+Pi-XK adds durable Goal, single-child Task, Session Chain, and project Memory workflows to Pi without changing Pi's agent loop, provider, or native message format. Pi keeps each physical JSONL transcript; Pi-XK keeps Goal/Task/chain/Memory events, checkpoint evidence, artifacts, derived read models, and child transcripts under the project `.pi-xk` directory.
 
 This package README is the command and installation reference. Start with the repository documentation for the complete behavior and risk model:
 
@@ -11,9 +11,10 @@ This package README is the command and installation reference. Start with the re
 - [Operations and recovery](../../docs/pi-xk/operations-and-recovery.md)
 - [Compatibility and user impact](../../docs/pi-xk/compatibility-and-impact.md)
 - [Session Chain Rollups and model retrieval](../../docs/pi-xk/session-chain-rollups-and-model-retrieval.md)
+- [Memory v1 evidence graph and progressive retrieval](../../docs/pi-xk/memory-v1.md)
 - [Host patch boundary](../../docs/pi-xk/host-patch-boundary.md)
 
-The package remains private and is never published to npm. Development installs reference a built local checkout; fixed GitHub-only releases bundle its built output and `pi-xk-core` beside a dedicated `pi-xk` executable. Its supported baseline is a trusted, personal, interactive full-access profile. It does not provide a sandbox, per-tool permission policy, concurrent Tasks, worktree isolation, general long-term memory, or an unattended execution guarantee.
+The package remains private and is never published to npm. Development installs reference a built local checkout; fixed GitHub-only releases bundle its built output and `pi-xk-core` beside a dedicated `pi-xk` executable. Its supported baseline is a trusted, personal, interactive full-access profile. It does not provide a sandbox, per-tool permission policy, concurrent Tasks, worktree isolation, a cross-project knowledge base, a general context-budget controller, or an unattended execution guarantee.
 
 ## GitHub Binary Release
 
@@ -131,7 +132,7 @@ Task states are `pending -> running -> succeeded|failed|cancelled|orphaned`. Gra
 /chain doctor deep                  Fully replay and hash all Segment/L1/L2 facts.
 /chain doctor repair-projections    Rebuild read model, catalog, and Rollup Markdown only.
 /chain doctor repair-lock <nonce>   Repair a confirmed abandoned Chain write lock.
-/xk status                          Aggregate current Chain, Rollup, Goal, Task, and recovery state.
+/xk status                          Aggregate current Chain, Rollup, Goal, Task, Memory, and recovery state.
 ```
 
 A long logical conversation is a `SessionChain` composed of complete native Pi JSONL Segments. An empty persistent session creates its project-local managed root on the first valid ordinary request; an existing Pi transcript is adopted once as an external root without copying it, and `--no-session` stays unmanaged. At a settled boundary, Pi-XK automatically rolls over after 16 MiB or 4,000 entries; at 64 MiB or 16,000 entries it must roll over before the next provider turn. It never rolls over while a Task is running or awaiting delivery, a Goal draft or protected revision is open, or a Goal lifecycle intent is unsettled.
@@ -139,6 +140,35 @@ A long logical conversation is a `SessionChain` composed of complete native Pi J
 Rollover writes a provenance-bearing L1 Segment summary with a validated short title, reads its canonical Artifact Store content back, seals the previous Segment, and replaces only the runtime's physical session. Historical L1 V1 artifacts remain readable with `title: null`; new writers use L1 V2. By default, every five sealed Segments schedule one branch-serial L2 publication job from validated L1 artifacts only; L2 provider latency does not block entering the successor Segment. Cross-process generation locks prevent duplicate paid calls. A metadata-only manifest exposes available ranges and says the list tool can provide titles, but does not inject any title or summary body. `pi_xk_list_chain_summaries` lets the model locate L1 work by title/range, and `pi_xk_read_chain_summary` reads relevant verified L1/L2 evidence on demand.
 
 Active Goals continue through physical replacement without a pause, while normal quit/reload/new/resume/fork still preserve their conservative Goal-pause behavior. Compaction remains Pi-native and independent: native compaction persists a safe short title plus recovery version, never resends the last user message, and only adds recovery context to the next actual run. A subsequent rollover does not copy that temporary recovery into the successor Segment. Continuing after a historical Segment or tree position always creates a successor branch; sealed Segments are never rewritten. Pi-XK adds a compact `Chain <id> · S<n> · <size>` footer status alongside Pi's native footer.
+
+## Memory Commands And Model Tools
+
+```text
+/memory status
+/memory remember <text>
+/memory search <query>
+/memory show <id>
+/memory timeline <id>
+/memory graph <id> [1|2]
+/memory backfill [1-20]
+/memory refresh <id>
+/memory archive <id>
+/memory invalidate <id>
+/memory detach-evidence <memory> <evidence>
+/memory purge <id>
+/memory proposals
+/memory proposal show|confirm|reject <id>
+/memory config [on|off]
+/memory doctor [deep|repair-projections|repair-lock <nonce>]
+```
+
+Memory v1 stores project-scoped typed revisions, Cues, directed edges, evidence references, capture/proposal state, lifecycle changes, and purge tombstones through canonical Artifact Store objects plus `.pi-xk/memory/events.jsonl`. Trust (`verified|model_inferred|disputed`), dynamic freshness (`current|stale|unknown`), and lifecycle (`active|superseded|invalidated|archived`) remain independent. SQLite FTS5, graph adjacency, heat, read models, History Cues, source cursors, and Markdown are rebuildable projections.
+
+Automatic capture is limited to new latest Goal turn-end checkpoints, Goal completion, and published verified L2 Rollups. Existing history is baselined rather than automatically backfilled. `/memory remember` performs no model call and stores a user-confirmed verified fact; `/memory backfill` is explicit, defaults to one source, and is capped at 20. Model-generated capture facts remain inferred or disputed.
+
+The model sees only a bounded D0 metadata manifest. `pi_xk_search_memory` returns D1 candidates without statements, `pi_xk_read_memory` reads one to five fully validated D2 memories, and `pi_xk_expand_memory_evidence` expands at most three D3 sources for one Memory. `pi_xk_propose_memory_change` records a CAS-guarded proposal without applying it. `pi_xk_request_compaction` only registers a request; after the run settles, the Host requires no queued input/workflow gate, at least five effective user turns, and either 32 messages or 25% context growth before calling native compaction.
+
+All Memory/evidence text is historical evidence, never instruction. A result artifact is reused after a crash; a recorded low-risk proposal can finish publication without another provider call. A generation with no result artifact is indeterminate and is not automatically retried. `config off` stops capture, proposal application, and access writes while leaving existing Memory readable.
 
 ## Files And Recovery
 
@@ -157,6 +187,21 @@ Each confirmed Goal is stored below the current project root. Pi-XK does not cre
   task-read-model.json
   session/                      # TaskSpec V1 compatibility only
     <child-session>.jsonl
+
+.pi-xk/memory/
+  .write.lock
+  events.jsonl
+  memory-read-model.json
+  memory-read-model.checkpoint.json
+  memory-config.json
+  source-cursors.json
+  index.sqlite
+  locks/
+  pending/
+  projections/
+    manifest.json
+    index.md
+    memories/<memoryId>.md
 
 .pi-xk/sessions/
   catalog.json
@@ -180,6 +225,8 @@ Each domain's `events.jsonl` is its fact source. Goal contract/read-model files 
 For Tasks, `events.jsonl` is the fact source, `task-read-model.json` is rebuildable, and parent-session `task_link` entries store only event references. Complete result envelopes remain in the project artifact store and child messages remain in the child transcript. A V2 Task started from a Session Chain records the parent `chainId/branchId/segmentId/entryId`; its `childChainId` points into `.pi-xk/sessions/chains/`. The `.pi-xk/tasks/<taskId>/session/` path is retained only for V1 Task facts, which remain readable without rewriting historical events or hashes.
 
 For Session Chains, `events.jsonl`, native Segment JSONL, L1 artifacts, and L2 artifacts are facts. `chain-read-model.json`, `catalog.json`, Rollup Markdown, pending publication records, and runtime migration state are derived/recovery data. The read model checkpoints event byte offset, sequence, and head hash so normal status/manifest queries consume only a valid event tail. A sealed Segment records its final file hash, leaf, and L1 artifact. `/chain doctor deep` reports changed facts instead of rewriting them; `/chain doctor repair-projections` rebuilds only derived read model, catalog, and Markdown files.
+
+For Memory, canonical revision/Cue/Edge/proposal/source artifacts and `memory/events.jsonl` are facts. `memory-read-model*.json`, `index.sqlite`, History Cues, source cursors, and Markdown are projection/recovery state. `/memory doctor deep` verifies the full event/artifact/evidence graph; `/memory doctor repair-projections` rebuilds only read model, SQLite, and Markdown. It never modifies Goal, Task, Chain, compaction, transcript, or canonical Memory facts.
 
 ## Security Boundary
 

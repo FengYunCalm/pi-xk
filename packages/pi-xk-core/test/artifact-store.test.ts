@@ -9,6 +9,7 @@ import {
 	ArtifactNotFoundError,
 	ArtifactStore,
 	ArtifactValidationError,
+	redactArtifactText,
 } from "../src/index.ts";
 
 const tempDirs: string[] = [];
@@ -28,6 +29,12 @@ afterEach(async () => {
 });
 
 describe("ArtifactStore", () => {
+	it("keeps repeated secret redaction canonical", () => {
+		const once = redactArtifactText('{"statement":"Use token=secretvalue123 as a fixture."}').content;
+		expect(redactArtifactText(once).content).toBe(once);
+		expect(once).toContain("token=[REDACTED]");
+	});
+
 	it("stores a redacted immutable JSON artifact with durable metadata", async () => {
 		const { store, projectRoot } = await createStore();
 		const secret = "sk-secret-12345678901234567890";

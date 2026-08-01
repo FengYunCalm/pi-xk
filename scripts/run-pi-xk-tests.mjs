@@ -60,6 +60,11 @@ const commands = platformSmoke
 				"test/goal-store.test.ts",
 				"test/task-store.test.ts",
 				"test/session-chain-store.test.ts",
+				"test/memory-contract.test.ts",
+				"test/memory-freshness.test.ts",
+				"test/memory-store.test.ts",
+				"test/memory-index.test.ts",
+				"test/memory-service.test.ts",
 			],
 			[
 				"--workspace",
@@ -70,6 +75,8 @@ const commands = platformSmoke
 				"test/session-manager/file-operations.test.ts",
 				"test/suite/pi-xk-package-install.test.ts",
 				"test/suite/pi-xk-github-release.test.ts",
+				"test/suite/pi-xk-memory-extension.test.ts",
+				"test/suite/pi-xk-memory-source-bridge.test.ts",
 			],
 		]
 	: [
@@ -94,6 +101,11 @@ const commands = platformSmoke
 		"test/session-chain-read-model.test.ts",
 		"test/session-chain-summary-v2.test.ts",
 		"test/sync-directory.test.ts",
+		"test/memory-contract.test.ts",
+		"test/memory-freshness.test.ts",
+		"test/memory-store.test.ts",
+		"test/memory-index.test.ts",
+		"test/memory-service.test.ts",
 	],
 	[
 		"--workspace",
@@ -116,6 +128,8 @@ const commands = platformSmoke
 		"test/suite/pi-xk-package-install.test.ts",
 		"test/suite/pi-xk-github-release.test.ts",
 		"test/suite/pi-xk-session-chain-summary-quality.test.ts",
+		"test/suite/pi-xk-memory-extension.test.ts",
+		"test/suite/pi-xk-memory-source-bridge.test.ts",
 	],
 		];
 

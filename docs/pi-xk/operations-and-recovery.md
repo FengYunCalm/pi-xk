@@ -1,6 +1,6 @@
 # Pi-XK 运维与恢复
 
-本文面向需要检查落盘状态、备份项目、诊断中断和安全移除扩展的使用者。Pi-XK 当前没有独立 daemon 或服务端；“运维”主要是 Pi profile、项目 `.pi-xk/`、原生 session 与事件日志之间的一致性管理。
+本文面向需要检查落盘状态、备份项目、诊断中断和安全移除扩展的使用者。Pi-XK 当前没有独立 daemon 或服务端；“运维”主要是 Pi profile、项目 `.pi-xk/`、原生 session、Goal/Task/Chain/Memory 事件与 Artifact Store 之间的一致性管理。
 
 ## 1. 数据位置
 
@@ -25,6 +25,20 @@
     task-read-model.json
     session/                         # 仅 Task V1 历史兼容
       <child-session>.jsonl
+  memory/
+    .write.lock                       # 仅事件写入期间存在；PID/nonce/createdAt
+    events.jsonl
+    memory-read-model.json
+    memory-read-model.checkpoint.json
+    memory-config.json
+    source-cursors.json
+    index.sqlite
+    locks/<captureId>.generation.lock
+    pending/<captureId>.result.json
+    projections/
+      manifest.json
+      index.md
+      memories/<memoryId>.md
   sessions/
     catalog.json
     chains/<chainId>/
@@ -57,13 +71,18 @@ Pi-XK 不创建项目级 `.pi` 目录来保存自己的领域状态。项目 `.p
 | Goal `goal-read-model.json` | 投影 | 通过 replay 重建 | 不参与最终裁决 |
 | Task `events.jsonl` | 是 | 否 | TaskSpec、child、终态与 result reference |
 | Task `task-read-model.json` | 投影 | 通过 replay 重建 | 可丢弃视图，不是历史 |
+| Memory `events.jsonl` | 是 | 否 | revision/Cue/Edge/proposal 引用、capture、生命周期、purge tombstone 和 access 事件 |
+| Memory revision/Cue/Edge/proposal/source artifact | 是 | 否 | Artifact Store 中的 canonical 内容；事件发布这些对象 |
+| Memory read model/checkpoint | 投影 | 通过 replay 重建 | 普通 status/search 的快速路径，不参与裁决 |
+| Memory `index.sqlite` / Markdown | 投影 | `/memory doctor repair-projections` | FTS5、图、时间、heat 和人类可读视图 |
+| Memory `source-cursors.json` / pending result | 恢复数据 | 由 source bridge/controller 管理 | 控制自动发现基线并复用已生成结果；不是 Memory 事实 |
 | Chain `events.jsonl` | 是 | 否 | chain/branch/segment/rollover 拓扑 |
 | managed Segment JSONL | 是 | 否 | 完整 Pi session；sealed 后不可变 |
 | L1/L2 Artifact object | 是 | 否 | 内容寻址的 Segment summary、Chain Rollup、checkpoint 或 result 内容 |
 | `chain-read-model.json` / `catalog.json` | 投影 | 通过 Core rebuild API 重建 | 包含已发布 Rollup 和失败投影 |
 | Rollup Markdown | 投影 | 由 repair 路径重建 | doctor 检测缺失或陈旧；不是 L2 事实源 |
 | Rollup pending/state | 恢复数据 | 由 Controller 管理 | 复用已生成 artifact，并标记历史自动 backfill 边界 |
-| Goal/Task/Chain write lock | 并发协调 | 只能按 doctor 给出的 nonce 显式修复 | metadata 为 PID、nonce、createdAt；不是业务完成证据 |
+| Goal/Task/Chain/Memory write lock | 并发协调 | 只能按 doctor 给出的 nonce 显式修复 | metadata 为 PID、nonce、createdAt；不是业务完成证据 |
 
 “可重建”不等于建议直接删除。优先使用对应 Core rebuild API；Session Chain prepared rollover 和 sealed integrity 使用 `/chain doctor`。保留操作前备份，并先确认损坏的是投影而不是事实源。
 
@@ -78,6 +97,10 @@ Pi-XK 不创建项目级 `.pi` 目录来保存自己的领域状态。项目 `.p
 | `/task start ...` | 创建 Task 目录、事件和独立 child SessionChain |
 | 自动或手动 rollover | 创建 L1 artifact、target Segment 和 chain event；完整窗口可能再生成 L2 |
 | `/chain rollup backfill [limit]` | 显式生成最早缺失的完整 L2 窗口，可能调用 provider |
+| 第一次加载 Memory v1 | 默认启用并记录当前 Goal/Chain head 作为自动捕获 baseline；不批量调用模型回填旧历史 |
+| 新 Goal checkpoint/completion 或 L2 publication | 后台发现稳定来源并产生 Memory capture；可能调用 provider |
+| `/memory remember <text>` | 不调用模型，创建用户确认的 verified Memory |
+| `/memory backfill [limit]` | 显式、有限额捕获历史 eligible Goal/L2 source；默认一个、最多 20 |
 | compaction | Pi 写带可选标题、原因和 recovery version 的原生 compaction entry；active Goal 另写 checkpoint evidence reference |
 
 如果草案取消，项目中不应出现对应 Goal 目录。若确认过程被中断，create 的幂等恢复会根据已有事实补齐缺失投影，而不是重复 initial event。
@@ -155,6 +178,31 @@ V3 State 的 `recent_work_log` 最多保留 20 条重要记录。`tried_and_reje
 /xk status
 ```
 
+### Memory
+
+```text
+/memory status
+/memory search <query>
+/memory show <memoryId>
+/memory timeline <memoryId>
+/memory graph <memoryId> [1|2]
+/memory proposals
+/memory doctor
+/memory doctor deep
+/memory doctor repair-projections
+```
+
+重点检查：
+
+- event head、read-model checkpoint 和 SQLite head 是否一致；
+- trust/freshness/lifecycle 是否被分开解释，尤其不要把 inferred 或 stale 当作 verified current；
+- capture 是 scheduled、generating、proposed、applied、failed 还是 indeterminate；
+- unresolved proposal 是否需要用户 confirm/reject；
+- History Cue 是否只用于定位 L1/compaction 来源，而没有被升级成正式事实；
+- write lock 是否属于仍存活进程。
+
+普通 `/memory doctor` 检查 head、index、lock、capture 和 projection metadata；deep 模式完整 replay event、验证全部 artifact/evidence、引用、purge tombstone 和 Markdown digest。repair 只重建 read model、SQLite 与 Markdown。
+
 ## 5. 正常生命周期
 
 ### Goal
@@ -197,6 +245,19 @@ V3 State 的 `recent_work_log` 最多保留 20 条重要记录。`tried_and_reje
 | `/chain rollup backfill [limit]` | 显式、有限额补齐历史窗口 |
 | sealed Segment hash 变化 | doctor 报 corruption，不自动重写 |
 
+### Memory
+
+| 事件 | 结果 |
+| --- | --- |
+| 新 stable source | 后台串行 capture；模型结果 canonical read-back 后记录 proposal/application |
+| `/memory remember` | 直接写 verified Memory，不调用 provider |
+| 模型提出 Memory 变更 | 只记录 CAS 保护 proposal，不直接 apply |
+| `/memory config off` | 停止 capture、proposal apply 和 access 写入；既有 Memory 保持只读 |
+| SQLite/Markdown 更新失败 | Memory fact 保持已提交；doctor 可重建投影 |
+| generation started 后结果未知 | 标记 indeterminate，不自动重复 provider 调用 |
+| archive/invalidate | 新 lifecycle revision；旧 artifact 保留 |
+| purge | 显式确认、引用检查和 tombstone 后才清理独占 artifact |
+
 ## 6. Rollup 恢复与诊断
 
 Rollup 发布的故障边界与 rollover 分开：
@@ -213,7 +274,27 @@ Rollup 发布的故障边界与 rollover 分开：
 
 关闭自动 Rollup 不会禁用 doctor 或只读摘要工具。
 
-## 7. Rollover 恢复
+## 7. Memory Capture 与索引恢复
+
+Memory publication 的恢复边界：
+
+1. 已有模型 result artifact：重新验证并复用，不再次调用 provider。
+2. `proposal_recorded` 已存在且无需确认：下一次 stable-source scan 完成 apply，不再次调用 provider。
+3. `memory_change_applied` 已写但 read model/SQLite/Markdown 未更新：重放 event tail 或 repair projections。
+4. `generation_started` 后没有 result artifact：结果未知，保持 indeterminate；只能在确认 provider 幂等性或用户显式判断后处理。
+5. source digest、evidence ownership、schema 或 CAS 无效：报告不可重试事实错误，不移动 cursor 伪装成功。
+
+SQLite 缺失、损坏或与 event head 不一致时：
+
+```text
+/memory doctor
+/memory doctor deep
+/memory doctor repair-projections
+```
+
+repair 会构建临时 SQLite/read model/Markdown，完整验证后再替换，不修改 Memory event、Artifact Store、Goal、Task、Chain 或 transcript。History Cue 和 source cursor 也是派生/恢复数据；删除它们可能改变后续发现成本，但不能删除已经发布的 Memory facts。
+
+## 8. Rollover 恢复
 
 两阶段 rollover 的恢复判断基于 chain event 与 session marker，而不是文件修改时间：
 
@@ -237,14 +318,14 @@ doctor 只报告事实和恢复需求，不改写 sealed Segment。启动恢复�
 
 不要通过复制最新 Segment、修改 event sequence、删除 hash 字段或把任意文件改名成 target 来绕过诊断。这会破坏可重放性。
 
-## 8. 备份与恢复范围
+## 9. 备份与恢复范围
 
 完整恢复一个 Pi-XK 项目至少需要两部分：
 
 1. 项目根的 `.pi-xk/`；
 2. 对应 Pi profile 中的原生 session，尤其是被采用为 external root 的历史 session。
 
-只备份 `.pi-xk/` 可能丢失 external root 的原始正文；只备份 Pi session 又会丢失 Goal/Task/Chain 事件和 artifact。还应保留项目源码版本与工作区产物，因为 evidence 中可能只保存路径/hash，不复制正文。
+只备份 `.pi-xk/` 可能丢失 external root、compaction evidence 的原始正文；只备份 Pi session 又会丢失 Goal/Task/Chain/Memory 事件和 artifact。还应保留项目源码版本与工作区产物，因为 evidence 中可能只保存路径/hash，不复制正文，Git freshness 也依赖 repository identity、baseline 和相关 path。
 
 备份时：
 
@@ -252,11 +333,11 @@ doctor 只报告事实和恢复需求，不改写 sealed Segment。启动恢复�
 - 同时保留目录结构、文件名和字节内容；
 - 不对 sealed Segment 或 artifact 做文本换行转换；
 - 记录 Pi-XK Git revision、Node/Pi 版本和 `PI_CODING_AGENT_DIR`；
-- 恢复后先运行 `/chain doctor`，再恢复 Goal 或启动新 Task。
+- 恢复后先运行 `/chain doctor` 与 `/memory doctor`，再恢复 Goal 或启动新 Task。
 
 当前没有正式 backup/restore CLI、retention policy 或 GC。任何删除都应视为人工数据管理操作。
 
-## 9. 常见故障
+## 10. 常见故障
 
 ### `fd is unavailable`
 
@@ -268,7 +349,7 @@ npm run check:pi-xk-runtime
 
 Ubuntu/Debian 可安装 `fd-find`；Pi 能识别 `fdfind`。也可以把可信的 `fd` 放入 `<PI_CODING_AGENT_DIR>/bin/fd`。preflight 不下载二进制，也不联系 provider。
 
-### `/goal`、`/task` 或 `/chain` 不存在
+### `/goal`、`/task`、`/chain` 或 `/memory` 不存在
 
 依次检查：
 
@@ -312,7 +393,7 @@ Pi-XK 在 provider 调用前尝试 rollover。失败时输入被明确保留在�
 
 ### doctor 报 abandoned write lock
 
-Goal、Task、Chain 使用相同的 PID/nonce 锁协议。只有 owner PID 明确不存在且 nonce 与检查结果完全一致时，才允许显式修复：
+Goal、Task、Chain、Memory 使用相同的 PID/nonce 锁协议。只有 owner PID 明确不存在且 nonce 与检查结果完全一致时，才允许显式修复：
 
 ```text
 /goal doctor
@@ -321,11 +402,29 @@ Goal、Task、Chain 使用相同的 PID/nonce 锁协议。只有 owner PID 明�
 /task doctor [taskId] repair-lock <nonce>
 /chain doctor
 /chain doctor repair-lock <nonce>
+/memory doctor
+/memory doctor repair-lock <nonce>
 ```
 
 owner 仍存活、PID 状态无法确认、metadata malformed 或 nonce 已变化时都会拒绝删除。不要按锁年龄猜测，也不要手工删 `.write.lock`。
 
-## 10. 更新与移除
+### Memory 显示 indeterminate capture
+
+这表示 `generation_started` 已提交，但没有可证明的 result artifact。provider 可能已经计费并返回，也可能根本没有完成。Pi-XK 不自动重试，以免产生重复付费调用和重复事实。保留 pending/event/artifact 现场，运行 `/memory doctor deep`；只有确认 provider 幂等 key 可复用或用户明确决定重试时再处理。
+
+### Memory index missing/corrupt/stale
+
+先运行 `/memory doctor` 区分事实错误和投影错误。仅当 event/artifact 验证通过时执行 `/memory doctor repair-projections`。不要通过删除 `events.jsonl` 或 artifact 让 SQLite 看起来一致。
+
+### Memory proposal 一直未处理
+
+使用 `/memory proposals` 和 `/memory proposal show <id>` 检查。模型主动提出的变更、既有 Memory 修订、verified/lifecycle/evidence/purge 变更不会自动 apply；需要用户 confirm 或 reject。event head/revision 已变化时，旧 proposal 的 CAS 会拒绝覆盖新事实。
+
+### Memory freshness 变为 stale/unknown
+
+`stale` 表示相关 scope path 与捕获基线不一致或来源消失；无关 dirty 文件不会触发。`unknown` 表示 Git/source 无法确定。`/memory refresh <id>` 只重新计算投影和 freshness，不调用模型、不会把旧结论改成 current。
+
+## 11. 更新与移除
 
 受支持的本地管理入口为：
 
@@ -338,4 +437,4 @@ npm run pi-xk:uninstall
 
 可用 `--agent-dir <path>` 指定隔离 profile；`--dry-run` 不构建也不写 settings。install/upgrade 会构建并运行 runtime preflight，uninstall 只删除该 checkout 的 package 引用。然后正常退出并重启 Pi。不要在 active Goal 或 running Task 中热切换不兼容代码；reload 会触发保守暂停/取消语义。
 
-移除扩展只删除 Pi settings 中的 package 引用，不删除项目数据。若需要归档项目，优先保留 `.pi-xk/` 和原生 session；确认不再需要且备份可用后，才单独处理这些目录。
+移除扩展只删除 Pi settings 中的 package 引用，不删除项目数据，包括 Memory event、artifact、SQLite 和 Markdown。若需要归档项目，优先保留 `.pi-xk/` 和原生 session；确认不再需要且备份可用后，才单独处理这些目录。

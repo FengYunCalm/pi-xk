@@ -9,7 +9,15 @@ export type SummaryEvidenceKind =
 	| "session-chain-l2"
 	| "session-chain-summary-index"
 	| "session-chain-summary-in"
-	| "task-result";
+	| "task-result"
+	| "memory-d1"
+	| "memory-d2"
+	| "memory-d3"
+	| "memory-timeline"
+	| "memory-graph"
+	| "memory-proposal"
+	| "memory-proposal-record"
+	| "memory-doctor";
 
 export type ContextSummaryEvidenceKind = "compaction" | "turn-prefix" | "branch";
 

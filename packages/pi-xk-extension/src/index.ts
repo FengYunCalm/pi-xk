@@ -12,6 +12,27 @@ export {
 	type PiXkTaskResultMessage,
 } from "./goal-extension.ts";
 export {
+	type MemoryCaptureRequest,
+	type MemoryCaptureResultV1,
+	MemoryController,
+	type MemoryGenerationHost,
+} from "./memory-controller.ts";
+export { createPiXkMemoryExtension, type PiXkMemoryExtensionOptions } from "./memory-extension.ts";
+export {
+	type BuildMemoryCaptureProposalInput,
+	buildMemoryCaptureProposal,
+	MEMORY_CAPTURE_PROMPT,
+	MEMORY_CAPTURE_PROMPT_VERSION,
+	MEMORY_CAPTURE_RESPONSE_SCHEMA,
+	type MemoryCaptureCueEnvelopeV1,
+	type MemoryCaptureEdgeEnvelopeV1,
+	type MemoryCaptureEndpointEnvelopeV1,
+	type MemoryCaptureEnvelopeV1,
+	type MemoryCaptureMemoryEnvelopeV1,
+	parseMemoryCaptureEnvelope,
+} from "./memory-prompt.ts";
+export { MemorySourceBridge, type PublishedRollupSourceV1 } from "./memory-source-bridge.ts";
+export {
 	createPiXkSessionChainExtension,
 	type PiXkSessionChainExtensionOptions,
 } from "./session-chain-extension.ts";

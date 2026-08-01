@@ -39,6 +39,7 @@ import {
 	SESSION_CHAIN_ROLLUP_PROMPT_VERSION,
 	type SessionChainRollupConfig,
 	SessionChainRollupManager,
+	type SessionChainRollupManagerOptions,
 	type SessionChainRollupPublicationState,
 	type SessionChainRollupPublicationV1,
 } from "./session-chain-rollup.ts";
@@ -176,7 +177,7 @@ export type SessionChainRolloverHostResult =
 
 export interface SessionChainHost {
 	readonly sessionManager: ReadonlySessionManager;
-	readonly model: { contextWindow: number } | undefined;
+	readonly model: { contextWindow: number; provider?: string; id?: string; modelId?: string } | undefined;
 	summarizeSessionContext(options: SessionChainSummarizeOptions): Promise<SessionChainSummarizeResult>;
 	rolloverSession(options: SessionChainRolloverHostOptions): Promise<SessionChainRolloverHostResult>;
 }
@@ -188,6 +189,7 @@ export interface SessionChainControllerOptions {
 	store?: SessionChainStore;
 	now?: () => string;
 	createSessionManagerAt?: CreateSessionManagerAt;
+	onRollupPublished?: SessionChainRollupManagerOptions["onRollupPublished"];
 }
 
 export type SessionChainSummaryLevel = "l1" | "l2" | "all";
@@ -675,6 +677,7 @@ export class SessionChainController {
 			store: this.store,
 			now: this.now,
 			verifyL1SummaryEvidence: (chainId, branch, segment) => this.verifyL1SummaryEvidence(chainId, branch, segment),
+			onRollupPublished: options.onRollupPublished,
 		});
 	}
 

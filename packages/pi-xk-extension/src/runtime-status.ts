@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { GoalStore, TaskStore } from "pi-xk-core";
+import { GoalStore, type MemoryService, TaskStore } from "pi-xk-core";
 import { getGoalRequiredAcceptanceStatus, readGoalStateSection } from "./goal-status.ts";
 import { isPiXkSessionLink, isPiXkTaskLink, PI_XK_SESSION_LINK_CUSTOM_TYPE } from "./index.ts";
 import { formatSessionChainRollupPublicationStatus, type SessionChainController } from "./session-chain-controller.ts";
@@ -123,12 +123,27 @@ async function chainStatus(
 export async function renderPiXkRuntimeStatus(
 	ctx: ExtensionContext,
 	controller: SessionChainController,
+	memory: MemoryService,
 ): Promise<string> {
-	const [chain, goal, task] = await Promise.all([chainStatus(ctx, controller), goalStatus(ctx), taskStatus(ctx)]);
-	const diagnostics = [...chain.diagnostics, ...goal.diagnostics, ...task.diagnostics];
+	const [chain, goal, task, memoryStatus] = await Promise.all([
+		chainStatus(ctx, controller),
+		goalStatus(ctx),
+		taskStatus(ctx),
+		memory.status().catch((error: unknown) => ({ error: error instanceof Error ? error.message : String(error) })),
+	]);
+	const memoryFailed = "error" in memoryStatus;
+	const diagnostics = [
+		...chain.diagnostics,
+		...goal.diagnostics,
+		...task.diagnostics,
+		...(memoryFailed ? [`memory_status_failed:${memoryStatus.error}`] : []),
+	];
+	const memoryLine = memoryFailed
+		? "Memory: unavailable"
+		: `Memory: ${memoryStatus.index?.memoryCount ?? 0} · pending ${memoryStatus.captures.scheduled + memoryStatus.captures.generating + memoryStatus.captures.proposed} · failed ${memoryStatus.captures.failed} · stale ${memoryStatus.index?.stateCounts.freshness.stale ?? 0} · disputed ${memoryStatus.index?.stateCounts.trust.disputed ?? 0}`;
 	const recovery =
 		diagnostics.length === 0
 			? "Recovery: clear"
 			: `Recovery: ${diagnostics.length} diagnostic(s) · ${diagnostics.slice(0, 3).join(", ")}${diagnostics.length > 3 ? ", ..." : ""}`;
-	return ["Pi-XK status", ...chain.lines, goal.line, task.line, recovery].join("\n");
+	return ["Pi-XK status", ...chain.lines, goal.line, task.line, memoryLine, recovery].join("\n");
 }

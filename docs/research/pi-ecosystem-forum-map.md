@@ -2,7 +2,7 @@
 
 > **状态**：研究快照
 >
-> **日期**：2026-07-28（在 2026-07-19/21 快照上增量核验 6 个候选）
+> **日期**：2026-08-02（在 2026-07-19/21/28 快照上补充 Pi-XK Memory v1 架构结论）
 >
 > **用途**：Pi-XK 选型前的首要参考；不是允许直接安装依赖的清单。
 >
@@ -16,7 +16,7 @@
 2. Goal、子代理、模型代理和 GUI 往往各自维护状态，不能未经适配直接作为 Pi-XK 内核；
 3. npm 同名包、未声明仓库、native addon、后台 daemon 和直接写 models.json 的工具需要单独审查。
 
-Pi-XK 的策略是：核心保持 Pi 原生 session + 自己的 Goal event log；第三方项目优先作为设计证据和隔离实验对象，只有通过契约测试后才可作为可选 adapter。
+Pi-XK 的策略是：核心保持 Pi 原生 session、Goal/Task/Chain 事件域与独立 Memory event/artifact 事实源；第三方项目优先作为设计证据和隔离实验对象，只有通过契约测试后才可作为可选 adapter。同一可写 profile 不叠装第二套 context/memory 主机制。
 
 ## 证据范围与缺口
 
@@ -38,18 +38,31 @@ Pi-XK 的策略是：核心保持 Pi 原生 session + 自己的 Goal event log�
 | 主题 | 论坛经验 | 对 Pi-XK 的决定 |
 | --- | --- | --- |
 | 极简核心 | Pi 本体小，强大来自 package；但“全塞进去”的扩展反而破坏可控性 | 保持 extension-first，领域状态不塞进 Pi 核心 |
-| 上下文 | context-mode、DCP、observational memory 都在解决长会话，但信息丢失和摘要链偏移是主要问题 | 一次只实验一个上下文主机制；Pi-XK 保持独立 artifact/provenance |
+| 上下文 | context-mode、DCP、observational memory 都在解决长会话，但信息丢失和摘要链偏移是主要问题 | Pi-XK 使用原生 compaction + Session Chain + Memory v1；替代主机制只能在隔离 profile 对照 |
 | Goal | pi-until-done、pi-codex-goal 提供持续执行体验 | 研究 UX，不把第三方 Goal 文件当 Pi-XK 的事实源 |
 | 子代理 | pi-subagents 的角色、fallback、后台任务和 artifact 具有参考价值 | TaskSupervisor 仍由 Pi-XK 定义；第三方只做可替换 adapter |
 | 模型网关 | pi-switch 解决模型路由、429/5xx failover 和本地配置 | 作为个人供应商 sidecar，不嵌入 Agent 内核 |
 | GUI | pi-web/pi-app 改善会话可见性和配置体验 | UI 放在外围；禁止多 UI 同时写同一 session |
 | Telegram | 多种 bridge 在 daemon、会话生命周期与 auth reload 上差异很大 | 消息桥接是外部 adapter，不影响 Goal/Task 内核 |
 
+## Pi-XK Memory v1 的落地取舍
+
+Pi-XK 没有直接采用任何候选。当前实现综合了 [Memory is Reconstructed, Not Retrieved](https://arxiv.org/abs/2606.06036) 的 cue/关联/主动重建思想与 Magic Context 的 capture/consolidate/recall、SQLite 投影思想，但固定以下差异：
+
+- 事实结构是有类型、有方向、带时间与 provenance 的多重图，不是固定树、无约束向量库或逐消息副本；
+- Artifact Store + Memory event log 是事实源，SQLite/FTS5、图邻接、heat、History Cue 和 Markdown 都可删除重建；
+- 标题只是 Cue，模型推断默认不是 verified，冲突通过 disputed/revision/edge 保留；
+- 每次请求只注入 D0 metadata，D1/D2/D3 按需读取，不把完整记忆或第三方 context manager 塞进主 prompt；
+- 模型负责语义提炼和 proposal，Host 负责 schema、evidence ownership、CAS、确认、发布和崩溃恢复；
+- v1 只在当前项目内工作，不做跨项目知识库、vector、Observation/Resource 自修改或自动 GC。
+
+完整契约见 [Memory v1](../pi-xk/memory-v1.md) 与 [ADR-0007](../adr/0007-memory-v1.md)。这意味着第三方 memory 项目的后续价值主要是 benchmark 和替代方案对照，不再是 Pi-XK 默认运行时依赖候选。
+
 ## 2026-07-28 六项增量核验
 
 | 项目 | 当前事实快照 | 实际接入面 | 与 Pi-XK 的关系 | 当前决定 |
 | --- | --- | --- | --- | --- |
-| [pi-observational-memory](https://github.com/elpapi42/pi-observational-memory) | npm `3.0.3`，MIT；`master` 是活跃开发分支且 dev 依赖已指向 Pi `0.81.x`；V3 不读取 V2 配置或 memory 格式 | 注册自己的 proactive compaction trigger、`session_before_compact` summary、observer/reflection/dropper 和按 ID recall | 与当前 Pi-XK `0.80.x` 的 compaction recovery、Session Chain L1/L2 和后续通用 memory 都有语义重叠 | 只在独立 profile 做替代方案实验；完成版本加载、compaction、恢复和事实源契约测试前不与日常 Pi-XK profile 叠装 |
+| [pi-observational-memory](https://github.com/elpapi42/pi-observational-memory) | npm `3.0.3`，MIT；`master` 是活跃开发分支且 dev 依赖已指向 Pi `0.81.x`；V3 不读取 V2 配置或 memory 格式 | 注册自己的 proactive compaction trigger、`session_before_compact` summary、observer/reflection/dropper 和按 ID recall | 与当前 Pi-XK `0.80.x` 的 compaction recovery、Session Chain L1/L2 和 Memory v1 有直接语义重叠 | 只在独立 profile 做替代方案实验；完成版本加载、compaction、恢复和事实源契约测试前不与日常 Pi-XK profile 叠装 |
 | [pi-ace-tool](https://github.com/justhil/pi-ace-tool) | 仓库 `package.json` 为 `0.1.0` 并声明 MIT，但仓库没有 LICENSE 文件；官方 npm registry 无同名包 | 注册 `search_context`，本地增量索引后把新增或变更代码块上传到 Augment 官方或兼容 API；提供 OAuth、配置和显式 prompt enhance | 是远程语义代码检索 adapter，不是本地索引或 Goal/Session 状态源 | 仅可从固定 Git commit 在隔离项目试验；许可证补齐且上传/删除/忽略规则可验收前不进入默认工具集 |
 | [pi-nano-context](https://www.npmjs.com/package/pi-nano-context) | npm `0.1.1`，MIT；仍 peer 依赖旧包名 `@mariozechner/pi-coding-agent` | 读取当前 session context，在编辑器下方画分段 token bar，并替换 footer 后重新呈现 extension statuses | 只影响 TUI，不改变 context 或 session；自定义 footer 可能与其他 UI 扩展竞争 | 等待上游切换到 `@earendil-works` peer 或完成兼容补丁后再做 UI smoke |
 | [pi-tool-display](https://www.npmjs.com/package/pi-tool-display) | npm `0.5.0`，MIT；支持当前 Pi `0.80.x` peer；包声明条件式 `postinstall` | 接管内置工具、MCP 和显式 custom tool 的渲染，提供紧凑输出、diff、pending preview、preset 和 consumer adapter | 可改善日常 TUI，但不提供 Pi-XK 状态或事实源；默认工具 ownership 可能与其他 renderer 冲突 | 可作为隔离 profile 的可选 UI；采用前核验 lifecycle script、reload cleanup、窄终端和逐工具 ownership |
@@ -71,7 +84,7 @@ Pi-XK 的策略是：核心保持 Pi 原生 session + 自己的 Goal event log�
 
 ### 上下文扩展的互斥规则
 
-以下项目都触碰 context、compaction 或跨会话记忆；同一 Pi profile 中只能选择一个作为主实验对象：
+Pi-XK Memory v1 已是日常 Pi-XK profile 的项目级记忆主机制。以下项目都触碰 context、compaction 或跨会话记忆；评估它们时必须使用另一个 profile/fixture，并且同一 profile 中只能选择一个主实验对象：
 
 - pi-observational-memory：事件/反思驱动的预备记忆；
 - Dynamic Context Pruning：模型调用压缩工具并在 context 中替换消息；
@@ -87,7 +100,8 @@ Pi-XK 的策略是：核心保持 Pi 原生 session + 自己的 Goal event log�
 | --- | --- | --- |
 | [Pievo](https://github.com/kky42/pievo) | profile 隔离、Pending Change Set、CAS、审批、Git 回滚 | 自动 Evolution 有成本和数据外发边界；只借 proposal/approval 思路 |
 | [Plannotator](https://github.com/backnotprop/plannotator) | 浏览器计划/diff 审阅、批注回传 | 适合 proposal 审批 UI；不参与运行时事实源 |
-| [Magic Context](https://github.com/cortexkit/magic-context) | 分层上下文、cache-stable context、SQLite 工作流 | 体量和状态面较大，不适合作为 Pi-XK 地基 |
+| [Magic Context](https://github.com/cortexkit/magic-context) | capture/consolidate/recall、cache-stable 分层上下文、SQLite 工作流 | 学习渐进式披露和投影恢复；不作为依赖、事实源或第二 context manager |
+| EvoMemory/OpenCode plugin family | 逐步提炼、访问热度、经验演进和模型主导维护 | 学习 proposal 与经验提炼；不采用逐消息复制、第二 transcript、正则主导分类或模型直接改写事实 |
 | [oh-my-pi](https://github.com/can1357/oh-my-pi) | 独立 `omp` harness、LSP/DAP、browser、subagent、Hindsight、hashline 和 native tools | 大型 fork，不是 Pi extension；整体合并会替换 Pi-XK 的 host、profile 与上游同步边界 |
 | [pi-adaptative](https://github.com/Caupulican/pi-adaptative) | source-backed self-modification、profile、reload | 研究 proposal/reload 边界；不接入其自动演化实现 |
 | [rpiv-ask-user-question](https://www.npmjs.com/package/@juicesharp/rpiv-ask-user-question) | MIT，2.1.0；最多四题、预览、note、复核、自由输入和 RPC/ACP fallback | 可作为通用澄清 UI；Goal 受保护字段仍走 Pi-XK revision 确认和事件 CAS |
@@ -136,14 +150,14 @@ Pi-XK 的策略是：核心保持 Pi 原生 session + 自己的 Goal event log�
 
 - 保持 Pi 原生 session 与 Pi-XK Goal event log 的边界；
 - 完成 extension-first integration spike；
-- 不同时安装任何 context/memory 扩展；
+- 使用 Pi-XK Memory v1；不同时安装任何第三方 context/memory 扩展；
 - 不把 GUI、模型网关、Telegram 当作核心设计前提。
 
 ### 第一批隔离实验
 
 1. pi-mcp-adapter：验证 lazy lifecycle、输出保护和 Pi-XK resource generation 的兼容性。
 2. pi-subagents：只读研究任务，比较其 artifact/status 契约与 Pi-XK TaskSpec。
-3. pi-observational-memory、DCP、pi-hermes-memory 三选一：分别在独立 profile 中跑长会话，不叠装。
+3. pi-observational-memory、DCP、pi-hermes-memory 三选一：分别在独立 profile 中与 Pi-XK Memory v1 跑同一长会话对照，不共享可写项目状态。
 4. pi-codex-goal：只比较 Goal UX，不导入其状态格式。
 
 ### 后续可选能力
@@ -157,14 +171,14 @@ Pi-XK 的策略是：核心保持 Pi 原生 session + 自己的 Goal event log�
 1. `pi-tool-display`：独立 profile 做 renderer ownership、reload、窄终端和 Pi-XK custom tool smoke；不修改事实源。
 2. `rpiv-ask-user-question`：比较普通澄清与 Goal revision 确认，验证非交互/RPC fallback；不把工具回答直接提交为 Goal event。
 3. `pi-ace-tool`：只在无敏感内容的 fixture 仓库验证索引增量、远端删除语义、忽略规则和 WSL 路径；不连接日常项目。
-4. `pi-observational-memory`：单独 profile 跑多次 compaction/重启，与 Pi-XK 原生 compaction + Session Chain 做同任务对照；不叠装其他 memory extension。
+4. `pi-observational-memory`：单独 profile 跑多次 compaction/重启，与 Pi-XK 原生 compaction + Session Chain + Memory v1 做同任务对照；不叠装其他 memory extension。
 5. `pi-nano-context`：上游 peer 包名修复或本地兼容补丁后再验证 footer/status 共存。
 6. `oh-my-pi`：只作为独立 `omp` 可执行文件跑相同 benchmark，不共享 Pi-XK 可写 profile，不尝试作为 extension 加载。
 
 ## 后续研究问题
 
 - 对 pi-subagents 的 child session、artifact、worktree 和 stop 语义写一次契约对照；
-- 用同一长任务分别评估 observational-memory、DCP 和 Hermes，测量 token、恢复质量与 session 可重放性；
+- 用同一长任务分别评估 Pi-XK Memory v1、observational-memory、DCP 和 Hermes，测量 token、召回/冲突质量、恢复质量与 session 可重放性；
 - 对 pi-mcp-adapter 的输出 spill 文件、OAuth 与 project config 做最小集成实验；
 - 对 `pi-tool-display`、`rpiv-ask-user-question` 和 `pi-nano-context` 建立当前 Pi `0.80.x` 的加载、reload、窄终端与多扩展 UI 兼容矩阵；
 - 对 `pi-ace-tool` 记录上传边界、远端删除能力、Git commit pin 和许可证补齐结果；

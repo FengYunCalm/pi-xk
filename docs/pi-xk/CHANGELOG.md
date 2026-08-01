@@ -6,6 +6,7 @@
 
 - Goal V3 contracts with a stable Intent Anchor, revisioned Current Objective, controlled objective-only refinement, protected-field confirmation, and separate Objective/State projections.
 - L1 Segment Summary V2 titles exposed through verified Session Chain list/read flows while preserving L1 V1 compatibility.
+- Project-scoped Memory v1 with typed evidence graph revisions, three-dimensional trust/freshness/lifecycle state, stable Goal/L2 capture, explicit verified remember, D0–D3 model retrieval, SQLite FTS5/graph projections, controlled proposals, timeline/doctor commands, and model-requested compaction gates.
 
 ### Changed
 
@@ -16,6 +17,7 @@
 - Session Chain L1 and L2 generation now replace the generic summary contract with their strict `pi.summary-evidence.v1` JSON contracts, and model-facing `summary-in` content is explicitly historical evidence rather than instructions.
 - Goal revision feedback is explicitly user-role candidate data rather than contract authority, Task success requires concrete evidence, and compaction recovery follows the current logical trigger without inventing a user request from a Goal kickoff.
 - Session Chain append now uses a revisioned read-model checkpoint with an exact idempotency-key index, avoiding full event-log replay for ordinary head-matched writes while retaining full replay for retries, conflicts, recovery, and old checkpoints.
+- Memory capture now treats Artifact Store objects and the hash-chained Memory event log as facts while keeping read model, SQLite, History Cue, source cursors, heat, and Markdown as rebuildable projections; existing history is never automatically backfilled.
 
 ### Fixed
 
@@ -39,6 +41,8 @@
 - Pi-XK GitHub release builds now require the checkout commit to equal the release tag commit, and binary entrypoints reject incomplete, inconsistent, or extended provenance manifests.
 - Windows and macOS Pi-XK CI smoke now materializes the ignored provider catalog with the strict `pi-ai` build on fresh checkouts, reuses a complete local catalog without a refresh, validates catalog publication with fixture data, launches `npm.cmd` through the Windows command shell, and skips only the 512 MiB session-file stress case that remains covered by the full suite.
 - Native Windows Pi-XK release packaging now invokes the bundled PowerShell zip helper directly, while WSL retains its shell-based fallback.
+- Memory retrieval now caps the combined FTS/graph candidate pool at 200 before pagination, and capture recovery applies an already-recorded low-risk proposal without repeating the provider call or losing an advanced source cursor.
+- Memory SQLite rebuilds now stream bounded artifact/reference batches through one Worker transaction, cache insert statements, publish head/count metadata only at commit, roll back failed chunks, and remove failed temporary databases instead of cloning a complete index snapshot.
 
 ## [0.1.1]
 

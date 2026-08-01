@@ -7,6 +7,7 @@
 - **Pi-XK durable agent workflows** - Use reviewable Goal V3 contracts with a stable Intent Anchor, controlled Current Objective revisions, automatic Goal continuation, and one isolated Task V2 child run with explicit status, cancellation, shutdown recovery, and native queued follow-up input. See [Pi-XK Getting Started](../../docs/pi-xk/getting-started.md).
 - **Segmented Session Chains** - Continue long-running work across complete native Pi JSONL Segments with safe rollover, successor branches, Goal and Task continuity, chain titles and archive controls, and tiered recovery diagnostics. See [Pi-XK Design and Boundaries](../../docs/pi-xk/design-and-boundaries.md).
 - **Verified L1/L2 history retrieval** - Preserve canonical per-Segment L1 summaries, publish non-blocking branch Rollups, expose only a bounded memory manifest, and let models read fully verified historical evidence on demand. See [Session Chain Rollups and Model Retrieval](../../docs/pi-xk/session-chain-rollups-and-model-retrieval.md).
+- **Project evidence-graph Memory** - Capture stable Goal/L2 evidence into project-scoped typed Memory, retrieve it through bounded D0–D3 disclosure, and rebuild SQLite/Markdown projections from canonical artifacts and events. See [Pi-XK Memory v1](../../docs/pi-xk/memory-v1.md).
 
 ### Added
 
@@ -22,6 +23,7 @@
 - Added Pi-XK Goal V3 revisions with objective-only automatic refinement, protected-field review commands, state revision diagnostics, and read-only Objective projections.
 - Added Session Chain L1 V2 titles to summary list/read results while keeping L1 V1 artifacts readable with `title: null`.
 - Added per-run `before_agent_start.activeTools` projections, fail-closed `onCritical` prompt/context hooks, and declarative filesystem capability metadata for workflow preflight.
+- Added Pi-XK Memory commands and model tools for search, validated read, evidence expansion, CAS-guarded proposals, explicit verified remember, lifecycle/timeline/graph control, backfill, doctor recovery, and settled model-requested compaction.
 
 ### Fixed
 
@@ -53,6 +55,8 @@
 - Fixed Pi-XK Goal runs to persist their run-start fact before provider execution, Task results to verify every referenced artifact, and Session Chain append to avoid routine full event-log replay while preserving exact idempotency recovery.
 - Fixed Pi-XK Rollup queue duplication and publication crash recovery, write-lock empty-file races, stale fast catalogs, and L2 artifact producer validation.
 - Fixed Pi-XK GitHub release recovery to build only the tagged commit and made the binary entrypoint validate the complete provenance manifest contract.
+- Fixed Pi-XK Memory FTS/graph search to cap the merged candidate pool before pagination, and recovered already-recorded low-risk capture proposals without repeating provider generation or stranding an advanced source cursor.
+- Fixed Pi-XK Memory index rebuilds to stream bounded reference/artifact batches through one Worker transaction, avoid complete snapshot cloning, roll back failed chunks, and remove failed temporary SQLite files.
 
 ## [0.80.10] - 2026-07-16
 

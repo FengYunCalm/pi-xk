@@ -38,7 +38,7 @@ const ARTIFACT_TOKEN_PATTERN =
 const ARTIFACT_BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi;
 
 const ARTIFACT_SECRET_ASSIGNMENT_PATTERN =
-	/(["']?(?:api[_-]?key|token|secret|password|authorization)["']?\s*[:=]\s*["']?)([^"',\s}\]]+)/gi;
+	/(["']?(?:api[_-]?key|token|secret|password|authorization)["']?\s*[:=]\s*["']?)(\[REDACTED\]|[^"',\s}\]]+)/gi;
 
 export class ArtifactStoreError extends Error {
 	constructor(message: string) {
@@ -193,7 +193,7 @@ export function redactArtifactText(content: string): RedactionResult {
 	result = replaceWithCount(
 		result.content,
 		ARTIFACT_SECRET_ASSIGNMENT_PATTERN,
-		(_match, prefix) => `${prefix}[REDACTED]`,
+		(_match, prefix, assignedValue) => `${prefix}${assignedValue === "[REDACTED]" ? assignedValue : "[REDACTED]"}`,
 	);
 	total += result.replacements;
 	return { content: result.content, replacements: total };
@@ -464,5 +464,20 @@ export class ArtifactStore {
 			throw new ArtifactInputError(`artifact exceeds requested read limit: ${artifactId}`);
 		}
 		return await this.readStored(artifactId);
+	}
+
+	/** Deletes one canonical object after its owning domain has durably published an explicit tombstone. */
+	async remove(artifactId: string): Promise<boolean> {
+		const paths = this.paths(artifactId);
+		try {
+			await this.readStored(artifactId);
+		} catch (error) {
+			if (error instanceof ArtifactNotFoundError) return false;
+			throw error;
+		}
+		await unlink(paths.dataPath);
+		await unlink(paths.metadataPath);
+		await syncDirectory(paths.objectDirectory);
+		return true;
 	}
 }

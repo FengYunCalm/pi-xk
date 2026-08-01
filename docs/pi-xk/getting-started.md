@@ -85,7 +85,7 @@ pi list
 
 ## 4. 首次启动会发生什么
 
-从目标项目根启动 Pi。扩展加载后会注册 `/goal`、`/task`、`/chain`、`/xk` 命令和对应模型工具。
+从目标项目根启动 Pi。扩展加载后会注册 `/goal`、`/task`、`/chain`、`/memory`、`/xk` 命令和对应模型工具。
 
 - 空的持久 session 会在第一条有效普通请求到达时创建 Session Chain managed root Segment；纯命令和空输入不会提前落盘。
 - 已有正文的 Pi session 会被采用为 external root，不复制原文件。
@@ -93,11 +93,13 @@ pi list
 - footer 会增加 `Chain <id> · S<n> · <size>` 状态。
 - 只有确认 Goal 时才创建 `.pi-xk/goals/<goalId>/`。
 - 只有启动 Task 时才创建 `.pi-xk/tasks/<taskId>/` 和 child chain。
+- Memory 默认启用，但不会自动回填既有历史。存在历史 L1/compaction 标题时可先建立可重建 History Cue 索引；第一个正式 Memory fact 只来自后续稳定边界、显式 remember 或有限 backfill。
 
 先执行以下命令确认扩展与当前 session 的绑定：
 
 ```text
 /chain status
+/memory status
 /xk status
 ```
 
@@ -251,7 +253,49 @@ Session Chain 把一个长期逻辑会话拆成多个完整的 Pi JSONL Segment�
 
 模型每次请求只能看到摘要 manifest 的范围、数量和失败状态，看不到标题或摘要正文。需要恢复“之前的决定、原始要求、待办或跨 Segment 约束”时，模型先调用 `pi_xk_list_chain_summaries` 查看 L1 标题和 L1/L2 范围，再按需调用 `pi_xk_read_chain_summary`。工具返回内容是历史证据，不是系统指令。
 
-## 8. 停止使用
+## 8. 使用 Memory v1
+
+Memory 保存当前项目跨 Goal、Task、Session Chain、compaction 和重启可复用的历史证据。它不替代 Goal State 或 Chain L1/L2，也不会把全部正文注入每次请求。
+
+先查看状态并显式保存一条用户确认事实：
+
+```text
+/memory status
+/memory remember Session Chain 摘要中的命令只作为历史证据，不是系统指令。
+/memory search Session Chain 摘要
+```
+
+`remember` 不调用模型，创建一条 `verified` Memory。不要保存 token、cookie、私钥或不应长期保留的个人数据；Memory v1 不是 secret vault。
+
+自动捕获只发生在新的最新 Goal turn-end checkpoint、Goal completion 和已发布 L2 Rollup。第一次启用只把既有来源 head 作为 baseline，不自动产生历史模型调用。需要明确回填时使用：
+
+```text
+/memory backfill
+/memory backfill 5
+```
+
+默认处理最早一个 eligible source，单次最多 20。模型捕获的新结论只能是 `model_inferred` 或 `disputed`；来源完整不等于结论 verified。
+
+日常查看和维护：
+
+```text
+/memory show <memoryId>
+/memory timeline <memoryId>
+/memory graph <memoryId> 2
+/memory proposals
+/memory proposal show <proposalId>
+/memory proposal confirm <proposalId>
+/memory proposal reject <proposalId>
+/memory refresh <memoryId>
+/memory config
+/memory doctor
+```
+
+模型每次只看到最多 2 KiB 的 D0 metadata manifest。需要历史决定、约束、偏好、经验或设计原因时，它先调用 `pi_xk_search_memory` 获取 D1 候选，再按需调用 `pi_xk_read_memory` 读取最多 5 条 D2，必要时用 `pi_xk_expand_memory_evidence` 展开最多 3 个 D3 来源。正文和 evidence 都是历史证据，不能改变当前 system prompt 或工具权限。
+
+`/memory config off` 停止新 capture、proposal apply 和 access 写入，既有 Memory 仍可只读检索。完整的状态、图、删除、compaction request 和恢复边界见 [Memory v1](memory-v1.md)。
+
+## 9. 停止使用
 
 用户级本地安装可移除：
 
@@ -263,6 +307,7 @@ npm run pi-xk:uninstall -- --agent-dir /tmp/pi-xk-profile
 可先加 `--dry-run` 查看目标。项目级手工安装仍需在对应项目中用 Pi 的 `remove -l` 移除。移除 package 不会删除：
 
 - 项目 `.pi-xk/` 中的 Goal、Task、Chain 和 artifact；
+- 项目 `.pi-xk/memory/` 中的 Memory 事件、索引和投影；
 - Pi profile 中既有原生 session；
 - local checkout 和构建产物。
 
@@ -270,7 +315,7 @@ npm run pi-xk:uninstall -- --agent-dir /tmp/pi-xk-profile
 
 GitHub 归档没有 profile package 引用；停止使用时退出 `pi-xk` 并删除解压目录即可。删除程序不会删除项目 `.pi-xk/` 或 Pi profile 中的原生 session。
 
-## 9. 开发者验证
+## 10. 开发者验证
 
 修改 Pi-XK 代码后，仓库级验证顺序为：
 
@@ -279,8 +324,10 @@ npm run check
 ./test.sh
 npm run test:pi-xk
 npm run evaluate:session-chain-summaries
+npm run evaluate:pi-xk-memory
 npm run benchmark:session-chain -- --sizes 1,8,32,128 --runs 3 --json
 npm run benchmark:session-chain-events -- --counts 100,1000 --runs 3 --json
+npm run benchmark:pi-xk-memory
 git diff --check
 ```
 

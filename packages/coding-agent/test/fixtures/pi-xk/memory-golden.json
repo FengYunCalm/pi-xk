@@ -1,0 +1,130 @@
+{
+  "schema": "pi-xk.memory-golden.v1",
+  "memories": [
+    {
+      "memoryId": "memory_rollup_interval",
+      "kind": "decision",
+      "title": "Default Rollup interval",
+      "statement": "Session Chain Rollup uses five sealed Segments per default window.",
+      "trust": "model_inferred",
+      "freshness": "current",
+      "lifecycle": "active",
+      "evidenceSupported": true
+    },
+    {
+      "memoryId": "memory_policy_boundary",
+      "kind": "constraint",
+      "title": "Policy layer remains excluded",
+      "statement": "Pi-XK does not add a general Policy layer or sandbox in Memory v1.",
+      "trust": "verified",
+      "freshness": "current",
+      "lifecycle": "active",
+      "evidenceSupported": true
+    },
+    {
+      "memoryId": "memory_manifest_boundary",
+      "kind": "constraint",
+      "title": "Memory manifest is metadata only",
+      "statement": "D0 exposes counts and tool guidance but never memory bodies, cue titles, or historical user text.",
+      "trust": "model_inferred",
+      "freshness": "current",
+      "lifecycle": "active",
+      "evidenceSupported": true
+    },
+    {
+      "memoryId": "memory_goal_contract",
+      "kind": "procedure",
+      "title": "Goal contract revision boundary",
+      "statement": "The model proposes Goal objective refinement through revision CAS and cannot edit the objective projection directly.",
+      "trust": "model_inferred",
+      "freshness": "current",
+      "lifecycle": "active",
+      "evidenceSupported": true
+    },
+    {
+      "memoryId": "memory_purge_tombstone",
+      "kind": "constraint",
+      "title": "Explicit purge keeps a tombstone",
+      "statement": "Memory purge requires confirmation, detached evidence, no active edge, and permanently retains a source-digest tombstone.",
+      "trust": "verified",
+      "freshness": "current",
+      "lifecycle": "active",
+      "evidenceSupported": true
+    },
+    {
+      "memoryId": "memory_git_freshness",
+      "kind": "procedure",
+      "title": "Git freshness is path scoped",
+      "statement": "Only changes to the recorded repository-relative scope paths make code memory stale; unrelated dirty files do not.",
+      "trust": "model_inferred",
+      "freshness": "current",
+      "lifecycle": "active",
+      "evidenceSupported": true
+    },
+    {
+      "memoryId": "memory_heat_limit",
+      "kind": "constraint",
+      "title": "Heat is ranking only",
+      "statement": "Access heat is bounded to a ten percent ranking contribution and never changes lifecycle or deletes memory.",
+      "trust": "verified",
+      "freshness": "current",
+      "lifecycle": "active",
+      "evidenceSupported": true
+    },
+    {
+      "memoryId": "memory_task_queue",
+      "kind": "decision",
+      "title": "Task input uses the native queue",
+      "statement": "Ordinary user input waits in the Pi queue while a child Task is running and is processed after Task delivery.",
+      "trust": "model_inferred",
+      "freshness": "current",
+      "lifecycle": "active",
+      "evidenceSupported": true
+    },
+    {
+      "memoryId": "memory_compaction_manual",
+      "kind": "decision",
+      "title": "Manual compaction resumes on the next request",
+      "statement": "A manual compaction without an Active Goal waits for the next real user request before recovery.",
+      "trust": "disputed",
+      "freshness": "current",
+      "lifecycle": "active",
+      "evidenceSupported": true,
+      "conflictGroup": "compaction-resume"
+    },
+    {
+      "memoryId": "memory_compaction_legacy",
+      "kind": "decision",
+      "title": "Legacy compaction immediate resume claim",
+      "statement": "An older note claims every manual compaction should immediately call the model again.",
+      "trust": "disputed",
+      "freshness": "stale",
+      "lifecycle": "active",
+      "evidenceSupported": true,
+      "conflictGroup": "compaction-resume"
+    }
+  ],
+  "edges": [
+    {
+      "edgeId": "edge_compaction_conflict",
+      "from": "memory_compaction_manual",
+      "to": "memory_compaction_legacy",
+      "relation": "contradicts"
+    }
+  ],
+  "queries": [
+    { "query": "default Rollup interval five Segments", "expected": ["memory_rollup_interval"], "forbidden": [] },
+    { "query": "Policy layer sandbox excluded", "expected": ["memory_policy_boundary"], "forbidden": [] },
+    { "query": "manifest metadata memory bodies", "expected": ["memory_manifest_boundary"], "forbidden": [] },
+    { "query": "Goal objective revision CAS", "expected": ["memory_goal_contract"], "forbidden": [] },
+    { "query": "purge confirmation tombstone", "expected": ["memory_purge_tombstone"], "forbidden": [] },
+    { "query": "dirty unrelated files freshness paths", "expected": ["memory_git_freshness"], "forbidden": [] },
+    { "query": "heat ranking lifecycle delete", "expected": ["memory_heat_limit"], "forbidden": [] },
+    { "query": "user input child Task queue", "expected": ["memory_task_queue"], "forbidden": [] },
+    {
+      "query": "manual compaction next real request",
+      "expected": ["memory_compaction_manual"],
+      "forbidden": ["memory_compaction_legacy"]
+    }
+  ]
+}

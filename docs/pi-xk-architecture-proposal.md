@@ -1,10 +1,10 @@
 # Pi-XK 架构策划案
 
-> **状态**：`pi-xk-v0.1.0` 已于 2026-07-26 正式发布；Phase 0、Phase 1.1–1.8、Task Run v1、Session Chain v1.1 / Rollup v1、正确性、恢复、长链性能、本地产品化和 GitHub-only 发行链均已落地。`pi-xk-v0.1.1` 正在进行发布后稳定化与完整验收，尚未标记完成。Policy/沙箱、完整 TaskSupervisor、通用 Context/memory 与 Proposal/反省闭环不在当前范围。
+> **状态**：`pi-xk-v0.1.0` 已于 2026-07-26 正式发布；Phase 0、Phase 1.1–1.8、Task Run v1、Session Chain v1.1 / Rollup v1、正确性、恢复、长链性能、本地产品化和 GitHub-only 发行链均已落地。当前未发布主线进一步实现了 Goal V3/compaction recovery 与 Phase 4 的项目级 Memory v1 切片。Policy/沙箱、完整 TaskSupervisor、通用 Context budget controller、跨项目知识库与 Observation/Resource 反省闭环仍未完成。
 >
-> **版本**：1.1.3
+> **版本**：1.2.0
 >
-> **日期**：2026-07-28
+> **日期**：2026-08-02
 >
 > **定位**：基于 Pi 的维护型 fork，加上可验证的领域层、任务编排层和安全边界。
 >
@@ -75,6 +75,7 @@ Pi-XK 不从头重写 Agent，也不把一个大型 Pi fork 整体吞入本仓�
 - **Resource**：Skill、规则、模板、extension、MCP 配置等可加载能力。
 - **Proposal**：对 Resource、规则或代码的候选变更，必须经过验证和审批才能生效。
 - **Observation**：从工具失败、用户纠正、重复犹豫或资源老化中提取的低权限证据记录；它只能推动分析或 proposal，不能直接修改 Resource 或进入系统提示。
+- **Memory**：跨 Goal、Task、branch 和重启的项目级证据图。Artifact Store 与 Memory event log 是事实源；SQLite、图邻接、heat、History Cue 和 Markdown 是可重建投影。
 - **Read model / index / cache**：由事实源重建的加速视图，损坏时删除并重建，不参与裁决事实。
 
 ## 2. 对 Pi Agent v3.1 的敌对审计
@@ -175,6 +176,9 @@ flowchart TD
     X --> J
     Y --> A
     H --> O[Observer / Proposal Builder]
+    H --> MM[Project Memory Controller]
+    MM --> ME[Memory Event Log + Artifacts]
+    ME --> MI[SQLite FTS5 / Graph / Markdown]
     O --> G[Proposal Store]
     G --> AP[Validate -> Approve -> Apply]
     AP --> RL[Generation-bound Resource Reload]
@@ -189,6 +193,7 @@ flowchart TD
 | `xk-contracts` | schema、版本、校验和类型 | 文件系统副作用 |
 | `xk-state` | Goal/Task/Proposal 事件追加、重放和 read model | 直接执行 shell 或模型请求 |
 | `xk-context` | L0/L1/L2、压缩和 artifact 选择 | 把摘要当事实 |
+| `xk-memory` | 项目级 evidence graph、capture、检索、timeline 和投影恢复 | 改写 Goal/Task/Chain/transcript 或充当跨项目知识库 |
 | `xk-policy` | capability 评估、审批、审计和沙箱选择 | 解析业务目标或替模型决策 |
 | `xk-tasks` | 调度、预算、取消、恢复、结果 envelope | 隐式修改父工作区 |
 | `xk-learning` | 观察、证据聚合、proposal 验证 | 自动提升权限或改全局资源 |
@@ -223,6 +228,16 @@ flowchart TD
 │       ├── goal-state.md             # identity-matched 的可变执行状态
 │       └── goal-read-model.json      # 生命周期/checkpoint 等可重建查询视图
 ├── tasks/                           # Task 事件/索引
+├── memory/
+│   ├── events.jsonl                 # Memory 发布、生命周期、purge 与 access 事实
+│   ├── memory-read-model.json       # 可重建快速视图
+│   ├── memory-read-model.checkpoint.json
+│   ├── memory-config.json           # enabled/off；不是事实正文
+│   ├── source-cursors.json          # 稳定来源发现游标
+│   ├── index.sqlite                 # 可重建 FTS5/图/时间/heat 投影
+│   ├── locks/                       # capture generation locks
+│   ├── pending/                     # 已生成、待 publication 的结果引用
+│   └── projections/                 # 可重建 Markdown/manifest
 ├── learning/
 │   ├── observations.jsonl           # 追加式观察事实；不原地写 processed 标记
 │   ├── claims/                      # 可过期 work claim/lease，不是事实源
@@ -408,13 +423,13 @@ checkpoint 的最终领域契约应能引用目标进度、验收状态、已验
 
 ### 8.1 L0/L1/L2 是预算策略，不是新的会话格式
 
-Session Chain v1.1 已交付一个受限子集：sealed Segment 的 L1 artifact、固定窗口 L2 Rollup、metadata-only manifest 和当前 chain 内的只读按需查询。它不等于本节规划的通用跨域 budget controller、长期 memory、FTS/SQLite 索引或跨项目知识源。
+Session Chain v1.1 已交付 sealed Segment 的 L1 artifact、固定窗口 L2 Rollup、metadata-only manifest 和当前 chain 内的只读按需查询。Memory v1 又交付了当前项目跨 Goal/Task/branch/source 的证据图、FTS5/图投影和 D0–D3 渐进检索。仍未交付的是统一跨域 token budget controller、跨项目/用户级知识源、vector 检索、通用敏感信息策略和 Observation/Resource 自修改闭环。
 
 | 层 | 内容 | 生命周期 | 可信度处理 |
 | --- | --- | --- | --- |
 | L0 | 安全策略、Goal contract 摘要、当前 generation、最近 checkpoint 指针 | 每次 request 常驻 | 由 runtime 生成，不接受模型覆盖 |
 | L1 | 当前 Pi branch、最近用户/assistant turn、未消费工具结果 | 当前 turn/压缩窗口 | 保留原始 entry ID 和工具状态 |
-| L2 | 旧 branch、完整报告、历史 diff、失败样本和长期记忆 | 按需查询 | 先返回 provenance、hash 和敏感级别，再注入 |
+| L2 | 旧 branch、完整报告、历史 diff、失败样本和项目 Memory | 按需查询 | 先返回 provenance、三维状态和范围，再读取结构化正文/evidence |
 
 L0/L1/L2 的具体 token 配额由模型上下文窗口、输入成本和工具结果大小动态计算。固定“20k/500”只能作为测试样例，不能作为系统不变量。
 
@@ -467,16 +482,23 @@ Host -> Context controller: rebuild L0/L1 from durable entries
 
 压缩必须遵守工具调用与工具结果的配对边界，不能截断成无法被 provider 接受的消息序列。摘要模型超时、拒绝或输出不符合 schema 时，采用保守裁剪/延迟压缩，不把自然语言错误写成 compaction 真相。可实现 microcompact 和 reactive compact，但它们都只能清理派生上下文，不能删除 Pi 原始 session entry。
 
-### 8.5 Memory 与观察数据
+### 8.5 Memory v1 已完成切片
 
-长期记忆采用“人类可读源 + 可重建索引”模式：
+当前项目级 Memory 使用 Artifact Store + `memory/events.jsonl` 作为事实源，并以不可变 revision、Cue、有向 Edge、Evidence、proposal 和 tombstone 表达知识演进。模型负责语义提炼和检索判断，Host 负责 schema、source digest、evidence ownership、CAS、自动应用边界、用户确认、锁和崩溃恢复。
 
-- 用户明确批准的事实可进入项目或用户级 memory source；每条事实有来源、更新时间、过期策略和敏感级别。
-- 失败、纠正和经验先进入观察事件，不直接进入系统提示。
-- 明确的工具错误、验收失败和用户显式纠正是强信号；编辑距离、犹豫词和时间衰减只能作为弱信号，不能单独触发 Resource 修改。
-- FTS/SQLite 只保存检索索引，删除后由 source/artifact 重建。
-- secret scanner 和 redaction 在写入前执行；检测到凭据、token、cookie 或个人数据时默认拒绝持久化。
-- 记忆注入采用最小相关片段和预算上限，显示 provenance，避免把未验证旧结论伪装成规则。
+固定三维状态：
+
+- trust：`verified | model_inferred | disputed`；模型输出不能自动成为 verified；
+- freshness：`current | stale | unknown`；代码相关项按 repository、baseline 和相关 path digest 动态计算；
+- lifecycle：`active | superseded | invalidated | archived`；历史 revision 不重写。
+
+当前自动捕获只发生在新 Goal turn-end checkpoint、Goal completion 与已发布 L2 Rollup。普通聊天、局部未完成工作和 L1/compaction 标题不会直接创建 Memory；标题只进入可重建 History Cue。`/memory remember` 不调用模型并创建 verified 项目事实；历史必须显式有限额 backfill。
+
+检索采用 D0 metadata manifest -> D1 FTS5/图候选 -> D2 完整验证 Memory -> D3 原始 evidence。SQLite、read model、History Cue、source cursor、heat 和 Markdown 都是投影。D1 以 FTS5 和一至二跳图邻接通过 RRF 融合，候选池最多 200；heat 只能有限调序，不能改变事实或触发删除。v1 不启用 vector。
+
+publication 在 result artifact、proposal event、apply event 和 projection 之间可恢复：已有结果不重复调用 provider；`generation_started` 后没有结果时标记 indeterminate，不自动重复未知付费调用；事实已提交但投影失败时由 doctor 重建。完整决策见 ADR-0007。
+
+Memory v1 不等于 Observation/Resource 反省。失败、纠正和经验自动转成 Observation、跨项目聚合、secret/TTL policy、Resource proposal/apply 仍属于后续 Phase 5；不得因为 Memory 已实现就宣称自动自我改进或用户级全局知识库已经存在。
 
 ## 9. TaskSupervisor：统一子代理、后台任务和恢复
 
@@ -743,9 +765,9 @@ drafted -> validated -> awaiting_approval -> applied
 
 ### 12.6 结构化经验沉淀
 
-只有 proposal 已批准、应用并通过 post-apply verification 后，才允许生成结构化经验候选。经验至少包含 resourceId、appliedRevision、fixedScenario、evidence IDs、验证前后指标、有效期和适用边界；它首先进入 Phase 4 的人类可读 memory source，而不是单独维护一份不可追溯的 `memory.jsonl`。
+Resource proposal 派生的 procedure/lesson 只有在 proposal 已批准、应用并通过 post-apply verification 后，才允许进入 Memory change proposal。候选至少包含 resourceId、appliedRevision、fixedScenario、evidence IDs、验证前后指标、有效期和适用边界；它复用 Memory v1 revision/evidence/CAS 事实域，不单独维护不可追溯的 `memory.jsonl`。
 
-memory 检索索引可以重建。注入必须通过 `before_agent_start`/`context` 的预算与 provenance 规则，只选择与当前 Goal/Task 匹配的已批准片段；失败 observation、被拒 proposal、模型犹豫词和未验证总结永远不能直接进入系统提示。
+这条规则只约束未来 Observation/Resource 闭环，不否定 Memory v1 已有的 Goal checkpoint/completion、L2 Rollup 和显式 remember 来源。Memory 索引可以重建；D0 不注入正文，D1–D3 只选择与当前问题相关的 provenance-bearing evidence。失败 observation、被拒 proposal、模型犹豫词和未验证总结永远不能直接进入系统提示或自动升级为 verified。
 
 ## 13. Claude Code 能力映射
 
@@ -804,6 +826,7 @@ pi_xk.policy.*
 pi_xk.sandbox.*
 pi_xk.resource.*
 pi_xk.compaction.*
+pi_xk.memory.*
 pi_xk.proposal.*
 pi_xk.observation.*
 pi_xk.learning.*
@@ -817,6 +840,7 @@ pi_xk.artifact.*
 - session append/replay 成功率、尾部损坏次数和恢复耗时；
 - checkpoint 成功率、重复事件率、read model 重建耗时；
 - compaction 触发原因、压缩前后 token、摘要 sourceHash 命中率和 stale 率；
+- Memory capture scheduled/generating/indeterminate/applied/failed、D1/D2/D3 读取、freshness/disputed、index rebuild 和 proposal 冲突；
 - task queue 等待、运行、取消、超时、孤儿和重试计数；
 - policy ask/allow/deny、sandbox 启动失败和越界尝试；
 - MCP 连接、超时、输出 guard 截断和 OAuth 失败；
@@ -856,7 +880,7 @@ pi_xk.artifact.*
 - 工具结果已持久化后的 `turn_end` 与 `session_before_compact` 的自动 checkpoint；
 - artifact store、redaction 和可重建 read model。
 
-**2026-07-28 实现状态：** Phase 1.1–1.8、Goal V3 和 Task Run v1 均已完成。Goal 使用只读 Objective 合同投影与可变 State 执行台账；新证据只能自动修正 Current Objective，Intent Anchor、验收、约束和授权等受保护字段必须由用户确认。原生 compaction 持久化安全短标题，并只在下一次真实逻辑 run 注入一次 recovery system context，不重复最后一条用户消息，也不与 Goal kickoff 竞争。Session Chain v1.1 把长期逻辑会话拆为完整原生 Pi JSONL Segment：新空会话进入项目级 managed Segment，既有 Pi session 作为不复制的 external root 被采用，`events.jsonl` 是拓扑事实源，而 catalog/read model 可重建。soft（16 MiB/4,000 entries）只在 settled 后轮转，hard（64 MiB/16,000 entries）在下一次 provider turn 前强制轮转；Task 运行、Task 结果待交付、Goal 草案、待确认 Goal revision 或 lifecycle intent 会阻止轮转。L1 以 Artifact Store read-back 内容为 canonical；当前 V2 writer 增加可检索标题，统一验证器继续核对 marker/seal/successor provenance。默认每 5 个 sealed Segment 登记只读取 L1 的后台 L2 publication；branch 串行队列与 generation lock 避免重复付费调用。checkpointed read model 通过 event tail 快速更新，普通 status/manifest/picker 不再完整 replay。系统提示词只注入 metadata manifest，模型读取正文前完成完整 provenance 验证。active Goal 在 `reason: "rollover"` 下继续。Task 普通输入使用 Pi follow-up 队列延迟处理，仍保持单 child 与父屏障。Chain 标题/归档、分级 doctor、统一锁恢复、`/xk status` 与本地安装脚本已经落地。尚未实现的是通用跨域 Context controller、long-term memory、完整 TaskSupervisor（并发/DAG/retry/budget/deadline/RPC/worktree/sandbox）以及 Policy、artifact retention/GC。
+**2026-08-02 实现状态：** Phase 1.1–1.8、Goal V3 和 Task Run v1 均已完成。Goal 使用只读 Objective 合同投影与可变 State 执行台账；新证据只能自动修正 Current Objective，Intent Anchor、验收、约束和授权等受保护字段必须由用户确认。原生 compaction 持久化安全短标题，并只在下一次真实逻辑 run 注入一次 recovery system context，不重复最后一条用户消息，也不与 Goal kickoff 竞争。Session Chain v1.1 把长期逻辑会话拆为完整原生 Pi JSONL Segment：新空会话进入项目级 managed Segment，既有 Pi session 作为不复制的 external root 被采用，`events.jsonl` 是拓扑事实源，而 catalog/read model 可重建。soft（16 MiB/4,000 entries）只在 settled 后轮转，hard（64 MiB/16,000 entries）在下一次 provider turn 前强制轮转；Task 运行、Task 结果待交付、Goal 草案、待确认 Goal revision 或 lifecycle intent 会阻止轮转。L1 以 Artifact Store read-back 内容为 canonical；当前 V2 writer 增加可检索标题，统一验证器继续核对 marker/seal/successor provenance。默认每 5 个 sealed Segment 登记只读取 L1 的后台 L2 publication；branch 串行队列与 generation lock 避免重复付费调用。checkpointed read model 通过 event tail 快速更新，普通 status/manifest/picker 不再完整 replay。系统提示词只注入 metadata manifest，模型读取正文前完成完整 provenance 验证。active Goal 在 `reason: "rollover"` 下继续。Task 普通输入使用 Pi follow-up 队列延迟处理，仍保持单 child 与父屏障。Chain 标题/归档、分级 doctor、统一锁恢复、`/xk status` 与本地安装脚本已经落地。项目级 Memory v1 也已实现，提供证据图、稳定边界捕获、D0–D3 检索和可重建 SQLite/Markdown。尚未实现的是通用跨域 Context budget controller、跨项目知识库、完整 TaskSupervisor（并发/DAG/retry/budget/deadline/RPC/worktree/sandbox）、Policy、Observation/Resource 反省闭环和 artifact retention/GC。
 
 #### Phase 1.7：Goal 连续执行（已完成）
 
@@ -919,6 +943,21 @@ Session Chain v1.1 独立于完整 Phase 3 和通用 Phase 4：它解决一个�
 
 退出门槛：每个 Segment 单独可被 Pi 打开；L1 递进且与 artifact/marker 对应；十次默认 rollover 生成两个独立 L2；模型可从 manifest 发现并通过只读工具读取 L1/L2；关闭 Rollup 后不产生新 L2 调用但既有摘要可读；prepared 和 Rollup publication 崩溃能恢复；硬阈值绝不把普通输入送入未轮转的 provider turn；Goal/Task gate 阻止不安全轮转；active Goal 在真实 rollover 后仍由 replacement runtime 继续。
 
+### 已完成实施切片：Project Memory v1
+
+Memory v1 在不复制 transcript、不修改 Goal/Task/Chain 事实的前提下，为当前项目增加跨来源长期证据图：
+
+- `MemoryRevisionV1`、Cue、九种有向 Edge、严格 EvidenceRef、proposal、capture 与 access event；
+- Artifact Store + `memory/events.jsonl` 事实源，hash/CAS/idempotency/统一锁和 checkpointed tail replay；
+- trust/freshness/lifecycle 三维状态、Git path-scoped freshness、effective/recorded 时间线和冲突保留；
+- Goal checkpoint/completion、L2 publication、explicit remember 和有限 backfill；普通 turn/标题不直接升级为事实；
+- D0 metadata manifest、D1 FTS5/图搜索、D2 完整验证读取、D3 evidence 展开和受控 proposal；
+- Node/Bun SQLite worker、RRF、200 candidate pool、有限 heat、Markdown 投影和 quick/deep/repair doctor；
+- capture result/proposal/event/index 各崩溃点恢复，未知 provider 结果不自动重复调用；
+- 模型请求 compaction 只登记 settled boundary 意图，仍由 Host 检查 queued input、工作流 gate、5 turn 与 32 message/25% context 条件。
+
+本切片不提供跨项目/用户级知识库、vector/embedding、自动 Task result source scan、通用 context budget controller、Observation/Resource 自修改、Policy/沙箱、retention/GC 或后台 daemon。
+
 ### 16.3 Phase 2：Policy 与沙箱
 
 交付：
@@ -952,21 +991,28 @@ Session Chain v1.1 独立于完整 Phase 3 和通用 Phase 4：它解决一个�
 
 ### 16.5 Phase 4：Context 与 memory
 
-Session Chain 专用 L1/L2 与按需读取已经完成；本 Phase 剩余范围是跨 Goal/Task/branch/source 的通用预算、检索、长期 memory、敏感信息和过期策略。
+Session Chain 专用 L1/L2 与项目级 Memory v1 已经完成。Memory v1 覆盖跨 Goal/Task/branch/source 的证据图、FTS5/图检索、时间线、Git freshness、捕获恢复和 D0–D3；本 Phase 剩余范围是统一 token budget controller、跨项目/用户级知识边界、vector 是否必要、通用敏感信息/TTL/retention 策略和更多显式 source adapter。
 
-交付：
+已交付：
+
+- 项目级 typed Memory graph、Artifact/event 事实源和可重建 SQLite/Markdown；
+- stable-source capture、显式 remember/backfill、proposal/CAS 和三维状态；
+- D0–D3 检索、History Cue、RRF/graph、doctor/rebuild 与 model-requested compaction gate。
+
+剩余交付：
 
 - L0/L1/L2 budget controller、sourceHash 摘要和按需 artifact 查询；
 - Pi compaction hooks 的保守失败策略、microcompact/reactive compact（如有必要）；
-- 人类可读 memory source、FTS/SQLite 重建索引、secret scan 和 TTL；
-- stale summary/index 的诊断和拒绝注入。
+- 跨项目/用户级 scope 的明确 trust、secret scan、TTL、retention 和删除策略；
+- 对 Task result 等新 source adapter 的显式价值评估，以及 vector 检索的必要性证据。
 
-退出门槛：
+剩余退出门槛：
 
 - 工具调用/结果消息始终保持 provider 可接受的配对；
 - 压缩失败不丢原始 session entry；
 - 旧摘要 sourceHash 不匹配时不会进入 L0；
-- 敏感 fixture 不会进入 memory/artifact/session 日志。
+- 跨项目或敏感 fixture 在没有明确 policy/授权时不会进入共享 Memory；
+- 新 source/vector/TTL 能证明收益并保持现有 event/artifact 事实兼容。
 
 ### 16.6 Phase 5：Proposal 与可选生态集成
 
@@ -986,7 +1032,7 @@ Session Chain 专用 L1/L2 与按需读取已经完成；本 Phase 剩余范围�
 
 ### 16.7 最小可行版本（MVP）
 
-当前个人 full-access profile 的首个可用基线已经由 Pi 原生 session、Goal contract/event log、自动 checkpoint、artifact 引用和 crash recovery 构成。面向 supervised/unattended 的产品化 MVP 才额外要求基础 policy ask/deny 与一个隔离 worker。MCP、长期记忆、自动 proposal 和复杂 DAG 都在这两个基线之后加入，避免把尚无执行底座的“更聪明”机制提前塞入主会话。
+当前个人 full-access profile 的可用基线已经由 Pi 原生 session、Goal contract/event log、自动 checkpoint、artifact、Session Chain、Task v1 和项目级 Memory v1 构成。面向 supervised/unattended 的产品化 MVP 才额外要求基础 policy ask/deny 与一个隔离 worker。MCP、跨项目知识、Observation/Resource 自动 proposal 和复杂 DAG 仍在这些基线之后，避免把权限与调度问题包装成“更聪明”的主会话能力。
 
 ## 17. 验收矩阵
 
@@ -1002,6 +1048,7 @@ Session Chain 专用 L1/L2 与按需读取已经完成；本 Phase 剩余范围�
 | Task 输入 | Task running 时连续普通输入、status/cancel、Goal/Chain 写命令 | 普通输入按序延迟；status/cancel 即时；状态变更拒绝；parent/child 不并发调用模型 |
 | Session Chain 长链 | 100/1000 events、tail append、read-model 损坏、summary 分页 | 正常 manifest/status 只读有效 event tail；异常回退 replay；首页成本随 page size 而非全库增长 |
 | Summary 语义 | 多 Segment 约束、决策、完成项、否决项、未决项 | golden fixture 对 omission、reversal、stale、false completion 均可检测 |
+| Memory | Goal/L2 capture、显式 remember、冲突/as-of、D0–D3、SQLite 删除、publication 崩溃 | 无 unsupported verified/静默冲突；事实可重放；投影可重建；未知 provider 结果不重复调用 |
 | Task Phase 3 | 并发、DAG、retry、deadline、RPC、worktree、sandbox | 预算与策略生效；父取消回收所有 descendant 和进程组；未经验证不合并 diff |
 | Resource | untrusted project、冲突 Skill、reload 竞态 | trust gate、generation 原子切换、旧版本可恢复 |
 | MCP | lazy connect、OAuth、超大输出、server 崩溃 | token 不入日志，输出 guard、取消和错误 schema 生效 |
@@ -1082,9 +1129,9 @@ Pi-XK 的第一原则不是“让 Agent 自己做更多事”，而是“让每�
 
 - 采用 Pi 维护型 fork，保持上游可同步；
 - 复用 Pi session tree、AgentHarness、ResourceLoader、compaction、RPC 和 TUI；
-- 用 Goal/Task/Proposal 事件域补足 Pi 的产品级编排能力；
+- 用 Goal/Task/Memory/Proposal 事件域补足 Pi 的产品级编排与长期证据能力；
 - 用统一 CapabilityPolicy 和外部沙箱弥补 Pi 默认权限边界；
-- 用 artifact、sourceHash、generation 和 CAS 抑制摘要、缓存和热加载竞态；
+- 用 artifact、sourceHash、generation、三维 Memory 状态和 CAS 抑制摘要、检索、缓存和热加载竞态；
 - 用显式 proposal 替代定时自我修改；
 - 用故障注入、恢复和安全测试定义“完成”，而不是用功能清单定义“完美”。
 

@@ -24,7 +24,7 @@
 | 网络文件系统或最终一致存储 | 未验证；durability、rename、fsync 和 lock 语义可能不同 |
 | Windows 原生 | 未形成正式兼容矩阵；路径、锁和未来沙箱仍是开放问题 |
 | 无人值守运行 | 不支持安全承诺；Policy、预算与 fail-closed sandbox 未完成 |
-| 跨版本 schema 迁移 | 仅有明确的 Goal/Task 历史读兼容；没有通用迁移 CLI |
+| 跨版本 schema 迁移 | Goal/Task/Chain 有明确历史读兼容，Memory v1 从空域开始；没有通用迁移 CLI |
 
 ## 2. 安装作用域
 
@@ -38,29 +38,30 @@
 
 | Pi 能力 | Pi-XK 是否替换 | 实际影响 |
 | --- | --- | --- |
-| Provider/model registry | 否 | 使用当前 model；Goal/Task/L1 summary/L2 Rollup 可能产生额外 provider 调用 |
+| Provider/model registry | 否 | 使用当前 model；Goal/Task/L1 summary/L2 Rollup/Memory capture 可能产生额外 provider 调用 |
 | Agent loop | 否 | active Goal settled 后由 extension 发起下一 run |
-| Tool protocol | 否 | 新增 Pi-XK model tools；Goal draft 时限制可调用工具；V3 Goal 通过受控 revision tool 演进 |
+| Tool protocol | 否 | 新增 Goal/Task/Chain/Memory model tools；Goal draft 时限制可调用工具；proposal 与修订仍受 Host schema 和 CAS 控制 |
 | Session JSONL schema | 否 | 使用原生 custom entry/custom message 承载小型引用和 marker |
 | Session tree | 否 | tree navigation 会暂停 active Goal；从历史位置继续时 chain 创建 successor branch |
 | `/resume` | 否 | 仍选择物理 session；逻辑 chain head 应用 `/chain` 选择 |
 | `/new`、`/fork`、`/clone` | 否 | 普通 session 切换会保守暂停 active Goal；新空 session 会被 chain bootstrap |
 | `/compact` | 否 | compaction 保持 Pi 原生；生成历史标题，并给下一次真实 run 一次性 recovery system context；active Goal 写 checkpoint，但不暂停 |
 | Footer | 不替换 | 通过 `setStatus` 组合显示 Goal timer 和 Chain 状态 |
-| System prompt | 不替换 | 按状态追加 Goal 文件路径/revision、固定大小 Session Chain manifest 和一次性 compaction recovery；不注入完整 Goal 合同、标题或摘要正文 |
+| System prompt | 不替换 | 按状态追加 Goal 文件路径/revision、固定大小 Session Chain/Memory manifest 和一次性 compaction recovery；不注入完整 Goal 合同、标题、摘要或 Memory 正文 |
 | ResourceLoader/trust | 否 | package 仍按 Pi 的 user/project scope 与 trust 规则加载 |
 
 ## 4. 可见 UI 变化
 
 扩展加载后增加：
 
-- `/goal`、`/task`、`/chain`、`/xk status` 命令；
-- 模型可见的 Goal lifecycle、Goal draft、Task start/finish 工具；
+- `/goal`、`/task`、`/chain`、`/memory`、`/xk status` 命令；
+- 模型可见的 Goal lifecycle、Goal draft、Task start/finish、Chain summary 和 Memory D1–D3/proposal/compaction-request 工具；
 - `Goal active · 12m 34s` 一类 footer status；
 - `Chain <id> · S<n> · <size>` 一类 footer status；
 - Goal 草案的 TUI review/revise 对话框；
 - 受保护 Goal revision 的 TUI/命令审阅，以及 compaction 的短标题展示；
 - lifecycle、Task 和 rollover 的通知与错误提示。
+- `Memory <count> · stale <count> · disputed <count>` 状态及 proposal/capture/doctor 输出。
 
 Goal timer 每秒刷新 UI，但不每秒写事件。多个扩展都使用 footer status 时应依赖 Pi 的组合机制；Pi-XK 不替换整个 footer。
 
@@ -94,6 +95,8 @@ Pi-XK 会在以下情况消费、延迟或拒绝用户输入：
 | Session Chain rollover | 生成 segment delta 与 cumulative carry-forward summary |
 | 每 N 个 sealed Segment | rollover 提交后登记后台 L2 Rollup；失败不回滚 rollover |
 | `/chain rollup backfill` | 显式生成历史完整窗口，受 limit 控制 |
+| 新 Goal checkpoint/completion 或 L2 publication | Memory source bridge 在稳定边界生成结构化 inferred/disputed Memory proposal |
+| `/memory backfill [limit]` | 显式捕获历史 eligible Goal/L2 source，默认一个、最多 20 |
 
 因此：
 
@@ -105,6 +108,9 @@ Pi-XK 会在以下情况消费、延迟或拒绝用户输入：
 - Task child 的消耗独立于 parent 当前 turn；
 - provider failure retry 没有当前文档可配置的次数上限，Goal 会保持 active，直到生命周期改变或 runtime 退出；
 - L2 无效响应自动尝试最多 3 次；Rollup provider/I/O/event publication 的临时失败保持可重试，不与无效响应共用该上限；
+- Memory 自动 capture 只处理启用后的新 stable source；第一次加载不批量回填旧历史；
+- `/memory remember`、search/read/expand、refresh 和 doctor 不调用模型；`pi_xk_propose_memory_change` 也只记录 proposal；
+- `generation_started` 后结果未知的 Memory capture 不自动重试，以避免重复付费调用；
 - 当前没有强制 cost/token budget controller，provider 账单仍需外部监控。
 
 在有成本约束的环境中，应主动查看 `/goal status`、及时 pause/end，并避免把 Pi-XK 当作无人值守预算执行器。
@@ -125,7 +131,11 @@ sealed Segment 不重写。从历史 Segment 或 tree 位置继续会创建 succ
 
 ### 移除 extension
 
-移除 package 不删除任何 session 或 `.pi-xk` 数据。原生 Pi 仍能打开单个 Segment JSONL，但不会自动理解 Pi-XK 的逻辑 chain、Goal/Task 事件或跨 Segment summary 关系。
+移除 package 不删除任何 session 或 `.pi-xk` 数据。原生 Pi 仍能打开单个 Segment JSONL，但不会自动理解 Pi-XK 的逻辑 chain、Goal/Task/Memory 事件、证据图或跨 Segment summary 关系。
+
+### Memory 数据
+
+Memory facts 由 `.pi-xk/memory/events.jsonl` 与 `.pi-xk/artifacts/objects/` 中的 revision/Cue/Edge/proposal/source artifact 共同构成。`index.sqlite`、read model、History Cue、source cursor 和 Markdown 是可重建或可重新发现的投影/恢复数据。自动捕获和显式 backfill 会增加 artifact/event/SQLite 空间；archive/invalidate 不删除历史，purge 也保留 tombstone。当前没有自动 retention 或 Artifact GC。
 
 ## 8. Goal 对日常 session 操作的影响
 
@@ -167,13 +177,15 @@ Task child 使用相同项目根、相同用户权限和默认内置工具 `read
 
 Compaction 后不会把最后一条用户提示词再次发送。overflow 在同一逻辑 run 内继续一次；active Goal threshold 只使用已有 Goal kickoff；无 Goal 的 manual/threshold compaction 等待下一条真实请求；queued message 仍由 Pi 原生队列触发。recovery 只作为下一次实际 run 的 system context，成功 assistant 响应后即不再 pending。Session Chain rollover 后 successor 使用 L1 summary-in，不继承源 Segment 的临时 recovery。
 
-不要关闭 Pi compaction 并期待 Session Chain 自动替代所有 context 管理。Session Chain v1.1 已把 L1/L2 摘要暴露给模型按需读取，但仍不是通用长期记忆系统、全文检索器或跨项目 knowledge base。
+不要关闭 Pi compaction 并期待 Session Chain 或 Memory 自动替代所有 context 管理。Session Chain 管理当前逻辑会话的 L1/L2；Memory v1 管理当前项目跨来源的长期证据图。两者都不是统一 token budget controller，也不提供跨项目 knowledge base。
 
 ## 11. 模型可见性和提示词影响
 
-每次普通请求会多出一段固定大小 manifest，内容只有当前 branch、sealed 范围、L1/L2 数量/范围、pending/failure 状态和工具说明。它只告诉模型列表可提供 L1 标题和范围，不包含标题、摘要正文或历史用户文本。
+每次普通请求会追加两类有界 metadata：Session Chain manifest 包含当前 branch、sealed/L1/L2 范围和 publication 状态；Memory D0 manifest 最多 2 KiB，包含 enabled、trust/freshness 计数、capture 诊断和工具可用性。两者都不包含标题、摘要正文、Memory statement、evidence 或历史用户文本。
 
 当模型判断当前问题依赖“之前、继续、原始要求、待办、历史约束或 Goal/Task 恢复”时，可先调用只读列表工具查看 L1 标题和 L1/L2 范围，再读取相关摘要。工具调用会增加本地读取和一个 tool round，但不会触发 provider 摘要生成、backfill 或修复。摘要内的命令和伪系统提示仅作为不可信历史证据返回，不能扩大工具权限。
+
+当问题依赖跨 Goal/branch 的决定、约束、偏好、经验、未决事项或设计原因时，模型先用 `pi_xk_search_memory` 获取 D1 候选，再按需读取最多 5 条 D2，只有 D2 不足、stale 或 disputed 时才展开最多 3 个 D3 evidence。Memory 内容同样是历史证据，不是系统指令。D2/D3 的实际读取才记录 access；单纯搜索曝光不增加 heat。
 
 V3 Goal 的普通 system guidance 也只提供 `goal-objective.md`、`goal-state.md` 路径、合同 revision 和 mismatch/修订反馈，不复制原始用户要求或完整合同。Objective 是只读合同投影；State 是执行台账，实质进展必须在 run 结束前回写。被用户要求修改的 revision feedback 只作为下一次修订 run 的 user-role JSON 数据，不能自行改变合同、system 规则、工具权限或授权；provider error/aborted 后仍可恢复，成功响应后不再注入。revision CAS 冲突会终止旧 run 并重新 preflight。模型只有在新证据使 Current Objective 的表述过时时才应提案，不能静默改变 Intent Anchor、验收、约束或授权。
 
@@ -200,6 +212,8 @@ peak RSS 包含 Node 进程和已加载 runtime 的基线，不是纯 session �
 
 另有 `npm run benchmark:session-chain-events -- --counts 100,1000 --runs 3 --json` 专门验证 checkpointed read model。它要求已消费完整 event log 后的重复 manifest/status 加载走 `fast` 模式，读取并验证 checkpoint 对应的最后一条 event，且读取量小于完整日志的 10%；该 benchmark 不替代 deep doctor 的线性事实校验。
 
+Memory 使用 `npm run benchmark:pi-xk-memory` 测量合成 100/1,000/10,000/100,000 Memory 及图边场景，并用 `npm run evaluate:pi-xk-memory` 检查语义 fixture。它们是当前 commit/机器的回归证据，不是 Node/Bun、Windows/macOS 的正式 SLA。普通 D0/status/search 应走 checkpointed read model 与 SQLite，不完整 replay event log；deep doctor 和全量 projection rebuild 仍允许线性增长。
+
 ## 13. 第三方扩展兼容
 
 高风险组合：
@@ -210,7 +224,7 @@ peak RSS 包含 Node 进程和已加载 runtime 的基线，不是纯 session �
 - 替换 footer、input/follow-up 队列或 session lifecycle 的大型 extension；
 - 自动修改 `models.json` 或重载 provider 的 gateway 管理器。
 
-当前规则是一次只在隔离 profile 实验一个 context/memory 主机制。`pi-mcp-adapter`、`pi-subagents`、`pi-observational-memory` 等不属于核心依赖，采用前需要契约测试和供应链复核。
+当前规则是 Pi-XK Memory 作为日常 profile 的唯一 context/memory 主机制。Magic Context、`pi-observational-memory`、DCP、Hermes 等只能在另一个隔离 profile 做替代方案实验，不能与同一项目的可写 Pi-XK Memory 叠装。`pi-mcp-adapter`、`pi-subagents` 等也不属于核心依赖，采用前需要契约测试和供应链复核。
 
 Pi-XK 为此增加的 Host API 还包括 `queueUserMessage`：extension 可以把用户消息加入 Pi 原生 follow-up 队列而不立即启动 turn。它不是通用后台调度器，不允许绕过 rollover read-only 状态，也不改变正常 `prompt()` 的 input hook 顺序。
 
@@ -224,12 +238,14 @@ Pi-XK 为此增加的 Host API 还包括 `queueUserMessage`：extension 可以�
 2. 等待 Task terminal，避免留下 running child；
 3. 运行 `/chain doctor` 并记录 current head；
 4. 退出 Pi；
-5. 备份 `.pi-xk/` 与相关 Pi 原生 session；
+5. 备份 `.pi-xk/` 与相关 Pi 原生 session，包含 Memory event/artifact；
 6. 更新 checkout、build、运行验证，再重启。
 
 升级到 Session Chain v1.1 不重写现有 chain 或 L1 artifact。新代码从后续完整窗口开始自动生成 L2；历史完整窗口只在 `/chain rollup backfill [limit]` 时生成。写入 v2 Rollup event 后，旧代码可能无法继续写同一 chain，因此不要让新旧版本交替运行。
 
 Goal V1/V2 和 Task V1 的读取兼容已经实现，但这不代表任意未来版本都可直接降级。新 Goal 使用 V3；旧 Goal 首次迁移需用户确认，历史 event/hash 不重写。写入 Goal event v2、Session Chain L1 V2 或其他新 schema 后，旧代码可能无法继续写同一状态。没有明确 migration/rollback 说明时，不应让新旧 Pi-XK 版本交替写同一个项目状态。
+
+Memory v1 不自动回填升级前的 Goal/L2。升级后先记录当前 source head 作为 baseline，之后的新稳定边界才自动捕获；历史来源使用有限额 `/memory backfill [limit]`。一旦写入 `pi-xk.memory-event.v1` 和对应 artifact，旧版本可以忽略该目录，但不能安全管理、修复或继续写 Memory；SQLite/Markdown 可以重建，event/artifact 不能通过降级删除。
 
 ## 15. 决策清单
 
@@ -238,10 +254,12 @@ Goal V1/V2 和 Task V1 的读取兼容已经实现，但这不代表任意未来
 - 接受 extension 与 child 使用当前用户完整权限；
 - 接受项目新增 `.pi-xk/` 和 managed session 数据；
 - 接受 Goal、Task、rollover 带来的额外 provider 调用；
+- 接受 Memory 稳定边界捕获带来的额外 provider 调用，或预先执行 `/memory config off`；
 - 接受默认每 5 个 sealed Segment 的 L2 调用，或预先执行 `/chain rollup config off`；
 - 不需要同一 parent 的并发 Task、worktree 隔离或无人值守预算；
 - 不会让多个进程并行写同一 session；
 - 已决定使用用户级还是项目级 package scope；
 - 已准备同时备份 `.pi-xk/` 与原生 Pi session。
+- 不会在同一可写 profile 叠装另一套 context/memory 主机制。
 
 任一项不成立时，应先使用隔离 profile/容器做实验，或暂不启用 Pi-XK。

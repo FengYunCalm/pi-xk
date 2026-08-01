@@ -115,7 +115,7 @@ interface SessionChainRollupWindow {
 	sourceDigest: string;
 }
 
-interface SessionChainRollupManagerOptions {
+export interface SessionChainRollupManagerOptions {
 	projectRoot: string;
 	store: SessionChainStore;
 	now: () => string;
@@ -124,6 +124,15 @@ interface SessionChainRollupManagerOptions {
 		branch: SessionBranchProjectionV1,
 		segment: SessionSegmentProjectionV1,
 	) => Promise<SegmentSummary>;
+	onRollupPublished?: (
+		source: {
+			chainId: string;
+			branchId: string;
+			windowIndex: number;
+			artifactId: string;
+		},
+		host: SessionChainHost,
+	) => void | Promise<void>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -196,6 +205,7 @@ export class SessionChainRollupManager {
 	private readonly store: SessionChainStore;
 	private readonly now: () => string;
 	private readonly verifyL1SummaryEvidence: SessionChainRollupManagerOptions["verifyL1SummaryEvidence"];
+	private readonly onRollupPublished: SessionChainRollupManagerOptions["onRollupPublished"];
 	private readonly publicationQueues = new Map<string, Promise<void>>();
 	private readonly publicationErrors = new Map<string, unknown>();
 
@@ -204,6 +214,7 @@ export class SessionChainRollupManager {
 		this.store = options.store;
 		this.now = options.now;
 		this.verifyL1SummaryEvidence = options.verifyL1SummaryEvidence;
+		this.onRollupPublished = options.onRollupPublished;
 	}
 
 	private queueKey(chainId: string, branchId: string): string {
@@ -1047,6 +1058,15 @@ export class SessionChainRollupManager {
 				},
 			);
 			await rm(this.pendingPath(chainId, branchId, window.windowIndex), { force: true });
+			try {
+				const notification = this.onRollupPublished?.(
+					{ chainId, branchId, windowIndex: window.windowIndex, artifactId },
+					host,
+				);
+				if (notification) void notification.catch(() => {});
+			} catch {
+				// A downstream observer cannot change the already-published Rollup fact.
+			}
 			stage = "markdown_projection";
 			const rollup = await this.store.readChainRollup(artifactId);
 			await this.replaceDerivedFile(
