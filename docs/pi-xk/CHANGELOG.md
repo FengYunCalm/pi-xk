@@ -43,6 +43,11 @@
 - Native Windows Pi-XK release packaging now invokes the bundled PowerShell zip helper directly, while WSL retains its shell-based fallback.
 - Memory retrieval now caps the combined FTS/graph candidate pool at 200 before pagination, and capture recovery applies an already-recorded low-risk proposal without repeating the provider call or losing an advanced source cursor.
 - Memory SQLite rebuilds now stream bounded artifact/reference batches through one Worker transaction, cache insert statements, publish head/count metadata only at commit, roll back failed chunks, and remove failed temporary databases instead of cloning a complete index snapshot.
+- Memory evidence reads now validate complete Goal, Task, Chain, compaction, Git, and explicit-source ownership; Goal checkpoints capture event-time State artifacts, and sources with no durable knowledge finish as `capture_skipped` instead of false failures.
+- Memory D1 now unifies Memory/History Cue pagination, supports historical revisions, short CJK literal fallback, temporal recall, and effective-time graph edges without weakening trust, lifecycle, or evidence checks.
+- Memory projection mutations now use cross-process locks and event-head CAS deltas; History Cue discovery persists a sealed-Segment cursor, stable refreshes avoid reopening old sessions, and repair publishes SQLite/Markdown/manifest from one rechecked read-model snapshot.
+- Contended file locks now avoid repeated temporary-file fsync/link cycles while the owner lock exists, preventing DrvFS contention from amplifying bounded retries.
+- Goal completion Memory now binds to the final event-time checkpoint State; retryable failed captures remain discoverable after cursor advancement, purge removes only exclusively owned proposal/result content, and doctor validates versioned source/History Cue cursors without guessing fact baselines.
 
 ## [0.1.1]
 

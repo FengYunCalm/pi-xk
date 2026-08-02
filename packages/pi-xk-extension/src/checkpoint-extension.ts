@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import type {
 	AgentEndEvent,
 	AgentSettledEvent,
@@ -9,7 +10,13 @@ import type {
 	SessionShutdownEvent,
 	TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
-import type { GoalCheckpointV2, GoalStore } from "pi-xk-core";
+import {
+	GOAL_CHECKPOINT_EVIDENCE_ARTIFACT_SCHEMA,
+	type GoalCheckpoint,
+	type GoalCheckpointV2,
+	type GoalContract,
+	type GoalStore,
+} from "pi-xk-core";
 import {
 	assertPiXkSessionLink,
 	createPiXkCheckpointRef,
@@ -183,19 +190,47 @@ function checkpointIdempotencyKey(intent: PiXkCheckpointIntent): string {
 	return `checkpoint:${intent.goalId}:${intent.sessionId}:${intent.leafId}:${intent.reason}`;
 }
 
-async function checkpointFromIntent(goalStore: GoalStore, intent: PiXkCheckpointIntent): Promise<GoalCheckpointV2> {
+function checkpointMatchesIntent(checkpoint: GoalCheckpoint, intent: PiXkCheckpointIntent): boolean {
+	if (
+		checkpoint.sessionId !== intent.sessionId ||
+		checkpoint.leafId !== intent.leafId ||
+		checkpoint.reason !== intent.reason ||
+		checkpoint.createdAt !== intent.createdAt
+	) {
+		return false;
+	}
+	if (checkpoint.reason !== "turn_end" || intent.reason !== "turn_end") return true;
+	return checkpoint.turnIndex === intent.turnIndex && checkpoint.toolResultCount === intent.toolResultCount;
+}
+
+async function checkpointFromIntent(
+	goalStore: GoalStore,
+	contract: GoalContract,
+	intent: PiXkCheckpointIntent,
+): Promise<GoalCheckpointV2> {
+	const stateDiagnostic = intent.reason === "turn_end" ? await goalStore.inspectGoalFiles(intent.goalId) : null;
+	if (
+		stateDiagnostic &&
+		(stateDiagnostic.state.status === "missing" ||
+			stateDiagnostic.state.status === "corrupt" ||
+			(stateDiagnostic.state.status === "mismatched" && stateDiagnostic.state.detail?.startsWith("identity header")))
+	) {
+		throw new Error(`Goal checkpoint state cannot be snapshotted: ${stateDiagnostic.state.status}`);
+	}
 	const artifact = await goalStore.putArtifact({
 		contentType: "application/json",
 		value:
 			intent.reason === "turn_end"
 				? {
-						schema: "pi-xk.checkpoint-evidence.v1",
+						schema: GOAL_CHECKPOINT_EVIDENCE_ARTIFACT_SCHEMA,
 						goalId: intent.goalId,
 						sessionId: intent.sessionId,
 						leafId: intent.leafId,
 						turnIndex: intent.turnIndex,
 						toolResultCount: intent.toolResultCount,
 						reason: intent.reason,
+						contractRevision: contract.schema === "pi-xk.goal.contract.v3" ? contract.revision : null,
+						goalState: await readFile(stateDiagnostic!.state.path, "utf8"),
 						createdAt: intent.createdAt,
 					}
 				: {
@@ -206,9 +241,9 @@ async function checkpointFromIntent(goalStore: GoalStore, intent: PiXkCheckpoint
 						reason: intent.reason,
 						createdAt: intent.createdAt,
 					},
-		producer: intent.reason === "turn_end" ? "pi-xk.checkpoint-evidence.v1" : "pi-xk.compaction-source.v1",
+		producer: intent.reason === "turn_end" ? GOAL_CHECKPOINT_EVIDENCE_ARTIFACT_SCHEMA : "pi-xk.compaction-source.v1",
 		sensitivity: "redacted",
-		sourceIds: [intent.sessionId, intent.leafId],
+		sourceIds: [intent.goalId, intent.sessionId, intent.leafId],
 		createdAt: intent.createdAt,
 	});
 	const evidence = {
@@ -257,11 +292,23 @@ async function persistCheckpointIntent(
 		for (let attempt = 0; attempt < 2; attempt++) {
 			try {
 				const replay = await goalStore.loadGoal(binding.goalId);
+				const eventId = checkpointEventId(intent);
+				const existing = replay.events.find((event) => event.eventId === eventId);
+				if (existing) {
+					if (
+						existing.eventType !== "goal_checkpointed" ||
+						!checkpointMatchesIntent(existing.payload.checkpoint, intent)
+					) {
+						throw new Error(`Checkpoint event ID collision: ${eventId}`);
+					}
+					appendCheckpointRef(pi, ctx, binding, eventId);
+					return true;
+				}
 				const result = await goalStore.appendCheckpoint(
 					binding.goalId,
-					await checkpointFromIntent(goalStore, intent),
+					await checkpointFromIntent(goalStore, replay.contract, intent),
 					{
-						eventId: checkpointEventId(intent),
+						eventId,
 						idempotencyKey: checkpointIdempotencyKey(intent),
 						expectedHead: replay.head,
 					},

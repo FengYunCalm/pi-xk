@@ -1,4 +1,4 @@
-import { stat } from "node:fs/promises";
+import { readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -13,6 +13,7 @@ import {
 	MemoryController,
 	type MemoryGenerationHost,
 } from "../../../pi-xk-extension/src/memory-controller.ts";
+import { MEMORY_CAPTURE_RESPONSE_SCHEMA } from "../../../pi-xk-extension/src/memory-prompt.ts";
 import { MemorySourceBridge } from "../../../pi-xk-extension/src/memory-source-bridge.ts";
 import { SessionChainRollupManager } from "../../../pi-xk-extension/src/session-chain-rollup.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
@@ -57,7 +58,12 @@ function contract(goalId: string, ownerSessionId: string): GoalContractV3 {
 	};
 }
 
-async function createCheckpoint(projectRoot: string, ownerSessionId: string, suffix = "") {
+async function createCheckpoint(
+	projectRoot: string,
+	ownerSessionId: string,
+	suffix = "",
+	transformState: (state: string) => string = (state) => state,
+) {
 	const store = new GoalStore(projectRoot);
 	const goal = contract(`goal_memory_bridge${suffix}`, ownerSessionId);
 	const created = await store.createGoal(goal, {
@@ -67,11 +73,24 @@ async function createCheckpoint(projectRoot: string, ownerSessionId: string, suf
 		timestamp: goal.createdAt,
 	});
 	const evidence = await store.putArtifact({
-		contentType: "text/plain",
-		text: "Checkpoint evidence for leaf_checkpoint.",
-		producer: "pi-xk.memory-source-bridge.test.v1",
-		sensitivity: "internal",
-		sourceIds: [goal.goalId, `leaf_checkpoint${suffix}`],
+		contentType: "application/json",
+		value: {
+			schema: "pi-xk.checkpoint-evidence.v2",
+			goalId: goal.goalId,
+			sessionId: ownerSessionId,
+			leafId: `leaf_checkpoint${suffix}`,
+			turnIndex: 1,
+			toolResultCount: 0,
+			reason: "turn_end",
+			contractRevision: goal.revision,
+			goalState: transformState(
+				await readFile(join(projectRoot, ".pi-xk", "goals", goal.goalId, "goal-state.md"), "utf8"),
+			),
+			createdAt: "2026-08-01T00:01:00.000Z",
+		},
+		producer: "pi-xk.checkpoint-evidence.v2",
+		sensitivity: "redacted",
+		sourceIds: [goal.goalId, ownerSessionId, `leaf_checkpoint${suffix}`],
 		createdAt: "2026-08-01T00:01:00.000Z",
 	});
 	return await store.appendCheckpoint(
@@ -104,6 +123,28 @@ async function createCheckpoint(projectRoot: string, ownerSessionId: string, suf
 			expectedHead: created.head,
 		},
 	);
+}
+
+function durableMemoryEnvelope(title: string): string {
+	return JSON.stringify({
+		schema: MEMORY_CAPTURE_RESPONSE_SCHEMA,
+		reason: "The Goal checkpoint contains a durable project fact.",
+		cues: [],
+		memories: [
+			{
+				memoryId: null,
+				expectedRevision: null,
+				kind: "fact",
+				title,
+				statement: `${title} remains recoverable after a retryable source failure.`,
+				applicability: "Pi-XK Memory stable-source recovery.",
+				trust: "model_inferred",
+				effectiveFrom: "2026-08-01T00:01:00.000Z",
+				cueKeys: [],
+			},
+		],
+		edges: [],
+	});
 }
 
 describe("Pi-XK Memory source bridge", () => {
@@ -147,10 +188,12 @@ describe("Pi-XK Memory source bridge", () => {
 			},
 		});
 		await bridge.initialize();
-		await expect(stat(join(harness.tempDir, ".pi-xk", "memory", "source-cursors.json"))).rejects.toMatchObject({
-			code: "ENOENT",
-		});
+		await expect(stat(join(harness.tempDir, ".pi-xk", "memory", "source-cursors.json"))).resolves.toBeDefined();
 		await createCheckpoint(harness.tempDir, harness.sessionManager.getSessionId());
+		await writeFile(
+			join(harness.tempDir, ".pi-xk", "goals", "goal_memory_bridge", "goal-state.md"),
+			"later mutable state that must not become checkpoint evidence\n",
+		);
 
 		await bridge.captureStableSources({ model: undefined, generate: vi.fn() });
 
@@ -170,9 +213,122 @@ describe("Pi-XK Memory source bridge", () => {
 			schema: "pi-xk.memory-goal-source.v1",
 			contractRevision: 1,
 			event: { eventId: "evt_goal_checkpoint", eventType: "goal_checkpointed" },
+			state: expect.stringContaining("# Goal State"),
 		});
 		expect(request.content).toContain("# Goal State");
+		expect(request.content).not.toContain("later mutable state");
 		await expect(stat(join(harness.tempDir, ".pi-xk", "memory", "source-cursors.json"))).resolves.toBeDefined();
+	});
+
+	it("builds Goal completion Memory from the final event-time checkpoint State", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const service = new MemoryService(harness.tempDir);
+		services.push(service);
+		const captured: MemoryCaptureRequest[] = [];
+		const bridge = new MemorySourceBridge({
+			projectRoot: harness.tempDir,
+			controller: {
+				getService: () => service,
+				resumePublications: async () => [],
+				capture: async (request) => {
+					captured.push(request);
+					return {
+						captureId: `capture_${request.sourceId}`,
+						status: "applied",
+						proposalId: null,
+						confirmationRequired: false,
+					};
+				},
+			},
+		});
+		await bridge.initialize();
+		const completeState = (state: string): string =>
+			state
+				.replace(
+					"- A-1: required; unverified; evidence: not recorded.",
+					"- A-1: required; verified; evidence: targeted Memory bridge test passed.",
+				)
+				.replace(
+					'- {"evidence":"","summary":"","verifiedAcceptanceIds":[]}',
+					'- {"evidence":"targeted tests are green","summary":"Goal evidence is complete.","verifiedAcceptanceIds":["A-1"]}',
+				);
+		const checkpoint = await createCheckpoint(
+			harness.tempDir,
+			harness.sessionManager.getSessionId(),
+			"_completion",
+			completeState,
+		);
+		const store = new GoalStore(harness.tempDir);
+		const activated = await store.appendLifecycleEvent(
+			"goal_memory_bridge_completion",
+			{ eventType: "goal_activated", payload: { sessionId: harness.sessionManager.getSessionId() } },
+			{
+				eventId: "evt_goal_activated_completion",
+				idempotencyKey: "goal:activate:memory-bridge-completion",
+				expectedHead: checkpoint.head,
+				actor: "user",
+				timestamp: "2026-08-01T00:02:00.000Z",
+			},
+		);
+		await store.appendLifecycleEvent(
+			"goal_memory_bridge_completion",
+			{
+				eventType: "goal_ended",
+				payload: {
+					outcome: "accepted",
+					reason: "all required evidence is verified",
+					verifiedAcceptanceIds: ["A-1"],
+					finalEvidence: "targeted tests are green",
+					finalSummary: "Goal evidence is complete.",
+				},
+			},
+			{
+				eventId: "evt_goal_ended_completion",
+				idempotencyKey: "goal:end:memory-bridge-completion",
+				expectedHead: activated.head,
+				actor: "user",
+				timestamp: "2026-08-01T00:03:00.000Z",
+			},
+		);
+		const statePath = join(harness.tempDir, ".pi-xk", "goals", "goal_memory_bridge_completion", "goal-state.md");
+		await writeFile(
+			statePath,
+			completeState(await readFile(statePath, "utf8")).replace(
+				"- Goal initialized.\n\n## pause_audit",
+				"- Goal initialized.\n- later mutable state that is not completion evidence\n\n## pause_audit",
+			),
+		);
+
+		await bridge.captureStableSources({ model: undefined, generate: vi.fn() });
+
+		const completion = captured.find((request) => request.sourceType === "goal_completion");
+		expect(completion).toBeDefined();
+		expect(completion?.content).toContain("targeted Memory bridge test passed");
+		expect(completion?.content).not.toContain("later mutable state that is not completion evidence");
+	});
+
+	it("advances past a checkpoint whose event-time State is not synchronized with its contract", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const service = new MemoryService(harness.tempDir);
+		services.push(service);
+		const capture = vi.fn();
+		const bridge = new MemorySourceBridge({
+			projectRoot: harness.tempDir,
+			controller: { getService: () => service, capture, resumePublications: async () => [] },
+		});
+		await bridge.initialize();
+		await createCheckpoint(harness.tempDir, harness.sessionManager.getSessionId(), "_stale", (state) =>
+			state.replace("## contract_revision\n- 1", "## contract_revision\n- 2"),
+		);
+
+		await expect(bridge.captureStableSources({ model: undefined, generate: vi.fn() })).resolves.toEqual([]);
+		expect(capture).not.toHaveBeenCalled();
+		const cursor = JSON.parse(
+			await readFile(join(harness.tempDir, ".pi-xk", "memory", "source-cursors.json"), "utf8"),
+		) as { goals: Record<string, { sequence: number; hash: string }> };
+		expect(cursor.goals.goal_memory_bridge_stale?.sequence).toBe(2);
 	});
 
 	it("baselines historical sources without creating Memory state or backfilling them", async () => {
@@ -197,14 +353,103 @@ describe("Pi-XK Memory source bridge", () => {
 		await bridge.initialize();
 		expect(await bridge.captureStableSources({ model: undefined, generate: vi.fn() })).toEqual([]);
 		expect(captured).toEqual([]);
-		await expect(stat(join(harness.tempDir, ".pi-xk", "memory", "source-cursors.json"))).rejects.toMatchObject({
-			code: "ENOENT",
-		});
+		await expect(stat(join(harness.tempDir, ".pi-xk", "memory", "source-cursors.json"))).resolves.toBeDefined();
 
 		await createCheckpoint(harness.tempDir, harness.sessionManager.getSessionId(), "_new");
 		await bridge.captureStableSources({ model: undefined, generate: vi.fn() });
 		expect(captured.map((request) => request.sourceId)).toEqual(["evt_goal_checkpoint_new"]);
 		await expect(stat(join(harness.tempDir, ".pi-xk", "memory", "source-cursors.json"))).resolves.toBeDefined();
+	});
+
+	it("recovers a persisted baseline cursor after restart without skipping a later source", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const service = new MemoryService(harness.tempDir);
+		services.push(service);
+		await createCheckpoint(harness.tempDir, harness.sessionManager.getSessionId(), "_baseline");
+		const capture = vi.fn(async (request: MemoryCaptureRequest) => ({
+			captureId: `capture_${request.sourceId}`,
+			status: "applied" as const,
+			proposalId: null,
+			confirmationRequired: false,
+		}));
+		const controller = { getService: () => service, capture, resumePublications: async () => [] };
+		await new MemorySourceBridge({ projectRoot: harness.tempDir, controller }).initialize();
+
+		await createCheckpoint(harness.tempDir, harness.sessionManager.getSessionId(), "_after_restart");
+		const restarted = new MemorySourceBridge({ projectRoot: harness.tempDir, controller });
+		await restarted.initialize();
+		await restarted.captureStableSources({ model: undefined, generate: vi.fn() });
+
+		expect(capture).toHaveBeenCalledTimes(1);
+		expect(capture.mock.calls[0]?.[0]).toMatchObject({ sourceId: "evt_goal_checkpoint_after_restart" });
+	});
+
+	it("retries a failed retryable source after its source cursor has advanced", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		class RetryOnceMemoryService extends MemoryService {
+			private shouldFailSearch = true;
+
+			override async search(input: Parameters<MemoryService["search"]>[0]) {
+				if (this.shouldFailSearch) {
+					this.shouldFailSearch = false;
+					throw new Error("simulated transient Memory index failure");
+				}
+				return await super.search(input);
+			}
+		}
+		const service = new RetryOnceMemoryService(harness.tempDir);
+		services.push(service);
+		const controller = new MemoryController({ projectRoot: harness.tempDir, service });
+		const bridge = new MemorySourceBridge({ projectRoot: harness.tempDir, controller });
+		await bridge.initialize();
+		await createCheckpoint(harness.tempDir, harness.sessionManager.getSessionId(), "_retryable_source");
+		const generate = vi.fn(async () => ({
+			text: durableMemoryEnvelope("Retryable source recovery"),
+			model: { provider: "faux", modelId: "faux" },
+		}));
+		const host: MemoryGenerationHost = {
+			model: { provider: "faux", modelId: "faux", contextWindow: 100_000 },
+			generate,
+		};
+
+		await expect(bridge.captureStableSources(host)).resolves.toEqual([expect.objectContaining({ status: "failed" })]);
+		const cursorPath = join(harness.tempDir, ".pi-xk", "memory", "source-cursors.json");
+		const advanced = JSON.parse(await readFile(cursorPath, "utf8")) as {
+			goals: Record<string, { sequence: number }>;
+		};
+		expect(advanced.goals.goal_memory_bridge_retryable_source?.sequence).toBe(2);
+
+		await expect(bridge.captureStableSources(host)).resolves.toEqual([
+			expect.objectContaining({ status: "applied" }),
+		]);
+		expect(generate).toHaveBeenCalledTimes(1);
+	});
+
+	it("rejects a source cursor that advances beyond its Goal event log", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const service = new MemoryService(harness.tempDir);
+		services.push(service);
+		await createCheckpoint(harness.tempDir, harness.sessionManager.getSessionId(), "_cursor_head");
+		const controller = { getService: () => service, capture: vi.fn(), resumePublications: async () => [] };
+		const bridge = new MemorySourceBridge({ projectRoot: harness.tempDir, controller });
+		await bridge.initialize();
+		const cursorPath = join(harness.tempDir, ".pi-xk", "memory", "source-cursors.json");
+		const cursor = JSON.parse(await readFile(cursorPath, "utf8")) as {
+			goals: Record<string, { sequence: number; hash: string }>;
+		};
+		cursor.goals.goal_memory_bridge_cursor_head!.sequence = 999;
+		await writeFile(cursorPath, `${JSON.stringify(cursor)}\n`, "utf8");
+
+		await expect(bridge.doctor("deep")).resolves.toEqual([
+			expect.objectContaining({ code: "source_cursor_invalid", repairable: false }),
+		]);
+		await expect(bridge.captureStableSources({ model: undefined, generate: vi.fn() })).rejects.toThrow(
+			/cursor.*(?:ahead|event log|match)/i,
+		);
+		expect(controller.capture).not.toHaveBeenCalled();
 	});
 
 	it("backfills one earliest source by default and honors the explicit limit without repeats", async () => {
@@ -259,6 +504,39 @@ describe("Pi-XK Memory source bridge", () => {
 			"evt_goal_checkpoint_one",
 			"evt_goal_checkpoint_two",
 		]);
+	});
+
+	it("does not silently skip corrupted Goal evidence during explicit backfill", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const checkpoint = await createCheckpoint(
+			harness.tempDir,
+			harness.sessionManager.getSessionId(),
+			"_corrupt_backfill",
+		);
+		if (checkpoint.event.eventType !== "goal_checkpointed") throw new Error("checkpoint fixture type is invalid");
+		const checkpointPayload = checkpoint.event.payload.checkpoint;
+		if (checkpointPayload.schema !== "pi-xk.goal-checkpoint.v2")
+			throw new Error("checkpoint fixture schema is invalid");
+		const reference = checkpointPayload.evidence.artifacts.find(
+			(artifact) => artifact.role === "checkpoint_evidence",
+		);
+		if (!reference) throw new Error("missing checkpoint evidence fixture");
+		const digest = reference.artifactId.slice("sha256:".length);
+		await writeFile(
+			join(harness.tempDir, ".pi-xk", "artifacts", "objects", digest.slice(0, 2), `${digest}.data`),
+			"{}\n",
+		);
+		const service = new MemoryService(harness.tempDir);
+		services.push(service);
+		const bridge = new MemorySourceBridge({
+			projectRoot: harness.tempDir,
+			controller: { getService: () => service, capture: vi.fn(), resumePublications: async () => [] },
+		});
+
+		await expect(bridge.backfill({ model: undefined, generate: vi.fn() })).rejects.toThrow(
+			/artifact|digest|integrity/i,
+		);
 	});
 
 	it("rejects a capture request whose body or digest is not the canonical source artifact", async () => {
@@ -557,6 +835,29 @@ describe("Pi-XK Memory source bridge", () => {
 			]),
 		);
 		expect(cues).toHaveLength(2);
+		const historyCursorPath = join(harness.tempDir, ".pi-xk", "memory", "history-cue-cursor.json");
+		await expect(stat(historyCursorPath)).resolves.toBeDefined();
+		await writeFile(historyCursorPath, "{}\n", "utf8");
+		const restarted = new MemorySourceBridge({
+			projectRoot: harness.tempDir,
+			controller: { getService: () => service, capture: vi.fn(), resumePublications: async () => [] },
+		});
+		await expect(restarted.refreshHistoryCues()).rejects.toThrow(/cursor is invalid|repair-projections/i);
+		await expect(restarted.refreshHistoryCues({ forceRebuild: true })).resolves.toEqual(cues);
+		const persistedCursor = await readFile(historyCursorPath, "utf8");
+		const tamperedCursor = JSON.parse(persistedCursor) as { cues: Array<{ title: string }> };
+		tamperedCursor.cues[0]!.title = "tampered projection title";
+		await writeFile(historyCursorPath, `${JSON.stringify(tamperedCursor)}\n`, "utf8");
+		await expect(restarted.doctor("quick")).resolves.toEqual([
+			expect.objectContaining({ code: "history_cue_cursor_invalid", repairable: true }),
+		]);
+		await expect(restarted.refreshHistoryCues()).rejects.toThrow(/cursor.*(?:digest|invalid)/i);
+		await expect(restarted.refreshHistoryCues({ forceRebuild: true })).resolves.toEqual(cues);
+		await rm(sessionPath);
+		await expect(restarted.refreshHistoryCues()).resolves.toEqual(cues);
+		const repairedCursor = JSON.parse(await readFile(historyCursorPath, "utf8")) as Record<string, unknown>;
+		const originalCursor = JSON.parse(persistedCursor) as Record<string, unknown>;
+		expect({ ...repairedCursor, updatedAt: originalCursor.updatedAt }).toEqual(originalCursor);
 		const result = await service.search({ query: "Artifact read path", includeHistoryCues: true });
 		expect(result.items).toEqual([]);
 		expect(result.historyCues[0]).toMatchObject({ sourceType: "compaction", sessionId: "session_history_cue" });

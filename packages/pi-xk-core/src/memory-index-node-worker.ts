@@ -35,7 +35,12 @@ function execute(request: MemoryIndexWorkerRequestV1): MemoryIndexWorkerResultV1
 		projection.abortRebuild();
 		return { kind: "void" };
 	}
+	if (operation.kind === "apply_delta") {
+		projection.applyDelta(operation.delta);
+		return { kind: "void" };
+	}
 	if (operation.kind === "search") return { kind: "search", value: projection.search(operation.input) };
+	if (operation.kind === "graph") return { kind: "graph", value: projection.graph(operation.input) };
 	if (operation.kind === "record_access") {
 		projection.recordAccess(operation.memoryIds, operation.accessedAt, operation.head);
 		return { kind: "void" };

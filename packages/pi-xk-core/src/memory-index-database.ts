@@ -3,7 +3,10 @@ import {
 	type MemoryHistoryCueCandidateV1,
 	type MemoryIndexCandidateV1,
 	type MemoryIndexCueV1,
+	type MemoryIndexDeltaV1,
 	type MemoryIndexEdgeV1,
+	type MemoryIndexGraphInputV1,
+	type MemoryIndexGraphResultV1,
 	type MemoryIndexHistoryCueV1,
 	type MemoryIndexMemoryV1,
 	type MemoryIndexRebuildChunkV1,
@@ -65,6 +68,12 @@ interface MemoryIndexRebuildState {
 		historyCueCount: number;
 	};
 	stateCounts: MemoryIndexStatusV1["stateCounts"];
+	ids: {
+		memories: Set<string>;
+		cues: Set<string>;
+		edges: Set<string>;
+		historyCues: Set<string>;
+	};
 }
 
 const MEMORY_CANDIDATE_POOL_LIMIT = 200;
@@ -180,6 +189,12 @@ function milliseconds(timestamp: string | null): number | null {
 	return Number.isNaN(result) ? null : result;
 }
 
+function canonicalTimestamp(timestamp: string, field: string): string {
+	const value = milliseconds(timestamp);
+	if (value === null) throw new Error(`Memory index ${field} must be a valid timestamp`);
+	return new Date(value).toISOString();
+}
+
 const schemaSql = `
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS metadata (
@@ -235,10 +250,13 @@ CREATE TABLE IF NOT EXISTS edges (
   from_id TEXT NOT NULL,
   to_kind TEXT NOT NULL,
   to_id TEXT NOT NULL,
-  relation TEXT NOT NULL
+  relation TEXT NOT NULL,
+  effective_from TEXT NOT NULL,
+  effective_to TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS edges_from ON edges(from_kind, from_id);
 CREATE INDEX IF NOT EXISTS edges_to ON edges(to_kind, to_id);
+CREATE INDEX IF NOT EXISTS edges_effective_time ON edges(effective_from, effective_to);
 CREATE TABLE IF NOT EXISTS history_cues (
   cue_id TEXT PRIMARY KEY,
   source_type TEXT NOT NULL,
@@ -285,22 +303,30 @@ export class MemorySqliteProjection {
           memory_id, revision, artifact_id, kind, title, statement, applicability, trust, freshness,
           lifecycle, effective_from, effective_to, recorded_at, source_digest, evidence_ids, access_count,
           last_accessed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	        ON CONFLICT(memory_id) DO UPDATE SET
+	          revision=excluded.revision, artifact_id=excluded.artifact_id, kind=excluded.kind,
+	          title=excluded.title, statement=excluded.statement, applicability=excluded.applicability,
+	          trust=excluded.trust, freshness=excluded.freshness, lifecycle=excluded.lifecycle,
+	          effective_from=excluded.effective_from, effective_to=excluded.effective_to,
+	          recorded_at=excluded.recorded_at, source_digest=excluded.source_digest,
+	          evidence_ids=excluded.evidence_ids, access_count=excluded.access_count,
+	          last_accessed_at=excluded.last_accessed_at`,
 		);
 		this.insertMemoryFtsStatement = this.database.prepare(
 			"INSERT INTO memory_fts(memory_id, title, statement, applicability) VALUES (?, ?, ?, ?)",
 		);
 		this.insertCueStatement = this.database.prepare(
-			"INSERT INTO cues(cue_id, revision, artifact_id, kind, key, label, aliases) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			"INSERT INTO cues(cue_id, revision, artifact_id, kind, key, label, aliases) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(cue_id) DO UPDATE SET revision=excluded.revision, artifact_id=excluded.artifact_id, kind=excluded.kind, key=excluded.key, label=excluded.label, aliases=excluded.aliases",
 		);
 		this.insertCueFtsStatement = this.database.prepare(
 			"INSERT INTO cue_fts(cue_id, key, label, aliases) VALUES (?, ?, ?, ?)",
 		);
 		this.insertEdgeStatement = this.database.prepare(
-			"INSERT INTO edges(edge_id, artifact_id, from_kind, from_id, to_kind, to_id, relation) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			"INSERT INTO edges(edge_id, artifact_id, from_kind, from_id, to_kind, to_id, relation, effective_from, effective_to) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(edge_id) DO UPDATE SET artifact_id=excluded.artifact_id, from_kind=excluded.from_kind, from_id=excluded.from_id, to_kind=excluded.to_kind, to_id=excluded.to_id, relation=excluded.relation, effective_from=excluded.effective_from, effective_to=excluded.effective_to",
 		);
 		this.insertHistoryCueStatement = this.database.prepare(
-			"INSERT INTO history_cues(cue_id, source_type, source_id, title, recorded_at, chain_id, branch_id, segment_id, ordinal, session_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			"INSERT INTO history_cues(cue_id, source_type, source_id, title, recorded_at, chain_id, branch_id, segment_id, ordinal, session_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(cue_id) DO UPDATE SET source_type=excluded.source_type, source_id=excluded.source_id, title=excluded.title, recorded_at=excluded.recorded_at, chain_id=excluded.chain_id, branch_id=excluded.branch_id, segment_id=excluded.segment_id, ordinal=excluded.ordinal, session_id=excluded.session_id",
 		);
 		this.insertHistoryCueFtsStatement = this.database.prepare(
 			"INSERT INTO history_cue_fts(cue_id, title) VALUES (?, ?)",
@@ -376,6 +402,8 @@ export class MemorySqliteProjection {
 			edge.toKind,
 			edge.toId,
 			edge.relation,
+			edge.effectiveFrom,
+			edge.effectiveTo,
 		);
 	}
 
@@ -407,6 +435,7 @@ export class MemorySqliteProjection {
 				plan,
 				counts: { memoryCount: 0, cueCount: 0, edgeCount: 0, historyCueCount: 0 },
 				stateCounts: emptyStateCounts(),
+				ids: { memories: new Set(), cues: new Set(), edges: new Set(), historyCues: new Set() },
 			};
 		} catch (error) {
 			this.database.exec("ROLLBACK");
@@ -429,6 +458,8 @@ export class MemorySqliteProjection {
 				}
 			}
 			for (const memory of chunk.memories) {
+				if (state.ids.memories.has(memory.memoryId)) throw new Error("Memory index rebuild duplicates memoryId");
+				state.ids.memories.add(memory.memoryId);
 				if (!Object.hasOwn(state.stateCounts.trust, memory.trust)) {
 					throw new Error("Memory index rebuild trust is invalid");
 				}
@@ -443,9 +474,21 @@ export class MemorySqliteProjection {
 				state.stateCounts.freshness[memory.freshness] += 1;
 				state.stateCounts.lifecycle[memory.lifecycle] += 1;
 			}
-			for (const cue of chunk.cues) this.insertCue(cue);
-			for (const edge of chunk.edges) this.insertEdge(edge);
-			for (const cue of chunk.historyCues) this.insertHistoryCue(cue);
+			for (const cue of chunk.cues) {
+				if (state.ids.cues.has(cue.cueId)) throw new Error("Memory index rebuild duplicates cueId");
+				state.ids.cues.add(cue.cueId);
+				this.insertCue(cue);
+			}
+			for (const edge of chunk.edges) {
+				if (state.ids.edges.has(edge.edgeId)) throw new Error("Memory index rebuild duplicates edgeId");
+				state.ids.edges.add(edge.edgeId);
+				this.insertEdge(edge);
+			}
+			for (const cue of chunk.historyCues) {
+				if (state.ids.historyCues.has(cue.cueId)) throw new Error("Memory index rebuild duplicates history cueId");
+				state.ids.historyCues.add(cue.cueId);
+				this.insertHistoryCue(cue);
+			}
 			state.counts.memoryCount += chunk.memories.length;
 			state.counts.cueCount += chunk.cues.length;
 			state.counts.edgeCount += chunk.edges.length;
@@ -513,6 +556,113 @@ export class MemorySqliteProjection {
 			this.abortRebuild();
 			throw error;
 		}
+	}
+
+	private refreshMetadata(head: MemoryIndexSnapshotV1["head"]): void {
+		const count = (table: "memories" | "cues" | "edges" | "history_cues"): number => {
+			const row = this.database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get();
+			if (!isRecord(row)) throw new Error(`Memory index ${table} count is invalid`);
+			return nonNegativeInteger(row.count, `${table} count`);
+		};
+		this.putMetadata("head_sequence", String(head.sequence));
+		this.putMetadata("head_hash", head.hash ?? "");
+		this.putMetadata("memory_count", String(count("memories")));
+		this.putMetadata("cue_count", String(count("cues")));
+		this.putMetadata("edge_count", String(count("edges")));
+		this.putMetadata("history_cue_count", String(count("history_cues")));
+		for (const [column, values] of [
+			["trust", ["verified", "model_inferred", "disputed"]],
+			["freshness", ["current", "stale", "unknown"]],
+			["lifecycle", ["active", "superseded", "invalidated", "archived"]],
+		] as const) {
+			const rows = new Map(
+				this.database
+					.prepare(`SELECT ${column} AS value, COUNT(*) AS count FROM memories GROUP BY ${column}`)
+					.all()
+					.map((row) => {
+						if (!isRecord(row)) throw new Error(`Memory index ${column} count is invalid`);
+						return [
+							requiredString(row.value, `${column} value`),
+							nonNegativeInteger(row.count, `${column} count`),
+						] as const;
+					}),
+			);
+			for (const value of values) this.putMetadata(`${column}_${value}_count`, String(rows.get(value) ?? 0));
+		}
+	}
+
+	applyDelta(delta: MemoryIndexDeltaV1): void {
+		if (this.rebuildState) throw new Error("Memory index cannot apply a delta during rebuild");
+		const expected = validateRebuildPlan({
+			head: delta.expectedHead,
+			memoryCount: 0,
+			cueCount: 0,
+			edgeCount: 0,
+			historyCueCount: 0,
+		}).head;
+		const head = validateRebuildPlan({
+			head: delta.head,
+			memoryCount: 0,
+			cueCount: 0,
+			edgeCount: 0,
+			historyCueCount: 0,
+		}).head;
+		const current = this.status().head;
+		if (current.sequence !== expected.sequence || current.hash !== expected.hash) {
+			throw new Error("Memory index delta head conflict");
+		}
+		const factChanges =
+			delta.memories.length +
+			delta.cues.length +
+			delta.edges.length +
+			delta.removeMemoryIds.length +
+			delta.removeCueIds.length +
+			delta.removeEdgeIds.length;
+		const sameHead = head.sequence === expected.sequence && head.hash === expected.hash;
+		if (head.sequence < expected.sequence || (head.sequence === expected.sequence && !sameHead)) {
+			throw new Error("Memory index delta head must not move backwards");
+		}
+		if (sameHead && factChanges > 0) {
+			throw new Error("Memory index fact delta must advance the event head");
+		}
+		if (sameHead && delta.historyCues.length === 0) return;
+		transaction(this.database, () => {
+			for (const memoryId of new Set(delta.removeMemoryIds)) {
+				this.database.prepare("DELETE FROM memory_fts WHERE memory_id = ?").run(memoryId);
+				this.database
+					.prepare(
+						"DELETE FROM edges WHERE (from_kind = 'memory' AND from_id = ?) OR (to_kind = 'memory' AND to_id = ?)",
+					)
+					.run(memoryId, memoryId);
+				this.database.prepare("DELETE FROM memories WHERE memory_id = ?").run(memoryId);
+			}
+			for (const cueId of new Set(delta.removeCueIds)) {
+				this.database.prepare("DELETE FROM cue_fts WHERE cue_id = ?").run(cueId);
+				this.database
+					.prepare(
+						"DELETE FROM edges WHERE (from_kind = 'cue' AND from_id = ?) OR (to_kind = 'cue' AND to_id = ?)",
+					)
+					.run(cueId, cueId);
+				this.database.prepare("DELETE FROM cues WHERE cue_id = ?").run(cueId);
+			}
+			for (const edgeId of new Set(delta.removeEdgeIds)) {
+				this.database.prepare("DELETE FROM edges WHERE edge_id = ?").run(edgeId);
+			}
+			for (const memory of delta.memories) {
+				this.database.prepare("DELETE FROM memory_fts WHERE memory_id = ?").run(memory.memoryId);
+				this.insertMemory(memory);
+			}
+			for (const cue of delta.cues) {
+				this.database.prepare("DELETE FROM cue_fts WHERE cue_id = ?").run(cue.cueId);
+				this.insertCue(cue);
+			}
+			for (const edge of delta.edges) this.insertEdge(edge);
+			for (const cue of delta.historyCues) {
+				this.database.prepare("DELETE FROM history_cue_fts WHERE cue_id = ?").run(cue.cueId);
+				this.insertHistoryCue(cue);
+			}
+			this.refreshMetadata(head);
+		});
 	}
 
 	status(): MemoryIndexStatusV1 {
@@ -616,7 +766,40 @@ export class MemorySqliteProjection {
 			.map(rankedId);
 	}
 
-	private relatedMemoryIds(seedKind: "memory" | "cue", seedId: string, depth: 1 | 2): string[] {
+	private likeIds(
+		table: "memories" | "cues" | "history_cues",
+		idColumn: "memory_id" | "cue_id",
+		query: string,
+	): string[] {
+		const escaped = `%${query.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_")}%`;
+		const predicate =
+			table === "memories"
+				? "title LIKE ? ESCAPE '\\' OR statement LIKE ? ESCAPE '\\' OR applicability LIKE ? ESCAPE '\\'"
+				: table === "cues"
+					? "key LIKE ? ESCAPE '\\' OR label LIKE ? ESCAPE '\\' OR aliases LIKE ? ESCAPE '\\'"
+					: "title LIKE ? ESCAPE '\\'";
+		const values = table === "history_cues" ? [escaped] : [escaped, escaped, escaped];
+		return this.database
+			.prepare(`SELECT ${idColumn} AS id FROM ${table} WHERE ${predicate} LIMIT ${MEMORY_CANDIDATE_POOL_LIMIT}`)
+			.all(...values)
+			.map((row) => {
+				if (!isRecord(row)) throw new Error("Memory index LIKE row is invalid");
+				return requiredString(row.id, "LIKE id");
+			});
+	}
+
+	private matchingIds(
+		ftsTable: "memory_fts" | "cue_fts" | "history_cue_fts",
+		dataTable: "memories" | "cues" | "history_cues",
+		idColumn: "memory_id" | "cue_id",
+		query: string,
+	): string[] {
+		const fts = this.ftsRanks(ftsTable, idColumn, query).map((row) => row.id);
+		if ([...query].length >= 3 && fts.length > 0) return fts;
+		return [...new Set([...fts, ...this.likeIds(dataTable, idColumn, query)])];
+	}
+
+	private relatedMemoryIds(seedKind: "memory" | "cue", seedId: string, depth: 1 | 2, asOf: string): string[] {
 		const found = new Set<string>();
 		let frontier = [{ kind: seedKind, id: seedId }];
 		const visited = new Set<string>();
@@ -628,9 +811,9 @@ export class MemorySqliteProjection {
 				visited.add(nodeKey);
 				for (const raw of this.database
 					.prepare(
-						"SELECT from_kind, from_id, to_kind, to_id FROM edges WHERE (from_kind = ? AND from_id = ?) OR (to_kind = ? AND to_id = ?)",
+						"SELECT from_kind, from_id, to_kind, to_id FROM edges WHERE ((from_kind = ? AND from_id = ?) OR (to_kind = ? AND to_id = ?)) AND effective_from <= ? AND (effective_to IS NULL OR effective_to > ?)",
 					)
-					.all(node.kind, node.id, node.kind, node.id)) {
+					.all(node.kind, node.id, node.kind, node.id, asOf, asOf)) {
 					if (!isRecord(raw)) throw new Error("Memory index edge row is invalid");
 					const fromKind = requiredString(raw.from_kind, "edge from_kind") as "memory" | "cue";
 					const fromId = requiredString(raw.from_id, "edge from_id");
@@ -649,12 +832,12 @@ export class MemorySqliteProjection {
 		return [...found];
 	}
 
-	private relations(memoryId: string): MemoryIndexCandidateV1["relations"] {
+	private relations(memoryId: string, asOf: string): MemoryIndexCandidateV1["relations"] {
 		return this.database
 			.prepare(
-				"SELECT edge_id, from_kind, from_id, to_kind, to_id, relation FROM edges WHERE (from_kind = 'memory' AND from_id = ?) OR (to_kind = 'memory' AND to_id = ?)",
+				"SELECT edge_id, from_kind, from_id, to_kind, to_id, relation FROM edges WHERE ((from_kind = 'memory' AND from_id = ?) OR (to_kind = 'memory' AND to_id = ?)) AND effective_from <= ? AND (effective_to IS NULL OR effective_to > ?)",
 			)
-			.all(memoryId, memoryId)
+			.all(memoryId, memoryId, asOf, asOf)
 			.map((raw) => {
 				if (!isRecord(raw)) throw new Error("Memory index relation row is invalid");
 				const fromKind = requiredString(raw.from_kind, "relation from_kind") as "memory" | "cue";
@@ -685,32 +868,33 @@ export class MemorySqliteProjection {
 		const offset = input.offset ?? 0;
 		if (!Number.isInteger(offset) || offset < 0 || offset > MEMORY_CANDIDATE_POOL_LIMIT)
 			throw new Error(`Memory index offset must be 0 to ${MEMORY_CANDIDATE_POOL_LIMIT}`);
+		const asOf = canonicalTimestamp(input.asOf ?? new Date().toISOString(), "asOf");
 		const pools: string[][] = [];
-		const lexical = this.ftsRanks("memory_fts", "memory_id", query).map((row) => row.id);
+		const lexical = this.matchingIds("memory_fts", "memories", "memory_id", query);
 		if (lexical.length > 0) pools.push(lexical);
-		const cueMatches = this.ftsRanks("cue_fts", "cue_id", query).map((row) => row.id);
+		const cueMatches = this.matchingIds("cue_fts", "cues", "cue_id", query);
 		if (input.graphDepth > 0) {
 			const graphDepth: 1 | 2 = input.graphDepth === 2 ? 2 : 1;
 			const graph = new Set<string>();
 			for (const memoryId of lexical) {
-				for (const related of this.relatedMemoryIds("memory", memoryId, graphDepth)) graph.add(related);
+				for (const related of this.relatedMemoryIds("memory", memoryId, graphDepth, asOf)) graph.add(related);
 			}
 			for (const cueId of cueMatches) {
-				for (const related of this.relatedMemoryIds("cue", cueId, graphDepth)) graph.add(related);
+				for (const related of this.relatedMemoryIds("cue", cueId, graphDepth, asOf)) graph.add(related);
 			}
 			if (graph.size > 0) pools.push([...graph]);
 		}
-		if (pools.length === 0) {
-			const escaped = `%${query.replaceAll("%", "\\%").replaceAll("_", "\\_")}%`;
+		const temporalQuery = /(?:上次|最近|近期|刚才|previous|recent|latest|last(?:\s+time)?)/iu.test(query);
+		if (temporalQuery) {
 			pools.push(
 				this.database
 					.prepare(
-						`SELECT memory_id AS id FROM memories WHERE title LIKE ? ESCAPE '\\' OR statement LIKE ? ESCAPE '\\' LIMIT ${MEMORY_CANDIDATE_POOL_LIMIT}`,
+						`SELECT memory_id AS id FROM memories ORDER BY recorded_at DESC LIMIT ${MEMORY_CANDIDATE_POOL_LIMIT}`,
 					)
-					.all(escaped, escaped)
+					.all()
 					.map((row) => {
-						if (!isRecord(row)) throw new Error("Memory index fallback row is invalid");
-						return requiredString(row.id, "fallback id");
+						if (!isRecord(row)) throw new Error("Memory index recent row is invalid");
+						return requiredString(row.id, "recent id");
 					}),
 			);
 		}
@@ -731,11 +915,11 @@ export class MemorySqliteProjection {
 			const row = memoryRow(raw);
 			if (row.lifecycle !== "active") continue;
 			if (input.kinds && !input.kinds.includes(row.kind)) continue;
-			const asOf = milliseconds(input.asOf ?? new Date().toISOString());
+			const asOfMilliseconds = milliseconds(asOf);
 			if (
-				asOf === null ||
-				asOf < Date.parse(row.effective_from) ||
-				(row.effective_to !== null && asOf >= Date.parse(row.effective_to))
+				asOfMilliseconds === null ||
+				asOfMilliseconds < Date.parse(row.effective_from) ||
+				(row.effective_to !== null && asOfMilliseconds >= Date.parse(row.effective_to))
 			)
 				continue;
 			const lastAccessed = milliseconds(row.last_accessed_at);
@@ -754,7 +938,7 @@ export class MemorySqliteProjection {
 				effectiveFrom: row.effective_from,
 				effectiveTo: row.effective_to,
 				recordedAt: row.recorded_at,
-				relations: this.relations(row.memory_id),
+				relations: this.relations(row.memory_id, asOf),
 				score: baseScore * (1 + heatBoost + trustBoost + freshnessBoost),
 			});
 		}
@@ -762,9 +946,22 @@ export class MemorySqliteProjection {
 
 		const historyCues: MemoryHistoryCueCandidateV1[] = [];
 		if (input.includeHistoryCues) {
-			for (const [index, match] of this.ftsRanks("history_cue_fts", "cue_id", query).entries()) {
-				const raw = this.database.prepare("SELECT * FROM history_cues WHERE cue_id = ?").get(match.id);
+			const historyMatches = this.matchingIds("history_cue_fts", "history_cues", "cue_id", query);
+			if (temporalQuery) {
+				for (const raw of this.database
+					.prepare(
+						`SELECT cue_id AS id FROM history_cues WHERE recorded_at <= ? ORDER BY recorded_at DESC LIMIT ${MEMORY_CANDIDATE_POOL_LIMIT}`,
+					)
+					.all(asOf)) {
+					if (!isRecord(raw)) throw new Error("Memory index recent history row is invalid");
+					const id = requiredString(raw.id, "recent history id");
+					if (!historyMatches.includes(id)) historyMatches.push(id);
+				}
+			}
+			for (const [index, cueId] of historyMatches.entries()) {
+				const raw = this.database.prepare("SELECT * FROM history_cues WHERE cue_id = ?").get(cueId);
 				if (!isRecord(raw)) continue;
+				if (Date.parse(requiredString(raw.recorded_at, "history recorded_at")) > Date.parse(asOf)) continue;
 				historyCues.push({
 					cueId: requiredString(raw.cue_id, "history cue_id"),
 					sourceType: requiredString(
@@ -783,9 +980,81 @@ export class MemorySqliteProjection {
 				});
 			}
 		}
+		const merged = [
+			...candidates.map((value) => ({ kind: "memory" as const, id: value.memoryId, score: value.score, value })),
+			...historyCues.map((value) => ({ kind: "history" as const, id: value.cueId, score: value.score, value })),
+		]
+			.sort(
+				(left, right) =>
+					right.score - left.score || left.kind.localeCompare(right.kind) || left.id.localeCompare(right.id),
+			)
+			.slice(0, MEMORY_CANDIDATE_POOL_LIMIT);
+		const page = merged.slice(offset, offset + input.limit);
 		return {
-			memories: candidates.slice(offset, offset + input.limit),
-			historyCues: historyCues.slice(offset, offset + input.limit),
+			memories: page.filter((entry) => entry.kind === "memory").map((entry) => entry.value),
+			historyCues: page.filter((entry) => entry.kind === "history").map((entry) => entry.value),
+			hasMore: offset + input.limit < merged.length,
+		};
+	}
+
+	graph(input: MemoryIndexGraphInputV1): MemoryIndexGraphResultV1 {
+		if (input.depth !== 1 && input.depth !== 2) throw new Error("Memory index graph depth must be 1 or 2");
+		const asOf = canonicalTimestamp(input.asOf ?? new Date().toISOString(), "graph asOf");
+		if (!this.database.prepare("SELECT 1 AS present FROM memories WHERE memory_id = ?").get(input.rootMemoryId)) {
+			throw new Error(`Memory index graph root is missing: ${input.rootMemoryId}`);
+		}
+		let frontier = new Set([`memory:${input.rootMemoryId}`]);
+		const nodes = new Set(frontier);
+		const edges = new Map<string, MemoryIndexGraphResultV1["edges"][number]>();
+		for (let level = 0; level < input.depth; level++) {
+			const next = new Set<string>();
+			for (const node of frontier) {
+				const separator = node.indexOf(":");
+				const kind = node.slice(0, separator) as "memory" | "cue";
+				const id = node.slice(separator + 1);
+				for (const raw of this.database
+					.prepare(
+						"SELECT edge_id, from_kind, from_id, to_kind, to_id, relation FROM edges WHERE ((from_kind = ? AND from_id = ?) OR (to_kind = ? AND to_id = ?)) AND effective_from <= ? AND (effective_to IS NULL OR effective_to > ?)",
+					)
+					.all(kind, id, kind, id, asOf, asOf)) {
+					if (!isRecord(raw)) throw new Error("Memory index graph edge row is invalid");
+					const from = {
+						kind: requiredString(raw.from_kind, "graph from_kind") as "memory" | "cue",
+						id: requiredString(raw.from_id, "graph from_id"),
+					};
+					const to = {
+						kind: requiredString(raw.to_kind, "graph to_kind") as "memory" | "cue",
+						id: requiredString(raw.to_id, "graph to_id"),
+					};
+					const edgeId = requiredString(raw.edge_id, "graph edge_id");
+					edges.set(edgeId, {
+						edgeId,
+						from,
+						to,
+						relation: requiredString(
+							raw.relation,
+							"graph relation",
+						) as MemoryIndexGraphResultV1["edges"][number]["relation"],
+					});
+					for (const endpoint of [from, to]) {
+						const key = `${endpoint.kind}:${endpoint.id}`;
+						nodes.add(key);
+						next.add(key);
+					}
+				}
+			}
+			frontier = next;
+		}
+		return {
+			memoryIds: [...nodes]
+				.filter((node) => node.startsWith("memory:"))
+				.map((node) => node.slice("memory:".length))
+				.sort(),
+			cueIds: [...nodes]
+				.filter((node) => node.startsWith("cue:"))
+				.map((node) => node.slice("cue:".length))
+				.sort(),
+			edges: [...edges.values()].sort((left, right) => left.edgeId.localeCompare(right.edgeId)),
 		};
 	}
 }

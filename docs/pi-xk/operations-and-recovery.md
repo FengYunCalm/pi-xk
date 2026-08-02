@@ -32,8 +32,10 @@
     memory-read-model.checkpoint.json
     memory-config.json
     source-cursors.json
+    history-cue-cursor.json
     index.sqlite
     locks/<captureId>.generation.lock
+    locks/projection.lock
     pending/<captureId>.result.json
     projections/
       manifest.json
@@ -75,7 +77,7 @@ Pi-XK 不创建项目级 `.pi` 目录来保存自己的领域状态。项目 `.p
 | Memory revision/Cue/Edge/proposal/source artifact | 是 | 否 | Artifact Store 中的 canonical 内容；事件发布这些对象 |
 | Memory read model/checkpoint | 投影 | 通过 replay 重建 | 普通 status/search 的快速路径，不参与裁决 |
 | Memory `index.sqlite` / Markdown | 投影 | `/memory doctor repair-projections` | FTS5、图、时间、heat 和人类可读视图 |
-| Memory `source-cursors.json` / pending result | 恢复数据 | 由 source bridge/controller 管理 | 控制自动发现基线并复用已生成结果；不是 Memory 事实 |
+| Memory `source-cursors.json` / `history-cue-cursor.json` / pending result | 恢复数据 | 由 source bridge/controller 管理 | 控制自动发现基线、sealed Segment 增量扫描并复用已生成结果；不是 Memory 事实 |
 | Chain `events.jsonl` | 是 | 否 | chain/branch/segment/rollover 拓扑 |
 | managed Segment JSONL | 是 | 否 | 完整 Pi session；sealed 后不可变 |
 | L1/L2 Artifact object | 是 | 否 | 内容寻址的 Segment summary、Chain Rollup、checkpoint 或 result 内容 |
@@ -97,7 +99,7 @@ Pi-XK 不创建项目级 `.pi` 目录来保存自己的领域状态。项目 `.p
 | `/task start ...` | 创建 Task 目录、事件和独立 child SessionChain |
 | 自动或手动 rollover | 创建 L1 artifact、target Segment 和 chain event；完整窗口可能再生成 L2 |
 | `/chain rollup backfill [limit]` | 显式生成最早缺失的完整 L2 窗口，可能调用 provider |
-| 第一次加载 Memory v1 | 默认启用并记录当前 Goal/Chain head 作为自动捕获 baseline；不批量调用模型回填旧历史 |
+| 第一次加载 Memory v1 | 默认启用并记录当前 Goal/Chain head 作为自动捕获 baseline；建立不复制正文的 History Cue cursor/cache；不批量调用模型回填旧历史 |
 | 新 Goal checkpoint/completion 或 L2 publication | 后台发现稳定来源并产生 Memory capture；可能调用 provider |
 | `/memory remember <text>` | 不调用模型，创建用户确认的 verified Memory |
 | `/memory backfill [limit]` | 显式、有限额捕获历史 eligible Goal/L2 source；默认一个、最多 20 |
@@ -258,6 +260,8 @@ V3 State 的 `recent_work_log` 最多保留 20 条重要记录。`tried_and_reje
 | archive/invalidate | 新 lifecycle revision；旧 artifact 保留 |
 | purge | 显式确认、引用检查和 tombstone 后才清理独占 artifact |
 
+Goal completion 的稳定来源不是结束后仍可编辑的 `goal-state.md`，而是 `goal_ended` 前最后一个 `turn_end` checkpoint 所引用的 event-time State artifact。checkpoint artifact、metadata、合同 revision 或 State grammar 不一致时，Memory capture 拒绝该来源。
+
 ## 6. Rollup 恢复与诊断
 
 Rollup 发布的故障边界与 rollover 分开：
@@ -280,9 +284,11 @@ Memory publication 的恢复边界：
 
 1. 已有模型 result artifact：重新验证并复用，不再次调用 provider。
 2. `proposal_recorded` 已存在且无需确认：下一次 stable-source scan 完成 apply，不再次调用 provider。
-3. `memory_change_applied` 已写但 read model/SQLite/Markdown 未更新：重放 event tail 或 repair projections。
-4. `generation_started` 后没有 result artifact：结果未知，保持 indeterminate；只能在确认 provider 幂等性或用户显式判断后处理。
-5. source digest、evidence ownership、schema 或 CAS 无效：报告不可重试事实错误，不移动 cursor 伪装成功。
+3. `memory_change_applied` 已写但 read model/SQLite/Markdown 未更新：重放 event tail、应用 event-head CAS delta，或 repair projections。
+4. 已知 `capture_failed` 且 `retryable: true`、没有 pending result：后续 stable-source scan 为同一 capture 开始下一 attempt；即使 source cursor 已前移也会重新发现来源。
+5. 已知 `capture_failed` 且 `retryable: false`：先修正来源、provenance、schema 或配置，不自动重试。
+6. `generation_started` 后没有 result artifact：结果未知，保持 indeterminate；只能在确认 provider 幂等性或用户显式判断后处理。
+7. source digest、evidence ownership、schema 或 CAS 无效：报告不可重试事实错误，不移动 cursor 伪装成功。
 
 SQLite 缺失、损坏或与 event head 不一致时：
 
@@ -292,7 +298,11 @@ SQLite 缺失、损坏或与 event head 不一致时：
 /memory doctor repair-projections
 ```
 
-repair 会构建临时 SQLite/read model/Markdown，完整验证后再替换，不修改 Memory event、Artifact Store、Goal、Task、Chain 或 transcript。History Cue 和 source cursor 也是派生/恢复数据；删除它们可能改变后续发现成本，但不能删除已经发布的 Memory facts。
+repair 会先受控重建 History Cue cursor/cache，再固定一个 read-model head；SQLite 已与该 head 一致时复用，否则构建临时数据库，Markdown/manifest 也只使用该快照，最后复核事实 head。它不修改 Memory event、Artifact Store、Goal、Task、Chain 或 transcript。History Cue 和 source cursor 是派生/恢复数据；删除它们会使下一次 repair 重新扫描 sealed Segment，但不能删除已经发布的 Memory facts。
+
+`source-cursors.v1` 会在 sequence 与事实日志一致时原位升级为携带 head hash 的 v2；`history-cue-cursor.v1` 会通过事实重建为带 content digest 的 v2。source cursor 损坏不能自动修复，因为猜测 baseline 可能跳过或重复付费 capture；History Cue cursor 只保存可重建 locator，可由 repair-projections 安全重建。
+
+purge 在 tombstone 中记录可清理的 revision/edge/evidence 和独占 proposal/model-result 内容 artifact。共享 proposal/result、pending 引用以及 Goal/Task/Chain 等其他领域引用会保留；deep doctor 不把 tombstone 已声明删除的独占对象误报为事实损坏。
 
 ## 8. Rollover 恢复
 
@@ -412,9 +422,13 @@ owner 仍存活、PID 状态无法确认、metadata malformed 或 nonce 已变�
 
 这表示 `generation_started` 已提交，但没有可证明的 result artifact。provider 可能已经计费并返回，也可能根本没有完成。Pi-XK 不自动重试，以免产生重复付费调用和重复事实。保留 pending/event/artifact 现场，运行 `/memory doctor deep`；只有确认 provider 幂等 key 可复用或用户明确决定重试时再处理。
 
+如果 doctor 显示 `capture_failed_retryable`，这是结果已知的失败，下一次匹配 stable-source boundary 可以安全开始新 attempt；`capture_failed_non_retryable` 则要求先修正来源或配置。两者都不等同于 indeterminate。
+
 ### Memory index missing/corrupt/stale
 
 先运行 `/memory doctor` 区分事实错误和投影错误。仅当 event/artifact 验证通过时执行 `/memory doctor repair-projections`。不要通过删除 `events.jsonl` 或 artifact 让 SQLite 看起来一致。
+
+如果 session startup 报 History Cue cursor invalid，普通刷新会停止并保留现场；`/memory doctor repair-projections` 会从 sealed Segment 的标题和 compaction locator 受控重建该 cursor。稳定 chain 的日常刷新只比较 chain head，不会重复打开全部历史 Segment。
 
 ### Memory proposal 一直未处理
 

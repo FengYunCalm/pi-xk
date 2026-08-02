@@ -12,7 +12,7 @@ Pi-XK 是 Pi 的维护型 fork 与扩展层。它在保留 Pi provider、Agent l
 | Goal 连续执行 | 已实现 | active Goal 会自动继续，直到模型提交合格的 pause/end intent 或用户显式控制 |
 | Task Run v1 | 已实现 | 同一 parent 只运行一个 in-process child；无并发、DAG、retry、deadline 或 worktree 隔离 |
 | Session Chain v1.1 | 已实现 | 物理 Segment、L1 递进摘要、默认每 5 段 L2 Rollup、模型按需检索、恢复和 successor branch |
-| Memory v1 | 已实现 | 项目级有向证据图、Goal/L2 稳定边界捕获、显式 verified 记忆、D0–D3 渐进检索、SQLite FTS5/图投影和恢复 |
+| Memory v1 | 已实现 | 项目级有向证据图、Goal/L2 稳定边界捕获、显式 verified 记忆、D0–D3 时间/图检索、增量 SQLite/History Cue 投影和恢复 |
 | 日常状态与管理 | 已实现 | `/xk status` 聚合 Chain/Goal/Task/Memory/恢复诊断；Chain 支持标题、归档和默认隐藏归档项 |
 | Artifact store | 已实现 | 项目级、内容寻址、单 artifact 最大 64 KiB；不是任意大文件仓库 |
 | Policy 与沙箱 | 未实现 | 扩展继承启动 Pi 的用户权限，不提供逐工具授权或无人值守隔离 |
@@ -89,4 +89,4 @@ flowchart LR
 
 ## 版本基线
 
-当前文档对应 2026-08-02 的 Pi-XK Goal V3、compaction recovery、Session Chain v1.1、Memory v1、增量 append checkpoint 与既有 GitHub-only 发行实现。完整验收以当前 commit 实际执行 `npm run test:pi-xk` 的输出为准，不再在长期文档中固化会随回归测试增长而过期的计数；旧的 `42/97`、`55/119`、`63/157`、`93/241` 都不是当前完整证据。发布前还必须运行 `npm run check`、`./test.sh`、Session Chain 与 Memory 评估/benchmark、隔离归档 smoke、Windows/macOS 定向 CI 和 `git diff --check`。
+当前文档对应 2026-08-03 的 Pi-XK Goal V3、compaction recovery、Session Chain v1.1、Memory v1、增量 append/checkpoint/projection 与既有 GitHub-only 发行实现。完整验收以当前 commit 实际执行 `npm run test:pi-xk` 的输出为准，不再在长期文档中固化会随回归测试增长而过期的计数；旧的 `42/97`、`55/119`、`63/157`、`93/241` 都不是当前完整证据。发布前还必须运行 `npm run check`、`./test.sh`、Session Chain 与 Memory 评估/benchmark、隔离归档 smoke、Windows/macOS 定向 CI 和 `git diff --check`。

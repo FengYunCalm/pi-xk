@@ -2,9 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { ArtifactStore } from "./artifact-store.ts";
-import { GoalStore } from "./goal-store.ts";
 import {
-	type EvidenceRefV1,
 	MEMORY_CAPTURE_SOURCE_SCHEMA,
 	MEMORY_CHANGE_PROPOSAL_SCHEMA,
 	MEMORY_EVIDENCE_REF_SCHEMA,
@@ -15,17 +13,24 @@ import {
 	type MemoryKind,
 	MemoryValidationError,
 } from "./memory-contract.ts";
-import { readGitEvidence, verifyGitEvidenceLocator } from "./memory-freshness.ts";
+import { resolveMemoryCompactionEvidence, validateMemoryEvidenceOwnership } from "./memory-evidence.ts";
+import { readGitEvidence } from "./memory-freshness.ts";
 import type {
 	MemoryHistoryCueCandidateV1,
 	MemoryIndexCandidateV1,
+	MemoryIndexCueV1,
+	MemoryIndexDeltaV1,
+	MemoryIndexEdgeV1,
 	MemoryIndexHistoryCueV1,
+	MemoryIndexMemoryV1,
 	MemoryIndexRebuildChunkV1,
 	MemoryIndexRebuildPlanV1,
 	MemoryIndexStatusV1,
 } from "./memory-index.ts";
 import { MemoryIndexWorkerClient } from "./memory-index-worker-client.ts";
 import {
+	type MemoryApplyOptions,
+	type MemoryApplyResultV1,
 	type MemoryMutationOptions,
 	type MemoryPurgeResultV1,
 	type MemoryReadModelV1,
@@ -33,10 +38,8 @@ import {
 	MemoryStore,
 	type MemoryWriteResult,
 } from "./memory-store.ts";
-import { SessionChainStore } from "./session-chain-store.ts";
 import { stableJsonStringify } from "./stable-json.ts";
 import { syncDirectory } from "./sync-directory.ts";
-import { TaskStore } from "./task-store.ts";
 
 const MEMORY_CONFIG_SCHEMA = "pi-xk.memory-config.v1";
 const EXPLICIT_MEMORY_PROMPT_VERSION = "pi-xk.memory-explicit.v1";
@@ -95,6 +98,7 @@ export interface MemoryServiceStatusV1 {
 		proposed: number;
 		applied: number;
 		rejected: number;
+		skipped: number;
 	};
 	lock: Awaited<ReturnType<MemoryStore["inspectWriteLock"]>>;
 }
@@ -162,31 +166,6 @@ function exactKeys(value: Record<string, unknown>, expected: readonly string[]):
 
 function sha256(value: string): string {
 	return `sha256:${createHash("sha256").update(value).digest("hex")}`;
-}
-
-function chainRollupSourceDigest(input: {
-	chainId: string;
-	branchId: string;
-	windowIndex: number;
-	startOrdinal: number;
-	endOrdinal: number;
-	segmentIds: readonly string[];
-	summaryArtifactIds: readonly string[];
-}): string {
-	return sha256(
-		JSON.stringify({
-			schema: "pi-xk.session-chain-rollup.v1",
-			chainId: input.chainId,
-			branchId: input.branchId,
-			windowIndex: input.windowIndex,
-			startOrdinal: input.startOrdinal,
-			endOrdinal: input.endOrdinal,
-			segments: input.segmentIds.map((segmentId, index) => ({
-				segmentId,
-				summaryArtifactId: input.summaryArtifactIds[index],
-			})),
-		}),
-	);
 }
 
 function validateProjectionManifest(value: unknown): MemoryProjectionManifestV1 {
@@ -301,6 +280,18 @@ function encodeCursor(queryDigest: string, offset: number): string {
 	return Buffer.from(stableJsonStringify(cursor), "utf8").toString("base64url");
 }
 
+function memorySearchText(value: string): string {
+	return value.normalize("NFKC").toLocaleLowerCase("en-US");
+}
+
+function memorySearchTokens(query: string): string[] {
+	return [...new Set([...query.matchAll(/[\p{L}\p{N}_]+/gu)].map((match) => memorySearchText(match[0])))];
+}
+
+function isTemporalMemoryQuery(query: string): boolean {
+	return /(?:上次|最近|近期|刚才|previous|recent|latest|last(?:\s+time)?)/iu.test(query);
+}
+
 export class MemoryService {
 	private readonly projectRoot: string;
 	private readonly memoryDirectory: string;
@@ -398,6 +389,181 @@ export class MemoryService {
 			() => undefined,
 		);
 		return current;
+	}
+
+	private withProjectionMutation<T>(operation: () => Promise<T>): Promise<T> {
+		return this.withProjectionOperation(async () => await this.store.withProjectionLock(operation));
+	}
+
+	private async indexCanApply(expectedHead: MemoryReadModelV1["head"]): Promise<boolean> {
+		if (!this.index) return false;
+		try {
+			const status = await this.index.status();
+			return status.head.sequence === expectedHead.sequence && status.head.hash === expectedHead.hash;
+		} catch {
+			await this.index.close().catch(() => {});
+			this.index = undefined;
+			this.lastIndexState = "absent";
+			return false;
+		}
+	}
+
+	private async indexEntities(
+		readModel: MemoryReadModelV1,
+		memoryIds: ReadonlySet<string>,
+		cueIds: ReadonlySet<string>,
+		edgeIds: ReadonlySet<string>,
+	): Promise<{ memories: MemoryIndexMemoryV1[]; cues: MemoryIndexCueV1[]; edges: MemoryIndexEdgeV1[] }> {
+		const memoryReferences = readModel.memories.filter((reference) => memoryIds.has(reference.memoryId));
+		const cueReferences = readModel.cues.filter((reference) => cueIds.has(reference.cueId));
+		const edgeReferences = readModel.edges.filter((reference) => edgeIds.has(reference.edgeId));
+		const cueIdSet = new Set(readModel.cues.map((reference) => reference.cueId));
+		const accessByMemoryId = new Map(readModel.accesses.map((access) => [access.memoryId, access]));
+		const [memories, cues, edges] = await Promise.all([
+			this.store.readMemoriesByReferences(memoryReferences, (cueId) => cueIdSet.has(cueId)),
+			this.store.readCuesByReferences(cueReferences),
+			this.store.readEdgesByReferences(edgeReferences),
+		]);
+		return {
+			memories: memories.map((memory) => {
+				const access = accessByMemoryId.get(memory.revision.memoryId);
+				return {
+					memoryId: memory.revision.memoryId,
+					revision: memory.revision.revision,
+					artifactId: memory.artifactId,
+					kind: memory.revision.kind,
+					title: memory.revision.title,
+					statement: memory.revision.statement,
+					applicability: memory.revision.applicability,
+					trust: memory.state.trust,
+					freshness: memory.state.freshness,
+					lifecycle: memory.state.lifecycle,
+					effectiveFrom: memory.revision.effectiveFrom,
+					effectiveTo: memory.revision.effectiveTo,
+					recordedAt: memory.revision.provenance.recordedAt,
+					sourceDigest: memory.revision.sourceDigest,
+					evidenceIds: memory.revision.evidenceRefs.map((evidence) => evidence.evidenceId),
+					accessCount: access?.accessCount ?? 0,
+					lastAccessedAt: access?.lastAccessedAt ?? null,
+				};
+			}),
+			cues: cues.map(({ cue, artifactId }) => ({
+				cueId: cue.cueId,
+				revision: cue.revision,
+				artifactId,
+				kind: cue.kind,
+				key: cue.key,
+				label: cue.label,
+				aliases: cue.aliases,
+			})),
+			edges: edges.map(({ edge, artifactId }) => ({
+				edgeId: edge.edgeId,
+				artifactId,
+				fromKind: edge.from.kind,
+				fromId: edge.from.id,
+				toKind: edge.to.kind,
+				toId: edge.to.id,
+				relation: edge.relation,
+				effectiveFrom: edge.effectiveFrom,
+				effectiveTo: edge.effectiveTo,
+			})),
+		};
+	}
+
+	private async applyIndexDelta(
+		expectedHead: MemoryReadModelV1["head"],
+		readModel: MemoryReadModelV1,
+		changes: {
+			memoryIds?: Iterable<string>;
+			cueIds?: Iterable<string>;
+			edgeIds?: Iterable<string>;
+			removeMemoryIds?: Iterable<string>;
+			removeCueIds?: Iterable<string>;
+			removeEdgeIds?: Iterable<string>;
+			historyCues?: Iterable<MemoryIndexHistoryCueV1>;
+		},
+	): Promise<boolean> {
+		if (!this.index) return false;
+		try {
+			const entities = await this.indexEntities(
+				readModel,
+				new Set(changes.memoryIds ?? []),
+				new Set(changes.cueIds ?? []),
+				new Set(changes.edgeIds ?? []),
+			);
+			const delta: MemoryIndexDeltaV1 = {
+				expectedHead,
+				head: readModel.head,
+				...entities,
+				historyCues: [...(changes.historyCues ?? [])],
+				removeMemoryIds: [...(changes.removeMemoryIds ?? [])],
+				removeCueIds: [...(changes.removeCueIds ?? [])],
+				removeEdgeIds: [...(changes.removeEdgeIds ?? [])],
+			};
+			await this.index.applyDelta(delta);
+			this.lastIndexState = "current";
+			return true;
+		} catch {
+			await this.index.close().catch(() => {});
+			this.index = undefined;
+			this.lastIndexState = "absent";
+			return false;
+		}
+	}
+
+	async synchronizeHistoryCues(
+		cues: readonly MemoryIndexHistoryCueV1[],
+		options: { newCueIds?: readonly string[]; forceRebuild?: boolean } = {},
+	): Promise<void> {
+		const next = [...cues].sort((left, right) => left.cueId.localeCompare(right.cueId));
+		const nextCueIds = new Set(next.map((cue) => cue.cueId));
+		if (nextCueIds.size !== next.length) throw new MemoryValidationError("Memory history cue IDs must be unique");
+		const newCueIds = new Set(options.newCueIds ?? []);
+		if ([...newCueIds].some((cueId) => !nextCueIds.has(cueId))) {
+			throw new MemoryValidationError("Memory history cue delta references an unknown cue");
+		}
+		await this.withProjectionMutation(async () => {
+			this.setHistoryCues(next);
+			const readModel = (await this.store.loadReadModelSnapshot()).readModel;
+			if (options.forceRebuild) {
+				await this.rebuildIndex(readModel);
+				return;
+			}
+			const delta = next.filter((cue) => newCueIds.has(cue.cueId));
+			const expectedExistingCount = next.length - delta.length;
+			if (!(await this.adoptMatchingIndex(readModel, expectedExistingCount, true))) {
+				await this.rebuildIndex(readModel);
+				return;
+			}
+			if (delta.length > 0) {
+				if (!(await this.applyIndexDelta(readModel.head, readModel, { historyCues: delta }))) {
+					await this.rebuildIndex(readModel);
+					return;
+				}
+			}
+			this.indexedHistoryGeneration = this.historyGeneration;
+			this.lastIndexState = "current";
+		});
+	}
+
+	async applyProposal(proposalArtifactId: string, options: MemoryApplyOptions): Promise<MemoryApplyResultV1> {
+		return await this.withProjectionMutation(async () => {
+			const updateIndex = await this.indexCanApply(options.expectedHead);
+			const result = await this.store.applyProposal(proposalArtifactId, options);
+			if (updateIndex) {
+				const readModel = (await this.store.loadReadModelSnapshot()).readModel;
+				const purgedMemoryIds = new Set((result.write.event.payload.purges ?? []).map((purge) => purge.memoryId));
+				await this.applyIndexDelta(options.expectedHead, readModel, {
+					memoryIds: result.write.event.payload.revisions
+						.map((reference) => reference.memoryId)
+						.filter((memoryId) => !purgedMemoryIds.has(memoryId)),
+					cueIds: result.write.event.payload.cues.map((reference) => reference.cueId),
+					edgeIds: result.write.event.payload.edges.map((reference) => reference.edgeId),
+					removeMemoryIds: purgedMemoryIds,
+				});
+			}
+			return result;
+		});
 	}
 
 	private indexRebuildPlan(
@@ -503,6 +669,8 @@ export class MemoryService {
 					toKind: edge.to.kind,
 					toId: edge.to.id,
 					relation: edge.relation,
+					effectiveFrom: edge.effectiveFrom,
+					effectiveTo: edge.effectiveTo,
 				})),
 				historyCues: [],
 			};
@@ -517,7 +685,34 @@ export class MemoryService {
 		}
 	}
 
-	private async existingIndexMatches(readModel: MemoryReadModelV1): Promise<boolean> {
+	private async adoptMatchingIndex(
+		readModel: MemoryReadModelV1,
+		historyCueCount: number,
+		allowStaleHistoryGeneration = false,
+	): Promise<boolean> {
+		if (this.index) {
+			const staleHistoryGeneration = this.indexedHistoryGeneration !== this.historyGeneration;
+			try {
+				const [status, integrity] = await Promise.all([this.index.status(), this.index.integrityCheck()]);
+				if (
+					(allowStaleHistoryGeneration || !staleHistoryGeneration) &&
+					integrity === "ok" &&
+					status.head.sequence === readModel.head.sequence &&
+					status.head.hash === readModel.head.hash &&
+					status.memoryCount === readModel.memories.length &&
+					status.cueCount === readModel.cues.length &&
+					status.edgeCount === readModel.edges.length &&
+					status.historyCueCount === historyCueCount
+				) {
+					return true;
+				}
+			} catch {
+				// Close and retry from the on-disk projection below.
+			}
+			await this.index.close().catch(() => {});
+			this.index = undefined;
+			if (staleHistoryGeneration && !allowStaleHistoryGeneration) return false;
+		}
 		try {
 			await stat(this.indexPath);
 		} catch (error) {
@@ -534,11 +729,10 @@ export class MemoryService {
 				status.memoryCount === readModel.memories.length &&
 				status.cueCount === readModel.cues.length &&
 				status.edgeCount === readModel.edges.length &&
-				status.historyCueCount === 0 &&
-				this.historyGeneration === 0
+				status.historyCueCount === historyCueCount
 			) {
 				this.index = candidate;
-				this.indexedHistoryGeneration = 0;
+				this.indexedHistoryGeneration = this.historyGeneration;
 				this.lastIndexState = "current";
 				return true;
 			}
@@ -547,6 +741,15 @@ export class MemoryService {
 		}
 		await candidate.close();
 		return false;
+	}
+
+	private async ensureIndexForReadModel(readModel: MemoryReadModelV1): Promise<MemoryIndexWorkerClient> {
+		if (!(await this.adoptMatchingIndex(readModel, this.historyCues.length))) {
+			await this.rebuildIndex(readModel);
+		}
+		if (!this.index) throw new MemoryValidationError("Memory index is unavailable after rebuild");
+		this.indexedHistoryGeneration = this.historyGeneration;
+		return this.index;
 	}
 
 	private async rebuildIndex(readModel: MemoryReadModelV1): Promise<void> {
@@ -616,8 +819,7 @@ export class MemoryService {
 					// Rebuild the disposable projection below.
 				}
 			}
-			if (!this.index && (await this.existingIndexMatches(readModel))) continue;
-			await this.rebuildIndex(readModel);
+			await this.ensureIndexForReadModel(readModel);
 			rebuilt = true;
 		}
 	}
@@ -737,7 +939,7 @@ export class MemoryService {
 			actor: "user",
 			timestamp: recordedAt,
 		});
-		const applied = await this.store.applyProposal(recorded.proposalArtifactId, {
+		const applied = await this.applyProposal(recorded.proposalArtifactId, {
 			eventId: `evt_memory_apply_${suffix}`,
 			idempotencyKey: `memory:apply:${proposal.proposalId}`,
 			expectedHead: recorded.write.head,
@@ -785,6 +987,9 @@ export class MemoryService {
 			graphDepth: input.graphDepth ?? 1,
 		});
 		const offset = input.cursor ? decodeCursor(input.cursor, digest) : 0;
+		if (input.asOf) {
+			return await this.searchAtHistoricalRevision(input, query, limit, offset, digest);
+		}
 		const result = await this.withProjectionOperation(async () => {
 			const { index } = await this.ensureIndex();
 			return await index.search({
@@ -800,10 +1005,125 @@ export class MemoryService {
 		return {
 			items: result.memories,
 			historyCues: result.historyCues,
-			nextCursor:
-				result.memories.length === limit || result.historyCues.length === limit
-					? encodeCursor(digest, offset + limit)
-					: null,
+			nextCursor: result.hasMore ? encodeCursor(digest, offset + limit) : null,
+		};
+	}
+
+	private async searchAtHistoricalRevision(
+		input: MemorySearchInputV1,
+		query: string,
+		limit: number,
+		offset: number,
+		digest: string,
+	): Promise<MemorySearchResultV1> {
+		const asOf = input.asOf!;
+		if (Number.isNaN(Date.parse(asOf)))
+			throw new MemoryValidationError("Memory search asOf must be an ISO timestamp");
+		const normalizedQuery = memorySearchText(query);
+		const tokens = memorySearchTokens(query);
+		const temporal = isTemporalMemoryQuery(query);
+		const historical = (await this.store.readMemoriesAt(asOf)).filter(
+			(memory) =>
+				memory.revision.lifecycle === "active" && (!input.kinds || input.kinds.includes(memory.revision.kind)),
+		);
+		const ranked = historical
+			.map((memory) => {
+				const text = memorySearchText(
+					`${memory.revision.title}\n${memory.revision.statement}\n${memory.revision.applicability}`,
+				);
+				const tokenHits = tokens.filter((token) => text.includes(token)).length;
+				const relevance = text.includes(normalizedQuery) ? 2 : tokens.length > 0 ? tokenHits / tokens.length : 0;
+				return { memory, relevance };
+			})
+			.filter((entry) => entry.relevance > 0 || temporal)
+			.sort(
+				(left, right) =>
+					right.relevance - left.relevance ||
+					Date.parse(right.memory.revision.provenance.recordedAt) -
+						Date.parse(left.memory.revision.provenance.recordedAt) ||
+					left.memory.revision.memoryId.localeCompare(right.memory.revision.memoryId),
+			)
+			.slice(0, 200);
+
+		const { index, historyCues } = await this.withProjectionOperation(async () => {
+			const { index } = await this.ensureIndex();
+			const historyCues: MemoryHistoryCueCandidateV1[] = [];
+			if (input.includeHistoryCues) {
+				for (let historyOffset = 0; historyOffset < 200; historyOffset += 50) {
+					const page = await index.search({
+						query,
+						kinds: [],
+						asOf,
+						includeHistoryCues: true,
+						limit: 50,
+						offset: historyOffset,
+						graphDepth: 0,
+					});
+					historyCues.push(...page.historyCues);
+					if (!page.hasMore) break;
+				}
+			}
+			return { index, historyCues };
+		});
+		const candidates: MemoryIndexCandidateV1[] = [];
+		for (const [rank, entry] of ranked.entries()) {
+			let relations: MemoryIndexCandidateV1["relations"] = [];
+			if ((input.graphDepth ?? 1) > 0) {
+				try {
+					const graph = await index.graph({
+						rootMemoryId: entry.memory.revision.memoryId,
+						depth: input.graphDepth === 2 ? 2 : 1,
+						asOf,
+					});
+					relations = graph.edges
+						.filter(
+							(edge) =>
+								(edge.from.kind === "memory" && edge.from.id === entry.memory.revision.memoryId) ||
+								(edge.to.kind === "memory" && edge.to.id === entry.memory.revision.memoryId),
+						)
+						.map((edge) => {
+							const other =
+								edge.from.kind === "memory" && edge.from.id === entry.memory.revision.memoryId
+									? edge.to
+									: edge.from;
+							return { edgeId: edge.edgeId, relation: edge.relation, otherKind: other.kind, otherId: other.id };
+						});
+				} catch {
+					// A purged or projection-missing historical root can still be returned from its verified revision artifact.
+				}
+			}
+			candidates.push({
+				memoryId: entry.memory.revision.memoryId,
+				revision: entry.memory.revision.revision,
+				artifactId: entry.memory.artifactId,
+				kind: entry.memory.revision.kind,
+				title: entry.memory.revision.title,
+				state: entry.memory.state,
+				effectiveFrom: entry.memory.revision.effectiveFrom,
+				effectiveTo: entry.memory.revision.effectiveTo,
+				recordedAt: entry.memory.revision.provenance.recordedAt,
+				relations,
+				score: entry.relevance + 1 / (60 + rank + 1),
+			});
+		}
+		const merged = [
+			...candidates.map((value) => ({ kind: "memory" as const, id: value.memoryId, score: value.score, value })),
+			...historyCues.map((value) => ({ kind: "history" as const, id: value.cueId, score: value.score, value })),
+		]
+			.sort(
+				(left, right) =>
+					right.score - left.score || left.kind.localeCompare(right.kind) || left.id.localeCompare(right.id),
+			)
+			.slice(0, 200);
+		const page = merged.slice(offset, offset + limit);
+		return {
+			items: page
+				.filter((entry): entry is Extract<(typeof page)[number], { kind: "memory" }> => entry.kind === "memory")
+				.map((entry) => entry.value),
+			historyCues: page
+				.filter((entry): entry is Extract<(typeof page)[number], { kind: "history" }> => entry.kind === "history")
+				.map((entry) => entry.value),
+			nextCursor: offset + limit < merged.length ? encodeCursor(digest, offset + limit) : null,
 		};
 	}
 
@@ -815,20 +1135,14 @@ export class MemoryService {
 		) {
 			throw new MemoryValidationError("Memory read requires 1 to 5 unique memory IDs");
 		}
-		const memories = await this.store.readMemories(input.memoryIds);
+		const memories = input.asOf
+			? await Promise.all(
+					input.memoryIds.map(async (memoryId) => await this.store.readMemoryAt(memoryId, input.asOf!)),
+				)
+			: await this.store.readMemories(input.memoryIds);
 		for (const memory of memories) {
-			for (const evidence of memory.revision.evidenceRefs) await this.validateEvidenceOwnership(evidence);
-		}
-		if (input.asOf) {
-			const asOf = Date.parse(input.asOf);
-			if (Number.isNaN(asOf)) throw new MemoryValidationError("Memory asOf must be an ISO timestamp");
-			for (const memory of memories) {
-				if (
-					asOf < Date.parse(memory.revision.effectiveFrom) ||
-					(memory.revision.effectiveTo !== null && asOf >= Date.parse(memory.revision.effectiveTo))
-				) {
-					throw new MemoryValidationError(`Memory is not effective at asOf: ${memory.revision.memoryId}`);
-				}
+			for (const evidence of memory.revision.evidenceRefs) {
+				await validateMemoryEvidenceOwnership(this.projectRoot, evidence);
 			}
 		}
 		return { memories };
@@ -839,10 +1153,12 @@ export class MemoryService {
 		revision?: number;
 		evidenceIds?: readonly string[];
 	}): Promise<MemoryEvidenceExpansionV1> {
-		const memory = await this.store.readMemory(input.memoryId);
-		for (const evidence of memory.revision.evidenceRefs) await this.validateEvidenceOwnership(evidence);
-		if (input.revision !== undefined && input.revision !== memory.revision.revision) {
-			throw new MemoryValidationError("Historical revision expansion requires the timeline API");
+		const memory =
+			input.revision === undefined
+				? await this.store.readMemory(input.memoryId)
+				: await this.store.readMemoryRevision(input.memoryId, input.revision);
+		for (const evidence of memory.revision.evidenceRefs) {
+			await validateMemoryEvidenceOwnership(this.projectRoot, evidence);
 		}
 		const selected = input.evidenceIds
 			? memory.revision.evidenceRefs.filter((evidence) => input.evidenceIds?.includes(evidence.evidenceId))
@@ -857,7 +1173,7 @@ export class MemoryService {
 			let unavailableReason: string | null = null;
 			if (reference.artifactId) content = (await this.artifacts.read(reference.artifactId)).content;
 			else if (reference.sourceType === "compaction") {
-				content = stableJsonStringify(await this.resolveCompactionEvidence(reference));
+				content = stableJsonStringify(await resolveMemoryCompactionEvidence(this.projectRoot, reference));
 			} else if (reference.sourceType === "git")
 				content = await readGitEvidence(this.projectRoot, reference.locator);
 			else unavailableReason = "Evidence has no Artifact Store object and must be resolved by its source domain.";
@@ -881,30 +1197,14 @@ export class MemoryService {
 
 	async graph(memoryId: string, depth: 1 | 2 = 1): Promise<MemoryGraphResultV1> {
 		if (depth !== 1 && depth !== 2) throw new MemoryValidationError("Memory graph depth must be 1 or 2");
-		await this.store.readMemory(memoryId);
-		const allEdges = await this.store.readEdges();
-		let frontier = new Set([`memory:${memoryId}`]);
-		const nodes = new Set(frontier);
-		const selectedEdges = new Map<string, (typeof allEdges)[number]>();
-		for (let level = 0; level < depth; level++) {
-			const next = new Set<string>();
-			for (const edge of allEdges) {
-				const from = `${edge.edge.from.kind}:${edge.edge.from.id}`;
-				const to = `${edge.edge.to.kind}:${edge.edge.to.id}`;
-				if (!frontier.has(from) && !frontier.has(to)) continue;
-				selectedEdges.set(edge.edge.edgeId, edge);
-				nodes.add(from);
-				nodes.add(to);
-				next.add(from);
-				next.add(to);
-			}
-			frontier = next;
-		}
-		const memoryIds = [...nodes]
-			.filter((node) => node.startsWith("memory:"))
-			.map((node) => node.slice("memory:".length));
-		const cueIds = [...nodes].filter((node) => node.startsWith("cue:")).map((node) => node.slice("cue:".length));
-		const [memories, cues] = await Promise.all([this.store.readMemories(memoryIds), this.store.readCues(cueIds)]);
+		const graph = await this.withProjectionOperation(async () => {
+			const { index } = await this.ensureIndex();
+			return await index.graph({ rootMemoryId: memoryId, depth });
+		});
+		const [memories, cues] = await Promise.all([
+			this.store.readMemories(graph.memoryIds),
+			this.store.readCues(graph.cueIds),
+		]);
 		return {
 			rootMemoryId: memoryId,
 			depth,
@@ -917,18 +1217,13 @@ export class MemoryService {
 				})),
 				...cues.map(({ cue }) => ({ kind: "cue" as const, id: cue.cueId, label: cue.label, key: cue.key })),
 			],
-			edges: [...selectedEdges.values()].map(({ edge }) => ({
-				edgeId: edge.edgeId,
-				from: edge.from,
-				to: edge.to,
-				relation: edge.relation,
-			})),
+			edges: graph.edges,
 		};
 	}
 
 	async refresh(memoryId: string): Promise<MemoryReadResultV1> {
 		await this.store.readMemory(memoryId);
-		await this.withProjectionOperation(async () => {
+		await this.withProjectionMutation(async () => {
 			await this.rebuildIndex((await this.store.loadReadModelSnapshot()).readModel);
 			await this.ensureIndex();
 		});
@@ -944,13 +1239,20 @@ export class MemoryService {
 		const memory = await this.store.readMemory(memoryId);
 		const replay = await this.store.replay();
 		const operationId = randomUUID().replaceAll("-", "");
-		await this.store.changeMemoryLifecycle(memoryId, memory.revision.revision, lifecycle, reason, {
-			eventId: `evt_memory_lifecycle_${operationId}`,
-			idempotencyKey: `memory:lifecycle:${operationId}`,
-			expectedHead: replay.head,
-			actor: "user",
-			timestamp: new Date().toISOString(),
-			confirmed: true,
+		await this.withProjectionMutation(async () => {
+			const updateIndex = await this.indexCanApply(replay.head);
+			await this.store.changeMemoryLifecycle(memoryId, memory.revision.revision, lifecycle, reason, {
+				eventId: `evt_memory_lifecycle_${operationId}`,
+				idempotencyKey: `memory:lifecycle:${operationId}`,
+				expectedHead: replay.head,
+				actor: "user",
+				timestamp: new Date().toISOString(),
+				confirmed: true,
+			});
+			if (updateIndex) {
+				const readModel = (await this.store.loadReadModelSnapshot()).readModel;
+				await this.applyIndexDelta(replay.head, readModel, { memoryIds: [memoryId] });
+			}
 		});
 		return await this.store.readMemory(memoryId);
 	}
@@ -960,13 +1262,20 @@ export class MemoryService {
 		const memory = await this.store.readMemory(memoryId);
 		const replay = await this.store.replay();
 		const operationId = randomUUID().replaceAll("-", "");
-		await this.store.detachMemoryEvidence(memoryId, memory.revision.revision, evidenceId, reason, {
-			eventId: `evt_memory_detach_${operationId}`,
-			idempotencyKey: `memory:detach:${operationId}`,
-			expectedHead: replay.head,
-			actor: "user",
-			timestamp: new Date().toISOString(),
-			confirmed: true,
+		await this.withProjectionMutation(async () => {
+			const updateIndex = await this.indexCanApply(replay.head);
+			await this.store.detachMemoryEvidence(memoryId, memory.revision.revision, evidenceId, reason, {
+				eventId: `evt_memory_detach_${operationId}`,
+				idempotencyKey: `memory:detach:${operationId}`,
+				expectedHead: replay.head,
+				actor: "user",
+				timestamp: new Date().toISOString(),
+				confirmed: true,
+			});
+			if (updateIndex) {
+				const readModel = (await this.store.loadReadModelSnapshot()).readModel;
+				await this.applyIndexDelta(replay.head, readModel, { memoryIds: [memoryId] });
+			}
 		});
 		return await this.store.readMemory(memoryId);
 	}
@@ -976,13 +1285,21 @@ export class MemoryService {
 		const memory = await this.store.readMemory(memoryId);
 		const replay = await this.store.replay();
 		const operationId = randomUUID().replaceAll("-", "");
-		return await this.store.purgeMemory(memoryId, memory.revision.revision, reason, {
-			eventId: `evt_memory_purge_${operationId}`,
-			idempotencyKey: `memory:purge:${operationId}`,
-			expectedHead: replay.head,
-			actor: "user",
-			timestamp: new Date().toISOString(),
-			confirmed: true,
+		return await this.withProjectionMutation(async () => {
+			const updateIndex = await this.indexCanApply(replay.head);
+			const result = await this.store.purgeMemory(memoryId, memory.revision.revision, reason, {
+				eventId: `evt_memory_purge_${operationId}`,
+				idempotencyKey: `memory:purge:${operationId}`,
+				expectedHead: replay.head,
+				actor: "user",
+				timestamp: new Date().toISOString(),
+				confirmed: true,
+			});
+			if (updateIndex) {
+				const readModel = (await this.store.loadReadModelSnapshot()).readModel;
+				await this.applyIndexDelta(replay.head, readModel, { removeMemoryIds: [memoryId] });
+			}
+			return result;
 		});
 	}
 
@@ -991,7 +1308,7 @@ export class MemoryService {
 		options: MemoryMutationOptions,
 	): Promise<MemoryWriteResult<"access_recorded"> | null> {
 		if (!(await this.getConfig()).enabled) return null;
-		return await this.withProjectionOperation(async () => {
+		return await this.withProjectionMutation(async () => {
 			let updateIndex = false;
 			if (this.index) {
 				try {
@@ -1017,291 +1334,6 @@ export class MemoryService {
 			}
 			return write;
 		});
-	}
-
-	private async resolveCompactionEvidence(
-		evidence: Extract<EvidenceRefV1, { sourceType: "compaction" }>,
-	): Promise<Record<string, unknown>> {
-		const invalid = (message: string): never => {
-			throw new MemoryValidationError(`Memory evidence ${evidence.evidenceId} ${message}`);
-		};
-		const chains = new SessionChainStore(this.projectRoot);
-		for (const chain of await chains.listChains()) {
-			const replay = await chains.replayChain(chain.chainId);
-			for (const branch of replay.branches) {
-				for (const segment of branch.segments) {
-					if (segment.segmentId !== evidence.locator.sessionId) continue;
-					const path =
-						segment.location.kind === "external-root"
-							? resolve(segment.location.absolutePath)
-							: join(
-									this.projectRoot,
-									".pi-xk",
-									"sessions",
-									"chains",
-									chain.chainId,
-									"branches",
-									branch.branchId,
-									"segments",
-									segment.location.fileName,
-								);
-					let raw: string;
-					try {
-						raw = await readFile(path, "utf8");
-					} catch (error) {
-						if (isRecord(error) && error.code === "ENOENT") {
-							invalid("Session compaction source file is missing");
-						}
-						throw error;
-					}
-					let sessionHeaderMatches = false;
-					let compaction: Record<string, unknown> | undefined;
-					for (const line of raw.split("\n")) {
-						if (!line) continue;
-						let entry: unknown;
-						try {
-							entry = JSON.parse(line) as unknown;
-						} catch {
-							invalid("Session compaction source JSONL is malformed");
-						}
-						if (!isRecord(entry)) continue;
-						if (entry.type === "session" && entry.id === evidence.locator.sessionId) {
-							sessionHeaderMatches = true;
-						}
-						if (
-							entry.type === "compaction" &&
-							entry.id === evidence.locator.entryId &&
-							entry.title === evidence.locator.title
-						) {
-							compaction = entry;
-						}
-					}
-					if (!sessionHeaderMatches) invalid("does not match its Session header");
-					if (evidence.sourceId !== evidence.locator.entryId && evidence.sourceId !== evidence.locator.sessionId) {
-						invalid("does not match a Session compaction entry");
-					}
-					return compaction ?? invalid("does not match a Session compaction entry");
-				}
-			}
-		}
-		return invalid("does not match a Session compaction entry");
-	}
-
-	private async validateEvidenceOwnership(evidence: EvidenceRefV1): Promise<void> {
-		const invalid = (message: string): never => {
-			throw new MemoryValidationError(`Memory evidence ${evidence.evidenceId} ${message}`);
-		};
-		if (evidence.sourceType === "explicit") {
-			if (evidence.sourceId !== evidence.locator.commandId) invalid("does not match its explicit command");
-			const artifactId = evidence.artifactId;
-			if (!artifactId) {
-				throw new MemoryValidationError(`Memory evidence ${evidence.evidenceId} has no explicit artifact`);
-			}
-			const artifact = await this.artifacts.read(artifactId);
-			if (
-				evidence.sourceDigest !== artifactId ||
-				artifact.metadata.contentType !== "text/plain" ||
-				artifact.metadata.producer !== EXPLICIT_MEMORY_PROMPT_VERSION ||
-				!artifact.metadata.sourceIds.includes(evidence.locator.commandId)
-			) {
-				invalid("artifact is not owned by its explicit command");
-			}
-			return;
-		}
-		if (evidence.sourceType === "goal_checkpoint" || evidence.sourceType === "goal_completion") {
-			const goalId = evidence.locator.goalId;
-			const eventId =
-				evidence.sourceType === "goal_checkpoint" ? evidence.locator.checkpointEventId : evidence.locator.eventId;
-			const replay = await new GoalStore(this.projectRoot).replayGoal(goalId);
-			const event = replay.events.find((candidate) => candidate.eventId === eventId);
-			if (!event) throw new MemoryValidationError(`Memory evidence ${evidence.evidenceId} has no Goal event`);
-			if (evidence.sourceId !== eventId) invalid("does not match its Goal event");
-			if (
-				(evidence.sourceType === "goal_checkpoint" && event.eventType !== "goal_checkpointed") ||
-				(evidence.sourceType === "goal_completion" && event.eventType !== "goal_ended")
-			) {
-				invalid("has the wrong Goal event type");
-			}
-			const artifactId = evidence.artifactId;
-			if (!artifactId) {
-				throw new MemoryValidationError(`Memory evidence ${evidence.evidenceId} has no Goal source artifact`);
-			}
-			const stored = await this.artifacts.read(artifactId);
-			if (
-				evidence.sourceDigest !== artifactId ||
-				stored.metadata.contentType !== "application/json" ||
-				stored.metadata.producer !== "pi-xk.memory-goal-source.v1" ||
-				!stored.metadata.sourceIds.includes(goalId) ||
-				!stored.metadata.sourceIds.includes(eventId)
-			) {
-				invalid("Goal source artifact metadata or digest is invalid");
-			}
-			let source: unknown;
-			try {
-				source = JSON.parse(stored.content) as unknown;
-			} catch {
-				invalid("Goal source artifact is not JSON");
-			}
-			if (!isRecord(source)) {
-				throw new MemoryValidationError(
-					`Memory evidence ${evidence.evidenceId} Goal source artifact schema is invalid`,
-				);
-			}
-			if (!exactKeys(source, ["schema", "goalId", "contractRevision", "event", "state"])) {
-				invalid("Goal source artifact schema is invalid");
-			}
-			let contractRevision: number | null = null;
-			for (const candidate of replay.events) {
-				if (candidate.sequence > event.sequence) break;
-				if (candidate.eventType === "goal_created" || candidate.eventType === "goal_contract_updated") {
-					contractRevision =
-						candidate.payload.contract.schema === "pi-xk.goal.contract.v3"
-							? candidate.payload.contract.revision
-							: null;
-				}
-			}
-			if (
-				source.schema !== "pi-xk.memory-goal-source.v1" ||
-				source.goalId !== goalId ||
-				source.contractRevision !== contractRevision ||
-				typeof source.state !== "string" ||
-				stableJsonStringify(source.event) !== stableJsonStringify(event)
-			) {
-				invalid("Goal source artifact does not preserve the located event");
-			}
-			return;
-		}
-		if (evidence.sourceType === "chain_summary") {
-			const locator = evidence.locator;
-			const chains = new SessionChainStore(this.projectRoot);
-			const replay = await chains.replayChain(locator.chainId);
-			const branch = replay.branches.find((candidate) => candidate.branchId === locator.branchId);
-			if (!branch) {
-				throw new MemoryValidationError(`Memory evidence ${evidence.evidenceId} has no Session Chain branch`);
-			}
-			const artifactId = evidence.artifactId;
-			if (!artifactId) {
-				throw new MemoryValidationError(
-					`Memory evidence ${evidence.evidenceId} has no Session Chain summary artifact`,
-				);
-			}
-			if (evidence.sourceDigest !== artifactId) invalid("summary sourceDigest does not match its artifact");
-			if (locator.level === "l1") {
-				const segment = branch.segments.find(
-					(candidate) => candidate.segmentId === locator.segmentId && candidate.ordinal === locator.ordinal,
-				);
-				if (!segment) {
-					throw new MemoryValidationError(`Memory evidence ${evidence.evidenceId} has no matching L1 Segment`);
-				}
-				if (!segment.seal || segment.seal.summaryArtifactId !== artifactId || evidence.sourceId !== artifactId) {
-					invalid("does not match its sealed L1 Segment");
-				}
-				const summary = await chains.readSegmentSummary(artifactId);
-				const successor = replay.branches
-					.flatMap((candidate) => candidate.segments)
-					.find((candidate) => candidate.segmentId === summary.targetSegmentId);
-				if (
-					summary.chainId !== locator.chainId ||
-					summary.branchId !== locator.branchId ||
-					summary.sourceSegmentId !== locator.segmentId ||
-					summary.sourceLeafId !== summary.sourceRange.lastEntryId ||
-					summary.baseSummaryArtifactId !== segment.summaryInArtifactId ||
-					!successor ||
-					successor.predecessorSegmentId !== segment.segmentId ||
-					successor.summaryInArtifactId !== artifactId
-				) {
-					invalid("L1 summary artifact provenance does not match the chain topology");
-				}
-			} else {
-				const rollup = branch.rollups.find(
-					(candidate) =>
-						candidate.windowIndex === locator.windowIndex &&
-						candidate.artifactId === artifactId &&
-						candidate.eventId === evidence.sourceId,
-				);
-				if (!rollup) {
-					throw new MemoryValidationError(`Memory evidence ${evidence.evidenceId} has no published L2 Rollup`);
-				}
-				const artifact = await chains.readChainRollup(artifactId);
-				const segments = branch.segments.filter(
-					(candidate) => candidate.ordinal >= rollup.startOrdinal && candidate.ordinal <= rollup.endOrdinal,
-				);
-				const summaryArtifactIds = segments.map((candidate) => candidate.seal?.summaryArtifactId ?? "");
-				const expectedDigest = chainRollupSourceDigest({
-					chainId: locator.chainId,
-					branchId: locator.branchId,
-					windowIndex: rollup.windowIndex,
-					startOrdinal: rollup.startOrdinal,
-					endOrdinal: rollup.endOrdinal,
-					segmentIds: segments.map((candidate) => candidate.segmentId),
-					summaryArtifactIds,
-				});
-				if (
-					artifact.chainId !== locator.chainId ||
-					artifact.branchId !== locator.branchId ||
-					artifact.windowIndex !== locator.windowIndex ||
-					artifact.startOrdinal !== rollup.startOrdinal ||
-					artifact.endOrdinal !== rollup.endOrdinal ||
-					segments.length !== rollup.endOrdinal - rollup.startOrdinal + 1 ||
-					segments.some((candidate) => candidate.status !== "sealed" || !candidate.seal) ||
-					stableJsonStringify(artifact.segmentIds) !==
-						stableJsonStringify(segments.map((candidate) => candidate.segmentId)) ||
-					stableJsonStringify(artifact.summaryArtifactIds) !== stableJsonStringify(summaryArtifactIds) ||
-					artifact.sourceDigest !== rollup.sourceDigest ||
-					artifact.sourceDigest !== expectedDigest
-				) {
-					invalid("L2 Rollup artifact provenance does not match its ordered L1 sources");
-				}
-			}
-			return;
-		}
-		if (evidence.sourceType === "task_result") {
-			const artifactId = evidence.artifactId;
-			if (!artifactId) {
-				throw new MemoryValidationError(`Memory evidence ${evidence.evidenceId} has no Task result artifact`);
-			}
-			if (evidence.sourceDigest !== artifactId) invalid("Task sourceDigest does not match its artifact");
-			const inspection = await new TaskStore(this.projectRoot).inspectTask(evidence.locator.taskId);
-			const event = inspection.replay.events.find(
-				(candidate) =>
-					candidate.eventType !== "task_created" &&
-					candidate.eventType !== "task_started" &&
-					candidate.payload.resultArtifactId === artifactId,
-			);
-			if (!event) {
-				throw new MemoryValidationError(`Memory evidence ${evidence.evidenceId} has no terminal Task result`);
-			}
-			if (event.eventType === "task_created" || event.eventType === "task_started") {
-				throw new MemoryValidationError(
-					`Memory evidence ${evidence.evidenceId} does not match a terminal Task result`,
-				);
-			}
-			if (evidence.sourceId !== event.eventId && evidence.sourceId !== evidence.locator.taskId) {
-				invalid("does not match a terminal Task result");
-			}
-			if (
-				inspection.resultDiagnostic !== "valid" ||
-				!inspection.result ||
-				inspection.result.taskId !== evidence.locator.taskId ||
-				inspection.result.status !== event.payload.status ||
-				inspection.replay.resultArtifactId !== artifactId
-			) {
-				invalid("Task result artifact schema or terminal provenance is invalid");
-			}
-			return;
-		}
-		if (evidence.sourceType === "compaction") {
-			await this.resolveCompactionEvidence(evidence);
-			return;
-		}
-		if (evidence.sourceId !== evidence.locator.baselineCommit) {
-			invalid("does not match its Git baseline");
-		}
-		try {
-			await verifyGitEvidenceLocator(this.projectRoot, evidence.locator);
-		} catch (error) {
-			invalid(`Git source is invalid: ${error instanceof Error ? error.message : String(error)}`);
-		}
 	}
 
 	async doctor(mode: "quick" | "deep" = "quick"): Promise<MemoryDoctorReportV1> {
@@ -1368,6 +1400,31 @@ export class MemoryService {
 					: `Memory write lock owner is ${lock.ownerState}.`,
 				repairable: !lock.malformed && lock.ownerState === "missing",
 			});
+		}
+		for (const capture of readModel?.captures ?? []) {
+			if (capture.status === "failed") {
+				diagnostics.push({
+					code: capture.retryable === true ? "capture_failed_retryable" : "capture_failed_non_retryable",
+					message: `Memory capture ${capture.captureId} failed with ${capture.errorCode ?? "unknown_error"}; ${
+						capture.retryable === true
+							? "the next matching stable-source boundary may retry it"
+							: "its source or configuration requires explicit correction"
+					}.`,
+					repairable: false,
+				});
+				continue;
+			}
+			if (capture.status !== "generating") continue;
+			try {
+				await stat(join(this.memoryDirectory, "pending", `${capture.captureId}.json`));
+			} catch (error) {
+				if (!isRecord(error) || error.code !== "ENOENT") throw error;
+				diagnostics.push({
+					code: "capture_indeterminate",
+					message: `Memory capture ${capture.captureId} started generation but has no durable result pointer; do not retry it automatically.`,
+					repairable: false,
+				});
+			}
 		}
 		if ((readModel?.head.sequence ?? 0) > 0 || this.historyCues.length > 0) {
 			await this.withProjectionOperation(async () => {
@@ -1475,7 +1532,9 @@ export class MemoryService {
 				const deep = await this.store.inspectDeep();
 				deepReplay = deep.replay;
 				artifacts = deep.referencedArtifactIds.length;
-				for (const evidence of deep.evidenceRefs) await this.validateEvidenceOwnership(evidence);
+				for (const evidence of deep.evidenceRefs) {
+					await validateMemoryEvidenceOwnership(this.projectRoot, evidence);
+				}
 				if (deep.orphanArtifactIds.length > 0) {
 					diagnostics.push({
 						code: "orphan_memory_artifact",
@@ -1486,7 +1545,7 @@ export class MemoryService {
 				if (deep.purgedArtifactIdsPresent.length > 0) {
 					diagnostics.push({
 						code: "purged_artifact_retained",
-						message: `${deep.purgedArtifactIdsPresent.length} purged Memory revision artifact(s) remain on disk.`,
+						message: `${deep.purgedArtifactIdsPresent.length} unreferenced purged Memory artifact(s) remain on disk.`,
 						repairable: false,
 					});
 				}
@@ -1584,51 +1643,58 @@ export class MemoryService {
 	}
 
 	async repairProjections(): Promise<{ index: MemoryIndexStatusV1; markdownFiles: number }> {
-		return await this.withProjectionOperation(async () => {
-			const readModel = await this.store.rebuildReadModel();
-			await this.rebuildIndex(readModel);
-			const { index } = await this.ensureIndex();
-			const memories = await this.store.readMemories();
-			const projectionsDirectory = join(this.memoryDirectory, "projections");
-			const memoriesDirectory = join(projectionsDirectory, "memories");
-			await rm(memoriesDirectory, { recursive: true, force: true });
-			await mkdir(memoriesDirectory, { recursive: true });
-			const projectedMemories: MemoryProjectionManifestEntryV1[] = [];
-			for (const memory of memories) {
-				const markdown = this.renderMemoryMarkdown(memory);
-				await this.replaceFile(join(memoriesDirectory, `${memory.revision.memoryId}.md`), markdown);
-				projectedMemories.push({
-					memoryId: memory.revision.memoryId,
-					revision: memory.revision.revision,
-					digest: sha256(markdown),
-				});
+		return await this.withProjectionMutation(async () => {
+			for (let attempt = 0; attempt < 3; attempt++) {
+				const readModel = (await this.store.loadReadModelSnapshot()).readModel;
+				const index = await this.ensureIndexForReadModel(readModel);
+				const cueIds = new Set(readModel.cues.map((reference) => reference.cueId));
+				const memories = await this.store.readMemoriesByReferences(readModel.memories, (cueId) =>
+					cueIds.has(cueId),
+				);
+				const projectionsDirectory = join(this.memoryDirectory, "projections");
+				const memoriesDirectory = join(projectionsDirectory, "memories");
+				await rm(memoriesDirectory, { recursive: true, force: true });
+				await mkdir(memoriesDirectory, { recursive: true });
+				const projectedMemories: MemoryProjectionManifestEntryV1[] = [];
+				for (const memory of memories) {
+					const markdown = this.renderMemoryMarkdown(memory);
+					await this.replaceFile(join(memoriesDirectory, `${memory.revision.memoryId}.md`), markdown);
+					projectedMemories.push({
+						memoryId: memory.revision.memoryId,
+						revision: memory.revision.revision,
+						digest: sha256(markdown),
+					});
+				}
+				const indexMarkdown = [
+					"# Pi-XK Memory",
+					"",
+					"> Derived index. Artifact Store objects and the Memory event log are authoritative.",
+					"",
+					...memories.map(
+						(memory) =>
+							`- [${memory.revision.title}](memories/${memory.revision.memoryId}.md) - ${memory.revision.kind}, ${memory.state.trust}, ${memory.state.freshness}, ${memory.state.lifecycle}`,
+					),
+					"",
+				].join("\n");
+				await this.replaceFile(join(projectionsDirectory, "index.md"), indexMarkdown);
+				const manifest: MemoryProjectionManifestV1 = {
+					schema: "pi-xk.memory-projection-manifest.v1",
+					head: readModel.head,
+					memoryCount: memories.length,
+					indexDigest: sha256(indexMarkdown),
+					memories: projectedMemories,
+				};
+				validateProjectionManifest(manifest);
+				await this.replaceFile(
+					join(projectionsDirectory, "manifest.json"),
+					`${JSON.stringify(manifest, null, "\t")}\n`,
+				);
+				const latestHead = (await this.store.loadReadModelSnapshot()).readModel.head;
+				if (latestHead.sequence === readModel.head.sequence && latestHead.hash === readModel.head.hash) {
+					return { index: await index.status(), markdownFiles: memories.length + 1 };
+				}
 			}
-			const indexMarkdown = [
-				"# Pi-XK Memory",
-				"",
-				"> Derived index. Artifact Store objects and the Memory event log are authoritative.",
-				"",
-				...memories.map(
-					(memory) =>
-						`- [${memory.revision.title}](memories/${memory.revision.memoryId}.md) - ${memory.revision.kind}, ${memory.state.trust}, ${memory.state.freshness}, ${memory.state.lifecycle}`,
-				),
-				"",
-			].join("\n");
-			await this.replaceFile(join(projectionsDirectory, "index.md"), indexMarkdown);
-			const head = (await this.store.loadReadModelSnapshot()).readModel.head;
-			const manifest: MemoryProjectionManifestV1 = {
-				schema: "pi-xk.memory-projection-manifest.v1",
-				head,
-				memoryCount: memories.length,
-				indexDigest: sha256(indexMarkdown),
-				memories: projectedMemories,
-			};
-			validateProjectionManifest(manifest);
-			await this.replaceFile(
-				join(projectionsDirectory, "manifest.json"),
-				`${JSON.stringify(manifest, null, "\t")}\n`,
-			);
-			return { index: await index.status(), markdownFiles: memories.length + 1 };
+			throw new MemoryValidationError("Memory facts changed repeatedly while projections were being repaired");
 		});
 	}
 
@@ -1649,6 +1715,7 @@ export class MemoryService {
 						proposed: 0,
 						applied: 0,
 						rejected: 0,
+						skipped: 0,
 					},
 					lock,
 				};
@@ -1662,6 +1729,7 @@ export class MemoryService {
 				proposed: 0,
 				applied: 0,
 				rejected: 0,
+				skipped: 0,
 			};
 			for (const capture of readModel.captures) captures[capture.status] += 1;
 			return {

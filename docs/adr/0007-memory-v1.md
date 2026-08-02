@@ -46,8 +46,9 @@ Session Chain L1/compaction 标题只进入可重建的 History Cue 索引。标
   memory-read-model.checkpoint.json
   memory-config.json
   source-cursors.json
+  history-cue-cursor.json
   index.sqlite
-  locks/                         # capture generation locks
+  locks/                         # capture generation and projection locks
   pending/
   projections/
     manifest.json
@@ -64,6 +65,7 @@ Session Chain L1/compaction 标题只进入可重建的 History Cue 索引。标
 - `capture_scheduled`
 - `generation_started`
 - `capture_failed`
+- `capture_skipped`
 - `proposal_recorded`
 - `memory_change_applied`
 - `proposal_rejected`
@@ -120,11 +122,13 @@ Memory 与 active Goal 冲突时，Memory 只是历史证据；合同变化必�
 2. Goal completion；
 3. 已发布且完整验证的 L2 Rollup。
 
+Goal checkpoint 的捕获内容来自 checkpoint 事件引用的 event-time State artifact，而不是随后仍可变化的 `goal-state.md`。Goal completion 固定使用 `goal_ended` 之前最后一个 `turn_end` checkpoint；Host 同时核对 checkpoint artifact producer/metadata、Goal/Session/leaf identity、合同 revision 和 State grammar。缺失或不一致时来源不具备捕获资格，不能退回读取结束后的可变 State。
+
 用户可通过 `/memory remember <text>` 不经模型直接保存一条 verified 项目 Memory。`/memory backfill [limit]` 显式处理历史 eligible Goal/L2 source，默认最早一个，单次最多 20 个。
 
 普通聊天 turn、L1/compaction 标题、未完成局部步骤、访问热度和无来源猜测不会直接产生 Memory。Task result、compaction 和 Git 已有严格 evidence resolver，但 v1 的自动 source bridge 不主动扫描 Task result 或把 compaction 标题升级为正式 Memory。
 
-第一次启用不会自动付费回填历史。source cursor 只记录已观察的 Goal/Chain event head；Memory facts 仍由 capture event 与 Artifact Store 裁决。
+第一次启用不会自动付费回填历史。source cursor 只记录已观察的 Goal/Chain event head；History Cue 使用独立的可重建 cursor/cache，只扫描新增 sealed Segment，并且仍只保存标题、范围和 source locator，不复制摘要或 compaction 正文。Memory facts 仍由 capture event 与 Artifact Store 裁决。
 
 ### 6. Capture publication 可恢复且不重复未知付费调用
 
@@ -144,8 +148,11 @@ canonical source
 capture identity 由 canonical source、source digest 和 prompt version 确定性派生。每个 capture 使用 generation lock，项目内 publication 串行执行。
 
 - provider 结果 artifact 已存在时，恢复只重新验证和发布，不再次调用模型；
+- 生成器确认来源没有长期记忆价值时写 `capture_skipped`，不把正常空结果伪装成 provider/validation 失败；
 - `proposal_recorded` 已存在且无需确认时，下一次 source boundary 自动完成 publication，不再次调用模型；
 - event 已提交而索引/Markdown 失败时，事实保持已应用，doctor 重建投影；
+- 已知 `capture_failed` 且 `retryable: true`、没有 pending result 时，后续 stable-source scan 可以为同一确定性 capture 开始下一次 generation attempt；source cursor 即使已经前移也会重新发现该来源；
+- `retryable: false` 表示必须先修正来源、provenance、schema 或配置，不会自动重试；
 - `generation_started` 后既没有 result artifact，也没有可证明幂等的 provider 结果时，状态为 indeterminate，禁止自动重复付费调用；
 - 不可重试 schema/provenance/source 错误保留诊断，不通过篡改 source cursor 或 artifact 伪装完成。
 
@@ -170,7 +177,9 @@ capture identity 由 canonical source、source digest 和 prompt version 确定�
 - rebuild 使用 begin/chunk/finish/abort 协议：Service 分页校验 artifact/reference，Worker 在单一事务中增量写入并只在 finish 发布 head/count；失败回滚且不替换现有索引；
 - 不引入 SQLite native npm runtime dependency。
 
-D1 候选由 FTS5 与一至二跳图邻接池通过 RRF（`k=60`）融合。候选池最多 200，默认返回 12、最大 50。trust、freshness 与 30 天半衰期 heat 只做有限排序修正；heat 最大贡献 10%，不能改变 trust、freshness、lifecycle 或触发删除。v1 不启用 embedding/vector 检索。
+D1 候选由 FTS5 与一至二跳图邻接池通过 RRF（`k=60`）融合。短 CJK 查询使用转义后的字面量 fallback；“最近/上次/recent/previous”类查询加入时间候选。Memory 与 History Cue 共享同一排序和分页窗口，`asOf` 可从不可变 revision 时间线返回查询时仍有效、当前已归档的历史 revision。候选池最多 200，默认返回 12、最大 50。trust、freshness 与 30 天半衰期 heat 只做有限排序修正；heat 最大贡献 10%，不能改变 trust、freshness、lifecycle 或触发删除。v1 不启用 embedding/vector 检索。
+
+SQLite schema v2 为 Edge 保存 `effectiveFrom/effectiveTo`，图遍历和关系提示按查询时间过滤。Memory fact mutation 使用 event-head CAS 的增量 delta；History Cue 可在 Memory head 不变时单独增量发布，但不能借此修改事实表。跨进程 projection mutation 由独立文件锁串行化；delta head 冲突关闭旧索引并在下一次读取或 repair 时从事实重建。repair 固定一个 read-model head，为 SQLite、Markdown 和 manifest 使用同一组引用，结束时复核事实 head；事实并发变化时重试，而不是发布混合快照。
 
 普通 status/search 先验证 checkpointed read model 与 SQLite head；损坏、缺失或 head 不一致时从 event/artifact 重建。deep doctor 仍执行完整事实校验。
 
@@ -190,8 +199,8 @@ D1 候选由 FTS5 与一至二跳图邻接池通过 RRF（`k=60`）融合。候�
 - archive/invalidate 追加 lifecycle revision，不删除 artifact；
 - detach evidence 必须保留仍能满足 revision 约束的证据；
 - purge 需要用户确认、零 active inbound edge 和安全引用计数；
-- purge event 保留 memory ID/source digest tombstone，并阻止同一 source digest 被自动重建；
-- 共享 artifact 仍被其他事实引用时保留物理对象并报告。
+- purge event 保留 memory ID/source digest tombstone，并记录被该 Memory 独占的 revision、edge、evidence 及 proposal/model-result 内容 artifact ID，阻止同一 source digest 被自动重建；
+- 只有完全属于目标 Memory 的 proposal/model-result 正文才会进入清理集合；共享 proposal/result、pending 引用或其他领域仍引用的 artifact 保留物理对象并报告。
 
 低 heat 只能影响派生冷热排序，永远不能单独 archive、invalidate 或 purge。
 

@@ -225,6 +225,14 @@ describe("Pi-XK checkpoint bridge", () => {
 		const artifact = await new ArtifactStore(projectRoot).read(artifactId);
 		expect(artifact.content).toContain(checkpoint.leafId);
 		expect(artifact.content).not.toContain(secret);
+		expect(JSON.parse(artifact.content)).toMatchObject({
+			schema: "pi-xk.checkpoint-evidence.v2",
+			goalId,
+			sessionId: harness.sessionManager.getSessionId(),
+			leafId: checkpoint.leafId,
+			contractRevision: null,
+			goalState: expect.stringContaining("# Goal State"),
+		});
 
 		await harness.session.reload();
 		expect(getCheckpointRefs(harness)).toHaveLength(2);

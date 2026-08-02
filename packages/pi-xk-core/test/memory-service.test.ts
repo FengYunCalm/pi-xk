@@ -12,6 +12,7 @@ import {
 	GoalStore,
 	type MemoryCaptureSourceV1,
 	type MemoryChangeProposalV1,
+	MemoryNotFoundError,
 	MemoryService,
 	MemoryStore,
 	MemoryValidationError,
@@ -124,6 +125,160 @@ async function publishMemoryWithEvidence(
 	});
 }
 
+async function createGoalCompletionEvidence(
+	projectRoot: string,
+	suffix: string,
+	sourceState: string,
+): Promise<{ evidence: EvidenceRefV1; checkpointArtifactId: string }> {
+	const recordedAt = "2026-08-01T00:00:00.000Z";
+	const goalId = `goal_completion_evidence_${suffix}`;
+	const sessionId = `session_completion_evidence_${suffix}`;
+	const leafId = `leaf_completion_evidence_${suffix}`;
+	const checkpointState = "# Canonical event-time Goal State\n";
+	const contract: GoalContractV3 = {
+		schema: "pi-xk.goal.contract.v3",
+		goalId,
+		title: "Goal completion Memory evidence",
+		intentAnchor: "Preserve the final event-time Goal State as canonical Memory evidence.",
+		objective: "Validate Goal completion evidence against its final checkpoint.",
+		constraints: [],
+		acceptance: [
+			{
+				id: "A-1",
+				kind: "test",
+				description: "The final checkpoint remains canonical completion evidence.",
+				required: true,
+				command: "memory-service focused provenance test",
+			},
+		],
+		capabilities: { filesystem: "unrestricted", network: "unrestricted", spawn: "unrestricted" },
+		budgets: { tokens: 0, costCents: 0, wallSeconds: 0 },
+		ownerSessionId: sessionId,
+		createdAt: recordedAt,
+		schemaVersion: 3,
+		revision: 1,
+		nonGoals: [],
+		doneCondition: "The completion evidence remains bound to its final checkpoint.",
+		pauseCondition: "No valid checkpoint evidence is available.",
+		finalReport: "Report the evidence integrity result.",
+		executionAuthorization: "Run local Memory evidence validation.",
+	};
+	const goals = new GoalStore(projectRoot);
+	const created = await goals.createGoal(contract, {
+		eventId: `evt_goal_completion_created_${suffix}`,
+		idempotencyKey: `goal:completion-evidence:create:${suffix}`,
+		actor: "user",
+		timestamp: recordedAt,
+	});
+	const checkpointArtifact = await goals.putArtifact({
+		contentType: "application/json",
+		value: {
+			schema: "pi-xk.checkpoint-evidence.v2",
+			goalId,
+			sessionId,
+			leafId,
+			turnIndex: 1,
+			toolResultCount: 0,
+			reason: "turn_end",
+			contractRevision: 1,
+			goalState: checkpointState,
+			createdAt: "2026-08-01T00:01:00.000Z",
+		},
+		producer: "pi-xk.checkpoint-evidence.v2",
+		sensitivity: "redacted",
+		sourceIds: [goalId, sessionId, leafId],
+		createdAt: "2026-08-01T00:01:00.000Z",
+	});
+	const checkpoint = await goals.appendCheckpoint(
+		goalId,
+		{
+			schema: "pi-xk.goal-checkpoint.v2",
+			sessionId,
+			leafId,
+			turnIndex: 1,
+			toolResultCount: 0,
+			reason: "turn_end",
+			createdAt: "2026-08-01T00:01:00.000Z",
+			evidence: {
+				schema: "pi-xk.goal-checkpoint-evidence.v1",
+				sourceEntryIds: [leafId],
+				artifacts: [
+					{
+						schema: "pi-xk.artifact-ref.v1",
+						artifactId: checkpointArtifact.artifactId,
+						role: "checkpoint_evidence",
+					},
+				],
+			},
+		},
+		{
+			eventId: `evt_goal_completion_checkpoint_${suffix}`,
+			idempotencyKey: `goal:completion-evidence:checkpoint:${suffix}`,
+			expectedHead: created.head,
+			actor: "runtime",
+			timestamp: "2026-08-01T00:01:00.000Z",
+		},
+	);
+	const activated = await goals.appendLifecycleEvent(
+		goalId,
+		{ eventType: "goal_activated", payload: { sessionId } },
+		{
+			eventId: `evt_goal_completion_activated_${suffix}`,
+			idempotencyKey: `goal:completion-evidence:activate:${suffix}`,
+			expectedHead: checkpoint.head,
+			actor: "user",
+			timestamp: "2026-08-01T00:02:00.000Z",
+		},
+	);
+	const ended = await goals.appendLifecycleEvent(
+		goalId,
+		{
+			eventType: "goal_ended",
+			payload: {
+				outcome: "accepted",
+				reason: "Completion evidence fixture accepted.",
+				verifiedAcceptanceIds: ["A-1"],
+				finalEvidence: "Canonical checkpoint fixture.",
+				finalSummary: "Goal completion evidence is available.",
+			},
+		},
+		{
+			eventId: `evt_goal_completion_ended_${suffix}`,
+			idempotencyKey: `goal:completion-evidence:end:${suffix}`,
+			expectedHead: activated.head,
+			actor: "user",
+			timestamp: "2026-08-01T00:03:00.000Z",
+		},
+	);
+	const source = await new ArtifactStore(projectRoot).put({
+		contentType: "application/json",
+		value: {
+			schema: "pi-xk.memory-goal-source.v1",
+			goalId,
+			contractRevision: 1,
+			event: ended.event,
+			state: sourceState,
+		},
+		producer: "pi-xk.memory-goal-source.v1",
+		sensitivity: "internal",
+		sourceIds: [goalId, ended.event.eventId],
+		createdAt: ended.event.timestamp,
+	});
+	return {
+		evidence: {
+			schema: "pi-xk.memory-evidence-ref.v1",
+			evidenceId: `evidence_goal_completion_${suffix}`,
+			sourceType: "goal_completion",
+			sourceId: ended.event.eventId,
+			artifactId: source.artifactId,
+			sourceDigest: source.artifactId,
+			recordedAt: ended.event.timestamp,
+			locator: { goalId, eventId: ended.event.eventId },
+		},
+		checkpointArtifactId: checkpointArtifact.artifactId,
+	};
+}
+
 afterEach(async () => {
 	while (tempDirs.length > 0) {
 		const directory = tempDirs.pop();
@@ -132,6 +287,150 @@ afterEach(async () => {
 });
 
 describe("Memory Service", () => {
+	it("reads the revision that was effective at asOf instead of the current revision", async () => {
+		const { service } = await createService();
+		const remembered = await service.remember("Historical lifecycle queries must return the effective revision.", {
+			commandId: "command_memory_as_of_revision",
+			recordedAt: "2026-08-01T00:00:00.000Z",
+		});
+		const replay = await service.getStore().replay();
+		await service
+			.getStore()
+			.changeMemoryLifecycle(
+				remembered.revision.memoryId,
+				1,
+				"archived",
+				"Archive after the historical query point.",
+				{
+					eventId: "evt_memory_as_of_archive",
+					idempotencyKey: "memory:as-of:archive",
+					expectedHead: replay.head,
+					actor: "user",
+					timestamp: "2026-08-02T00:00:00.000Z",
+					confirmed: true,
+				},
+			);
+
+		const historical = await service.read({
+			memoryIds: [remembered.revision.memoryId],
+			asOf: "2026-08-01T12:00:00.000Z",
+		});
+		expect(historical.memories[0]?.revision).toMatchObject({ revision: 1, lifecycle: "active" });
+		const historicalSearch = await service.search({
+			query: "Historical lifecycle queries",
+			asOf: "2026-08-01T12:00:00.000Z",
+			graphDepth: 0,
+		});
+		expect(historicalSearch.items).toEqual([
+			expect.objectContaining({
+				memoryId: remembered.revision.memoryId,
+				revision: 1,
+				state: expect.objectContaining({ lifecycle: "active" }),
+			}),
+		]);
+		await service.close();
+	});
+
+	it("keeps historical search available after an unrelated Memory is purged", async () => {
+		const { service } = await createService();
+		const purgeTarget = await service.remember("This Memory will be permanently purged.", {
+			commandId: "command_memory_as_of_purge_target",
+			recordedAt: "2026-08-01T00:00:00.000Z",
+		});
+		const retained = await service.remember("Historical retrieval remains available for retained Memory.", {
+			commandId: "command_memory_as_of_retained",
+			recordedAt: "2026-08-01T00:01:00.000Z",
+		});
+		await service.changeLifecycle(purgeTarget.revision.memoryId, "archived", "Archive before purge.");
+		const evidenceId = purgeTarget.revision.evidenceRefs[0]?.evidenceId;
+		if (!evidenceId) throw new Error("missing purge evidence fixture");
+		await service.detachEvidence(
+			purgeTarget.revision.memoryId,
+			evidenceId,
+			"Detach the exclusively owned evidence before purge.",
+		);
+		await service.purge(purgeTarget.revision.memoryId, "Explicit permanent removal.");
+
+		await expect(service.timeline(purgeTarget.revision.memoryId)).rejects.toBeInstanceOf(MemoryNotFoundError);
+		const historical = await service.search({
+			query: "Historical retrieval remains available",
+			asOf: "2026-08-01T00:02:00.000Z",
+			graphDepth: 0,
+		});
+		expect(historical.items).toEqual([
+			expect.objectContaining({ memoryId: retained.revision.memoryId, revision: 1 }),
+		]);
+		await service.close();
+	});
+
+	it("rejects invalid evidence ownership before publishing a Memory fact", async () => {
+		const { projectRoot, service } = await createService();
+		const artifact = await new ArtifactStore(projectRoot).put({
+			contentType: "text/plain",
+			text: "This artifact is not owned by the claimed Goal checkpoint.",
+			producer: "pi-xk.test.invalid-evidence.v1",
+			sensitivity: "internal",
+			sourceIds: ["unrelated_source"],
+			createdAt: "2026-08-01T00:00:00.000Z",
+		});
+
+		await expect(
+			publishMemoryWithEvidence(projectRoot, service, "memory_invalid_apply_evidence", {
+				schema: "pi-xk.memory-evidence-ref.v1",
+				evidenceId: "evidence_invalid_apply_evidence",
+				sourceType: "goal_checkpoint",
+				sourceId: "evt_missing_checkpoint",
+				artifactId: artifact.artifactId,
+				sourceDigest: artifact.artifactId,
+				recordedAt: "2026-08-01T00:00:00.000Z",
+				locator: { goalId: "goal_missing", checkpointEventId: "evt_missing_checkpoint" },
+			}),
+		).rejects.toThrow(/Goal not found|Goal event/i);
+		expect((await service.getStore().replay()).memories.has("memory_invalid_apply_evidence")).toBe(false);
+		await service.close();
+	});
+
+	it("binds Goal completion evidence to the final event-time checkpoint State", async () => {
+		const { projectRoot, service } = await createService();
+		const mismatched = await createGoalCompletionEvidence(
+			projectRoot,
+			"mismatched_state",
+			"# Later mutable Goal State\n",
+		);
+		await expect(
+			publishMemoryWithEvidence(
+				projectRoot,
+				service,
+				"memory_goal_completion_mismatched_state",
+				mismatched.evidence,
+			),
+		).rejects.toThrow(/checkpoint State snapshot/i);
+
+		const canonical = await createGoalCompletionEvidence(
+			projectRoot,
+			"damaged_checkpoint",
+			"# Canonical event-time Goal State\n",
+		);
+		await publishMemoryWithEvidence(
+			projectRoot,
+			service,
+			"memory_goal_completion_damaged_checkpoint",
+			canonical.evidence,
+		);
+		const digest = canonical.checkpointArtifactId.slice("sha256:".length);
+		await writeFile(
+			join(projectRoot, ".pi-xk", "artifacts", "objects", digest.slice(0, 2), `${digest}.data`),
+			"{}\n",
+		);
+		await expect(service.read({ memoryIds: ["memory_goal_completion_damaged_checkpoint"] })).rejects.toThrow(
+			/artifact|digest|integrity/i,
+		);
+		await expect(service.expandEvidence({ memoryId: "memory_goal_completion_damaged_checkpoint" })).rejects.toThrow(
+			/artifact|digest|integrity/i,
+		);
+		await service.close();
+	});
+
 	it("provides D1-D3 retrieval and rebuilds a deleted SQLite projection", async () => {
 		const { projectRoot, service } = await createService();
 		const remembered = await service.remember("Prefer canonical Artifact Store read-back for summaries.", {
@@ -352,6 +651,76 @@ describe("Memory Service", () => {
 		await service.close();
 	});
 
+	it("reports retryable failures and indeterminate generation in doctor", async () => {
+		const { service } = await createService();
+		const store = service.getStore();
+		const first = await store.scheduleCapture(
+			{
+				schema: "pi-xk.memory-capture-source.v1",
+				captureId: "capture_doctor_retryable",
+				trigger: "backfill",
+				sourceIds: ["source_doctor_retryable"],
+				sourceDigest: `sha256:${"1".repeat(64)}`,
+				promptVersion: "pi-xk.memory-capture-v1",
+				createdAt: "2026-08-01T00:00:00.000Z",
+			},
+			{
+				eventId: "evt_memory_doctor_retryable_scheduled",
+				idempotencyKey: "memory:doctor:retryable:scheduled",
+				expectedHead: { sequence: 0, hash: null },
+			},
+		);
+		const generating = await store.markGenerationStarted("capture_doctor_retryable", 1, {
+			eventId: "evt_memory_doctor_retryable_generating",
+			idempotencyKey: "memory:doctor:retryable:generation:1",
+			expectedHead: first.head,
+		});
+		const failed = await store.markCaptureFailed(
+			{
+				captureId: "capture_doctor_retryable",
+				stage: "source",
+				errorCode: "memory_capture_context_failed",
+				retryable: true,
+				message: "Transient Memory index failure.",
+			},
+			{
+				eventId: "evt_memory_doctor_retryable_failed",
+				idempotencyKey: "memory:doctor:retryable:failed:1",
+				expectedHead: generating.head,
+			},
+		);
+		const second = await store.scheduleCapture(
+			{
+				schema: "pi-xk.memory-capture-source.v1",
+				captureId: "capture_doctor_indeterminate",
+				trigger: "backfill",
+				sourceIds: ["source_doctor_indeterminate"],
+				sourceDigest: `sha256:${"2".repeat(64)}`,
+				promptVersion: "pi-xk.memory-capture-v1",
+				createdAt: "2026-08-01T00:01:00.000Z",
+			},
+			{
+				eventId: "evt_memory_doctor_indeterminate_scheduled",
+				idempotencyKey: "memory:doctor:indeterminate:scheduled",
+				expectedHead: failed.head,
+			},
+		);
+		await store.markGenerationStarted("capture_doctor_indeterminate", 1, {
+			eventId: "evt_memory_doctor_indeterminate_generating",
+			idempotencyKey: "memory:doctor:indeterminate:generation:1",
+			expectedHead: second.head,
+		});
+
+		const report = await service.doctor("quick");
+		expect(report.diagnostics).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ code: "capture_failed_retryable", repairable: false }),
+				expect.objectContaining({ code: "capture_indeterminate", repairable: false }),
+			]),
+		);
+		await service.close();
+	});
+
 	it("keeps quick doctor on the verified checkpoint path", async () => {
 		const projectRoot = join(
 			tmpdir(),
@@ -549,6 +918,7 @@ describe("Memory Service", () => {
 	it("fully validates compaction provenance before D2 reads and resolves the D3 entry", async () => {
 		const { projectRoot, service } = await createService();
 		const sessionId = "session_memory_compaction";
+		const segmentId = "segment_memory_compaction";
 		const entryId = "compaction_memory_1";
 		const title = "Memory provenance compaction";
 		const sessionPath = join(projectRoot, "memory-compaction.jsonl");
@@ -579,7 +949,7 @@ describe("Memory Service", () => {
 				cwd: projectRoot,
 				rootBranchId: "branch_memory_compaction",
 				rootSegment: {
-					segmentId: sessionId,
+					segmentId,
 					ordinal: 1,
 					location: { kind: "external-root", absolutePath: sessionPath },
 					predecessorSegmentId: null,
@@ -750,16 +1120,18 @@ describe("Memory Service", () => {
 			sourceIds: [goalId, checkpoint.event.eventId],
 			createdAt: recordedAt,
 		});
-		await publishMemoryWithEvidence(projectRoot, service, "memory_invalid_goal_digest", {
-			schema: "pi-xk.memory-evidence-ref.v1",
-			evidenceId: "evidence_invalid_goal_digest",
-			sourceType: "goal_checkpoint",
-			sourceId: checkpoint.event.eventId,
-			artifactId: goalSource.artifactId,
-			sourceDigest: `sha256:${"d".repeat(64)}`,
-			recordedAt,
-			locator: { goalId, checkpointEventId: checkpoint.event.eventId },
-		});
+		await expect(
+			publishMemoryWithEvidence(projectRoot, service, "memory_invalid_goal_digest", {
+				schema: "pi-xk.memory-evidence-ref.v1",
+				evidenceId: "evidence_invalid_goal_digest",
+				sourceType: "goal_checkpoint",
+				sourceId: checkpoint.event.eventId,
+				artifactId: goalSource.artifactId,
+				sourceDigest: `sha256:${"d".repeat(64)}`,
+				recordedAt,
+				locator: { goalId, checkpointEventId: checkpoint.event.eventId },
+			}),
+		).rejects.toThrow(/digest/i);
 		const goalSchemaSource = await new ArtifactStore(projectRoot).put({
 			contentType: "application/json",
 			value: {
@@ -775,16 +1147,18 @@ describe("Memory Service", () => {
 			sourceIds: [goalId, checkpoint.event.eventId],
 			createdAt: recordedAt,
 		});
-		await publishMemoryWithEvidence(projectRoot, service, "memory_invalid_goal_schema", {
-			schema: "pi-xk.memory-evidence-ref.v1",
-			evidenceId: "evidence_invalid_goal_schema",
-			sourceType: "goal_checkpoint",
-			sourceId: checkpoint.event.eventId,
-			artifactId: goalSchemaSource.artifactId,
-			sourceDigest: goalSchemaSource.artifactId,
-			recordedAt,
-			locator: { goalId, checkpointEventId: checkpoint.event.eventId },
-		});
+		await expect(
+			publishMemoryWithEvidence(projectRoot, service, "memory_invalid_goal_schema", {
+				schema: "pi-xk.memory-evidence-ref.v1",
+				evidenceId: "evidence_invalid_goal_schema",
+				sourceType: "goal_checkpoint",
+				sourceId: checkpoint.event.eventId,
+				artifactId: goalSchemaSource.artifactId,
+				sourceDigest: goalSchemaSource.artifactId,
+				recordedAt,
+				locator: { goalId, checkpointEventId: checkpoint.event.eventId },
+			}),
+		).rejects.toThrow(/schema/i);
 
 		const chains = new SessionChainStore(projectRoot);
 		const chainCreated = await chains.createChain(
@@ -888,23 +1262,25 @@ describe("Memory Service", () => {
 				timestamp: recordedAt,
 			},
 		);
-		await publishMemoryWithEvidence(projectRoot, service, "memory_invalid_chain_digest", {
-			schema: "pi-xk.memory-evidence-ref.v1",
-			evidenceId: "evidence_invalid_chain_digest",
-			sourceType: "chain_summary",
-			sourceId: summaryArtifactId,
-			artifactId: summaryArtifactId,
-			sourceDigest: `sha256:${"1".repeat(64)}`,
-			recordedAt,
-			locator: {
-				chainId: "chain_memory_evidence",
-				branchId: "branch_memory_evidence",
-				level: "l1",
-				segmentId: "segment_memory_evidence",
-				ordinal: 1,
-				windowIndex: null,
-			},
-		});
+		await expect(
+			publishMemoryWithEvidence(projectRoot, service, "memory_invalid_chain_digest", {
+				schema: "pi-xk.memory-evidence-ref.v1",
+				evidenceId: "evidence_invalid_chain_digest",
+				sourceType: "chain_summary",
+				sourceId: summaryArtifactId,
+				artifactId: summaryArtifactId,
+				sourceDigest: `sha256:${"1".repeat(64)}`,
+				recordedAt,
+				locator: {
+					chainId: "chain_memory_evidence",
+					branchId: "branch_memory_evidence",
+					level: "l1",
+					segmentId: "segment_memory_evidence",
+					ordinal: 1,
+					windowIndex: null,
+				},
+			}),
+		).rejects.toThrow(/sourceDigest/i);
 
 		const tasks = new TaskStore(projectRoot);
 		const taskCreated = await tasks.createTask(
@@ -972,21 +1348,18 @@ describe("Memory Service", () => {
 			},
 		);
 		if (taskResult.event.eventType !== "task_succeeded") throw new Error("Task evidence fixture did not succeed");
-		await publishMemoryWithEvidence(projectRoot, service, "memory_invalid_task_digest", {
-			schema: "pi-xk.memory-evidence-ref.v1",
-			evidenceId: "evidence_invalid_task_digest",
-			sourceType: "task_result",
-			sourceId: taskResult.event.eventId,
-			artifactId: taskResult.event.payload.resultArtifactId,
-			sourceDigest: `sha256:${"2".repeat(64)}`,
-			recordedAt,
-			locator: { taskId: "task_memory_evidence" },
-		});
-
-		await expect(service.read({ memoryIds: ["memory_invalid_goal_digest"] })).rejects.toThrow(/digest/i);
-		await expect(service.read({ memoryIds: ["memory_invalid_goal_schema"] })).rejects.toThrow(/schema/i);
-		await expect(service.read({ memoryIds: ["memory_invalid_chain_digest"] })).rejects.toThrow(/sourceDigest/i);
-		await expect(service.read({ memoryIds: ["memory_invalid_task_digest"] })).rejects.toThrow(/sourceDigest/i);
+		await expect(
+			publishMemoryWithEvidence(projectRoot, service, "memory_invalid_task_digest", {
+				schema: "pi-xk.memory-evidence-ref.v1",
+				evidenceId: "evidence_invalid_task_digest",
+				sourceType: "task_result",
+				sourceId: taskResult.event.eventId,
+				artifactId: taskResult.event.payload.resultArtifactId,
+				sourceDigest: `sha256:${"2".repeat(64)}`,
+				recordedAt,
+				locator: { taskId: "task_memory_evidence" },
+			}),
+		).rejects.toThrow(/sourceDigest/i);
 		await service.close();
 	}, 30_000);
 

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { type FileHandle, link, mkdir, open, readFile, rm, unlink } from "node:fs/promises";
+import { type FileHandle, link, mkdir, open, readFile, rm, stat, unlink } from "node:fs/promises";
 import { basename, join } from "node:path";
 
 const LOCK_RETRY_LIMIT = 100;
@@ -64,6 +64,16 @@ function wait(ms: number): Promise<void> {
 	return new Promise((resolveWait) => setTimeout(resolveWait, ms));
 }
 
+async function pathExists(path: string): Promise<boolean> {
+	try {
+		await stat(path);
+		return true;
+	} catch (error) {
+		if (isErrno(error, "ENOENT")) return false;
+		throw error;
+	}
+}
+
 export async function inspectFileWriteLock(lockPath: string): Promise<WriteLockDiagnostic | undefined> {
 	let raw: string;
 	try {
@@ -119,6 +129,10 @@ export async function withFileWriteLock<TResult>(
 	for (let attempt = 0; attempt < LOCK_RETRY_LIMIT; attempt++) {
 		let ownsLock = false;
 		try {
+			if (await pathExists(options.lockPath)) {
+				await wait(LOCK_RETRY_DELAY_MS);
+				continue;
+			}
 			if (!(await publishStoredWriteLock(options.directory, options.lockPath, lock))) {
 				await wait(LOCK_RETRY_DELAY_MS);
 				continue;

@@ -321,11 +321,19 @@ async function handleMemoryCommand(
 			return;
 		}
 		if (trimmed === "doctor" || trimmed === "doctor deep") {
-			const report = await service.doctor(trimmed === "doctor deep" ? "deep" : "quick");
-			ctx.ui.notify(formatHistoricalEvidence("memory-doctor", report), report.ok ? "info" : "warning");
+			const mode = trimmed === "doctor deep" ? "deep" : "quick";
+			const report = await service.doctor(mode);
+			const bridgeDiagnostics = await bridge.doctor(mode);
+			const combined = {
+				...report,
+				ok: report.ok && bridgeDiagnostics.length === 0,
+				diagnostics: [...report.diagnostics, ...bridgeDiagnostics],
+			};
+			ctx.ui.notify(formatHistoricalEvidence("memory-doctor", combined), combined.ok ? "info" : "warning");
 			return;
 		}
 		if (trimmed === "doctor repair-projections") {
+			await bridge.refreshHistoryCues({ forceRebuild: true });
 			const repaired = await service.repairProjections();
 			ctx.ui.notify(
 				`Memory projections rebuilt: index ${repaired.index.memoryCount}; Markdown ${repaired.markdownFiles}`,

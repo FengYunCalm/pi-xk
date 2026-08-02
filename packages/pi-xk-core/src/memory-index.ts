@@ -8,7 +8,7 @@ import type {
 	MemoryTrust,
 } from "./memory-contract.ts";
 
-export const MEMORY_INDEX_SCHEMA_VERSION = 1;
+export const MEMORY_INDEX_SCHEMA_VERSION = 2;
 
 export interface MemoryIndexMemoryV1 {
 	memoryId: string;
@@ -48,6 +48,8 @@ export interface MemoryIndexEdgeV1 {
 	toKind: "memory" | "cue";
 	toId: string;
 	relation: MemoryEdgeRelation;
+	effectiveFrom: string;
+	effectiveTo: string | null;
 }
 
 export interface MemoryIndexHistoryCueV1 {
@@ -82,6 +84,14 @@ export interface MemoryIndexSnapshotV1 extends MemoryIndexRebuildChunkV1 {
 	head: MemoryHead;
 }
 
+export interface MemoryIndexDeltaV1 extends MemoryIndexRebuildChunkV1 {
+	expectedHead: MemoryHead;
+	head: MemoryHead;
+	removeMemoryIds: string[];
+	removeCueIds: string[];
+	removeEdgeIds: string[];
+}
+
 export interface MemoryIndexSearchInputV1 {
 	query: string;
 	kinds?: MemoryKind[];
@@ -113,10 +123,28 @@ export interface MemoryHistoryCueCandidateV1 extends MemoryIndexHistoryCueV1 {
 export interface MemoryIndexSearchResultV1 {
 	memories: MemoryIndexCandidateV1[];
 	historyCues: MemoryHistoryCueCandidateV1[];
+	hasMore: boolean;
+}
+
+export interface MemoryIndexGraphInputV1 {
+	rootMemoryId: string;
+	depth: 1 | 2;
+	asOf?: string;
+}
+
+export interface MemoryIndexGraphResultV1 {
+	memoryIds: string[];
+	cueIds: string[];
+	edges: Array<{
+		edgeId: string;
+		from: { kind: "memory" | "cue"; id: string };
+		to: { kind: "memory" | "cue"; id: string };
+		relation: MemoryEdgeRelation;
+	}>;
 }
 
 export interface MemoryIndexStatusV1 {
-	schemaVersion: 1;
+	schemaVersion: 2;
 	head: MemoryHead;
 	memoryCount: number;
 	cueCount: number;
@@ -132,7 +160,9 @@ export interface MemoryIndexStatusV1 {
 export interface MemoryIndexPort {
 	rebuild(snapshot: MemoryIndexSnapshotV1): Promise<void>;
 	rebuildFromChunks(plan: MemoryIndexRebuildPlanV1, chunks: AsyncIterable<MemoryIndexRebuildChunkV1>): Promise<void>;
+	applyDelta(delta: MemoryIndexDeltaV1): Promise<void>;
 	search(input: MemoryIndexSearchInputV1): Promise<MemoryIndexSearchResultV1>;
+	graph(input: MemoryIndexGraphInputV1): Promise<MemoryIndexGraphResultV1>;
 	recordAccess(memoryIds: readonly string[], accessedAt: string, head: MemoryHead): Promise<void>;
 	status(): Promise<MemoryIndexStatusV1>;
 	integrityCheck(): Promise<"ok" | string>;

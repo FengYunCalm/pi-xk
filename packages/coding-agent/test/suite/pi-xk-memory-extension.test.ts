@@ -10,7 +10,9 @@ import {
 	captureGitFreshnessBasis,
 	MemoryService,
 	MemoryStore,
+	MemoryValidationError,
 	stableJsonStringify,
+	TaskStore,
 } from "../../../pi-xk-core/src/index.ts";
 import { createPiXkRuntimeExtension } from "../../../pi-xk-extension/src/extension.ts";
 import {
@@ -103,25 +105,86 @@ async function createTaskCaptureRequest(
 	sourceId: string,
 	content: string,
 ): Promise<MemoryCaptureRequest> {
-	const artifacts = new ArtifactStore(projectRoot);
-	const source = await artifacts.put({
-		contentType: "text/plain",
-		text: content,
-		producer: "pi-xk.memory-controller-test.v1",
-		sensitivity: "internal",
-		sourceIds: [sourceId],
-		createdAt: "2026-08-01T00:00:00.000Z",
-	});
+	const recordedAt = "2026-08-01T00:00:00.000Z";
+	const tasks = new TaskStore(projectRoot);
+	const created = await tasks.createTask(
+		{
+			schema: "pi-xk.task.spec.v1",
+			taskId: sourceId,
+			parentSessionId: "session_memory_controller_test",
+			parentEntryId: `entry_${sourceId}`,
+			parentGoalId: null,
+			role: "verification",
+			prompt: content,
+			expectedResult: "A canonical Task result for Memory capture.",
+			workspaceMode: "same-workspace",
+			allowNestedSpawn: false,
+			createdAt: recordedAt,
+		},
+		{
+			eventId: `evt_${sourceId}_created`,
+			idempotencyKey: `task:${sourceId}:create`,
+			actor: "user",
+			timestamp: recordedAt,
+		},
+	);
+	const childSessionFile = join(projectRoot, `${sourceId}.jsonl`);
+	const started = await tasks.appendTaskStarted(
+		sourceId,
+		{
+			childSessionId: `session_${sourceId}`,
+			childSessionFile,
+			provider: "faux",
+			modelId: "faux",
+			thinkingLevel: "medium",
+			builtinTools: [],
+			attempt: 1,
+		},
+		{
+			eventId: `evt_${sourceId}_started`,
+			idempotencyKey: `task:${sourceId}:start`,
+			expectedHead: created.head,
+			actor: "runtime",
+			timestamp: recordedAt,
+		},
+	);
+	const terminal = await tasks.appendTaskResult(
+		sourceId,
+		{
+			schema: "pi-xk.task-result.v1",
+			taskId: sourceId,
+			status: "succeeded",
+			attempt: 1,
+			summary: content,
+			evidence: [],
+			artifactIds: [],
+			childSessionId: `session_${sourceId}`,
+			childSessionFile,
+			startedAt: recordedAt,
+			endedAt: recordedAt,
+			error: null,
+		},
+		{
+			eventId: `evt_${sourceId}_succeeded`,
+			idempotencyKey: `task:${sourceId}:result`,
+			expectedHead: started.head,
+			actor: "runtime",
+			timestamp: recordedAt,
+		},
+	);
+	if (terminal.event.eventType !== "task_succeeded") throw new Error("Task capture fixture did not succeed");
+	const artifactId = terminal.event.payload.resultArtifactId;
+	const canonical = await new ArtifactStore(projectRoot).read(artifactId);
 	return {
 		trigger: "backfill",
 		sourceType: "task_result",
 		sourceId,
-		artifactId: source.artifactId,
-		sourceDigest: source.artifactId,
+		artifactId,
+		sourceDigest: artifactId,
 		locator: { taskId: sourceId },
-		recordedAt: "2026-08-01T00:00:00.000Z",
+		recordedAt,
 		query: content,
-		content: (await artifacts.read(source.artifactId)).content,
+		content: canonical.content,
 		scope: { goalId: null, chainId: null, branchId: null, paths: [] },
 	};
 }
@@ -245,6 +308,134 @@ describe("Pi-XK Memory extension", () => {
 		releaseGeneration?.();
 		await expect(owner).resolves.toMatchObject({ status: "applied" });
 		expect(generate).toHaveBeenCalledTimes(1);
+	}, 15_000);
+
+	it("records a no-value capture as skipped instead of failed", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const controller = new MemoryController({ projectRoot: harness.tempDir });
+		controllers.push(controller);
+		const request = await createTaskCaptureRequest(
+			harness.tempDir,
+			"task_memory_no_durable_value",
+			"A transient task result with no reusable project fact.",
+		);
+		const result = await controller.capture(request, {
+			model: { provider: "faux", modelId: "selected", contextWindow: 100_000 },
+			generate: async () => ({
+				text: JSON.stringify({
+					schema: MEMORY_CAPTURE_RESPONSE_SCHEMA,
+					reason: "The source has no durable memory value.",
+					cues: [],
+					memories: [],
+					edges: [],
+				}),
+				model: { provider: "faux", modelId: "actual" },
+			}),
+		});
+		const replay = await controller.getService().getStore().replay();
+
+		expect(result).toMatchObject({ status: "no_durable_memory" });
+		expect(replay.captures.get(result.captureId)?.status).toBe("skipped");
+		expect((await controller.getService().status()).captures.skipped).toBe(1);
+		expect(replay.events.some((event) => event.eventType === "capture_failed")).toBe(false);
+		expect(replay.events).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					eventType: "capture_skipped",
+					payload: expect.objectContaining({ reasonCode: "no_durable_memory" }),
+				}),
+			]),
+		);
+	}, 15_000);
+
+	it("uses the actual generation model in published provenance", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const controller = new MemoryController({ projectRoot: harness.tempDir });
+		controllers.push(controller);
+		const request = await createTaskCaptureRequest(
+			harness.tempDir,
+			"task_memory_actual_model",
+			"A durable fact whose provider resolves to a different model.",
+		);
+		const result = await controller.capture(request, {
+			model: { provider: "faux", modelId: "selected", contextWindow: 100_000 },
+			generate: async () => ({
+				text: durableMemoryEnvelope("Actual generation model"),
+				model: { provider: "resolved-provider", modelId: "resolved-model" },
+			}),
+		});
+
+		expect(result.status).toBe("applied");
+		expect((await controller.getService().getStore().readMemories())[0]?.revision.provenance.model).toBe(
+			"resolved-provider/resolved-model",
+		);
+	}, 15_000);
+
+	it("fails capture explicitly when existing Memory context cannot be searched", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		class SearchFailingMemoryService extends MemoryService {
+			override async search(): Promise<never> {
+				throw new Error("simulated Memory index failure");
+			}
+		}
+		const service = new SearchFailingMemoryService(harness.tempDir);
+		const controller = new MemoryController({ projectRoot: harness.tempDir, service });
+		controllers.push(controller);
+		const request = await createTaskCaptureRequest(
+			harness.tempDir,
+			"task_memory_context_failure",
+			"A source that must not be generated against fabricated empty history.",
+		);
+		const generate = vi.fn(async () => ({
+			text: durableMemoryEnvelope("Must not generate"),
+			model: { provider: "faux", modelId: "faux" },
+		}));
+
+		await expect(
+			controller.capture(request, {
+				model: { provider: "faux", modelId: "faux", contextWindow: 100_000 },
+				generate,
+			}),
+		).resolves.toMatchObject({ status: "failed" });
+		expect(generate).not.toHaveBeenCalled();
+		expect((await service.getStore().replay()).captures.get(captureIdentity(request).captureId)).toMatchObject({
+			status: "failed",
+			errorCode: "memory_capture_context_failed",
+			retryable: true,
+		});
+	}, 15_000);
+
+	it("classifies invalid existing Memory context as non-retryable", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		class InvalidContextMemoryService extends MemoryService {
+			override async search(): Promise<never> {
+				throw new MemoryValidationError("simulated invalid Memory provenance");
+			}
+		}
+		const service = new InvalidContextMemoryService(harness.tempDir);
+		const controller = new MemoryController({ projectRoot: harness.tempDir, service });
+		controllers.push(controller);
+		const request = await createTaskCaptureRequest(
+			harness.tempDir,
+			"task_memory_invalid_context",
+			"A source that must stop when existing Memory provenance is invalid.",
+		);
+
+		await expect(
+			controller.capture(request, {
+				model: { provider: "faux", modelId: "faux", contextWindow: 100_000 },
+				generate: vi.fn(),
+			}),
+		).resolves.toMatchObject({ status: "failed" });
+		expect((await service.getStore().replay()).captures.get(captureIdentity(request).captureId)).toMatchObject({
+			status: "failed",
+			errorCode: "memory_capture_invalid",
+			retryable: false,
+		});
 	}, 15_000);
 
 	it("captures Git freshness and baseline evidence for code-scoped model Memory", async () => {
@@ -521,27 +712,12 @@ describe("Pi-XK Memory extension", () => {
 	it("reuses a persisted provider result after a retryable publication failure", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
+		const request = await createTaskCaptureRequest(
+			harness.tempDir,
+			"task_publication_recovery",
+			"Stable source with a paid provider result awaiting publication.",
+		);
 		const artifacts = new ArtifactStore(harness.tempDir);
-		const source = await artifacts.put({
-			contentType: "text/plain",
-			text: "Stable source with a paid provider result awaiting publication.",
-			producer: "pi-xk.memory-publication-recovery-test.v1",
-			sensitivity: "internal",
-			sourceIds: ["task_publication_recovery"],
-			createdAt: "2026-08-01T00:00:00.000Z",
-		});
-		const request: MemoryCaptureRequest = {
-			trigger: "backfill",
-			sourceType: "task_result",
-			sourceId: "task_publication_recovery",
-			artifactId: source.artifactId,
-			sourceDigest: source.artifactId,
-			locator: { taskId: "task_publication_recovery" },
-			recordedAt: "2026-08-01T00:00:00.000Z",
-			query: "paid provider result publication recovery",
-			content: (await artifacts.read(source.artifactId)).content,
-			scope: { goalId: null, chainId: null, branchId: null, paths: [] },
-		};
 		const { captureId, captureDigest } = captureIdentity(request);
 		const service = new MemoryService(harness.tempDir);
 		const scheduled = await service.getStore().scheduleCapture(
@@ -663,15 +839,6 @@ describe("Pi-XK Memory extension", () => {
 	it("keeps an applied capture when projection publication fails", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
-		const artifacts = new ArtifactStore(harness.tempDir);
-		const source = await artifacts.put({
-			contentType: "text/plain",
-			text: "Stable source whose derived projections fail after fact publication.",
-			producer: "pi-xk.memory-projection-failure-test.v1",
-			sensitivity: "internal",
-			sourceIds: ["task_projection_failure"],
-			createdAt: "2026-08-01T00:00:00.000Z",
-		});
 		class ProjectionFailingMemoryService extends MemoryService {
 			override async repairProjections(): Promise<never> {
 				throw new Error("simulated projection failure");
@@ -680,18 +847,11 @@ describe("Pi-XK Memory extension", () => {
 		const service = new ProjectionFailingMemoryService(harness.tempDir);
 		const controller = new MemoryController({ projectRoot: harness.tempDir, service });
 		controllers.push(controller);
-		const request: MemoryCaptureRequest = {
-			trigger: "backfill",
-			sourceType: "task_result",
-			sourceId: "task_projection_failure",
-			artifactId: source.artifactId,
-			sourceDigest: source.artifactId,
-			locator: { taskId: "task_projection_failure" },
-			recordedAt: "2026-08-01T00:00:00.000Z",
-			query: "projection failure after fact publication",
-			content: (await artifacts.read(source.artifactId)).content,
-			scope: { goalId: null, chainId: null, branchId: null, paths: [] },
-		};
+		const request = await createTaskCaptureRequest(
+			harness.tempDir,
+			"task_projection_failure",
+			"Stable source whose derived projections fail after fact publication.",
+		);
 
 		const result = await controller.capture(request, {
 			model: { provider: "faux", modelId: "faux", contextWindow: 100_000 },

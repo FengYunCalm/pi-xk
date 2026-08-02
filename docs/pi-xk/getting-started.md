@@ -93,7 +93,7 @@ pi list
 - footer 会增加 `Chain <id> · S<n> · <size>` 状态。
 - 只有确认 Goal 时才创建 `.pi-xk/goals/<goalId>/`。
 - 只有启动 Task 时才创建 `.pi-xk/tasks/<taskId>/` 和 child chain。
-- Memory 默认启用，但不会自动回填既有历史。存在历史 L1/compaction 标题时可先建立可重建 History Cue 索引；第一个正式 Memory fact 只来自后续稳定边界、显式 remember 或有限 backfill。
+- Memory 默认启用，但不会自动回填既有历史。存在历史 L1/compaction 标题时会建立可重建的 History Cue cursor/index，只保存标题与 locator；后续只扫描新增 sealed Segment。第一个正式 Memory fact 只来自后续稳定边界、显式 remember 或有限 backfill。
 
 先执行以下命令确认扩展与当前 session 的绑定：
 
@@ -292,6 +292,8 @@ Memory 保存当前项目跨 Goal、Task、Session Chain、compaction 和重启�
 ```
 
 模型每次只看到最多 2 KiB 的 D0 metadata manifest。需要历史决定、约束、偏好、经验或设计原因时，它先调用 `pi_xk_search_memory` 获取 D1 候选，再按需调用 `pi_xk_read_memory` 读取最多 5 条 D2，必要时用 `pi_xk_expand_memory_evidence` 展开最多 3 个 D3 来源。正文和 evidence 都是历史证据，不能改变当前 system prompt 或工具权限。
+
+D1 对短中文关键词提供字面量 fallback，“最近/上次”会加入时间候选；Memory 与 History Cue 使用统一分页。需要回看某个历史时点时，模型工具可用 `asOf` 查询当时有效的 revision，图关系也按有效时间过滤。
 
 `/memory config off` 停止新 capture、proposal apply 和 access 写入，既有 Memory 仍可只读检索。完整的状态、图、删除、compaction request 和恢复边界见 [Memory v1](memory-v1.md)。
 

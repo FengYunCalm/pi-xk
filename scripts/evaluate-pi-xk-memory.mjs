@@ -58,6 +58,8 @@ function snapshotFor(fixture) {
 			toKind: "memory",
 			toId: edge.to,
 			relation: edge.relation,
+			effectiveFrom: "2026-01-01T00:00:00.000Z",
+			effectiveTo: null,
 		})),
 		historyCues: [],
 	};

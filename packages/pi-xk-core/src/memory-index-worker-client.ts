@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import type {
+	MemoryIndexDeltaV1,
+	MemoryIndexGraphInputV1,
+	MemoryIndexGraphResultV1,
 	MemoryIndexPort,
 	MemoryIndexRebuildChunkV1,
 	MemoryIndexRebuildPlanV1,
@@ -150,6 +153,17 @@ export class MemoryIndexWorkerClient implements MemoryIndexPort {
 	async search(input: MemoryIndexSearchInputV1): Promise<MemoryIndexSearchResultV1> {
 		const result = await this.request({ kind: "search", input });
 		if (result.kind !== "search") throw new MemoryIndexWorkerError("Memory index search returned an invalid result");
+		return result.value;
+	}
+
+	async applyDelta(delta: MemoryIndexDeltaV1): Promise<void> {
+		const result = await this.request({ kind: "apply_delta", delta });
+		if (result.kind !== "void") throw new MemoryIndexWorkerError("Memory index delta returned an invalid result");
+	}
+
+	async graph(input: MemoryIndexGraphInputV1): Promise<MemoryIndexGraphResultV1> {
+		const result = await this.request({ kind: "graph", input });
+		if (result.kind !== "graph") throw new MemoryIndexWorkerError("Memory index graph returned an invalid result");
 		return result.value;
 	}
 

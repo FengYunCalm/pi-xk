@@ -101,6 +101,11 @@ export {
 	validateGoalLifecycleEventInput,
 } from "./contract.ts";
 export {
+	GOAL_CHECKPOINT_EVIDENCE_ARTIFACT_SCHEMA,
+	type GoalCheckpointEvidenceArtifactV2,
+	validateGoalCheckpointEvidenceArtifactV2,
+} from "./goal-checkpoint-evidence.ts";
+export {
 	createGoalFiles,
 	type GoalCompletionStateEvidence,
 	GoalFileAlreadyExistsError,
@@ -381,6 +386,7 @@ export {
 	type SessionChainWriteResult,
 } from "./session-chain-store.ts";
 export { stableJsonStringify } from "./stable-json.ts";
+export { syncDirectory } from "./sync-directory.ts";
 export {
 	assertTaskId,
 	TASK_EVENT_SCHEMA,

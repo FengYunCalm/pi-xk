@@ -32,6 +32,7 @@ import {
 	validateMemoryEdgeV1,
 	validateMemoryRevisionV1,
 } from "./memory-contract.ts";
+import { validateMemoryEvidenceOwnership } from "./memory-evidence.ts";
 import { resolveGitFreshness } from "./memory-freshness.ts";
 import { stableJsonStringify } from "./stable-json.ts";
 import { syncDirectory } from "./sync-directory.ts";
@@ -48,6 +49,7 @@ export type MemoryEventType =
 	| "capture_scheduled"
 	| "generation_started"
 	| "capture_failed"
+	| "capture_skipped"
 	| "proposal_recorded"
 	| "memory_change_applied"
 	| "proposal_rejected"
@@ -77,6 +79,12 @@ export interface CaptureFailedPayloadV1 {
 	message: string;
 }
 
+export interface CaptureSkippedPayloadV1 {
+	captureId: string;
+	reasonCode: "no_durable_memory";
+	resultArtifactId: string;
+}
+
 export interface ProposalRecordedPayloadV1 {
 	captureId: string | null;
 	proposalId: string;
@@ -91,6 +99,16 @@ export interface MemoryChangeAppliedPayloadV1 {
 	revisions: PublishedMemoryRevisionRefV1[];
 	cues: PublishedCueRefV1[];
 	edges: PublishedEdgeRefV1[];
+	purges?: PublishedMemoryPurgeRefV1[];
+}
+
+export interface PublishedMemoryPurgeRefV1 {
+	memoryId: string;
+	revisionArtifactIds: string[];
+	edgeArtifactIds: string[];
+	evidenceArtifactIds: string[];
+	contentArtifactIds?: string[];
+	sourceDigest: string;
 }
 
 export interface PublishedMemoryRevisionRefV1 {
@@ -144,6 +162,9 @@ export interface EvidenceDetachedPayloadV1 {
 export interface MemoryPurgedPayloadV1 {
 	memoryId: string;
 	revisionArtifactIds: string[];
+	edgeArtifactIds?: string[];
+	evidenceArtifactIds?: string[];
+	contentArtifactIds?: string[];
 	sourceDigest: string;
 }
 
@@ -157,6 +178,7 @@ export type MemoryEventPayloadV1 =
 	| CaptureScheduledPayloadV1
 	| GenerationStartedPayloadV1
 	| CaptureFailedPayloadV1
+	| CaptureSkippedPayloadV1
 	| ProposalRecordedPayloadV1
 	| MemoryChangeAppliedPayloadV1
 	| ProposalRejectedPayloadV1
@@ -169,6 +191,7 @@ export interface MemoryEventPayloadMapV1 {
 	capture_scheduled: CaptureScheduledPayloadV1;
 	generation_started: GenerationStartedPayloadV1;
 	capture_failed: CaptureFailedPayloadV1;
+	capture_skipped: CaptureSkippedPayloadV1;
 	proposal_recorded: ProposalRecordedPayloadV1;
 	memory_change_applied: MemoryChangeAppliedPayloadV1;
 	proposal_rejected: ProposalRejectedPayloadV1;
@@ -206,7 +229,14 @@ interface HashableMemoryEventV1 extends Omit<MemoryEventBaseV1, "hash"> {
 	payload: MemoryEventPayloadV1;
 }
 
-export type MemoryCaptureStatus = "scheduled" | "generating" | "failed" | "proposed" | "applied" | "rejected";
+export type MemoryCaptureStatus =
+	| "scheduled"
+	| "generating"
+	| "failed"
+	| "skipped"
+	| "proposed"
+	| "applied"
+	| "rejected";
 
 export interface MemoryCaptureProjectionV1 {
 	captureId: string;
@@ -257,6 +287,7 @@ export interface MemoryApplyResultV1 {
 	write: MemoryWriteResult<"memory_change_applied">;
 	revisions: MemoryRevisionV1[];
 	cues: CueNodeV1[];
+	edges: MemoryEdgeV1[];
 }
 
 export interface MemoryPurgeCleanupDiagnosticV1 {
@@ -289,6 +320,7 @@ export interface MemoryReadModelV1 {
 		scheduled: number;
 		generating: number;
 		failed: number;
+		skipped: number;
 		proposed: number;
 		applied: number;
 		rejected: number;
@@ -631,6 +663,17 @@ function parsePayload(eventType: MemoryEventType, value: unknown): MemoryEventPa
 			message: requiredString(value.message, "message", 2048),
 		};
 	}
+	if (eventType === "capture_skipped") {
+		exact(value, ["captureId", "reasonCode", "resultArtifactId"], "capture_skipped payload");
+		if (value.reasonCode !== "no_durable_memory") {
+			throw new MemoryValidationError("capture_skipped reasonCode is invalid");
+		}
+		return {
+			captureId: requiredString(value.captureId, "captureId"),
+			reasonCode: value.reasonCode,
+			resultArtifactId: sha(value.resultArtifactId, "resultArtifactId"),
+		};
+	}
 	if (eventType === "proposal_recorded") {
 		exact(
 			value,
@@ -648,9 +691,17 @@ function parsePayload(eventType: MemoryEventType, value: unknown): MemoryEventPa
 		};
 	}
 	if (eventType === "memory_change_applied") {
-		exact(value, ["proposalId", "proposalArtifactId", "revisions", "cues", "edges"], "memory_change_applied payload");
+		const keys = Object.keys(value).sort().join(",");
+		const legacyKeys = ["proposalId", "proposalArtifactId", "revisions", "cues", "edges"].sort().join(",");
+		const purgeKeys = ["proposalId", "proposalArtifactId", "revisions", "cues", "edges", "purges"].sort().join(",");
+		if (keys !== legacyKeys && keys !== purgeKeys) {
+			throw new MemoryValidationError("memory_change_applied payload has unknown or missing fields");
+		}
 		if (!Array.isArray(value.revisions) || !Array.isArray(value.cues) || !Array.isArray(value.edges)) {
 			throw new MemoryValidationError("memory_change_applied artifact references must be arrays");
+		}
+		if (value.purges !== undefined && !Array.isArray(value.purges)) {
+			throw new MemoryValidationError("memory_change_applied purge references must be an array");
 		}
 		return {
 			proposalId: requiredString(value.proposalId, "proposalId"),
@@ -658,6 +709,54 @@ function parsePayload(eventType: MemoryEventType, value: unknown): MemoryEventPa
 			revisions: value.revisions.map((entry, index) => publishedRevisionRef(entry, `revisions[${index}]`)),
 			cues: value.cues.map((entry, index) => publishedCueRef(entry, `cues[${index}]`)),
 			edges: value.edges.map((entry, index) => publishedEdgeRef(entry, `edges[${index}]`)),
+			...(value.purges === undefined
+				? {}
+				: {
+						purges: value.purges.map((entry, index): PublishedMemoryPurgeRefV1 => {
+							if (!isRecord(entry)) throw new MemoryValidationError(`purges[${index}] must be an object`);
+							const allowedKeys = new Set([
+								"memoryId",
+								"revisionArtifactIds",
+								"edgeArtifactIds",
+								"evidenceArtifactIds",
+								"contentArtifactIds",
+								"sourceDigest",
+							]);
+							if (
+								!Object.keys(entry).every((key) => allowedKeys.has(key)) ||
+								![
+									"memoryId",
+									"revisionArtifactIds",
+									"edgeArtifactIds",
+									"evidenceArtifactIds",
+									"sourceDigest",
+								].every((key) => Object.hasOwn(entry, key))
+							) {
+								throw new MemoryValidationError(`purges[${index}] has unknown or missing fields`);
+							}
+							return {
+								memoryId: requiredString(entry.memoryId, `purges[${index}] memoryId`),
+								revisionArtifactIds: artifactArray(
+									entry.revisionArtifactIds,
+									`purges[${index}] revisionArtifactIds`,
+								),
+								edgeArtifactIds: artifactArray(entry.edgeArtifactIds, `purges[${index}] edgeArtifactIds`),
+								evidenceArtifactIds: artifactArray(
+									entry.evidenceArtifactIds,
+									`purges[${index}] evidenceArtifactIds`,
+								),
+								...(entry.contentArtifactIds === undefined
+									? {}
+									: {
+											contentArtifactIds: artifactArray(
+												entry.contentArtifactIds,
+												`purges[${index}] contentArtifactIds`,
+											),
+										}),
+								sourceDigest: sha(entry.sourceDigest, `purges[${index}] sourceDigest`),
+							};
+						}),
+					}),
 		};
 	}
 	if (eventType === "proposal_rejected") {
@@ -701,10 +800,34 @@ function parsePayload(eventType: MemoryEventType, value: unknown): MemoryEventPa
 		};
 	}
 	if (eventType === "memory_purged") {
-		exact(value, ["memoryId", "revisionArtifactIds", "sourceDigest"], "memory_purged payload");
+		const allowedKeys = new Set([
+			"memoryId",
+			"revisionArtifactIds",
+			"edgeArtifactIds",
+			"evidenceArtifactIds",
+			"contentArtifactIds",
+			"sourceDigest",
+		]);
+		if (
+			!Object.keys(value).every((key) => allowedKeys.has(key)) ||
+			!Object.hasOwn(value, "memoryId") ||
+			!Object.hasOwn(value, "revisionArtifactIds") ||
+			!Object.hasOwn(value, "sourceDigest")
+		) {
+			throw new MemoryValidationError("memory_purged payload has unknown or missing fields");
+		}
 		return {
 			memoryId: requiredString(value.memoryId, "memoryId"),
 			revisionArtifactIds: artifactArray(value.revisionArtifactIds, "revisionArtifactIds"),
+			...(value.edgeArtifactIds === undefined
+				? {}
+				: { edgeArtifactIds: artifactArray(value.edgeArtifactIds, "edgeArtifactIds") }),
+			...(value.evidenceArtifactIds === undefined
+				? {}
+				: { evidenceArtifactIds: artifactArray(value.evidenceArtifactIds, "evidenceArtifactIds") }),
+			...(value.contentArtifactIds === undefined
+				? {}
+				: { contentArtifactIds: artifactArray(value.contentArtifactIds, "contentArtifactIds") }),
 			sourceDigest: sha(value.sourceDigest, "sourceDigest"),
 		};
 	}
@@ -754,6 +877,7 @@ function parseEvent(value: unknown, lineNumber: number): MemoryEventV1 {
 				"capture_scheduled",
 				"generation_started",
 				"capture_failed",
+				"capture_skipped",
 				"proposal_recorded",
 				"memory_change_applied",
 				"proposal_rejected",
@@ -847,6 +971,17 @@ function projectCaptures(events: readonly MemoryEventV1[]): Map<string, MemoryCa
 				errorCode: event.payload.errorCode,
 				retryable: event.payload.retryable,
 			});
+		} else if (event.eventType === "capture_skipped") {
+			const capture = captures.get(event.payload.captureId);
+			if (!capture || capture.status !== "generating") {
+				throw new MemoryCorruptionError("capture_skipped requires a generating capture");
+			}
+			captures.set(capture.captureId, {
+				...capture,
+				status: "skipped",
+				errorCode: null,
+				retryable: null,
+			});
 		} else if (event.eventType === "proposal_recorded") {
 			if (proposals.has(event.payload.proposalId)) {
 				throw new MemoryCorruptionError("proposal_recorded duplicates proposalId");
@@ -881,6 +1016,20 @@ function projectCaptures(events: readonly MemoryEventV1[]): Map<string, MemoryCa
 		}
 	}
 	return captures;
+}
+
+function assertPurgeMatchesCurrentMemory(
+	current: PublishedMemoryRevisionRefV1 | undefined,
+	purge: { sourceDigest: string; revisionArtifactIds: readonly string[] },
+	eventType: "memory_change_applied" | "memory_purged",
+): void {
+	if (
+		!current ||
+		current.sourceDigest !== purge.sourceDigest ||
+		!purge.revisionArtifactIds.includes(current.artifactId)
+	) {
+		throw new MemoryCorruptionError(`${eventType} purge does not match the current Memory`);
+	}
 }
 
 function projectFacts(events: readonly MemoryEventV1[]): {
@@ -937,6 +1086,20 @@ function projectFacts(events: readonly MemoryEventV1[]): {
 					throw new MemoryCorruptionError(`memory_change_applied duplicates edge ${edge.edgeId}`);
 				edges.set(edge.edgeId, edge);
 			}
+			for (const purge of event.payload.purges ?? []) {
+				const current = memories.get(purge.memoryId);
+				assertPurgeMatchesCurrentMemory(current, purge, "memory_change_applied");
+				memories.delete(purge.memoryId);
+				for (const [edgeId, edge] of edges) {
+					if (
+						(edge.from.kind === "memory" && edge.from.id === purge.memoryId) ||
+						(edge.to.kind === "memory" && edge.to.id === purge.memoryId)
+					) {
+						edges.delete(edgeId);
+					}
+				}
+				purgedSourceDigests.add(purge.sourceDigest);
+			}
 		} else if (event.eventType === "proposal_rejected") {
 			if (!proposals.has(event.payload.proposalId) || resolvedProposals.has(event.payload.proposalId)) {
 				throw new MemoryCorruptionError("proposal_rejected requires one unresolved recorded proposal");
@@ -976,8 +1139,8 @@ function projectFacts(events: readonly MemoryEventV1[]): {
 				evidenceIds: current.evidenceIds.filter((evidenceId) => evidenceId !== event.payload.evidenceId),
 			});
 		} else if (event.eventType === "memory_purged") {
-			if (!memories.delete(event.payload.memoryId))
-				throw new MemoryCorruptionError("memory_purged references missing memory");
+			assertPurgeMatchesCurrentMemory(memories.get(event.payload.memoryId), event.payload, "memory_purged");
+			memories.delete(event.payload.memoryId);
 			for (const [edgeId, edge] of edges) {
 				if (
 					(edge.from.kind === "memory" && edge.from.id === event.payload.memoryId) ||
@@ -992,6 +1155,17 @@ function projectFacts(events: readonly MemoryEventV1[]): {
 				throw new MemoryCorruptionError("access_recorded duplicates runId");
 			}
 			accessRuns.add(event.payload.runId);
+			const evidenceIds = new Set<string>();
+			for (const memoryId of event.payload.memoryIds) {
+				const memory = memories.get(memoryId);
+				if (!memory) throw new MemoryCorruptionError("access_recorded references missing memory");
+				for (const evidenceId of memory.evidenceIds) evidenceIds.add(evidenceId);
+			}
+			for (const evidenceId of event.payload.evidenceIds) {
+				if (!evidenceIds.has(evidenceId)) {
+					throw new MemoryCorruptionError("access_recorded references unrelated evidence");
+				}
+			}
 		}
 	}
 	for (const edge of edges.values()) {
@@ -1049,6 +1223,8 @@ function accessProjections(events: readonly MemoryEventV1[]): Map<string, Memory
 					lastAccessedAt: event.timestamp,
 				});
 			}
+		} else if (event.eventType === "memory_change_applied") {
+			for (const purge of event.payload.purges ?? []) accesses.delete(purge.memoryId);
 		} else if (event.eventType === "memory_purged") {
 			accesses.delete(event.payload.memoryId);
 		}
@@ -1062,6 +1238,7 @@ function buildReadModel(replay: MemoryReplay): MemoryReadModelV1 {
 		scheduled: 0,
 		generating: 0,
 		failed: 0,
+		skipped: 0,
 		proposed: 0,
 		applied: 0,
 		rejected: 0,
@@ -1132,7 +1309,9 @@ function captureProjection(value: unknown, field: string): MemoryCaptureProjecti
 		field,
 	);
 	if (
-		!(["scheduled", "generating", "failed", "proposed", "applied", "rejected"] as unknown[]).includes(value.status)
+		!(["scheduled", "generating", "failed", "skipped", "proposed", "applied", "rejected"] as unknown[]).includes(
+			value.status,
+		)
 	) {
 		throw new MemoryValidationError(`${field} status is invalid`);
 	}
@@ -1230,15 +1409,22 @@ function validateReadModel(value: unknown): MemoryReadModelV1 {
 		accessProjection(entry, `Memory read model accesses[${index}]`),
 	);
 	if (!isRecord(value.counts)) throw new MemoryValidationError("Memory read model counts must be an object");
-	exact(
-		value.counts,
-		["scheduled", "generating", "failed", "proposed", "applied", "rejected"],
-		"Memory read model counts",
-	);
+	const countKeys = Object.keys(value.counts).sort().join(",");
+	const legacyCountKeys = ["scheduled", "generating", "failed", "proposed", "applied", "rejected"].sort().join(",");
+	const currentCountKeys = ["scheduled", "generating", "failed", "skipped", "proposed", "applied", "rejected"]
+		.sort()
+		.join(",");
+	if (countKeys !== legacyCountKeys && countKeys !== currentCountKeys) {
+		throw new MemoryValidationError("Memory read model counts has unknown or missing fields");
+	}
 	const counts = {
 		scheduled: nonNegativeInteger(value.counts.scheduled, "Memory read model scheduled count"),
 		generating: nonNegativeInteger(value.counts.generating, "Memory read model generating count"),
 		failed: nonNegativeInteger(value.counts.failed, "Memory read model failed count"),
+		skipped:
+			value.counts.skipped === undefined
+				? 0
+				: nonNegativeInteger(value.counts.skipped, "Memory read model skipped count"),
 		proposed: nonNegativeInteger(value.counts.proposed, "Memory read model proposed count"),
 		applied: nonNegativeInteger(value.counts.applied, "Memory read model applied count"),
 		rejected: nonNegativeInteger(value.counts.rejected, "Memory read model rejected count"),
@@ -1404,6 +1590,12 @@ function applyEventTail(readModel: MemoryReadModelV1, raw: string): MemoryReadMo
 					retryable: event.payload.retryable,
 				});
 			}
+		} else if (event.eventType === "capture_skipped") {
+			const capture = captures.get(event.payload.captureId);
+			if (!capture || capture.status !== "generating") {
+				throw new MemoryCorruptionError("capture_skipped requires a generating capture");
+			}
+			replaceCapture({ ...capture, status: "skipped", errorCode: null, retryable: null });
 		} else if (event.eventType === "proposal_recorded") {
 			if (proposals.has(event.payload.proposalId))
 				throw new MemoryCorruptionError("proposal_recorded duplicates proposalId");
@@ -1457,6 +1649,21 @@ function applyEventTail(readModel: MemoryReadModelV1, raw: string): MemoryReadMo
 					throw new MemoryCorruptionError(`memory_change_applied duplicates edge ${edge.edgeId}`);
 				edges.set(edge.edgeId, edge);
 			}
+			for (const purge of event.payload.purges ?? []) {
+				const current = memories.get(purge.memoryId);
+				assertPurgeMatchesCurrentMemory(current, purge, "memory_change_applied");
+				memories.delete(purge.memoryId);
+				accesses.delete(purge.memoryId);
+				for (const [edgeId, edge] of edges) {
+					if (
+						(edge.from.kind === "memory" && edge.from.id === purge.memoryId) ||
+						(edge.to.kind === "memory" && edge.to.id === purge.memoryId)
+					) {
+						edges.delete(edgeId);
+					}
+				}
+				purgedSourceDigests.add(purge.sourceDigest);
+			}
 		} else if (event.eventType === "proposal_rejected") {
 			const proposal = proposals.get(event.payload.proposalId);
 			if (!proposal || resolvedProposals.has(event.payload.proposalId)) {
@@ -1503,8 +1710,8 @@ function applyEventTail(readModel: MemoryReadModelV1, raw: string): MemoryReadMo
 				evidenceIds: current.evidenceIds.filter((evidenceId) => evidenceId !== event.payload.evidenceId),
 			});
 		} else if (event.eventType === "memory_purged") {
-			if (!memories.delete(event.payload.memoryId))
-				throw new MemoryCorruptionError("memory_purged references missing memory");
+			assertPurgeMatchesCurrentMemory(memories.get(event.payload.memoryId), event.payload, "memory_purged");
+			memories.delete(event.payload.memoryId);
 			for (const [edgeId, edge] of edges) {
 				if (
 					(edge.from.kind === "memory" && edge.from.id === event.payload.memoryId) ||
@@ -1614,6 +1821,23 @@ export class MemoryStore {
 					return new MemoryLockRecoveryError(`capture ${normalized} generation lock metadata is malformed`);
 				}
 				return new MemoryLockRecoveryError(`capture ${normalized} generation lock owner is ${failure.ownerState}`);
+			},
+		};
+	}
+
+	private projectionLockOptions(): FileWriteLockOptions {
+		return {
+			directory: this.paths.locksDirectory,
+			lockPath: join(this.paths.locksDirectory, "projection.lock"),
+			recoveryLockPath: join(this.paths.locksDirectory, "projection.recovery.lock"),
+			error: (failure: WriteLockFailure) => {
+				if (failure.kind === "locked") return new MemoryLockedError("updating Memory projections");
+				if (failure.kind === "recovery-locked") return new MemoryLockedError("recovering Memory projections");
+				if (failure.kind === "conflict") return new MemoryLockRecoveryConflictError();
+				if (failure.kind === "malformed") {
+					return new MemoryLockRecoveryError("Memory projection lock metadata is malformed");
+				}
+				return new MemoryLockRecoveryError(`Memory projection lock owner is ${failure.ownerState}`);
 			},
 		};
 	}
@@ -2103,6 +2327,19 @@ export class MemoryStore {
 		return await this.append("capture_failed", payload, options);
 	}
 
+	async markCaptureSkipped(
+		captureId: string,
+		resultArtifactId: string,
+		options: MemoryMutationOptions,
+	): Promise<MemoryWriteResult<"capture_skipped">> {
+		await this.artifacts.read(resultArtifactId);
+		return await this.append(
+			"capture_skipped",
+			{ captureId, reasonCode: "no_durable_memory", resultArtifactId },
+			options,
+		);
+	}
+
 	async rejectProposal(
 		proposalId: string,
 		reason: string,
@@ -2176,6 +2413,18 @@ export class MemoryStore {
 			if (actual !== revision) throw new MemoryRevisionConflictError(memoryId, revision, actual);
 		}
 		for (const operation of proposal.operations) {
+			if (
+				operation.kind === "change_lifecycle" ||
+				operation.kind === "detach_evidence" ||
+				operation.kind === "purge_memory"
+			) {
+				const actual = replay.memories.get(operation.memoryId)?.revision ?? null;
+				const expectedRevision = expected.get(operation.memoryId) ?? null;
+				if (actual !== operation.expectedRevision || expectedRevision !== operation.expectedRevision) {
+					throw new MemoryRevisionConflictError(operation.memoryId, operation.expectedRevision, actual);
+				}
+				continue;
+			}
 			if (operation.kind !== "publish_revision") continue;
 			const current = replay.memories.get(operation.revision.memoryId);
 			if (operation.revision.revision === 1) {
@@ -2208,14 +2457,12 @@ export class MemoryStore {
 		revisions: readonly MemoryRevisionV1[],
 		edges: readonly ReturnType<typeof validateMemoryEdgeV1>[],
 	): Promise<void> {
-		const artifactIds = new Set<string>();
 		for (const evidence of [
 			...revisions.flatMap((revision) => revision.evidenceRefs),
 			...edges.flatMap((edge) => edge.evidenceRefs),
 		]) {
-			if (evidence.artifactId) artifactIds.add(evidence.artifactId);
+			await validateMemoryEvidenceOwnership(this.projectRoot, evidence);
 		}
-		for (const artifactId of artifactIds) await this.artifacts.read(artifactId);
 	}
 
 	async applyProposal(proposalArtifactId: string, options: MemoryApplyOptions): Promise<MemoryApplyResultV1> {
@@ -2245,21 +2492,107 @@ export class MemoryStore {
 			throw new MemoryValidationError("proposal requires explicit user confirmation");
 		}
 		this.assertExpectedRevisions(replay, proposal);
-		if (proposal.operations.some((operation) => !operation.kind.startsWith("publish_"))) {
-			throw new MemoryValidationError(
-				"destructive proposal operations require their dedicated confirmed mutation API",
-			);
-		}
-		const revisions = proposal.operations
+		const publishedRevisions = proposal.operations
 			.filter((operation) => operation.kind === "publish_revision")
 			.map((operation) => validateMemoryRevisionV1(operation.revision));
+		const mutationOperations = proposal.operations.filter(
+			(operation) =>
+				operation.kind === "change_lifecycle" ||
+				operation.kind === "detach_evidence" ||
+				operation.kind === "purge_memory",
+		);
+		const publishedMemoryIds = new Set(publishedRevisions.map((revision) => revision.memoryId));
+		const mutationMemoryIds = new Set(mutationOperations.map((operation) => operation.memoryId));
+		for (const memoryId of mutationMemoryIds) {
+			if (publishedMemoryIds.has(memoryId)) {
+				throw new MemoryValidationError(`proposal cannot publish and destructively mutate ${memoryId}`);
+			}
+		}
+		const mutationRevisions: MemoryRevisionV1[] = [];
+		const purgeMemoryIds = new Set<string>();
+		const mutationRecordedAt = timestamp(options.timestamp ?? new Date().toISOString());
+		for (const memoryId of [...mutationMemoryIds].sort()) {
+			const current = await this.readMemory(memoryId);
+			let lifecycle = current.revision.lifecycle;
+			let evidenceRefs = [...current.revision.evidenceRefs];
+			let changed = false;
+			let lifecycleChanges = 0;
+			const detachedEvidenceIds = new Set<string>();
+			for (const operation of mutationOperations) {
+				if (operation.memoryId !== memoryId) continue;
+				if (operation.kind === "change_lifecycle") {
+					lifecycleChanges += 1;
+					if (lifecycleChanges > 1) {
+						throw new MemoryValidationError(`proposal changes lifecycle more than once for ${memoryId}`);
+					}
+					if (lifecycle === operation.lifecycle) {
+						throw new MemoryValidationError("Memory already has the requested lifecycle");
+					}
+					lifecycle = operation.lifecycle;
+					changed = true;
+				} else if (operation.kind === "detach_evidence") {
+					if (detachedEvidenceIds.has(operation.evidenceId)) {
+						throw new MemoryValidationError(`proposal detaches evidence more than once: ${operation.evidenceId}`);
+					}
+					detachedEvidenceIds.add(operation.evidenceId);
+					if (!evidenceRefs.some((evidence) => evidence.evidenceId === operation.evidenceId)) {
+						throw new MemoryValidationError(`Memory evidence does not exist: ${operation.evidenceId}`);
+					}
+					evidenceRefs = evidenceRefs.filter((evidence) => evidence.evidenceId !== operation.evidenceId);
+					changed = true;
+				} else {
+					if (purgeMemoryIds.has(memoryId)) {
+						throw new MemoryValidationError(`proposal purges Memory more than once: ${memoryId}`);
+					}
+					purgeMemoryIds.add(memoryId);
+				}
+			}
+			if (purgeMemoryIds.has(memoryId)) {
+				if (lifecycle !== "archived" && lifecycle !== "invalidated") {
+					throw new MemoryValidationError("Memory must be archived or invalidated before purge");
+				}
+				if (evidenceRefs.length > 0) {
+					throw new MemoryValidationError("Memory evidence must be detached before purge");
+				}
+				await this.assertNoActiveInboundEdges(replay, memoryId, mutationRecordedAt);
+			}
+			if (changed) {
+				mutationRevisions.push(
+					validateMemoryRevisionV1({
+						...current.revision,
+						revision: current.revision.revision + 1,
+						lifecycle,
+						evidenceRefs,
+						effectiveFrom: mutationRecordedAt,
+						effectiveTo: null,
+						supersedesRevision: current.revision.revision,
+						provenance: {
+							producer: options.actor === "user" ? "user" : "pi-xk",
+							model: null,
+							promptVersion: null,
+							recordedAt: mutationRecordedAt,
+						},
+					}),
+				);
+			}
+		}
+		const revisions = [...publishedRevisions, ...mutationRevisions];
 		const cues = proposal.operations
 			.filter((operation) => operation.kind === "publish_cue")
 			.map((operation) => validateCueNodeV1(operation.cue));
 		const edges = proposal.operations
 			.filter((operation) => operation.kind === "publish_edge")
 			.map((operation) => validateMemoryEdgeV1(operation.edge));
-		for (const entity of [...revisions, ...cues, ...edges]) {
+		for (const edge of edges) {
+			for (const endpoint of [edge.from, edge.to]) {
+				if (endpoint.kind === "memory" && purgeMemoryIds.has(endpoint.id)) {
+					throw new MemoryValidationError(
+						`proposal cannot publish edge ${edge.edgeId} for purged Memory ${endpoint.id}`,
+					);
+				}
+			}
+		}
+		for (const entity of [...publishedRevisions, ...cues, ...edges]) {
 			if (entity.sourceDigest !== proposal.sourceDigest) {
 				throw new MemoryValidationError("published entity sourceDigest must match its proposal");
 			}
@@ -2340,6 +2673,7 @@ export class MemoryStore {
 				evidenceIds: canonical.evidenceRefs.map((evidence) => evidence.evidenceId),
 			});
 		}
+		const canonicalEdges: MemoryEdgeV1[] = [];
 		const edgeRefs: PublishedEdgeRefV1[] = [];
 		for (const edge of edges) {
 			const stored = await this.artifacts.put({
@@ -2353,6 +2687,7 @@ export class MemoryStore {
 			const canonical = validateMemoryEdgeV1(
 				JSON.parse((await this.artifacts.read(stored.artifactId)).content) as unknown,
 			);
+			canonicalEdges.push(canonical);
 			edgeRefs.push({
 				edgeId: canonical.edgeId,
 				artifactId: stored.artifactId,
@@ -2361,6 +2696,55 @@ export class MemoryStore {
 				relation: canonical.relation,
 			});
 		}
+		const revisionRefsByMemoryId = new Map(revisionRefs.map((reference) => [reference.memoryId, reference]));
+		const purges: PublishedMemoryPurgeRefV1[] = [];
+		const purgeCleanupCandidates = new Set<string>();
+		for (const memoryId of [...purgeMemoryIds].sort()) {
+			const original = replay.memories.get(memoryId);
+			if (!original) throw new MemoryNotFoundError(memoryId);
+			const current = revisionRefsByMemoryId.get(memoryId) ?? original;
+			const revisionArtifactIds = [...new Set([...this.revisionArtifactIds(replay, memoryId), current.artifactId])];
+			const edgeArtifactIds = [...replay.edges.values()]
+				.filter(
+					(edge) =>
+						(edge.from.kind === "memory" && edge.from.id === memoryId) ||
+						(edge.to.kind === "memory" && edge.to.id === memoryId),
+				)
+				.map((edge) => edge.artifactId);
+			const evidenceArtifactIds = new Set<string>();
+			const contentArtifactIds = this.exclusiveProposalContentArtifactIds(replay, memoryId);
+			for (const artifactId of revisionArtifactIds) {
+				const revision = validateMemoryRevisionV1(
+					JSON.parse((await this.artifacts.read(artifactId)).content) as unknown,
+				);
+				for (const evidence of revision.evidenceRefs) {
+					if (evidence.artifactId) evidenceArtifactIds.add(evidence.artifactId);
+				}
+			}
+			for (const artifactId of [...edgeArtifactIds, ...evidenceArtifactIds]) {
+				await this.artifacts.read(artifactId);
+			}
+			for (const artifactId of [
+				...revisionArtifactIds,
+				...edgeArtifactIds,
+				...evidenceArtifactIds,
+				...contentArtifactIds,
+			]) {
+				purgeCleanupCandidates.add(artifactId);
+			}
+			purges.push({
+				memoryId,
+				revisionArtifactIds,
+				edgeArtifactIds,
+				evidenceArtifactIds: [...evidenceArtifactIds].sort(),
+				...(contentArtifactIds.length > 0 ? { contentArtifactIds: contentArtifactIds.sort() } : {}),
+				sourceDigest: original.sourceDigest,
+			});
+		}
+		const externallyReferencedPurgeArtifacts = await this.artifactsWithExternalReferences(
+			purgeCleanupCandidates,
+			purgeCleanupCandidates,
+		);
 		const write = await this.append(
 			"memory_change_applied",
 			{
@@ -2369,10 +2753,15 @@ export class MemoryStore {
 				revisions: revisionRefs,
 				cues: cueRefs,
 				edges: edgeRefs,
+				...(purges.length > 0 ? { purges } : {}),
 			},
 			options,
 		);
-		return { write, revisions: canonicalRevisions, cues: canonicalCues };
+		for (const artifactId of purgeCleanupCandidates) {
+			if (externallyReferencedPurgeArtifacts.has(artifactId)) continue;
+			await this.artifacts.remove(artifactId).catch(() => false);
+		}
+		return { write, revisions: canonicalRevisions, cues: canonicalCues, edges: canonicalEdges };
 	}
 
 	private factProjection(readModel: MemoryReadModelV1): MemoryFactProjection {
@@ -2456,43 +2845,117 @@ export class MemoryStore {
 		return results;
 	}
 
-	async readMemoryTimeline(memoryId: string): Promise<MemoryTimelineEntryV1[]> {
-		const replay = await this.replay();
-		const artifactIds: string[] = [];
+	private timelineArtifactIds(replay: MemoryReplay): Map<string, string[]> {
+		const artifactIds = new Map<string, string[]>();
+		const append = (memoryId: string, artifactId: string): void => {
+			if (!replay.memories.has(memoryId)) return;
+			const current = artifactIds.get(memoryId) ?? [];
+			current.push(artifactId);
+			artifactIds.set(memoryId, current);
+		};
 		for (const event of replay.events) {
 			if (event.eventType === "memory_change_applied") {
 				for (const revision of event.payload.revisions) {
-					if (revision.memoryId === memoryId) artifactIds.push(revision.artifactId);
+					append(revision.memoryId, revision.artifactId);
 				}
-			} else if (
-				(event.eventType === "memory_lifecycle_changed" || event.eventType === "evidence_detached") &&
-				event.payload.memoryId === memoryId
-			) {
-				artifactIds.push(event.payload.revisionArtifactId);
+			} else if (event.eventType === "memory_lifecycle_changed" || event.eventType === "evidence_detached") {
+				append(event.payload.memoryId, event.payload.revisionArtifactId);
 			}
 		}
-		if (artifactIds.length === 0) throw new MemoryNotFoundError(memoryId);
-		const timeline: MemoryTimelineEntryV1[] = [];
-		for (const [index, artifactId] of artifactIds.entries()) {
-			const revision = validateMemoryRevisionV1(
-				JSON.parse((await this.artifacts.read(artifactId)).content) as unknown,
-			);
-			if (revision.memoryId !== memoryId || revision.revision !== index + 1) {
-				throw new MemoryCorruptionError(`Memory timeline artifact breaks revision sequence: ${memoryId}`);
+		return artifactIds;
+	}
+
+	private async readTimelinesFromReplay(replay: MemoryReplay): Promise<Map<string, MemoryTimelineEntryV1[]>> {
+		const result = new Map<string, MemoryTimelineEntryV1[]>();
+		for (const [memoryId, artifactIds] of this.timelineArtifactIds(replay)) {
+			const timeline: MemoryTimelineEntryV1[] = [];
+			for (const [index, artifactId] of artifactIds.entries()) {
+				const revision = validateMemoryRevisionV1(
+					JSON.parse((await this.artifacts.read(artifactId)).content) as unknown,
+				);
+				if (revision.memoryId !== memoryId || revision.revision !== index + 1) {
+					throw new MemoryCorruptionError(`Memory timeline artifact breaks revision sequence: ${memoryId}`);
+				}
+				timeline.push({
+					revision,
+					artifactId,
+					state: {
+						trust: revision.trust,
+						freshness: revision.freshnessBasis
+							? await resolveGitFreshness(this.projectRoot, revision.freshnessBasis)
+							: "unknown",
+						lifecycle: revision.lifecycle,
+					},
+				});
 			}
-			timeline.push({
-				revision,
-				artifactId,
-				state: {
-					trust: revision.trust,
-					freshness: revision.freshnessBasis
-						? await resolveGitFreshness(this.projectRoot, revision.freshnessBasis)
-						: "unknown",
-					lifecycle: revision.lifecycle,
-				},
-			});
+			result.set(memoryId, timeline);
 		}
+		return result;
+	}
+
+	async readMemoryTimeline(memoryId: string): Promise<MemoryTimelineEntryV1[]> {
+		const timeline = (await this.readTimelinesFromReplay(await this.replay())).get(memoryId);
+		if (!timeline) throw new MemoryNotFoundError(memoryId);
 		return timeline;
+	}
+
+	async readMemoryRevision(memoryId: string, revision: number): Promise<MemoryReadResultV1> {
+		const timeline = await this.readMemoryTimeline(memoryId);
+		const result = timeline.find((entry) => entry.revision.revision === revision);
+		if (!result) throw new MemoryNotFoundError(`${memoryId}@${revision}`);
+		return result;
+	}
+
+	async readMemoryAt(memoryId: string, asOf: string): Promise<MemoryReadResultV1> {
+		const timestampValue = Date.parse(asOf);
+		if (Number.isNaN(timestampValue)) throw new MemoryValidationError("Memory asOf must be an ISO timestamp");
+		const timeline = await this.readMemoryTimeline(memoryId);
+		const matches = timeline.filter((entry, index) => {
+			const next = timeline[index + 1];
+			const explicitEnd = entry.revision.effectiveTo ? Date.parse(entry.revision.effectiveTo) : null;
+			const nextStart = next ? Date.parse(next.revision.effectiveFrom) : null;
+			const implicitEnd =
+				nextStart !== null && nextStart > Date.parse(entry.revision.effectiveFrom) ? nextStart : null;
+			const end =
+				explicitEnd === null
+					? implicitEnd
+					: implicitEnd === null
+						? explicitEnd
+						: Math.min(explicitEnd, implicitEnd);
+			return timestampValue >= Date.parse(entry.revision.effectiveFrom) && (end === null || timestampValue < end);
+		});
+		const result = matches.at(-1);
+		if (!result) throw new MemoryValidationError(`Memory is not effective at asOf: ${memoryId}`);
+		return result;
+	}
+
+	async readMemoriesAt(asOf: string): Promise<MemoryReadResultV1[]> {
+		const timestampValue = Date.parse(asOf);
+		if (Number.isNaN(timestampValue)) throw new MemoryValidationError("Memory asOf must be an ISO timestamp");
+		const timelines = await this.readTimelinesFromReplay(await this.replay());
+		const results: MemoryReadResultV1[] = [];
+		for (const timeline of timelines.values()) {
+			const result = timeline
+				.filter((entry, index) => {
+					const next = timeline[index + 1];
+					const explicitEnd = entry.revision.effectiveTo ? Date.parse(entry.revision.effectiveTo) : null;
+					const nextStart = next ? Date.parse(next.revision.effectiveFrom) : null;
+					const implicitEnd =
+						nextStart !== null && nextStart > Date.parse(entry.revision.effectiveFrom) ? nextStart : null;
+					const end =
+						explicitEnd === null
+							? implicitEnd
+							: implicitEnd === null
+								? explicitEnd
+								: Math.min(explicitEnd, implicitEnd);
+					return (
+						timestampValue >= Date.parse(entry.revision.effectiveFrom) && (end === null || timestampValue < end)
+					);
+				})
+				.at(-1);
+			if (result) results.push(result);
+		}
+		return results.sort((left, right) => left.revision.memoryId.localeCompare(right.revision.memoryId));
 	}
 
 	private async readCueReference(reference: PublishedCueRefV1): Promise<{ cue: CueNodeV1; artifactId: string }> {
@@ -2631,6 +3094,8 @@ export class MemoryStore {
 			...current.revision,
 			revision: current.revision.revision + 1,
 			lifecycle,
+			effectiveFrom: recordedAt,
+			effectiveTo: null,
 			supersedesRevision: current.revision.revision,
 			provenance: {
 				producer: options.actor === "user" ? "user" : "pi-xk",
@@ -2678,6 +3143,8 @@ export class MemoryStore {
 			...current.revision,
 			revision: current.revision.revision + 1,
 			evidenceRefs: current.revision.evidenceRefs.filter((evidence) => evidence.evidenceId !== evidenceId),
+			effectiveFrom: recordedAt,
+			effectiveTo: null,
 			supersedesRevision: current.revision.revision,
 			provenance: {
 				producer: options.actor === "user" ? "user" : "pi-xk",
@@ -2717,58 +3184,113 @@ export class MemoryStore {
 		return [...result];
 	}
 
-	private async assertNoActiveEdges(replay: MemoryReplay, memoryId: string, asOf: string): Promise<void> {
+	private exclusiveProposalContentArtifactIds(replay: MemoryReplay, memoryId: string): string[] {
+		const proposalIds = new Set<string>();
+		for (const event of replay.events) {
+			if (event.eventType !== "memory_change_applied") continue;
+			if (!event.payload.revisions.some((revision) => revision.memoryId === memoryId)) continue;
+			if (
+				event.payload.revisions.some((revision) => revision.memoryId !== memoryId) ||
+				event.payload.cues.length > 0 ||
+				event.payload.edges.length > 0 ||
+				(event.payload.purges ?? []).some((purge) => purge.memoryId !== memoryId)
+			) {
+				continue;
+			}
+			proposalIds.add(event.payload.proposalId);
+		}
+		const candidates = new Set<string>();
+		for (const proposalId of proposalIds) {
+			const recorded = replay.proposals.get(proposalId);
+			if (!recorded) throw new MemoryCorruptionError(`Applied Memory proposal is missing: ${proposalId}`);
+			candidates.add(recorded.proposalArtifactId);
+			candidates.add(recorded.resultArtifactId);
+		}
+		for (const event of replay.events) {
+			if (event.eventType === "proposal_recorded" && !proposalIds.has(event.payload.proposalId)) {
+				candidates.delete(event.payload.proposalArtifactId);
+				candidates.delete(event.payload.resultArtifactId);
+			} else if (event.eventType === "capture_skipped") {
+				candidates.delete(event.payload.resultArtifactId);
+			}
+		}
+		return [...candidates];
+	}
+
+	private async assertNoActiveInboundEdges(replay: MemoryReplay, memoryId: string, asOf: string): Promise<void> {
 		for (const edgeReference of replay.edges.values()) {
-			const touchesMemory =
-				(edgeReference.from.kind === "memory" && edgeReference.from.id === memoryId) ||
-				(edgeReference.to.kind === "memory" && edgeReference.to.id === memoryId);
-			if (!touchesMemory) continue;
+			if (edgeReference.to.kind !== "memory" || edgeReference.to.id !== memoryId) continue;
 			const edge = validateMemoryEdgeV1(
 				JSON.parse((await this.artifacts.read(edgeReference.artifactId)).content) as unknown,
 			);
 			if (edge.effectiveTo === null || Date.parse(edge.effectiveTo) > Date.parse(asOf)) {
-				throw new MemoryValidationError(`Memory has an active graph edge: ${edge.edgeId}`);
+				throw new MemoryValidationError(`Memory has an active inbound graph edge: ${edge.edgeId}`);
 			}
 		}
 	}
 
-	private async artifactHasExternalReference(artifactId: string): Promise<boolean> {
+	private async artifactsWithExternalReferences(
+		artifactIds: ReadonlySet<string>,
+		ignoredArtifactIds: ReadonlySet<string>,
+	): Promise<Set<string>> {
+		const referenced = new Set<string>();
+		if (artifactIds.size === 0) return referenced;
 		const piXkDirectory = join(this.projectRoot, ".pi-xk");
 		const artifactsDirectory = join(piXkDirectory, "artifacts");
 		const objectDirectory = join(artifactsDirectory, "objects");
-		const referenceBytes = Buffer.from(artifactId, "utf8");
+		const referenceBytes = new Map(
+			[...artifactIds].map((artifactId) => [artifactId, Buffer.from(artifactId, "utf8")]),
+		);
 		const searchableExtensions = new Set([".json", ".jsonl", ".md"]);
-		const visit = async (directory: string): Promise<boolean> => {
+		const rememberContentReferences = (content: Buffer): void => {
+			for (const [artifactId, bytes] of referenceBytes) {
+				if (!referenced.has(artifactId) && content.includes(bytes)) referenced.add(artifactId);
+			}
+		};
+		const visit = async (directory: string): Promise<void> => {
+			if (referenced.size === artifactIds.size) return;
 			let entries: Dirent[];
 			try {
 				entries = await readdir(directory, { withFileTypes: true });
 			} catch (error) {
-				if (isErrno(error, "ENOENT")) return false;
+				if (isErrno(error, "ENOENT")) return;
 				throw error;
 			}
 			for (const entry of entries) {
+				if (referenced.size === artifactIds.size) return;
 				const path = join(directory, entry.name);
 				if (entry.isDirectory()) {
-					if (path === this.paths.memoryDirectory) continue;
-					if (await visit(path)) return true;
+					if (path === this.paths.memoryDirectory) {
+						await visit(join(path, "pending"));
+						continue;
+					}
+					await visit(path);
 				} else if (entry.isFile() && directory.startsWith(objectDirectory) && extname(path) === ".json") {
 					const metadata = validateArtifactMetadata(JSON.parse(await readFile(path, "utf8")) as unknown);
-					if (metadata.artifactId === artifactId || metadata.producer.startsWith("pi-xk.memory")) continue;
-					if (metadata.sourceIds.includes(artifactId)) return true;
+					if (artifactIds.has(metadata.artifactId) || ignoredArtifactIds.has(metadata.artifactId)) continue;
+					if (
+						metadata.producer.startsWith("pi-xk.memory") &&
+						metadata.producer !== MEMORY_REVISION_SCHEMA &&
+						metadata.producer !== MEMORY_EDGE_SCHEMA
+					) {
+						continue;
+					}
+					for (const sourceId of metadata.sourceIds) {
+						if (artifactIds.has(sourceId)) referenced.add(sourceId);
+					}
 					const dataPath = `${path.slice(0, -".json".length)}.data`;
-					if ((await readFile(dataPath)).includes(referenceBytes)) return true;
+					rememberContentReferences(await readFile(dataPath));
 				} else if (
 					entry.isFile() &&
 					!directory.startsWith(artifactsDirectory) &&
-					searchableExtensions.has(extname(path)) &&
-					(await readFile(path)).includes(referenceBytes)
+					searchableExtensions.has(extname(path))
 				) {
-					return true;
+					rememberContentReferences(await readFile(path));
 				}
 			}
-			return false;
 		};
-		return await visit(piXkDirectory);
+		await visit(piXkDirectory);
+		return referenced;
 	}
 
 	async purgeMemory(
@@ -2792,8 +3314,17 @@ export class MemoryStore {
 		if (reference.evidenceIds.length > 0)
 			throw new MemoryValidationError("Memory evidence must be detached before purge");
 		const asOf = timestamp(options.timestamp ?? new Date().toISOString());
-		await this.assertNoActiveEdges(replay, memoryId, asOf);
+		await this.assertNoActiveInboundEdges(replay, memoryId, asOf);
 		const revisionArtifactIds = this.revisionArtifactIds(replay, memoryId);
+		const edgeArtifactIds = [...replay.edges.values()]
+			.filter(
+				(edge) =>
+					(edge.from.kind === "memory" && edge.from.id === memoryId) ||
+					(edge.to.kind === "memory" && edge.to.id === memoryId),
+			)
+			.map((edge) => edge.artifactId);
+		const evidenceArtifactIds = new Set<string>();
+		const contentArtifactIds = this.exclusiveProposalContentArtifactIds(replay, memoryId);
 		for (const artifactId of revisionArtifactIds) {
 			const stored = await this.artifacts.read(artifactId);
 			const revision = validateMemoryRevisionV1(JSON.parse(stored.content) as unknown);
@@ -2802,23 +3333,32 @@ export class MemoryStore {
 					"Memory purge revision artifact is not exclusively owned by the target Memory",
 				);
 			}
+			for (const evidence of revision.evidenceRefs) {
+				if (evidence.artifactId) evidenceArtifactIds.add(evidence.artifactId);
+			}
 		}
-		const externallyReferenced = new Set<string>();
-		for (const artifactId of revisionArtifactIds) {
-			if (await this.artifactHasExternalReference(artifactId)) externallyReferenced.add(artifactId);
-		}
+		const cleanupCandidates = new Set([
+			...revisionArtifactIds,
+			...edgeArtifactIds,
+			...evidenceArtifactIds,
+			...contentArtifactIds,
+		]);
+		const externallyReferenced = await this.artifactsWithExternalReferences(cleanupCandidates, cleanupCandidates);
 		const write = await this.append(
 			"memory_purged",
 			{
 				memoryId,
 				revisionArtifactIds,
+				...(edgeArtifactIds.length > 0 ? { edgeArtifactIds } : {}),
+				...(evidenceArtifactIds.size > 0 ? { evidenceArtifactIds: [...evidenceArtifactIds].sort() } : {}),
+				...(contentArtifactIds.length > 0 ? { contentArtifactIds: contentArtifactIds.sort() } : {}),
 				sourceDigest: reference.sourceDigest,
 			},
 			options,
 		);
 		const removedArtifactIds: string[] = [];
 		const cleanupDiagnostics: MemoryPurgeCleanupDiagnosticV1[] = [];
-		for (const artifactId of revisionArtifactIds) {
+		for (const artifactId of cleanupCandidates) {
 			if (externallyReferenced.has(artifactId)) continue;
 			try {
 				if (await this.artifacts.remove(artifactId)) removedArtifactIds.push(artifactId);
@@ -2868,9 +3408,25 @@ export class MemoryStore {
 		if (replay.tailDiagnostic) throw new MemoryRecoveryRequiredError();
 		const referenced = new Set<string>();
 		const purgedArtifactIds = new Set(
-			replay.events.flatMap((event) =>
-				event.eventType === "memory_purged" ? event.payload.revisionArtifactIds : [],
-			),
+			replay.events.flatMap((event) => {
+				if (event.eventType === "memory_purged") {
+					return [
+						...event.payload.revisionArtifactIds,
+						...(event.payload.edgeArtifactIds ?? []),
+						...(event.payload.evidenceArtifactIds ?? []),
+						...(event.payload.contentArtifactIds ?? []),
+					];
+				}
+				if (event.eventType === "memory_change_applied") {
+					return (event.payload.purges ?? []).flatMap((purge) => [
+						...purge.revisionArtifactIds,
+						...purge.edgeArtifactIds,
+						...purge.evidenceArtifactIds,
+						...(purge.contentArtifactIds ?? []),
+					]);
+				}
+				return [];
+			}),
 		);
 		const purgedArtifactIdsPresent: string[] = [];
 		const purgedArtifactIdsMissing: string[] = [];
@@ -2885,12 +3441,9 @@ export class MemoryStore {
 		const readArtifact = async (artifactId: string, allowPurgedMissing = false) => {
 			referenced.add(artifactId);
 			try {
-				const stored = await this.artifacts.read(artifactId);
-				if (allowPurgedMissing) purgedArtifactIdsPresent.push(artifactId);
-				return stored;
+				return await this.artifacts.read(artifactId);
 			} catch (error) {
 				if (allowPurgedMissing && error instanceof ArtifactNotFoundError) {
-					purgedArtifactIdsMissing.push(artifactId);
 					return null;
 				}
 				throw error;
@@ -2913,10 +3466,12 @@ export class MemoryStore {
 				) {
 					throw new MemoryCorruptionError("Memory capture source artifact does not match its event");
 				}
+			} else if (event.eventType === "capture_skipped") {
+				await readArtifact(event.payload.resultArtifactId);
 			} else if (event.eventType === "proposal_recorded") {
 				const [proposalStored] = await Promise.all([
-					readArtifact(event.payload.proposalArtifactId),
-					readArtifact(event.payload.resultArtifactId),
+					readArtifact(event.payload.proposalArtifactId, purgedArtifactIds.has(event.payload.proposalArtifactId)),
+					readArtifact(event.payload.resultArtifactId, purgedArtifactIds.has(event.payload.resultArtifactId)),
 				]);
 				if (!proposalStored) continue;
 				const proposal = validateMemoryChangeProposalV1(JSON.parse(proposalStored.content) as unknown);
@@ -2953,7 +3508,7 @@ export class MemoryStore {
 					}
 				}
 				for (const reference of event.payload.edges) {
-					const stored = await readArtifact(reference.artifactId);
+					const stored = await readArtifact(reference.artifactId, purgedArtifactIds.has(reference.artifactId));
 					if (!stored) continue;
 					const edge = validateMemoryEdgeV1(JSON.parse(stored.content) as unknown);
 					if (
@@ -3001,6 +3556,20 @@ export class MemoryStore {
 		} catch (error) {
 			if (!isErrno(error, "ENOENT")) throw error;
 		}
+		const externallyReferencedPurgedArtifacts = await this.artifactsWithExternalReferences(
+			purgedArtifactIds,
+			purgedArtifactIds,
+		);
+		for (const artifactId of purgedArtifactIds) {
+			referenced.add(artifactId);
+			try {
+				await this.artifacts.read(artifactId);
+				if (!externallyReferencedPurgedArtifacts.has(artifactId)) purgedArtifactIdsPresent.push(artifactId);
+			} catch (error) {
+				if (error instanceof ArtifactNotFoundError) purgedArtifactIdsMissing.push(artifactId);
+				else throw error;
+			}
+		}
 		const orphanArtifactIds: string[] = [];
 		const objectsDirectory = join(this.projectRoot, ".pi-xk", "artifacts", "objects");
 		try {
@@ -3030,7 +3599,7 @@ export class MemoryStore {
 				left.evidenceId.localeCompare(right.evidenceId),
 			),
 			orphanArtifactIds: orphanArtifactIds.sort(),
-			purgedArtifactIdsPresent: [...new Set(purgedArtifactIdsPresent)].sort(),
+			purgedArtifactIdsPresent: purgedArtifactIdsPresent.sort(),
 			purgedArtifactIdsMissing: [...new Set(purgedArtifactIdsMissing)].sort(),
 		};
 	}
@@ -3041,6 +3610,10 @@ export class MemoryStore {
 
 	async withCaptureGenerationLock<TResult>(captureId: string, action: () => Promise<TResult>): Promise<TResult> {
 		return await withFileWriteLock(this.captureGenerationLockOptions(captureId), action);
+	}
+
+	async withProjectionLock<TResult>(action: () => Promise<TResult>): Promise<TResult> {
+		return await withFileWriteLock(this.projectionLockOptions(), action);
 	}
 
 	async inspectCaptureGenerationLock(captureId: string): Promise<MemoryWriteLockDiagnostic | undefined> {

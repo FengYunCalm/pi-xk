@@ -1,4 +1,7 @@
 import type {
+	MemoryIndexDeltaV1,
+	MemoryIndexGraphInputV1,
+	MemoryIndexGraphResultV1,
 	MemoryIndexRebuildChunkV1,
 	MemoryIndexRebuildPlanV1,
 	MemoryIndexSearchInputV1,
@@ -12,7 +15,9 @@ export type MemoryIndexWorkerOperationV1 =
 	| { kind: "rebuild_chunk"; chunk: MemoryIndexRebuildChunkV1 }
 	| { kind: "rebuild_finish" }
 	| { kind: "rebuild_abort" }
+	| { kind: "apply_delta"; delta: MemoryIndexDeltaV1 }
 	| { kind: "search"; input: MemoryIndexSearchInputV1 }
+	| { kind: "graph"; input: MemoryIndexGraphInputV1 }
 	| { kind: "record_access"; memoryIds: string[]; accessedAt: string; head: MemoryIndexSnapshotV1["head"] }
 	| { kind: "status" }
 	| { kind: "integrity_check" }
@@ -27,6 +32,7 @@ export interface MemoryIndexWorkerRequestV1 {
 export type MemoryIndexWorkerResultV1 =
 	| { kind: "void" }
 	| { kind: "search"; value: MemoryIndexSearchResultV1 }
+	| { kind: "graph"; value: MemoryIndexGraphResultV1 }
 	| { kind: "status"; value: MemoryIndexStatusV1 }
 	| { kind: "integrity_check"; value: "ok" | string };
 

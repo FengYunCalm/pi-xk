@@ -98,6 +98,8 @@ function createEdge(index, memoryCount) {
 		toKind: "memory",
 		toId: memoryId((index * 17 + 1) % memoryCount),
 		relation: "related_to",
+		effectiveFrom: "2026-01-01T00:00:00.000Z",
+		effectiveTo: null,
 	};
 }
 

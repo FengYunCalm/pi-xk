@@ -69,6 +69,8 @@ function edge(edgeId: string, memoryId: string, cueId: string): MemoryIndexEdgeV
 		toKind: "cue",
 		toId: cueId,
 		relation: "applies_to",
+		effectiveFrom: "2026-08-01T00:00:00.000Z",
+		effectiveTo: null,
 	};
 }
 
@@ -125,7 +127,7 @@ describe("Memory SQLite projection", () => {
 		});
 		try {
 			expect(await client.status()).toEqual({
-				schemaVersion: 1,
+				schemaVersion: 2,
 				head: { sequence: 0, hash: null },
 				memoryCount: 0,
 				cueCount: 0,
@@ -225,7 +227,7 @@ describe("Memory SQLite projection", () => {
 		const projection = new MemorySqliteProjection(database);
 		projection.rebuild(snapshot());
 		expect(projection.status()).toEqual({
-			schemaVersion: 1,
+			schemaVersion: 2,
 			head: snapshot().head,
 			memoryCount: 2,
 			cueCount: 2,
@@ -257,6 +259,91 @@ describe("Memory SQLite projection", () => {
 			accessCount: 7,
 			lastAccessedAt: "2026-08-01T01:00:00.000Z",
 		});
+		database.close();
+	});
+
+	it("applies fact deltas atomically with event-head CAS", () => {
+		const database = new DatabaseSync(":memory:");
+		const projection = new MemorySqliteProjection(database);
+		const initial = snapshot();
+		projection.rebuild(initial);
+		const replacement = memory("memory_two", "Updated Goal policy", "Updated searchable statement", {
+			revision: 2,
+			accessCount: 3,
+		});
+		projection.applyDelta({
+			expectedHead: initial.head,
+			head: { sequence: 13, hash: `sha256:${"2".repeat(64)}` },
+			memories: [replacement],
+			cues: [],
+			edges: [],
+			historyCues: [],
+			removeMemoryIds: ["memory_one"],
+			removeCueIds: [],
+			removeEdgeIds: [],
+		});
+		expect(projection.status()).toMatchObject({
+			head: { sequence: 13, hash: `sha256:${"2".repeat(64)}` },
+			memoryCount: 1,
+			edgeCount: 1,
+		});
+		expect(projection.search({ query: "Updated searchable", limit: 12, graphDepth: 0 }).memories[0]).toMatchObject({
+			memoryId: "memory_two",
+			revision: 2,
+		});
+		expect(projection.search({ query: "Canonical summaries", limit: 12, graphDepth: 0 }).memories).toEqual([]);
+		const updatedHead = projection.status().head;
+		projection.applyDelta({
+			expectedHead: updatedHead,
+			head: updatedHead,
+			memories: [],
+			cues: [],
+			edges: [],
+			historyCues: [
+				{
+					cueId: "history_segment_10",
+					sourceType: "compaction",
+					sourceId: "compaction_segment_10",
+					title: "Incremental history cue",
+					recordedAt: "2026-08-02T00:00:00.000Z",
+					chainId: "chain_main",
+					branchId: "branch_main",
+					segmentId: "segment_10",
+					ordinal: 10,
+					sessionId: "session_segment_10",
+				},
+			],
+			removeMemoryIds: [],
+			removeCueIds: [],
+			removeEdgeIds: [],
+		});
+		expect(projection.status()).toMatchObject({ head: updatedHead, historyCueCount: 2 });
+		expect(() =>
+			projection.applyDelta({
+				expectedHead: updatedHead,
+				head: updatedHead,
+				memories: [replacement],
+				cues: [],
+				edges: [],
+				historyCues: [],
+				removeMemoryIds: [],
+				removeCueIds: [],
+				removeEdgeIds: [],
+			}),
+		).toThrow(/fact delta must advance/i);
+		expect(() =>
+			projection.applyDelta({
+				expectedHead: initial.head,
+				head: { sequence: 14, hash: `sha256:${"3".repeat(64)}` },
+				memories: [],
+				cues: [],
+				edges: [],
+				historyCues: [],
+				removeMemoryIds: [],
+				removeCueIds: [],
+				removeEdgeIds: [],
+			}),
+		).toThrow(/head conflict/i);
 		database.close();
 	});
 
@@ -301,7 +388,7 @@ describe("Memory SQLite projection", () => {
 		const projection = new MemorySqliteProjection(database);
 		projection.rebuild(snapshot());
 		const result = projection.search({
-			query: "Artifact summary",
+			query: "Artifact",
 			limit: 12,
 			graphDepth: 1,
 			includeHistoryCues: true,
@@ -317,6 +404,139 @@ describe("Memory SQLite projection", () => {
 			}),
 		]);
 		expect(result.historyCues[0]).not.toHaveProperty("statement");
+		database.close();
+	});
+
+	it("retrieves two-code-point CJK terms across memories, cues, and history cues", () => {
+		const database = new DatabaseSync(":memory:");
+		const projection = new MemorySqliteProjection(database);
+		projection.rebuild({
+			...snapshot(),
+			memories: [memory("memory_one", "目标修订", "目标合同需要确认")],
+			cues: [cue("cue_goal", "目标", "目标")],
+			edges: [edge("edge_one", "memory_one", "cue_goal")],
+			historyCues: [{ ...snapshot().historyCues[0]!, title: "目标复盘" }],
+		});
+		const result = projection.search({
+			query: "目标",
+			limit: 12,
+			graphDepth: 1,
+			includeHistoryCues: true,
+		});
+		expect(result.memories.map((entry) => entry.memoryId)).toEqual(["memory_one"]);
+		expect(result.historyCues.map((entry) => entry.cueId)).toEqual(["history_segment_5"]);
+		database.close();
+	});
+
+	it("uses one page budget across Memory and History Cue results", () => {
+		const database = new DatabaseSync(":memory:");
+		const projection = new MemorySqliteProjection(database);
+		projection.rebuild(snapshot());
+		const first = projection.search({
+			query: "Artifact",
+			limit: 1,
+			graphDepth: 0,
+			includeHistoryCues: true,
+		});
+		expect(first.memories.length + first.historyCues.length).toBe(1);
+		expect(first.hasMore).toBe(true);
+		const second = projection.search({
+			query: "Artifact",
+			limit: 1,
+			offset: 1,
+			graphDepth: 0,
+			includeHistoryCues: true,
+		});
+		expect(second.memories.length + second.historyCues.length).toBe(1);
+		database.close();
+	});
+
+	it("caps the combined Memory and History Cue candidate pool before pagination", () => {
+		const database = new DatabaseSync(":memory:");
+		const projection = new MemorySqliteProjection(database);
+		projection.rebuild({
+			head: { sequence: 1, hash: `sha256:${"8".repeat(64)}` },
+			memories: Array.from({ length: 150 }, (_, index) =>
+				memory(`memory_pool_${index}`, `Shared pool candidate ${index}`, "Shared pool candidate body"),
+			),
+			cues: [],
+			edges: [],
+			historyCues: Array.from({ length: 150 }, (_, index) => ({
+				cueId: `history_pool_${index}`,
+				sourceType: "segment_summary" as const,
+				sourceId: `sha256:${index.toString(16).padStart(64, "0")}`,
+				title: `Shared pool candidate ${index}`,
+				recordedAt: "2026-08-01T00:00:00.000Z",
+				chainId: "chain_pool",
+				branchId: "branch_pool",
+				segmentId: `segment_pool_${index}`,
+				ordinal: index + 1,
+				sessionId: null,
+			})),
+		});
+
+		const last = projection.search({
+			query: "Shared pool candidate",
+			limit: 50,
+			offset: 199,
+			graphDepth: 0,
+			includeHistoryCues: true,
+		});
+		expect(last.memories.length + last.historyCues.length).toBe(1);
+		expect(last.hasMore).toBe(false);
+		expect(
+			projection.search({
+				query: "Shared pool candidate",
+				limit: 50,
+				offset: 200,
+				graphDepth: 0,
+				includeHistoryCues: true,
+			}),
+		).toMatchObject({ memories: [], historyCues: [], hasMore: false });
+		database.close();
+	});
+
+	it("recalls recent entries without requiring temporal words in their text", () => {
+		const database = new DatabaseSync(":memory:");
+		const projection = new MemorySqliteProjection(database);
+		projection.rebuild(snapshot());
+		const result = projection.search({ query: "最近", limit: 1, graphDepth: 0 });
+		expect(result.memories).toHaveLength(1);
+		database.close();
+	});
+
+	it("filters graph traversal and relation hints by edge effective time", () => {
+		const database = new DatabaseSync(":memory:");
+		const projection = new MemorySqliteProjection(database);
+		projection.rebuild({
+			...snapshot(),
+			edges: snapshot().edges.map((entry) => ({ ...entry, effectiveTo: "2026-08-02T00:00:00.000Z" })),
+		});
+		expect(
+			projection.graph({ rootMemoryId: "memory_one", depth: 1, asOf: "2026-08-01T12:00:00.000Z" }).cueIds,
+		).toEqual(["cue_chain"]);
+		expect(
+			projection.graph({ rootMemoryId: "memory_one", depth: 1, asOf: "2026-08-03T00:00:00.000Z" }).cueIds,
+		).toEqual([]);
+		expect(
+			projection.search({
+				query: "Canonical summaries",
+				limit: 12,
+				graphDepth: 0,
+				asOf: "2026-08-03T00:00:00.000Z",
+			}).memories[0]?.relations,
+		).toEqual([]);
+		expect(
+			projection.graph({ rootMemoryId: "memory_one", depth: 1, asOf: "August 1, 2026 12:00:00 UTC" }).cueIds,
+		).toEqual(["cue_chain"]);
+		expect(
+			projection.search({
+				query: "Canonical summaries",
+				limit: 12,
+				graphDepth: 1,
+				asOf: "August 1, 2026 12:00:00 UTC",
+			}).memories[0]?.relations,
+		).toEqual([expect.objectContaining({ edgeId: "edge_one" })]);
 		database.close();
 	});
 
@@ -408,6 +628,8 @@ describe("Memory SQLite projection", () => {
 			toKind: "memory",
 			toId: graphMemories[index]!.memoryId,
 			relation: "related_to",
+			effectiveFrom: "2026-08-01T00:00:00.000Z",
+			effectiveTo: null,
 		}));
 		projection.rebuild({
 			head: { sequence: 1, hash: `sha256:${"1".repeat(64)}` },

@@ -14,6 +14,7 @@ import {
 	type MemoryEvidenceSourceType,
 	type MemoryExpectedRevisionV1,
 	MemoryLockedError,
+	type MemoryReadResultV1,
 	type MemoryScopeV1,
 	MemoryService,
 	MemoryValidationError,
@@ -29,7 +30,8 @@ import {
 	parseMemoryCaptureEnvelope,
 } from "./memory-prompt.ts";
 
-const MEMORY_CAPTURE_PENDING_SCHEMA = "pi-xk.memory-capture-pending.v1";
+const MEMORY_CAPTURE_PENDING_V1_SCHEMA = "pi-xk.memory-capture-pending.v1";
+const MEMORY_CAPTURE_PENDING_SCHEMA = "pi-xk.memory-capture-pending.v2";
 
 export interface MemoryGenerationHost {
 	model: { provider: string; modelId: string; contextWindow: number } | undefined;
@@ -59,10 +61,11 @@ export interface MemoryCaptureResultV1 {
 	confirmationRequired: boolean;
 }
 
-interface PendingCaptureResultV1 {
+interface PendingCaptureResultV2 {
 	schema: typeof MEMORY_CAPTURE_PENDING_SCHEMA;
 	captureId: string;
 	resultArtifactId: string;
+	model: string;
 	updatedAt: string;
 }
 
@@ -93,9 +96,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function captureFailure(
 	error: unknown,
-	stage: "generation" | "validation" | "artifact" | "publication" | "projection",
+	stage: "source" | "generation" | "validation" | "artifact" | "publication" | "projection",
 ) {
-	if (stage === "validation" || error instanceof MemoryValidationError) {
+	if (error instanceof MemoryValidationError) return { errorCode: "memory_capture_invalid", retryable: false };
+	if (stage === "source") return { errorCode: "memory_capture_context_failed", retryable: true };
+	if (stage === "validation") {
 		return { errorCode: "memory_capture_invalid", retryable: false };
 	}
 	if (stage === "projection") return { errorCode: "memory_projection_failed", retryable: true };
@@ -219,7 +224,7 @@ export class MemoryController {
 			throw new MemoryValidationError("Memory is disabled and read-only");
 		const current = await this.readProposal(proposalId);
 		const replay = await this.service.getStore().replay();
-		await this.service.getStore().applyProposal(current.proposalArtifactId, {
+		await this.service.applyProposal(current.proposalArtifactId, {
 			eventId: `evt_memory_apply_${suffix(sha256(proposalId))}`,
 			idempotencyKey: `memory:apply:${proposalId}`,
 			expectedHead: replay.head,
@@ -256,7 +261,7 @@ export class MemoryController {
 		return join(this.pendingDirectory, `${captureId}.json`);
 	}
 
-	private async replacePending(pending: PendingCaptureResultV1): Promise<void> {
+	private async replacePending(pending: PendingCaptureResultV2): Promise<void> {
 		await mkdir(this.pendingDirectory, { recursive: true });
 		const path = this.pendingPath(pending.captureId);
 		const temporary = join(this.pendingDirectory, `.${pending.captureId}-${randomUUID()}.tmp`);
@@ -274,7 +279,7 @@ export class MemoryController {
 		}
 	}
 
-	private async readPending(captureId: string): Promise<PendingCaptureResultV1 | null> {
+	private async readPending(captureId: string, legacyModel: string | null): Promise<PendingCaptureResultV2 | null> {
 		let value: unknown;
 		try {
 			value = JSON.parse(await readFile(this.pendingPath(captureId), "utf8")) as unknown;
@@ -282,10 +287,10 @@ export class MemoryController {
 			if (isRecord(error) && error.code === "ENOENT") return null;
 			throw error;
 		}
+		if (!isRecord(value)) {
+			throw new MemoryValidationError(`Memory pending capture is invalid: ${captureId}`);
+		}
 		if (
-			!isRecord(value) ||
-			Object.keys(value).sort().join(",") !== "captureId,resultArtifactId,schema,updatedAt" ||
-			value.schema !== MEMORY_CAPTURE_PENDING_SCHEMA ||
 			value.captureId !== captureId ||
 			typeof value.resultArtifactId !== "string" ||
 			!/^sha256:[a-f0-9]{64}$/.test(value.resultArtifactId) ||
@@ -294,7 +299,40 @@ export class MemoryController {
 		) {
 			throw new MemoryValidationError(`Memory pending capture is invalid: ${captureId}`);
 		}
-		return value as unknown as PendingCaptureResultV1;
+		const resultArtifactId = value.resultArtifactId;
+		const updatedAt = value.updatedAt;
+		if (
+			value.schema === MEMORY_CAPTURE_PENDING_V1_SCHEMA &&
+			Object.keys(value).sort().join(",") === "captureId,resultArtifactId,schema,updatedAt"
+		) {
+			if (!legacyModel) {
+				throw new MemoryValidationError(`Legacy Memory pending capture requires a selected model: ${captureId}`);
+			}
+			const upgraded: PendingCaptureResultV2 = {
+				schema: MEMORY_CAPTURE_PENDING_SCHEMA,
+				captureId,
+				resultArtifactId,
+				model: legacyModel,
+				updatedAt,
+			};
+			await this.replacePending(upgraded);
+			return upgraded;
+		}
+		if (
+			value.schema !== MEMORY_CAPTURE_PENDING_SCHEMA ||
+			Object.keys(value).sort().join(",") !== "captureId,model,resultArtifactId,schema,updatedAt" ||
+			typeof value.model !== "string" ||
+			value.model.trim().length === 0
+		) {
+			throw new MemoryValidationError(`Memory pending capture is invalid: ${captureId}`);
+		}
+		return {
+			schema: MEMORY_CAPTURE_PENDING_SCHEMA,
+			captureId,
+			resultArtifactId,
+			model: value.model,
+			updatedAt,
+		};
 	}
 
 	private captureIdentity(request: MemoryCaptureRequest): { captureId: string; digest: string } {
@@ -406,7 +444,7 @@ export class MemoryController {
 
 	private async recordFailure(
 		captureId: string,
-		stage: "generation" | "validation" | "artifact" | "publication" | "projection",
+		stage: "source" | "generation" | "validation" | "artifact" | "publication" | "projection",
 		error: unknown,
 	): Promise<void> {
 		const replay = await this.service.getStore().replay();
@@ -463,7 +501,7 @@ export class MemoryController {
 				confirmationRequired: true,
 			};
 		}
-		await this.service.getStore().applyProposal(proposal.proposalArtifactId, {
+		await this.service.applyProposal(proposal.proposalArtifactId, {
 			eventId: `evt_memory_apply_${suffix(sha256(capture.proposalId))}`,
 			idempotencyKey: `memory:apply:${capture.proposalId}`,
 			expectedHead: replay.head,
@@ -480,12 +518,8 @@ export class MemoryController {
 	}
 
 	private async existingContext(query: string) {
-		try {
-			const search = await this.service.search({ query, limit: 12, graphDepth: 1 });
-			return await this.service.getStore().readMemories(search.items.map((item) => item.memoryId));
-		} catch {
-			return [];
-		}
+		const search = await this.service.search({ query, limit: 12, graphDepth: 1 });
+		return await this.service.getStore().readMemories(search.items.map((item) => item.memoryId));
 	}
 
 	private async process(
@@ -513,6 +547,9 @@ export class MemoryController {
 		}
 		if (!capture) throw new MemoryValidationError(`Memory capture was not scheduled: ${captureId}`);
 		if (capture.status === "proposed") return await this.resumeProposedCapture(captureId);
+		if (capture.status === "skipped") {
+			return { captureId, status: "no_durable_memory", proposalId: null, confirmationRequired: false };
+		}
 		if (capture.status === "applied" || capture.status === "rejected") {
 			return {
 				captureId,
@@ -522,8 +559,9 @@ export class MemoryController {
 					capture.proposalId !== null && replay.proposals.get(capture.proposalId)?.confirmationRequired === true,
 			};
 		}
-		let pending = await this.readPending(captureId);
-		if (capture.status === "failed" && (capture.retryable !== true || !pending)) {
+		const selectedModel = host.model ? `${host.model.provider}/${host.model.modelId}` : null;
+		let pending = await this.readPending(captureId, selectedModel);
+		if (capture.status === "failed" && capture.retryable !== true) {
 			return { captureId, status: "failed", proposalId: capture.proposalId, confirmationRequired: false };
 		}
 		if (capture.status === "generating" && !pending) {
@@ -538,7 +576,13 @@ export class MemoryController {
 				actor: "runtime",
 				timestamp: this.now(),
 			});
-			const existing = await this.existingContext(request.query);
+			let existing: MemoryReadResultV1[];
+			try {
+				existing = await this.existingContext(request.query);
+			} catch (error) {
+				await this.recordFailure(captureId, "source", error);
+				return { captureId, status: "failed", proposalId: null, confirmationRequired: false };
+			}
 			const modelSource = stableJsonStringify({
 				schema: "pi-xk.memory-capture-input.v1",
 				captureId,
@@ -583,6 +627,7 @@ export class MemoryController {
 					schema: MEMORY_CAPTURE_PENDING_SCHEMA,
 					captureId,
 					resultArtifactId: result.artifactId,
+					model: `${generated.model.provider}/${generated.model.modelId}`,
 					updatedAt: this.now(),
 				};
 				await this.replacePending(pending);
@@ -610,7 +655,7 @@ export class MemoryController {
 				expectedEventHead: currentReplay.head,
 				evidence: this.evidence(request, captureDigest),
 				recordedAt: this.now(),
-				model: host.model ? `${host.model.provider}/${host.model.modelId}` : "unknown/unknown",
+				model: pending.model,
 				scope: { projectId: this.projectId(), ...request.scope },
 				existingMemories: new Map(currentMemories.map((memory) => [memory.revision.memoryId, memory])),
 				existingCues,
@@ -621,7 +666,15 @@ export class MemoryController {
 			return { captureId, status: "failed", proposalId: null, confirmationRequired: false };
 		}
 		if (!proposal) {
-			await this.recordFailure(captureId, "validation", new Error("The source has no durable memory value"));
+			const replay = await this.service.getStore().replay();
+			await this.service.getStore().markCaptureSkipped(captureId, pending.resultArtifactId, {
+				eventId: `evt_memory_skipped_${suffix(sha256(captureId))}`,
+				idempotencyKey: `memory:skipped:${captureId}`,
+				expectedHead: replay.head,
+				actor: "runtime",
+				timestamp: this.now(),
+			});
+			await rm(this.pendingPath(captureId), { force: true });
 			return { captureId, status: "no_durable_memory", proposalId: null, confirmationRequired: false };
 		}
 		try {

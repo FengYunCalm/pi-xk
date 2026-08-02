@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { appendFile, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,12 +8,15 @@ import {
 	ArtifactStore,
 	type MemoryCaptureSourceV1,
 	type MemoryChangeProposalV1,
+	MemoryCorruptionError,
+	type MemoryEventV1,
 	MemoryHeadConflictError,
 	MemoryLockedError,
 	MemoryNotFoundError,
 	MemoryRecoveryRequiredError,
 	MemoryStore,
 	MemoryValidationError,
+	stableJsonStringify,
 } from "../src/index.ts";
 
 const tempDirs: string[] = [];
@@ -40,12 +44,12 @@ function proposal(expectedEventHead: { sequence: number; hash: string | null }):
 	const evidence = {
 		schema: "pi-xk.memory-evidence-ref.v1" as const,
 		evidenceId: "evidence_goal_checkpoint",
-		sourceType: "goal_checkpoint" as const,
-		sourceId: "goal_example:checkpoint:evt_checkpoint_1",
+		sourceType: "explicit" as const,
+		sourceId: "command_memory_store_fixture",
 		artifactId: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-		sourceDigest: source().sourceDigest,
+		sourceDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 		recordedAt: "2026-08-01T00:00:00.000Z",
-		locator: { goalId: "goal_example", checkpointEventId: "evt_checkpoint_1" },
+		locator: { commandId: "command_memory_store_fixture" },
 	};
 	const provenance = {
 		producer: "model" as const,
@@ -142,9 +146,9 @@ async function publishMemoryWithoutEdges(
 	const evidenceArtifact = await new ArtifactStore(projectRoot).put({
 		contentType: "text/plain",
 		text: "checkpoint evidence",
-		producer: "pi-xk.test.v1",
+		producer: "pi-xk.memory-explicit.v1",
 		sensitivity: "internal",
-		sourceIds: ["goal_example", "evt_checkpoint_1"],
+		sourceIds: ["command_memory_store_fixture"],
 		createdAt: "2026-08-01T00:00:00.000Z",
 	});
 	const generated = proposal(generating.head);
@@ -155,6 +159,7 @@ async function publishMemoryWithoutEdges(
 	revisionOperation.revision.evidenceRefs[0] = {
 		...revisionOperation.revision.evidenceRefs[0],
 		artifactId: evidenceArtifact.artifactId,
+		sourceDigest: evidenceArtifact.artifactId,
 	};
 	const resultArtifact = await new ArtifactStore(projectRoot).put({
 		contentType: "application/json",
@@ -176,6 +181,98 @@ async function publishMemoryWithoutEdges(
 			expectedHead: recorded.write.head,
 		})
 	).write.head;
+}
+
+async function publishMemorySharingEvidence(
+	projectRoot: string,
+	store: MemoryStore,
+	expectedEventHead: { sequence: number; hash: string | null },
+): Promise<{ head: { sequence: number; hash: string | null }; evidenceArtifactId: string }> {
+	const original = await store.readMemory("memory_canonical_summary");
+	const evidence = original.revision.evidenceRefs[0];
+	if (!evidence?.artifactId) throw new Error("missing shared evidence fixture");
+	const sourceDigest = `sha256:${"d".repeat(64)}`;
+	const recordedAt = "2026-08-01T00:02:00.000Z";
+	const sharedProposal: MemoryChangeProposalV1 = {
+		schema: "pi-xk.memory-change-proposal.v1",
+		proposalId: "proposal_shared_evidence_memory",
+		captureId: null,
+		sourceDigest,
+		expectedEventHead,
+		expectedRevisions: [],
+		reason: "Publish another Memory that relies on the same retained evidence.",
+		operations: [
+			{
+				kind: "publish_revision",
+				revision: {
+					schema: "pi-xk.memory-revision.v1",
+					memoryId: "memory_shared_evidence",
+					revision: 1,
+					kind: "lesson",
+					title: "Shared evidence remains readable",
+					statement: "Evidence shared by two Memory records must outlive either record independently.",
+					applicability: "Memory purge cleanup.",
+					trust: "model_inferred",
+					lifecycle: "active",
+					effectiveFrom: recordedAt,
+					effectiveTo: null,
+					cueIds: [],
+					evidenceRefs: [evidence],
+					freshnessBasis: null,
+					sourceDigest,
+					supersedesRevision: null,
+					provenance: {
+						producer: "model",
+						model: "faux/model",
+						promptVersion: "pi-xk.memory-model-proposal.v1",
+						recordedAt,
+					},
+				},
+			},
+		],
+		provenance: {
+			producer: "model",
+			model: "faux/model",
+			promptVersion: "pi-xk.memory-model-proposal.v1",
+			recordedAt,
+		},
+	};
+	const resultArtifact = await new ArtifactStore(projectRoot).put({
+		contentType: "application/json",
+		value: sharedProposal,
+		producer: "pi-xk.memory-model-proposal.v1",
+		sensitivity: "internal",
+		sourceIds: [sharedProposal.proposalId],
+		createdAt: recordedAt,
+	});
+	const recorded = await store.recordProposal(sharedProposal, resultArtifact.artifactId, {
+		eventId: "evt_proposal_shared_evidence_memory",
+		idempotencyKey: "memory:proposal:shared-evidence-memory",
+		expectedHead: expectedEventHead,
+	});
+	const applied = await store.applyProposal(recorded.proposalArtifactId, {
+		eventId: "evt_apply_shared_evidence_memory",
+		idempotencyKey: "memory:apply:shared-evidence-memory",
+		expectedHead: recorded.write.head,
+	});
+	return { head: applied.write.head, evidenceArtifactId: evidence.artifactId };
+}
+
+async function rewriteLastMemoryEvent(
+	eventsPath: string,
+	mutate: (event: MemoryEventV1) => MemoryEventV1,
+): Promise<void> {
+	const lines = (await readFile(eventsPath, "utf8")).split("\n").filter((line) => line.length > 0);
+	const lastIndex = lines.length - 1;
+	const raw = lines[lastIndex];
+	if (!raw) throw new Error("missing Memory event fixture");
+	const mutated = mutate(JSON.parse(raw) as MemoryEventV1);
+	const { hash: _hash, ...hashable } = mutated;
+	lines[lastIndex] = stableJsonStringify({
+		...hashable,
+		hash: `sha256:${createHash("sha256").update(stableJsonStringify(hashable)).digest("hex")}`,
+	});
+	await writeFile(eventsPath, `${lines.join("\n")}\n`);
 }
 
 afterEach(async () => {
@@ -210,6 +307,30 @@ describe("Memory Store", () => {
 		release?.();
 		await expect(owner).resolves.toBe("owner");
 		expect(await first.inspectCaptureGenerationLock("capture_generation_lock")).toBeUndefined();
+	});
+
+	it("serializes projection mutations across store instances and releases the lock", async () => {
+		const { projectRoot, store: first } = await createStore();
+		const second = new MemoryStore(projectRoot);
+		let release: (() => void) | undefined;
+		let entered: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const owner = first.withProjectionLock(async () => {
+			entered?.();
+			await gate;
+			return "owner";
+		});
+		await started;
+
+		await expect(second.withProjectionLock(async () => "contender")).rejects.toThrow(/projection|locked/i);
+		release?.();
+		await expect(owner).resolves.toBe("owner");
+		await expect(second.withProjectionLock(async () => "next")).resolves.toBe("next");
 	});
 
 	it("does not create project state until the first capture is scheduled", async () => {
@@ -422,6 +543,96 @@ describe("Memory Store", () => {
 		expect(recovered.readModel.purgedSourceDigests).toEqual([source().sourceDigest]);
 	});
 
+	it("rejects a standalone purge whose source digest does not match the current Memory", async () => {
+		const { projectRoot, store } = await createStore();
+		let head = await publishMemoryWithoutEdges(projectRoot, store);
+		head = (
+			await store.changeMemoryLifecycle("memory_canonical_summary", 1, "archived", "No longer current.", {
+				eventId: "evt_purge_digest_lifecycle",
+				idempotencyKey: "lifecycle:purge-digest:2",
+				expectedHead: head,
+				confirmed: true,
+			})
+		).head;
+		head = (
+			await store.detachMemoryEvidence(
+				"memory_canonical_summary",
+				2,
+				"evidence_goal_checkpoint",
+				"Source retention ended.",
+				{
+					eventId: "evt_purge_digest_detach",
+					idempotencyKey: "detach:purge-digest:3",
+					expectedHead: head,
+					confirmed: true,
+				},
+			)
+		).head;
+		await store.purgeMemory("memory_canonical_summary", 3, "Explicit purge.", {
+			eventId: "evt_purge_digest",
+			idempotencyKey: "purge:digest:3",
+			expectedHead: head,
+			confirmed: true,
+		});
+		const eventsPath = join(projectRoot, ".pi-xk", "memory", "events.jsonl");
+		await rewriteLastMemoryEvent(eventsPath, (event) => {
+			if (event.eventType !== "memory_purged") throw new Error("missing purge event fixture");
+			return { ...event, payload: { ...event.payload, sourceDigest: `sha256:${"f".repeat(64)}` } };
+		});
+
+		await expect(store.replay()).rejects.toBeInstanceOf(MemoryCorruptionError);
+	});
+
+	it("rejects a standalone purge tail that omits the current revision artifact", async () => {
+		const { projectRoot, store } = await createStore();
+		let head = await publishMemoryWithoutEdges(projectRoot, store);
+		const memoryDirectory = join(projectRoot, ".pi-xk", "memory");
+		const readModelPath = join(memoryDirectory, "memory-read-model.json");
+		const checkpointPath = join(memoryDirectory, "memory-read-model.checkpoint.json");
+		const eventsPath = join(memoryDirectory, "events.jsonl");
+		const originalReadModel = await readFile(readModelPath, "utf8");
+		const originalCheckpoint = await readFile(checkpointPath, "utf8");
+		head = (
+			await store.changeMemoryLifecycle("memory_canonical_summary", 1, "archived", "No longer current.", {
+				eventId: "evt_purge_artifact_lifecycle",
+				idempotencyKey: "lifecycle:purge-artifact:2",
+				expectedHead: head,
+				confirmed: true,
+			})
+		).head;
+		head = (
+			await store.detachMemoryEvidence(
+				"memory_canonical_summary",
+				2,
+				"evidence_goal_checkpoint",
+				"Source retention ended.",
+				{
+					eventId: "evt_purge_artifact_detach",
+					idempotencyKey: "detach:purge-artifact:3",
+					expectedHead: head,
+					confirmed: true,
+				},
+			)
+		).head;
+		await store.purgeMemory("memory_canonical_summary", 3, "Explicit purge.", {
+			eventId: "evt_purge_artifact",
+			idempotencyKey: "purge:artifact:3",
+			expectedHead: head,
+			confirmed: true,
+		});
+		await rewriteLastMemoryEvent(eventsPath, (event) => {
+			if (event.eventType !== "memory_purged") throw new Error("missing purge event fixture");
+			return {
+				...event,
+				payload: { ...event.payload, revisionArtifactIds: [`sha256:${"e".repeat(64)}`] },
+			};
+		});
+		await writeFile(readModelPath, originalReadModel);
+		await writeFile(checkpointPath, originalCheckpoint);
+
+		await expect(store.loadReadModelSnapshot()).rejects.toBeInstanceOf(MemoryCorruptionError);
+	});
+
 	it("fails closed on a trailing partial event and repairs it explicitly", async () => {
 		const { projectRoot, store } = await createStore();
 		await store.scheduleCapture(source(), {
@@ -476,9 +687,9 @@ describe("Memory Store", () => {
 		const evidenceArtifact = await new ArtifactStore(projectRoot).put({
 			contentType: "text/plain",
 			text: "verified checkpoint evidence",
-			producer: "pi-xk.test.v1",
+			producer: "pi-xk.memory-explicit.v1",
 			sensitivity: "internal",
-			sourceIds: ["goal_example", "evt_checkpoint_1"],
+			sourceIds: ["command_memory_store_fixture"],
 			createdAt: "2026-08-01T00:00:00.000Z",
 		});
 		const generated = proposal(generating.head);
@@ -488,12 +699,14 @@ describe("Memory Store", () => {
 		evidenceOperation.revision.evidenceRefs[0] = {
 			...evidenceOperation.revision.evidenceRefs[0],
 			artifactId: evidenceArtifact.artifactId,
+			sourceDigest: evidenceArtifact.artifactId,
 		};
 		const edgeOperation = generated.operations.find((operation) => operation.kind === "publish_edge");
 		if (!edgeOperation || edgeOperation.kind !== "publish_edge") throw new Error("missing edge fixture");
 		edgeOperation.edge.evidenceRefs[0] = {
 			...edgeOperation.edge.evidenceRefs[0],
 			artifactId: evidenceArtifact.artifactId,
+			sourceDigest: evidenceArtifact.artifactId,
 		};
 		const resultArtifact = await new ArtifactStore(projectRoot).put({
 			contentType: "application/json",
@@ -522,6 +735,39 @@ describe("Memory Store", () => {
 		expect(read.revision.statement).toBe("Use token=[REDACTED] as a fixture.");
 		expect(read.state).toEqual({ trust: "model_inferred", freshness: "unknown", lifecycle: "active" });
 		expect((await store.replay()).captures.get(source().captureId)?.status).toBe("applied");
+
+		let head = applied.write.head;
+		head = (
+			await store.changeMemoryLifecycle("memory_canonical_summary", 1, "archived", "Prepare outbound-edge purge.", {
+				eventId: "evt_outbound_edge_lifecycle",
+				idempotencyKey: "lifecycle:outbound-edge:2",
+				expectedHead: head,
+				confirmed: true,
+			})
+		).head;
+		head = (
+			await store.detachMemoryEvidence(
+				"memory_canonical_summary",
+				2,
+				"evidence_goal_checkpoint",
+				"Detach before outbound-edge purge.",
+				{
+					eventId: "evt_outbound_edge_detach",
+					idempotencyKey: "detach:outbound-edge:3",
+					expectedHead: head,
+					confirmed: true,
+				},
+			)
+		).head;
+		await expect(
+			store.purgeMemory("memory_canonical_summary", 3, "Purge owns its outbound graph edge.", {
+				eventId: "evt_outbound_edge_purge",
+				idempotencyKey: "purge:outbound-edge:3",
+				expectedHead: head,
+				confirmed: true,
+			}),
+		).resolves.toBeDefined();
+		expect((await store.inspectDeep()).orphanArtifactIds).toEqual([]);
 	});
 
 	it("rejects stale proposal bases and revision conflicts before publishing artifacts", async () => {
@@ -611,6 +857,95 @@ describe("Memory Store", () => {
 		).rejects.toBeInstanceOf(MemoryValidationError);
 	});
 
+	it("applies confirmed lifecycle, evidence detach, and purge proposal operations atomically", async () => {
+		const { projectRoot, store } = await createStore();
+		const head = await publishMemoryWithoutEdges(projectRoot, store);
+		const current = await store.readMemory("memory_canonical_summary");
+		const destructiveProposal: MemoryChangeProposalV1 = {
+			schema: "pi-xk.memory-change-proposal.v1",
+			proposalId: "proposal_confirmed_destructive_change",
+			captureId: null,
+			sourceDigest: `sha256:${"e".repeat(64)}`,
+			expectedEventHead: head,
+			expectedRevisions: [{ memoryId: current.revision.memoryId, revision: current.revision.revision }],
+			reason: "Archive, detach the retained source, and purge the Memory after explicit confirmation.",
+			operations: [
+				{
+					kind: "change_lifecycle",
+					memoryId: current.revision.memoryId,
+					expectedRevision: current.revision.revision,
+					lifecycle: "archived",
+					reason: "The user requested archival before purge.",
+				},
+				{
+					kind: "detach_evidence",
+					memoryId: current.revision.memoryId,
+					expectedRevision: current.revision.revision,
+					evidenceId: "evidence_goal_checkpoint",
+					reason: "The user confirmed evidence detachment.",
+				},
+				{
+					kind: "purge_memory",
+					memoryId: current.revision.memoryId,
+					expectedRevision: current.revision.revision,
+					reason: "The user confirmed permanent removal.",
+				},
+			],
+			provenance: {
+				producer: "model",
+				model: "faux/model",
+				promptVersion: "pi-xk.memory-model-proposal.v1",
+				recordedAt: "2026-08-01T00:03:00.000Z",
+			},
+		};
+		const resultArtifact = await new ArtifactStore(projectRoot).put({
+			contentType: "application/json",
+			value: destructiveProposal,
+			producer: "pi-xk.memory-model-proposal.v1",
+			sensitivity: "internal",
+			sourceIds: [destructiveProposal.proposalId],
+			createdAt: destructiveProposal.provenance.recordedAt,
+		});
+		const recorded = await store.recordProposal(destructiveProposal, resultArtifact.artifactId, {
+			eventId: "evt_proposal_confirmed_destructive_change",
+			idempotencyKey: "memory:proposal:confirmed-destructive-change",
+			expectedHead: head,
+		});
+		const memoryDirectory = join(projectRoot, ".pi-xk", "memory");
+		const readModelPath = join(memoryDirectory, "memory-read-model.json");
+		const checkpointPath = join(memoryDirectory, "memory-read-model.checkpoint.json");
+		const beforeApplyReadModel = await readFile(readModelPath, "utf8");
+		const beforeApplyCheckpoint = await readFile(checkpointPath, "utf8");
+
+		expect(recorded.write.event.payload.confirmationRequired).toBe(true);
+		const applied = await store.applyProposal(recorded.proposalArtifactId, {
+			eventId: "evt_apply_confirmed_destructive_change",
+			idempotencyKey: "memory:apply:confirmed-destructive-change",
+			expectedHead: recorded.write.head,
+			actor: "user",
+			timestamp: "2026-08-01T00:04:00.000Z",
+			confirmed: true,
+		});
+
+		expect(applied.write.event.eventType).toBe("memory_change_applied");
+		expect(applied.write.event.payload.purges).toEqual([
+			expect.objectContaining({ memoryId: "memory_canonical_summary" }),
+		]);
+		await writeFile(readModelPath, beforeApplyReadModel);
+		await writeFile(checkpointPath, beforeApplyCheckpoint);
+		const tailRecovered = await store.loadReadModelSnapshot();
+		expect(tailRecovered.diagnostic.mode).toBe("tail");
+		expect(tailRecovered.readModel).toEqual(await store.rebuildReadModel());
+		await expect(store.readMemory("memory_canonical_summary")).rejects.toBeInstanceOf(MemoryNotFoundError);
+		expect(
+			(await store.replay()).events.some(
+				(event) =>
+					event.eventType === "memory_change_applied" &&
+					event.payload.proposalId === destructiveProposal.proposalId,
+			),
+		).toBe(true);
+	});
+
 	it("requires explicit lifecycle, evidence detach, and purge preconditions", async () => {
 		const { projectRoot, store } = await createStore();
 		let head = await publishMemoryWithoutEdges(projectRoot, store);
@@ -678,6 +1013,279 @@ describe("Memory Store", () => {
 		expect((await store.replay()).head).toEqual(purged.write.head);
 	});
 
+	it("rejects an edge published for a Memory purged by the same proposal", async () => {
+		const { projectRoot, store } = await createStore();
+		const head = await publishMemoryWithoutEdges(projectRoot, store);
+		const current = await store.readMemory("memory_canonical_summary");
+		const sourceDigest = `sha256:${"e".repeat(64)}`;
+		const provenance = {
+			producer: "model" as const,
+			model: "faux/model",
+			promptVersion: "pi-xk.memory-model-proposal.v1",
+			recordedAt: "2026-08-01T00:03:00.000Z",
+		};
+		const conflicting: MemoryChangeProposalV1 = {
+			schema: "pi-xk.memory-change-proposal.v1",
+			proposalId: "proposal_edge_for_purged_memory",
+			captureId: null,
+			sourceDigest,
+			expectedEventHead: head,
+			expectedRevisions: [{ memoryId: current.revision.memoryId, revision: current.revision.revision }],
+			reason: "Exercise the atomic graph and purge invariant.",
+			operations: [
+				{
+					kind: "publish_cue",
+					cue: {
+						schema: "pi-xk.memory-cue.v1",
+						cueId: "cue_purge_conflict",
+						revision: 1,
+						kind: "topic",
+						key: "purge-conflict",
+						label: "Purge conflict",
+						aliases: [],
+						scope: {
+							projectId: "project_pi_xk",
+							goalId: null,
+							chainId: null,
+							branchId: null,
+							paths: [],
+						},
+						sourceDigest,
+						provenance,
+					},
+				},
+				{
+					kind: "publish_edge",
+					edge: {
+						schema: "pi-xk.memory-edge.v1",
+						edgeId: "edge_purge_conflict",
+						from: { kind: "memory", id: current.revision.memoryId },
+						to: { kind: "cue", id: "cue_purge_conflict" },
+						relation: "related_to",
+						effectiveFrom: provenance.recordedAt,
+						effectiveTo: null,
+						evidenceRefs: current.revision.evidenceRefs,
+						sourceDigest,
+						provenance,
+					},
+				},
+				{
+					kind: "change_lifecycle",
+					memoryId: current.revision.memoryId,
+					expectedRevision: current.revision.revision,
+					lifecycle: "archived",
+					reason: "Prepare the Memory for purge.",
+				},
+				{
+					kind: "detach_evidence",
+					memoryId: current.revision.memoryId,
+					expectedRevision: current.revision.revision,
+					evidenceId: current.revision.evidenceRefs[0]!.evidenceId,
+					reason: "Detach evidence before purge.",
+				},
+				{
+					kind: "purge_memory",
+					memoryId: current.revision.memoryId,
+					expectedRevision: current.revision.revision,
+					reason: "Purge the Memory.",
+				},
+			],
+			provenance,
+		};
+		const resultArtifact = await new ArtifactStore(projectRoot).put({
+			contentType: "application/json",
+			value: conflicting,
+			producer: "pi-xk.memory-model-proposal.v1",
+			sensitivity: "internal",
+			sourceIds: [conflicting.proposalId],
+			createdAt: provenance.recordedAt,
+		});
+		const recorded = await store.recordProposal(conflicting, resultArtifact.artifactId, {
+			eventId: "evt_proposal_edge_for_purged_memory",
+			idempotencyKey: "memory:proposal:edge-for-purged-memory",
+			expectedHead: head,
+		});
+		await expect(
+			store.applyProposal(recorded.proposalArtifactId, {
+				eventId: "evt_apply_edge_for_purged_memory",
+				idempotencyKey: "memory:apply:edge-for-purged-memory",
+				expectedHead: recorded.write.head,
+				actor: "user",
+				timestamp: "2026-08-01T00:04:00.000Z",
+				confirmed: true,
+			}),
+		).rejects.toThrow(/cannot publish edge .* purged Memory/i);
+		expect((await store.replay()).head).toEqual(recorded.write.head);
+	});
+
+	it("retains evidence shared by another Memory during direct purge", async () => {
+		const { projectRoot, store } = await createStore();
+		let head = await publishMemoryWithoutEdges(projectRoot, store);
+		const shared = await publishMemorySharingEvidence(projectRoot, store, head);
+		head = shared.head;
+		head = (
+			await store.changeMemoryLifecycle("memory_canonical_summary", 1, "archived", "Archived before purge.", {
+				eventId: "evt_shared_memory_lifecycle",
+				idempotencyKey: "lifecycle:shared-memory:2",
+				expectedHead: head,
+				confirmed: true,
+			})
+		).head;
+		head = (
+			await store.detachMemoryEvidence(
+				"memory_canonical_summary",
+				2,
+				"evidence_goal_checkpoint",
+				"Detached from only the Memory being purged.",
+				{
+					eventId: "evt_shared_memory_detach",
+					idempotencyKey: "detach:shared-memory:3",
+					expectedHead: head,
+					confirmed: true,
+				},
+			)
+		).head;
+
+		const purged = await store.purgeMemory("memory_canonical_summary", 3, "Explicit purge.", {
+			eventId: "evt_shared_memory_purge",
+			idempotencyKey: "purge:shared-memory:3",
+			expectedHead: head,
+			confirmed: true,
+		});
+
+		expect(purged.retainedArtifactIds).toContain(shared.evidenceArtifactId);
+		await expect(new ArtifactStore(projectRoot).read(shared.evidenceArtifactId)).resolves.toBeDefined();
+		await expect(store.readMemory("memory_shared_evidence")).resolves.toMatchObject({
+			revision: {
+				evidenceRefs: [expect.objectContaining({ artifactId: shared.evidenceArtifactId })],
+			},
+		});
+	});
+
+	it("deletes exclusive proposal and model-result content after a direct purge", async () => {
+		const { projectRoot, store } = await createStore();
+		let head = await publishMemoryWithoutEdges(projectRoot, store);
+		const proposalEvent = (await store.replay()).events.find(
+			(event) =>
+				event.eventType === "proposal_recorded" && event.payload.proposalId === "proposal_goal_checkpoint_1",
+		);
+		if (!proposalEvent || proposalEvent.eventType !== "proposal_recorded") {
+			throw new Error("missing proposal content fixture");
+		}
+		head = (
+			await store.changeMemoryLifecycle("memory_canonical_summary", 1, "archived", "Archived before purge.", {
+				eventId: "evt_content_cleanup_lifecycle",
+				idempotencyKey: "lifecycle:content-cleanup:2",
+				expectedHead: head,
+				confirmed: true,
+			})
+		).head;
+		head = (
+			await store.detachMemoryEvidence(
+				"memory_canonical_summary",
+				2,
+				"evidence_goal_checkpoint",
+				"Detach evidence before deleting exclusive content.",
+				{
+					eventId: "evt_content_cleanup_detach",
+					idempotencyKey: "detach:content-cleanup:3",
+					expectedHead: head,
+					confirmed: true,
+				},
+			)
+		).head;
+
+		const purged = await store.purgeMemory("memory_canonical_summary", 3, "Delete exclusive Memory content.", {
+			eventId: "evt_content_cleanup_purge",
+			idempotencyKey: "purge:content-cleanup:3",
+			expectedHead: head,
+			confirmed: true,
+		});
+
+		expect(purged.removedArtifactIds).toEqual(
+			expect.arrayContaining([proposalEvent.payload.proposalArtifactId, proposalEvent.payload.resultArtifactId]),
+		);
+		await expect(
+			new ArtifactStore(projectRoot).read(proposalEvent.payload.proposalArtifactId),
+		).rejects.toBeInstanceOf(ArtifactNotFoundError);
+		await expect(new ArtifactStore(projectRoot).read(proposalEvent.payload.resultArtifactId)).rejects.toBeInstanceOf(
+			ArtifactNotFoundError,
+		);
+		await expect(store.inspectDeep()).resolves.toMatchObject({ purgedArtifactIdsPresent: [] });
+	});
+
+	it("retains evidence shared by another Memory during proposal purge", async () => {
+		const { projectRoot, store } = await createStore();
+		const initialHead = await publishMemoryWithoutEdges(projectRoot, store);
+		const shared = await publishMemorySharingEvidence(projectRoot, store, initialHead);
+		const current = await store.readMemory("memory_canonical_summary");
+		const destructiveProposal: MemoryChangeProposalV1 = {
+			schema: "pi-xk.memory-change-proposal.v1",
+			proposalId: "proposal_purge_with_shared_evidence",
+			captureId: null,
+			sourceDigest: `sha256:${"e".repeat(64)}`,
+			expectedEventHead: shared.head,
+			expectedRevisions: [{ memoryId: current.revision.memoryId, revision: current.revision.revision }],
+			reason: "Purge one Memory without deleting evidence retained by another Memory.",
+			operations: [
+				{
+					kind: "change_lifecycle",
+					memoryId: current.revision.memoryId,
+					expectedRevision: current.revision.revision,
+					lifecycle: "archived",
+					reason: "Archive before purge.",
+				},
+				{
+					kind: "detach_evidence",
+					memoryId: current.revision.memoryId,
+					expectedRevision: current.revision.revision,
+					evidenceId: "evidence_goal_checkpoint",
+					reason: "Detach only from the Memory being purged.",
+				},
+				{
+					kind: "purge_memory",
+					memoryId: current.revision.memoryId,
+					expectedRevision: current.revision.revision,
+					reason: "Permanent removal was confirmed.",
+				},
+			],
+			provenance: {
+				producer: "model",
+				model: "faux/model",
+				promptVersion: "pi-xk.memory-model-proposal.v1",
+				recordedAt: "2026-08-01T00:03:00.000Z",
+			},
+		};
+		const resultArtifact = await new ArtifactStore(projectRoot).put({
+			contentType: "application/json",
+			value: destructiveProposal,
+			producer: "pi-xk.memory-model-proposal.v1",
+			sensitivity: "internal",
+			sourceIds: [destructiveProposal.proposalId],
+			createdAt: destructiveProposal.provenance.recordedAt,
+		});
+		const recorded = await store.recordProposal(destructiveProposal, resultArtifact.artifactId, {
+			eventId: "evt_proposal_purge_with_shared_evidence",
+			idempotencyKey: "memory:proposal:purge-with-shared-evidence",
+			expectedHead: shared.head,
+		});
+		await store.applyProposal(recorded.proposalArtifactId, {
+			eventId: "evt_apply_purge_with_shared_evidence",
+			idempotencyKey: "memory:apply:purge-with-shared-evidence",
+			expectedHead: recorded.write.head,
+			actor: "user",
+			confirmed: true,
+			timestamp: "2026-08-01T00:04:00.000Z",
+		});
+
+		await expect(new ArtifactStore(projectRoot).read(shared.evidenceArtifactId)).resolves.toBeDefined();
+		await expect(store.readMemory("memory_shared_evidence")).resolves.toMatchObject({
+			revision: {
+				evidenceRefs: [expect.objectContaining({ artifactId: shared.evidenceArtifactId })],
+			},
+		});
+	});
+
 	it("retains a purged revision artifact that another project domain still references", async () => {
 		const { projectRoot, store } = await createStore();
 		let head = await publishMemoryWithoutEdges(projectRoot, store);
@@ -724,6 +1332,7 @@ describe("Memory Store", () => {
 		await expect(new ArtifactStore(projectRoot).read(revisionArtifactId)).resolves.toMatchObject({
 			metadata: { artifactId: revisionArtifactId },
 		});
+		expect((await store.inspectDeep()).purgedArtifactIdsPresent).not.toContain(revisionArtifactId);
 	});
 
 	it("retains artifacts referenced by another domain artifact", async () => {
@@ -784,6 +1393,9 @@ describe("Memory Store", () => {
 		const artifacts = new FailingCleanupArtifactStore(projectRoot);
 		const store = new MemoryStore(projectRoot, { artifactStore: artifacts });
 		let head = await publishMemoryWithoutEdges(projectRoot, store);
+		const evidenceArtifactId = (await store.readMemory("memory_canonical_summary")).revision.evidenceRefs[0]
+			?.artifactId;
+		if (!evidenceArtifactId) throw new Error("missing cleanup evidence fixture");
 		head = (
 			await store.changeMemoryLifecycle("memory_canonical_summary", 1, "invalidated", "Invalidated before purge.", {
 				eventId: "evt_cleanup_lifecycle",
@@ -818,5 +1430,6 @@ describe("Memory Store", () => {
 		expect(purged.cleanupDiagnostics.every((entry) => entry.errorCode === "EIO")).toBe(true);
 		await expect(store.readMemory("memory_canonical_summary")).rejects.toBeInstanceOf(MemoryNotFoundError);
 		expect((await store.replay()).head).toEqual(purged.write.head);
+		expect((await store.inspectDeep()).purgedArtifactIdsPresent).toContain(evidenceArtifactId);
 	});
 });

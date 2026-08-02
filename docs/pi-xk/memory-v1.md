@@ -71,8 +71,9 @@ Memory kind：
     memory-read-model.checkpoint.json
     memory-config.json               # enabled/off
     source-cursors.json              # 自动 source discovery 恢复游标，不是 Memory fact
+    history-cue-cursor.json          # sealed Segment/Cue 增量扫描缓存，可重建
     index.sqlite                     # 可重建 Node/Bun FTS5/graph 投影
-    locks/                            # capture generation lock；同样使用 PID/nonce/createdAt
+    locks/                            # capture generation/projection lock；PID/nonce/createdAt
     pending/                          # 已生成、尚未完成 publication 的结果引用
     projections/
       manifest.json
@@ -95,6 +96,8 @@ Memory kind：
 - 新的最新 Goal turn-end checkpoint；
 - Goal completion；
 - 成功发布且完整验证的 Session Chain L2 Rollup。
+
+Goal checkpoint 使用事件引用的 event-time State artifact。Goal completion 使用 `goal_ended` 前最后一个 `turn_end` checkpoint，并重新验证 artifact producer/metadata、Goal/Session/leaf identity、合同 revision 和 State grammar；结束后继续变化的 `goal-state.md` 不会改写 completion evidence。缺少最终 checkpoint 的 completion 不会退回读取当前 State。
 
 普通聊天 turn、局部未完成步骤、L1/compaction 标题和单纯访问次数不会直接触发模型捕获。
 
@@ -157,7 +160,7 @@ proposal 使用 expected event head 与 expected memory revisions。冲突不会
 
 ```text
 scheduled -> generating -> proposed -> applied
-                      \-> failed
+                      \-> skipped | failed
 proposed -> rejected
 ```
 
@@ -165,7 +168,10 @@ proposed -> rejected
 
 - 模型输出 artifact 已写入：恢复复用结果，不再次调用 provider；
 - proposal 已记录、无需确认但 apply 中断：下一次稳定 source boundary 自动完成 apply；
-- generation 已开始但没有 result artifact：显示 indeterminate，不自动重复未知付费调用；
+- 已知失败且 `retryable: true`、没有 pending result：下一次匹配的 stable-source scan 可以开始新 attempt；source cursor 已前移也不会使该来源永久丢失；
+- 已知失败且 `retryable: false`：必须先修正来源、provenance、schema 或配置；
+- generation 已开始但没有 result artifact：显示 indeterminate，不自动重复结果未知的付费调用；它与可重试的已知失败不同；
+- 生成器确认没有长期记忆价值：记录 `capture_skipped`，不是失败，也不创建空 Memory；
 - apply 已提交但 SQLite/Markdown 失败：Memory fact 仍为 applied，doctor 重建投影；
 - SQLite 重建按有界 reference/artifact batch 发送到 Worker，并在单一事务完成前保留旧 head/count；任一 batch 失败会回滚并删除临时数据库；
 - source/provenance/schema 无效：保留失败诊断，不修改原来源。
@@ -217,6 +223,8 @@ D1 返回：Memory ID、revision、kind、title、三维状态、有效时间、
 - 最多 200 个内部候选；
 - trust/freshness 与 30 天半衰期 heat 的有限排序修正。
 
+短中文/CJK 查询会使用安全字面量 fallback；“最近、上次、recent、previous”类请求加入时间候选。Memory 与 History Cue 在同一候选页中排序和分页，不会各自返回一整页。显式 `asOf` 查询从不可变 revision 时间线构造历史候选，因此当前已归档的 Memory 在查询时点仍 active 时仍可返回。
+
 Heat 最大只贡献 10%，不能改变事实状态或触发删除。v1 没有 embedding/vector 检索。
 
 ### D2：读取结构化 Memory
@@ -246,7 +254,7 @@ pi_xk_expand_memory_evidence
 ```
 
 - timeline 显示不可变 revision 历史和 recorded/effective time；
-- graph 显示一至二跳 Memory/Cue 和有向关系；
+- graph 显示一至二跳 Memory/Cue 和有向关系，并按 Edge 的有效时间过滤；
 - refresh 重新计算当前投影和 Git freshness，不调用模型、不修改 revision。
 
 `asOf` 由模型 search/read 工具支持，用于按事实有效时间查询。历史 revision 的 evidence 应先看 timeline；D3 不允许借当前 Memory ID 任意读取无关旧 artifact。
@@ -264,6 +272,8 @@ pi_xk_expand_memory_evidence
 - invalidate：明确标记不可继续使用；
 - detach：创建新 revision，不改写旧 revision；
 - purge：TUI 显式确认后检查引用，保留 tombstone，再删除可安全删除的独占 artifact。
+
+purge 的 tombstone 会列出目标 Memory 的 revision/edge/evidence，以及只服务于该 Memory 的 proposal/model-result 内容 artifact。共享 proposal/result、仍被 pending 引用或被其他领域引用的 artifact 不会被物理删除；deep doctor 将 tombstone 声明的已删除独占对象视为预期缺失。
 
 存在 active inbound edge 或共享 artifact 引用时，purge 拒绝或保留共享对象并报告。低访问频率从不自动删除 Memory。
 
@@ -322,6 +332,7 @@ pi_xk_expand_memory_evidence
 - SQLite schema、integrity 和 head；
 - write lock；
 - capture 状态；
+- source cursor 和 History Cue cursor 的 schema/digest；
 - Markdown manifest/index metadata。
 
 deep doctor 额外检查：
@@ -329,11 +340,14 @@ deep doctor 额外检查：
 - 完整 event hash/replay；
 - revision/cue/edge/proposal artifact；
 - Goal/Chain/Task/compaction/Git evidence ownership；
+- source cursor 对应的 Goal/Chain event head，以及 History Cue 对应的 sealed Segment、L1 title 和 compaction locator；
 - orphan Memory artifact；
 - purged artifact 是否仍在磁盘；
 - 每条 Memory Markdown digest。
 
-repair-projections 只重建 read model、SQLite、Markdown 和 projection manifest，不改 event、artifact 或来源。abandoned lock 仅在 PID 明确不存在且 nonce 精确匹配时修复。
+repair-projections 先显式重建损坏的 History Cue cursor/cache，再以同一个 read-model head 校验 Memory references；SQLite 已与该 head 一致时直接复用，否则从临时数据库重建。Markdown 和 manifest 使用同一快照，完成后复核事实 head，避免发布跨 revision 的混合投影。该命令不改 event、artifact 或来源。abandoned lock 仅在 PID 明确不存在且 nonce 精确匹配时修复。
+
+旧 `source-cursors.v1` 会在验证其 sequence 仍落在对应 event log 后升级为保存 sequence+hash 的 v2；旧 `history-cue-cursor.v1` 会从 sealed facts 重建为带 content digest 的 v2。损坏的 source cursor 可能影响“哪些稳定来源已经观察过”，doctor 只报告且不自动猜测；History Cue 不承载 Memory facts，因此可由 repair-projections 重建。
 
 ### 常见诊断
 
@@ -343,7 +357,11 @@ repair-projections 只重建 read model、SQLite、Markdown 和 projection manif
 | `read_model_*` | checkpoint/read model 缺失或落后 | repair projections；event 缩短则先保留现场 |
 | `fact_provenance_invalid` | artifact/evidence/source 不匹配 | 不自动修，检查事实源和备份 |
 | `orphan_memory_artifact` | artifact 未被 facts/pending 引用 | deep 审计；不要直接批量删除 |
-| generating + 无 pending result | provider 结果未知 | 不自动重试；保留诊断并人工判断 |
+| `capture_failed_retryable` | 已知失败且可安全重试 | 等待下一次匹配 stable-source scan，或检查 provider/I/O 状态 |
+| `capture_failed_non_retryable` | 来源、schema、provenance 或配置错误 | 先显式修正来源；不要机械重试 |
+| `capture_indeterminate` | generation 已开始但无 durable result pointer | 不自动重试；保留诊断并人工判断 |
+| `source_cursor_invalid` | source cursor schema/head 与事实不一致 | 不自动修；保留现场并核对 Goal/Chain event log |
+| `history_cue_cursor_invalid` | History Cue cursor/digest/source locator 损坏 | `/memory doctor repair-projections` |
 | proposed | 等待确认或 publication 恢复 | 查看 proposals/status；下个稳定边界会恢复低风险 apply |
 
 ## 15. 与 Goal、Task、Session Chain 的关系
@@ -362,9 +380,10 @@ Memory 与 active Goal 发生冲突时，模型应报告差异并走 `pi_xk_prop
 
 - D0 只读取 checkpointed read model/SQLite status，不应完整 replay event log；
 - D1 首页成本受 200 candidate pool 和 page limit 限制；
+- History Cue 正常刷新按 chain head 和 sealed Segment cursor 只处理新增来源；稳定 chain 不重复打开全部 Segment；
 - D2 最多 5 条，D3 最多 3 个 evidence；
 - Node/Bun SQLite 在 worker 中运行，Node 主进程不加载额外 native npm addon；
-- SQLite rebuild 不构造或跨 Worker 克隆完整 Memory/Edge snapshot；insert statement 复用，状态计数随 batch 单次累计；
+- SQLite schema v2 保存 Edge 有效时间；事实 mutation 通过 event-head CAS 增量更新，History Cue 使用同-head projection delta；完整 rebuild 不构造或跨 Worker 克隆完整 Memory/Edge snapshot；
 - 自动 capture 可能产生 provider 调用；explicit remember/search/read/refresh/doctor 不调用模型；
 - backfill 的 limit 是成本控制，不是迁移进度承诺。
 
