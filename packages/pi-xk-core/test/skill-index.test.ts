@@ -1,4 +1,5 @@
 import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
@@ -105,7 +106,7 @@ describe("Skill index", () => {
 	});
 
 	it("persists equivalent FTS state through the Node worker", async () => {
-		const root = await mkdtemp(join("/tmp", "pi-xk-skill-index-"));
+		const root = await mkdtemp(join(tmpdir(), "pi-xk-skill-index-"));
 		roots.push(root);
 		const client = new SkillIndexWorkerClient({
 			databasePath: join(root, "index.sqlite"),

@@ -1,5 +1,6 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/compat";
@@ -282,7 +283,7 @@ describe("Pi-XK Ambient Skill evolution", () => {
 	}, 20_000);
 
 	it("promotes a project Skill after three successful uses across two Git repositories", async () => {
-		const sharedRoot = await mkdtemp(join("/tmp", "pi-xk-global-skill-evolution-"));
+		const sharedRoot = await mkdtemp(join(tmpdir(), "pi-xk-global-skill-evolution-"));
 		temporaryRoots.push(sharedRoot);
 		const agentDir = join(sharedRoot, "agent");
 		const skillErrors: Error[] = [];

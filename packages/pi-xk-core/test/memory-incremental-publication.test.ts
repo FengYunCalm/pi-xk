@@ -1,4 +1,5 @@
 import { mkdtemp, rm, stat, utimes } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { MemoryService } from "../src/index.ts";
@@ -11,7 +12,7 @@ afterEach(async () => {
 
 describe("Memory incremental publication", () => {
 	it("updates only changed Markdown and keeps the open SQLite projection current", async () => {
-		const root = await mkdtemp(join("/tmp", "pi-xk-memory-incremental-"));
+		const root = await mkdtemp(join(tmpdir(), "pi-xk-memory-incremental-"));
 		roots.push(root);
 		const service = new MemoryService(root);
 		const first = await service.remember("The release workflow validates Node artifacts before Bun binaries.", {

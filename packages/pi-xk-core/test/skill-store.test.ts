@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -22,7 +23,7 @@ afterEach(async () => {
 });
 
 async function projectRoot(): Promise<string> {
-	const root = await mkdtemp(join("/tmp", "pi-xk-skill-store-"));
+	const root = await mkdtemp(join(tmpdir(), "pi-xk-skill-store-"));
 	roots.push(root);
 	return root;
 }

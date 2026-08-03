@@ -1,6 +1,7 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
@@ -169,7 +170,7 @@ async function createCandidate(root: string, store: SkillStore): Promise<SkillCa
 
 describe("SkillService", () => {
 	it("rebuilds a missing index from facts and returns D1 metadata plus controlled D2 bundle reads", async () => {
-		const root = await mkdtemp(join("/tmp", "pi-xk-skill-service-"));
+		const root = await mkdtemp(join(tmpdir(), "pi-xk-skill-service-"));
 		roots.push(root);
 		const store = new SkillStore(root, { projectId: "project_test", now: () => now });
 		const service = new SkillService(root, {}, store);
@@ -192,7 +193,7 @@ describe("SkillService", () => {
 	});
 
 	it("keeps existing Skill facts readable when automatic evolution is disabled", async () => {
-		const root = await mkdtemp(join("/tmp", "pi-xk-skill-service-"));
+		const root = await mkdtemp(join(tmpdir(), "pi-xk-skill-service-"));
 		roots.push(root);
 		const service = new SkillService(root, { projectId: "project_test", now: () => now });
 		await service.setConfig(false);
@@ -202,7 +203,7 @@ describe("SkillService", () => {
 	});
 
 	it("preserves expanded review evidence in the published Skill revision", async () => {
-		const root = await mkdtemp(join("/tmp", "pi-xk-skill-service-"));
+		const root = await mkdtemp(join(tmpdir(), "pi-xk-skill-service-"));
 		roots.push(root);
 		const service = new SkillService(root, { projectId: "project_test", now: () => now });
 		const explicitArtifact = await new ArtifactStore(root).put({
@@ -268,7 +269,7 @@ describe("SkillService", () => {
 	});
 
 	it("keeps an open index current across Skill publication and use evidence", async () => {
-		const root = await mkdtemp(join("/tmp", "pi-xk-skill-service-"));
+		const root = await mkdtemp(join(tmpdir(), "pi-xk-skill-service-"));
 		roots.push(root);
 		const service = new SkillService(root, { projectId: "project_test", now: () => now });
 		expect(await service.search({ query: "empty index" })).toEqual({
@@ -342,7 +343,7 @@ describe("SkillService", () => {
 	});
 
 	it("suppresses a project Skill after its Git scope becomes stale", async () => {
-		const root = await mkdtemp(join("/tmp", "pi-xk-skill-service-"));
+		const root = await mkdtemp(join(tmpdir(), "pi-xk-skill-service-"));
 		roots.push(root);
 		await writeFile(join(root, "workflow.ts"), "export const version = 1;\n", "utf8");
 		await execFile("git", ["init", "--quiet"], { cwd: root });
