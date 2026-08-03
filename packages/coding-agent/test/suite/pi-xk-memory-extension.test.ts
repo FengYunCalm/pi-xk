@@ -26,6 +26,7 @@ import {
 	MEMORY_CAPTURE_RESPONSE_SCHEMA,
 	parseMemoryCaptureEnvelope,
 } from "../../../pi-xk-extension/src/memory-prompt.ts";
+import { PI_XK_SESSION_CHAIN_LINK_CUSTOM_TYPE } from "../../../pi-xk-extension/src/session-chain-controller.ts";
 import { createHarness, getMessageText, type Harness } from "./harness.ts";
 import { contextSummaryEvidence } from "./summary-evidence-fixtures.ts";
 
@@ -1086,8 +1087,7 @@ describe("Pi-XK Memory extension", () => {
 			fauxAssistantMessage("The evidence-backed Memory revision is staged."),
 		]);
 		await harness.session.prompt("Review the prior Memory against the current implementation.");
-		if (memoryErrors.length > 0) console.error(memoryErrors.map((error) => error.stack ?? error.message).join("\n"));
-		expect(memoryErrors, memoryErrors.map((error) => error.stack ?? error.message).join("\n")).toEqual([]);
+		expect(memoryErrors).toEqual([]);
 		const replay = await service.getStore().replay();
 		expect(replay.events.some((event) => event.eventType === "memory_review_applied")).toBe(true);
 		const reviewToolResults = harness.session.messages
@@ -1106,6 +1106,73 @@ describe("Pi-XK Memory extension", () => {
 		});
 		expect(timeline[1]?.revision.evidenceRefs).toEqual([
 			expect.objectContaining({ sourceType: "agent_run", artifactId: null }),
+		]);
+	}, 20_000);
+
+	it("omits an uncommitted Session Chain locator from Agent-run evidence", async () => {
+		const memoryErrors: Error[] = [];
+		let extensionController: MemoryController | undefined;
+		const harness = await createHarness({
+			persistedSession: true,
+			extensionFactories: [
+				createPiXkMemoryExtension({
+					onMemoryError: (error) => memoryErrors.push(error),
+					createController: (projectRoot) => {
+						extensionController = new MemoryController({ projectRoot });
+						controllers.push(extensionController);
+						return extensionController;
+					},
+				}),
+			],
+		});
+		harnesses.push(harness);
+		harness.sessionManager.appendCustomEntry(PI_XK_SESSION_CHAIN_LINK_CUSTOM_TYPE, {
+			schema: "pi-xk.session-chain-link.v1",
+			kind: "segment_link",
+			chainId: "chain_pending_adoption",
+			branchId: "branch_pending_adoption",
+			segmentId: harness.sessionManager.getSessionId(),
+			ordinal: 1,
+			predecessorSegmentId: null,
+			summaryInArtifactId: null,
+			createdAt: "2026-08-03T08:00:00.000Z",
+		});
+		await harness.session.bindExtensions({});
+		await harness.session.prompt("/memory remember Pending Chain adoption must not invalidate Agent-run evidence.");
+		const service = extensionController?.getService();
+		if (!service) throw new Error("Memory extension controller was not created");
+		const memoryId = (await service.search({ query: "Pending Chain adoption" })).items[0]?.memoryId;
+		if (!memoryId) throw new Error("pending Chain adoption fixture was not published");
+
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("pi_xk_read_memory", { memoryIds: [memoryId] })),
+			fauxAssistantMessage(
+				fauxToolCall("pi_xk_review_memory", {
+					action: "revise",
+					sourceMemories: [{ memoryId, expectedRevision: 1 }],
+					replacement: {
+						kind: "decision",
+						title: "Pending Chain adoption preserves evidence",
+						statement: "Agent-run evidence remains valid while Session Chain adoption is not yet durable.",
+						applicability: "Pi-XK Memory settlement during Session Chain adoption.",
+						effectiveFrom: "2026-08-03T08:00:00.000Z",
+						cueIds: [],
+					},
+					reason: "The current run verifies the adoption boundary.",
+				}),
+			),
+			fauxAssistantMessage("The evidence-backed Memory revision is staged."),
+		]);
+		await harness.session.prompt("Review the Memory while Chain adoption is still pending.");
+
+		expect(memoryErrors).toEqual([]);
+		const timeline = (await service.timeline(memoryId)).revisions;
+		expect(timeline.map((entry) => entry.revision.revision)).toEqual([1, 2]);
+		expect(timeline[1]?.revision.evidenceRefs).toEqual([
+			expect.objectContaining({
+				sourceType: "agent_run",
+				locator: expect.objectContaining({ chainId: null, branchId: null, segmentId: null }),
+			}),
 		]);
 	}, 20_000);
 

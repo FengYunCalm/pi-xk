@@ -31,6 +31,8 @@ import {
 	type MemoryServiceStatusV1,
 	MemoryValidationError,
 	type RecallStopReason,
+	SessionChainNotFoundError,
+	SessionChainStore,
 	SKILL_REVIEW_DECISION_SCHEMA,
 	SKILL_REVIEW_PROMPT_VERSION,
 	SKILL_USE_EVIDENCE_SCHEMA,
@@ -155,6 +157,29 @@ function currentChainBinding(ctx: ExtensionContext): PiXkSessionChainBindingV1 |
 		}
 	}
 	return null;
+}
+
+function isSessionChainNotFoundError(error: unknown): boolean {
+	return error instanceof SessionChainNotFoundError || (isRecord(error) && error.name === "SessionChainNotFoundError");
+}
+
+async function currentDurableChainBinding(ctx: ExtensionContext): Promise<PiXkSessionChainBindingV1 | null> {
+	const binding = currentChainBinding(ctx);
+	if (!binding) return null;
+	const store = new SessionChainStore(ctx.cwd);
+	try {
+		await store.loadChainReadModel(binding.chainId);
+		return binding;
+	} catch (error) {
+		if (isSessionChainNotFoundError(error)) return null;
+		try {
+			await store.replayChain(binding.chainId);
+			return binding;
+		} catch (replayError) {
+			if (isSessionChainNotFoundError(replayError)) return null;
+			throw replayError;
+		}
+	}
 }
 
 function createBudgetUsage(): AmbientRecallBudgetUsageV1 {
@@ -1868,7 +1893,7 @@ export function createPiXkMemoryExtension(options: PiXkMemoryExtensionOptions = 
 				sessionId: ctx.sessionManager.getSessionId(),
 				startedAt: new Date().toISOString(),
 				initialEntryIds: new Set(ctx.sessionManager.getBranch().map((entry) => entry.id)),
-				binding: currentChainBinding(ctx),
+				binding: await currentDurableChainBinding(ctx),
 				queryDigests: [],
 				candidateIds: new Set(),
 				readRevisions: new Map(),
