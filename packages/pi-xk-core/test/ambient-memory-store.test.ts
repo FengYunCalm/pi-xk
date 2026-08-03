@@ -15,12 +15,15 @@ import {
 } from "../src/index.ts";
 
 const tempDirs: string[] = [];
+const services: MemoryService[] = [];
 
 async function createService(): Promise<{ projectRoot: string; service: MemoryService }> {
 	const projectRoot = join(tmpdir(), `pi-xk-ambient-memory-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 	await mkdir(projectRoot, { recursive: true });
+	const service = new MemoryService(projectRoot);
 	tempDirs.push(projectRoot);
-	return { projectRoot, service: new MemoryService(projectRoot) };
+	services.push(service);
+	return { projectRoot, service };
 }
 
 function digest(value: string): string {
@@ -126,6 +129,7 @@ function semanticDecision(
 }
 
 afterEach(async () => {
+	await Promise.all(services.splice(0).map(async (service) => await service.close()));
 	await Promise.all(tempDirs.splice(0).map(async (path) => await rm(path, { recursive: true, force: true })));
 });
 
