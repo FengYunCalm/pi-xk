@@ -111,6 +111,10 @@ function isErrno(error: unknown, code: string): boolean {
 	return isRecord(error) && error.code === code;
 }
 
+function isSessionChainNotFoundError(error: unknown): boolean {
+	return error instanceof SessionChainNotFoundError || (isRecord(error) && error.name === "SessionChainNotFoundError");
+}
+
 function digest(value: string): string {
 	return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
@@ -388,7 +392,7 @@ export class MemorySourceBridge {
 			try {
 				available.push({ chainId, replay: await this.chains.replayChain(chainId) });
 			} catch (error) {
-				if (!(error instanceof SessionChainNotFoundError)) throw error;
+				if (!isSessionChainNotFoundError(error)) throw error;
 			}
 		}
 		return available;
