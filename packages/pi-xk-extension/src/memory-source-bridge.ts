@@ -11,6 +11,7 @@ import {
 	GoalStore,
 	type MemoryIndexHistoryCueV1,
 	parseGoalStateProjection,
+	SessionChainNotFoundError,
 	SessionChainStore,
 	stableJsonStringify,
 	syncDirectory,
@@ -376,6 +377,23 @@ export class MemorySourceBridge {
 		return complete;
 	}
 
+	private async availableChainReplays(): Promise<
+		Array<{ chainId: string; replay: Awaited<ReturnType<SessionChainStore["replayChain"]>> }>
+	> {
+		const available: Array<{
+			chainId: string;
+			replay: Awaited<ReturnType<SessionChainStore["replayChain"]>>;
+		}> = [];
+		for (const chainId of await this.chainIds()) {
+			try {
+				available.push({ chainId, replay: await this.chains.replayChain(chainId) });
+			} catch (error) {
+				if (!(error instanceof SessionChainNotFoundError)) throw error;
+			}
+		}
+		return available;
+	}
+
 	private async currentCursor(): Promise<MemorySourceCursorV1 | MemorySourceCursorV2 | null> {
 		try {
 			return exactCursor(JSON.parse(await readFile(this.cursorPath, "utf8")) as unknown);
@@ -438,7 +456,7 @@ export class MemorySourceBridge {
 		const goals: MemorySourceCursorV2["goals"] = {};
 		for (const goalId of await this.goalIds()) goals[goalId] = (await this.goals.loadGoal(goalId)).head;
 		const chains: MemorySourceCursorV2["chains"] = {};
-		for (const chainId of await this.chainIds()) chains[chainId] = (await this.chains.replayChain(chainId)).head;
+		for (const { chainId, replay } of await this.availableChainReplays()) chains[chainId] = replay.head;
 		return { goals, chains };
 	}
 
@@ -796,8 +814,7 @@ export class MemorySourceBridge {
 		retryableSourceIds: ReadonlySet<string>,
 	): Promise<PublishedRollupSourceV1[]> {
 		const result: PublishedRollupSourceV1[] = [];
-		for (const chainId of await this.chainIds()) {
-			const replay = await this.chains.replayChain(chainId);
+		for (const { chainId, replay } of await this.availableChainReplays()) {
 			for (const event of replay.events) {
 				if (
 					(event.sequence <= (cursor.chains[chainId]?.sequence ?? 0) && !retryableSourceIds.has(event.eventId)) ||
@@ -913,8 +930,7 @@ export class MemorySourceBridge {
 				}
 			}
 		}
-		for (const chainId of await this.chainIds()) {
-			const replay = await this.chains.replayChain(chainId);
+		for (const { chainId, replay } of await this.availableChainReplays()) {
 			for (const branch of replay.branches) {
 				for (const rollup of branch.rollups) {
 					if (captured.has(rollup.eventId)) continue;
@@ -987,8 +1003,17 @@ export class MemorySourceBridge {
 				}
 			}
 		}
+		const availableReplays = new Map(
+			(await this.availableChainReplays()).map(({ chainId, replay }) => [chainId, replay]),
+		);
 		for (const chainId of chainIds) {
-			const replay = await this.chains.replayChain(chainId);
+			const replay = availableReplays.get(chainId);
+			if (!replay) {
+				if (stored?.chains[chainId]) {
+					throw new Error(`Memory history cue source chain became unavailable: ${chainId}`);
+				}
+				continue;
+			}
 			const previousHead = forceRebuild ? undefined : chains[chainId];
 			if (previousHead) {
 				if (replay.head.sequence < previousHead.sequence) {
