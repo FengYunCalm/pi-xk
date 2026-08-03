@@ -666,7 +666,7 @@ describe("Pi-XK Memory extension", () => {
 			{ timeout: 5_000 },
 		);
 
-		expect(memoryErrors).toEqual([]);
+		expect(memoryErrors, memoryErrors.map((error) => error.stack ?? error.message).join("\n")).toEqual([]);
 		expect(requestCounts).toEqual([1, 1]);
 		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")[0]).toMatchObject({
 			title: "Documentation transition",
