@@ -19,7 +19,7 @@ const execFile = promisify(execFileCallback);
 afterEach(async () => {
 	await Promise.all(skillServices.splice(0).map(async (service) => await service.close()));
 	for (const controller of memoryControllers.splice(0)) await controller.close();
-	for (const harness of harnesses.splice(0)) harness.cleanup();
+	for (const harness of harnesses.splice(0)) await harness.shutdown();
 	await Promise.all(temporaryRoots.splice(0).map(async (root) => await rm(root, { recursive: true, force: true })));
 });
 

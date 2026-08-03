@@ -193,7 +193,7 @@ async function createTaskCaptureRequest(
 afterEach(async () => {
 	for (const controller of controllers.splice(0)) await controller.close();
 	for (const harness of harnesses.splice(0)) {
-		harness.cleanup();
+		await harness.shutdown();
 	}
 });
 
@@ -1086,21 +1086,13 @@ describe("Pi-XK Memory extension", () => {
 			fauxAssistantMessage("The evidence-backed Memory revision is staged."),
 		]);
 		await harness.session.prompt("Review the prior Memory against the current implementation.");
-		await vi.waitFor(
-			async () => {
-				expect(
-					(await service.getStore().replay()).events.some((event) => event.eventType === "memory_review_applied"),
-				).toBe(true);
-			},
-			{ timeout: 5_000 },
-		);
-
 		expect(memoryErrors).toEqual([]);
+		const replay = await service.getStore().replay();
+		expect(replay.events.some((event) => event.eventType === "memory_review_applied")).toBe(true);
 		const reviewToolResults = harness.session.messages
 			.filter((message) => message.role === "toolResult")
 			.map(getMessageText);
 		expect(reviewToolResults).toEqual(expect.arrayContaining([expect.stringContaining('"status":"staged"')]));
-		const replay = await service.getStore().replay();
 		expect(replay.events.map((event) => event.eventType)).toEqual(
 			expect.arrayContaining(["reconstruction_recorded", "memory_review_applied", "access_recorded"]),
 		);

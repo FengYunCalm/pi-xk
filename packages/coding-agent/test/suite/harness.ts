@@ -18,6 +18,7 @@ import { registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { AgentSession, type AgentSessionEvent } from "../../src/core/agent-session.ts";
 import { AuthStorage } from "../../src/core/auth-storage.ts";
 import type { ExtensionRunner, LoadExtensionsResult } from "../../src/core/extensions/index.ts";
+import { emitSessionShutdownEvent } from "../../src/core/extensions/runner.ts";
 import { convertToLlm } from "../../src/core/messages.ts";
 import type { ModelRuntime } from "../../src/core/model-runtime.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
@@ -97,6 +98,7 @@ export interface Harness {
 	eventsOfType<T extends AgentSessionEvent["type"]>(type: T): Extract<AgentSessionEvent, { type: T }>[];
 	tempDir: string;
 	cleanup: () => void;
+	shutdown: () => Promise<void>;
 }
 
 function createTempDir(): string {
@@ -204,6 +206,16 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 	session.subscribe((event) => {
 		events.push(event);
 	});
+	let disposed = false;
+	const cleanup = (): void => {
+		if (disposed) return;
+		disposed = true;
+		session.dispose();
+		fauxProvider.unregister();
+		if (existsSync(tempDir)) {
+			rmSync(tempDir, { recursive: true });
+		}
+	};
 
 	return {
 		session,
@@ -222,11 +234,14 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 			return events.filter((event): event is Extract<AgentSessionEvent, { type: T }> => event.type === type);
 		},
 		tempDir,
-		cleanup() {
-			session.dispose();
-			fauxProvider.unregister();
-			if (existsSync(tempDir)) {
-				rmSync(tempDir, { recursive: true });
+		cleanup,
+		async shutdown() {
+			if (disposed) return;
+			try {
+				const runner = extensionRunnerRef.current;
+				if (runner) await emitSessionShutdownEvent(runner, { type: "session_shutdown", reason: "quit" });
+			} finally {
+				cleanup();
 			}
 		},
 	};

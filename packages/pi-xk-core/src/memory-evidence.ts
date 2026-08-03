@@ -237,9 +237,17 @@ export async function validateMemoryEvidenceOwnership(projectRoot: string, evide
 			!isRecord(header) ||
 			header.type !== "session" ||
 			header.id !== locator.sessionId ||
-			typeof header.cwd !== "string" ||
-			resolve(header.cwd) !== projectPath
+			typeof header.cwd !== "string"
 		) {
+			invalidEvidence(evidence, "does not match its native Session header and project");
+		}
+		let headerProjectPath: string;
+		try {
+			headerProjectPath = await realpath(resolve(header.cwd));
+		} catch {
+			invalidEvidence(evidence, "native Session header project path is unavailable");
+		}
+		if (headerProjectPath !== projectPath) {
 			invalidEvidence(evidence, "does not match its native Session header and project");
 		}
 		if (locator.chainId !== null && locator.branchId !== null && locator.segmentId !== null) {

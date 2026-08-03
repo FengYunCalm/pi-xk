@@ -61,6 +61,7 @@
 - Fixed Pi-XK Memory index rebuilds to stream bounded reference/artifact batches through one Worker transaction, avoid complete snapshot cloning, roll back failed chunks, and remove failed temporary SQLite files.
 - Fixed Pi-XK Memory review to reject unread revisions, preserve verified trust derivation, avoid semantic publication after error/abort/length runs, and retain implicit keep traces without duplicating transcript content.
 - Fixed Skill reload to reuse only the last trusted path/metadata snapshot, cache unchanged frontmatter, preserve disabled paths, avoid noisy missing-root diagnostics, and retain the previous Skill generation after reload failure.
+- Fixed Agent-run Memory evidence validation across canonical path aliases on macOS and Windows, and made Pi-XK test shutdown close managed Skill index workers before removing temporary projects.
 
 ## [0.80.10] - 2026-07-16
 
