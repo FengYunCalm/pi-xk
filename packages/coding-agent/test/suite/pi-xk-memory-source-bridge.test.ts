@@ -1,4 +1,4 @@
-import { readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -149,6 +149,58 @@ function durableMemoryEnvelope(title: string): string {
 }
 
 describe("Pi-XK Memory source bridge", () => {
+	it("ignores an incomplete Chain directory until its event log is durable", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const service = new MemoryService(harness.tempDir);
+		services.push(service);
+		const controller = { getService: () => service, capture: vi.fn(), resumePublications: async () => [] };
+		const bridge = new MemorySourceBridge({ projectRoot: harness.tempDir, controller });
+		const chainsDirectory = join(harness.tempDir, ".pi-xk", "sessions", "chains");
+		await mkdir(join(chainsDirectory, "chain_incomplete", "locks"), { recursive: true });
+
+		await expect(bridge.initialize()).resolves.toBeUndefined();
+		const cursorPath = join(harness.tempDir, ".pi-xk", "memory", "source-cursors.json");
+		const initialCursor = JSON.parse(await readFile(cursorPath, "utf8")) as {
+			chains: Record<string, unknown>;
+		};
+		expect(initialCursor.chains).toEqual({});
+
+		await rm(join(chainsDirectory, "chain_incomplete"), { recursive: true, force: true });
+		const store = new SessionChainStore(harness.tempDir);
+		await store.createChain(
+			{
+				schema: "pi-xk.session-chain.spec.v1",
+				chainId: "chain_completed",
+				title: "Completed test chain",
+				cwd: harness.tempDir,
+				rootBranchId: "branch_completed",
+				rootSegment: {
+					segmentId: "segment_completed",
+					ordinal: 1,
+					location: { kind: "external-root", absolutePath: join(harness.tempDir, "segment-completed.jsonl") },
+					predecessorSegmentId: null,
+					summaryInArtifactId: null,
+					createdAt: "2026-08-01T00:00:00.000Z",
+				},
+				createdAt: "2026-08-01T00:00:00.000Z",
+			},
+			{
+				eventId: "evt_completed_chain_created",
+				idempotencyKey: "chain:create:completed-test",
+				actor: "user",
+				timestamp: "2026-08-01T00:00:00.000Z",
+			},
+		);
+
+		await expect(bridge.captureStableSources({ model: undefined, generate: vi.fn() })).resolves.toEqual([]);
+		const resumedCursor = JSON.parse(await readFile(cursorPath, "utf8")) as {
+			chains: Record<string, { sequence: number; hash: string | null }>;
+		};
+		expect(resumedCursor.chains.chain_completed?.sequence).toBe(1);
+		expect(resumedCursor.chains.chain_incomplete).toBeUndefined();
+	});
+
 	it("does not create or advance capture cursors while Memory is off", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

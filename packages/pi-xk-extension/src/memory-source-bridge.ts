@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Dirent } from "node:fs";
-import { mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
+import { mkdir, open, readdir, readFile, rename, rm, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
@@ -362,7 +362,18 @@ export class MemorySourceBridge {
 	}
 
 	private async chainIds(): Promise<string[]> {
-		return await this.directories(join(this.projectRoot, ".pi-xk", "sessions", "chains"), "chain_");
+		const chainsDirectory = join(this.projectRoot, ".pi-xk", "sessions", "chains");
+		const candidates = await this.directories(chainsDirectory, "chain_");
+		const complete: string[] = [];
+		for (const chainId of candidates) {
+			try {
+				const events = await stat(join(chainsDirectory, chainId, "events.jsonl"));
+				if (events.isFile() && events.size > 0) complete.push(chainId);
+			} catch (error) {
+				if (!isErrno(error, "ENOENT")) throw error;
+			}
+		}
+		return complete;
 	}
 
 	private async currentCursor(): Promise<MemorySourceCursorV1 | MemorySourceCursorV2 | null> {
