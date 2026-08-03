@@ -190,7 +190,9 @@ async function publishMemorySharingEvidence(
 ): Promise<{ head: { sequence: number; hash: string | null }; evidenceArtifactId: string }> {
 	const original = await store.readMemory("memory_canonical_summary");
 	const evidence = original.revision.evidenceRefs[0];
-	if (!evidence?.artifactId) throw new Error("missing shared evidence fixture");
+	if (evidence?.schema !== "pi-xk.memory-evidence-ref.v1" || !evidence.artifactId) {
+		throw new Error("missing shared V1 evidence fixture");
+	}
 	const sourceDigest = `sha256:${"d".repeat(64)}`;
 	const recordedAt = "2026-08-01T00:02:00.000Z";
 	const sharedProposal: MemoryChangeProposalV1 = {
@@ -800,6 +802,7 @@ describe("Memory Store", () => {
 		const { projectRoot, store } = await createStore();
 		const head = await publishMemoryWithoutEdges(projectRoot, store);
 		const current = await store.readMemory("memory_canonical_summary");
+		if (current.revision.schema !== "pi-xk.memory-revision.v1") throw new Error("missing V1 Memory fixture");
 		const revisionProposal: MemoryChangeProposalV1 = {
 			schema: "pi-xk.memory-change-proposal.v1",
 			proposalId: "proposal_existing_inferred_revision",
@@ -861,6 +864,7 @@ describe("Memory Store", () => {
 		const { projectRoot, store } = await createStore();
 		const head = await publishMemoryWithoutEdges(projectRoot, store);
 		const current = await store.readMemory("memory_canonical_summary");
+		if (current.revision.schema !== "pi-xk.memory-revision.v1") throw new Error("missing V1 Memory fixture");
 		const destructiveProposal: MemoryChangeProposalV1 = {
 			schema: "pi-xk.memory-change-proposal.v1",
 			proposalId: "proposal_confirmed_destructive_change",
@@ -1017,6 +1021,7 @@ describe("Memory Store", () => {
 		const { projectRoot, store } = await createStore();
 		const head = await publishMemoryWithoutEdges(projectRoot, store);
 		const current = await store.readMemory("memory_canonical_summary");
+		if (current.revision.schema !== "pi-xk.memory-revision.v1") throw new Error("missing V1 Memory fixture");
 		const sourceDigest = `sha256:${"e".repeat(64)}`;
 		const provenance = {
 			producer: "model" as const,

@@ -5,6 +5,7 @@ import {
 	ArtifactStore,
 	captureGitFreshnessBasis,
 	type EvidenceRefV1,
+	type EvidenceRefV2,
 	MEMORY_CAPTURE_SOURCE_SCHEMA,
 	MEMORY_EVIDENCE_REF_SCHEMA,
 	type MemoryCaptureSourceV1,
@@ -24,7 +25,7 @@ import {
 	validateMemoryChangeProposalV1,
 } from "pi-xk-core";
 import {
-	buildMemoryCaptureProposal,
+	buildMemoryCaptureReview,
 	MEMORY_CAPTURE_PROMPT,
 	MEMORY_CAPTURE_PROMPT_VERSION,
 	parseMemoryCaptureEnvelope,
@@ -187,7 +188,7 @@ export class MemoryController {
 			sourceIds: [proposal.proposalId],
 			createdAt: recordedAt,
 		});
-		const recorded = await this.service.getStore().recordProposal(proposal, resultArtifact.artifactId, {
+		const recorded = await this.service.recordProposal(proposal, resultArtifact.artifactId, {
 			eventId: `evt_memory_proposal_${suffix(sha256(proposal.proposalId))}`,
 			idempotencyKey: `memory:proposal:${proposal.proposalId}`,
 			expectedHead: proposal.expectedEventHead,
@@ -224,7 +225,7 @@ export class MemoryController {
 			throw new MemoryValidationError("Memory is disabled and read-only");
 		const current = await this.readProposal(proposalId);
 		const replay = await this.service.getStore().replay();
-		await this.service.applyProposal(current.proposalArtifactId, {
+		const applied = await this.service.applyProposal(current.proposalArtifactId, {
 			eventId: `evt_memory_apply_${suffix(sha256(proposalId))}`,
 			idempotencyKey: `memory:apply:${proposalId}`,
 			expectedHead: replay.head,
@@ -233,7 +234,10 @@ export class MemoryController {
 			confirmed: true,
 		});
 		try {
-			await this.service.repairProjections();
+			await this.service.synchronizeProjections({
+				memoryIds: applied.write.event.payload.revisions.map((reference) => reference.memoryId),
+				removeMemoryIds: (applied.write.event.payload.purges ?? []).map((purge) => purge.memoryId),
+			});
 		} catch (error) {
 			if (current.proposal.captureId) await this.recordFailure(current.proposal.captureId, "projection", error);
 		}
@@ -244,7 +248,7 @@ export class MemoryController {
 			throw new MemoryValidationError("Memory is disabled and read-only");
 		await this.readProposal(proposalId);
 		const replay = await this.service.getStore().replay();
-		await this.service.getStore().rejectProposal(proposalId, reason, {
+		await this.service.rejectProposal(proposalId, reason, {
 			eventId: `evt_memory_reject_${suffix(sha256(proposalId))}`,
 			idempotencyKey: `memory:reject:${proposalId}`,
 			expectedHead: replay.head,
@@ -367,13 +371,16 @@ export class MemoryController {
 		envelope: ReturnType<typeof parseMemoryCaptureEnvelope>,
 		existingCues: Awaited<ReturnType<ReturnType<MemoryService["getStore"]>["readCues"]>>,
 		captureDigest: string,
+		recordedAt: string,
 	): Promise<Array<MemoryGitContext | undefined>> {
 		const pathsByCueKey = new Map(existingCues.map(({ cue }) => [cue.key, cue.scope.paths] as const));
 		for (const cue of envelope.cues) pathsByCueKey.set(cue.key, cue.paths);
 		const cache = new Map<string, Awaited<ReturnType<typeof captureGitFreshnessBasis>> | null>();
 		const contexts: Array<MemoryGitContext | undefined> = [];
-		for (const [index, memory] of envelope.memories.entries()) {
-			const paths = [...new Set(memory.cueKeys.flatMap((key) => pathsByCueKey.get(key) ?? []))].sort();
+		for (const [index, review] of envelope.reviews.entries()) {
+			const paths = [
+				...new Set((review.replacement?.cueKeys ?? []).flatMap((key) => pathsByCueKey.get(key) ?? [])),
+			].sort();
 			if (paths.length === 0) {
 				contexts.push(undefined);
 				continue;
@@ -400,7 +407,7 @@ export class MemoryController {
 				sourceId: basis.baselineCommit,
 				artifactId: null,
 				sourceDigest: evidenceDigest,
-				recordedAt: this.now(),
+				recordedAt,
 				locator: {
 					repositoryId: basis.repositoryId,
 					baselineCommit: basis.baselineCommit,
@@ -433,7 +440,7 @@ export class MemoryController {
 			promptVersion: MEMORY_CAPTURE_PROMPT_VERSION,
 			createdAt: request.recordedAt,
 		};
-		return await this.service.getStore().scheduleCapture(source, {
+		return await this.service.scheduleCapture(source, {
 			eventId: `evt_memory_schedule_${suffix(captureDigest)}`,
 			idempotencyKey: `memory:schedule:${captureId}`,
 			expectedHead: replay.head,
@@ -458,7 +465,7 @@ export class MemoryController {
 			return;
 		}
 		const classification = captureFailure(error, stage);
-		await this.service.getStore().markCaptureFailed(
+		await this.service.markCaptureFailed(
 			{
 				captureId,
 				stage,
@@ -501,7 +508,7 @@ export class MemoryController {
 				confirmationRequired: true,
 			};
 		}
-		await this.service.applyProposal(proposal.proposalArtifactId, {
+		const applied = await this.service.applyProposal(proposal.proposalArtifactId, {
 			eventId: `evt_memory_apply_${suffix(sha256(capture.proposalId))}`,
 			idempotencyKey: `memory:apply:${capture.proposalId}`,
 			expectedHead: replay.head,
@@ -510,7 +517,10 @@ export class MemoryController {
 		});
 		await rm(this.pendingPath(captureId), { force: true });
 		try {
-			await this.service.repairProjections();
+			await this.service.synchronizeProjections({
+				memoryIds: applied.write.event.payload.revisions.map((reference) => reference.memoryId),
+				removeMemoryIds: (applied.write.event.payload.purges ?? []).map((purge) => purge.memoryId),
+			});
 		} catch (error) {
 			await this.recordFailure(captureId, "projection", error);
 		}
@@ -518,7 +528,7 @@ export class MemoryController {
 	}
 
 	private async existingContext(query: string) {
-		const search = await this.service.search({ query, limit: 12, graphDepth: 1 });
+		const search = await this.service.search({ query, limit: 10, graphDepth: 1 });
 		return await this.service.getStore().readMemories(search.items.map((item) => item.memoryId));
 	}
 
@@ -569,7 +579,7 @@ export class MemoryController {
 		}
 		if (!pending) {
 			if (!host.model) throw new MemoryValidationError("Memory capture requires a selected model");
-			const started = await this.service.getStore().markGenerationStarted(captureId, (capture.attempt ?? 0) + 1, {
+			const started = await this.service.markGenerationStarted(captureId, (capture.attempt ?? 0) + 1, {
 				eventId: `evt_memory_generation_${suffix(captureDigest)}_${(capture.attempt ?? 0) + 1}`,
 				idempotencyKey: `memory:generation:${captureId}:${(capture.attempt ?? 0) + 1}`,
 				expectedHead: replay.head,
@@ -642,32 +652,31 @@ export class MemoryController {
 		}
 
 		if (!pending) throw new MemoryValidationError("Memory capture result is unavailable");
-		let proposal: MemoryChangeProposalV1 | null;
+		let review: ReturnType<typeof buildMemoryCaptureReview>;
 		try {
 			const result = await this.artifacts.read(pending.resultArtifactId);
 			const envelope = parseMemoryCaptureEnvelope(result.content);
-			const currentReplay = await this.service.getStore().replay();
-			const currentMemories = await this.service.getStore().readMemories();
+			const currentMemories = await this.existingContext(request.query);
 			const existingCues = await this.service.getStore().readCues();
-			proposal = buildMemoryCaptureProposal(envelope, {
+			review = buildMemoryCaptureReview(envelope, {
 				captureId,
 				sourceDigest: captureDigest,
-				expectedEventHead: currentReplay.head,
 				evidence: this.evidence(request, captureDigest),
-				recordedAt: this.now(),
+				recordedAt: pending.updatedAt,
 				model: pending.model,
+				query: request.query,
 				scope: { projectId: this.projectId(), ...request.scope },
 				existingMemories: new Map(currentMemories.map((memory) => [memory.revision.memoryId, memory])),
 				existingCues,
-				gitContexts: await this.gitContexts(envelope, existingCues, captureDigest),
+				gitContexts: await this.gitContexts(envelope, existingCues, captureDigest, pending.updatedAt),
 			});
 		} catch (error) {
 			await this.recordFailure(captureId, "validation", error);
 			return { captureId, status: "failed", proposalId: null, confirmationRequired: false };
 		}
-		if (!proposal) {
+		if (!review) {
 			const replay = await this.service.getStore().replay();
-			await this.service.getStore().markCaptureSkipped(captureId, pending.resultArtifactId, {
+			await this.service.markCaptureSkipped(captureId, pending.resultArtifactId, {
 				eventId: `evt_memory_skipped_${suffix(sha256(captureId))}`,
 				idempotencyKey: `memory:skipped:${captureId}`,
 				expectedHead: replay.head,
@@ -678,23 +687,53 @@ export class MemoryController {
 			return { captureId, status: "no_durable_memory", proposalId: null, confirmationRequired: false };
 		}
 		try {
-			const resultArtifact = await this.artifacts.read(pending.resultArtifactId);
-			const recorded = await this.service.getStore().recordProposal(proposal, resultArtifact.metadata.artifactId, {
-				eventId: `evt_memory_proposal_${suffix(sha256(proposal.proposalId))}`,
-				idempotencyKey: `memory:proposal:${proposal.proposalId}`,
-				expectedHead: proposal.expectedEventHead,
-				actor: "model",
-				timestamp: proposal.provenance.recordedAt,
+			const store = this.service.getStore();
+			const reconstruction = await this.service.recordReconstruction(review.trace, {
+				eventId: `evt_memory_reconstruction_${suffix(sha256(captureId))}`,
+				idempotencyKey: `memory:reconstruction:${captureId}`,
+				expectedHead: (await store.replay()).head,
+				actor: "runtime",
+				timestamp: review.trace.settledAt,
 			});
-			const confirmationRequired = recorded.write.event.payload.confirmationRequired;
-			if (!confirmationRequired) {
-				return await this.resumeProposedCapture(captureId);
+			const applied = await this.service.applyMemoryReviews(
+				review.decisions,
+				review.evidenceRefs as EvidenceRefV2[],
+				reconstruction.traceArtifactId,
+				{
+					eventId: `evt_memory_review_${suffix(sha256(captureId))}`,
+					idempotencyKey: `memory:review:${captureId}`,
+					expectedHead: (await store.replay()).head,
+					actor: "model",
+					timestamp: review.trace.settledAt,
+				},
+				{
+					captureId,
+					cues: review.cues,
+					freshnessBasisByDecisionId: review.freshnessBasisByDecisionId,
+				},
+			);
+			try {
+				await this.service.synchronizeProjections({
+					memoryIds: applied.write.event.payload.revisions.map((reference) => reference.memoryId),
+				});
+			} catch (error) {
+				await this.recordFailure(captureId, "projection", error);
 			}
 			await rm(this.pendingPath(captureId), { force: true });
-			return { captureId, status: "proposed", proposalId: proposal.proposalId, confirmationRequired: true };
+			return { captureId, status: "applied", proposalId: null, confirmationRequired: false };
 		} catch (error) {
+			const replay = await this.service.getStore().replay();
+			if (replay.captures.get(captureId)?.status === "applied") {
+				try {
+					await this.service.repairProjections();
+				} catch (projectionError) {
+					await this.recordFailure(captureId, "projection", projectionError);
+				}
+				await rm(this.pendingPath(captureId), { force: true });
+				return { captureId, status: "applied", proposalId: null, confirmationRequired: false };
+			}
 			await this.recordFailure(captureId, "publication", error);
-			return { captureId, status: "failed", proposalId: proposal.proposalId, confirmationRequired: false };
+			return { captureId, status: "failed", proposalId: null, confirmationRequired: false };
 		}
 	}
 

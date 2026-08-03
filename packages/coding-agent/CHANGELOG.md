@@ -8,6 +8,7 @@
 - **Segmented Session Chains** - Continue long-running work across complete native Pi JSONL Segments with safe rollover, successor branches, Goal and Task continuity, chain titles and archive controls, and tiered recovery diagnostics. See [Pi-XK Design and Boundaries](../../docs/pi-xk/design-and-boundaries.md).
 - **Verified L1/L2 history retrieval** - Preserve canonical per-Segment L1 summaries, publish non-blocking branch Rollups, expose only a bounded memory manifest, and let models read fully verified historical evidence on demand. See [Session Chain Rollups and Model Retrieval](../../docs/pi-xk/session-chain-rollups-and-model-retrieval.md).
 - **Project evidence-graph Memory** - Capture stable Goal/L2 evidence into project-scoped typed Memory, retrieve it through bounded D0–D3 disclosure, and rebuild SQLite/Markdown projections from canonical artifacts and events. See [Pi-XK Memory v1](../../docs/pi-xk/memory-v1.md).
+- **Ambient Memory and Skill evolution** - Let each model run decide whether historical knowledge is relevant, review only evidence it actually read, and evolve project Skills through audited candidates, use evidence, cooldowns, and settled-boundary reloads. See [Ambient Recall 与 Skill 演进](../../docs/pi-xk/ambient-recall-and-skill-evolution.md).
 
 ### Added
 
@@ -24,6 +25,7 @@
 - Added Session Chain L1 V2 titles to summary list/read results while keeping L1 V1 artifacts readable with `title: null`.
 - Added per-run `before_agent_start.activeTools` projections, fail-closed `onCritical` prompt/context hooks, and declarative filesystem capability metadata for workflow preflight.
 - Added Pi-XK Memory commands and model tools for search, validated read, evidence expansion, CAS-guarded proposals, explicit verified remember, lifecycle/timeline/graph control, backfill, doctor recovery, and settled model-requested compaction.
+- Added Ambient Recall budgets and reconstruction traces, Memory `keep/revise/supersede/dispute/create` review, Skill candidate/revision/use/promotion facts, project/global projections, Skill doctor commands, and resource-only Skill reload at settled boundaries.
 
 ### Fixed
 
@@ -57,6 +59,8 @@
 - Fixed Pi-XK GitHub release recovery to build only the tagged commit and made the binary entrypoint validate the complete provenance manifest contract.
 - Fixed Pi-XK Memory FTS/graph search to cap the merged candidate pool before pagination, and recovered already-recorded low-risk capture proposals without repeating provider generation or stranding an advanced source cursor.
 - Fixed Pi-XK Memory index rebuilds to stream bounded reference/artifact batches through one Worker transaction, avoid complete snapshot cloning, roll back failed chunks, and remove failed temporary SQLite files.
+- Fixed Pi-XK Memory review to reject unread revisions, preserve verified trust derivation, avoid semantic publication after error/abort/length runs, and retain implicit keep traces without duplicating transcript content.
+- Fixed Skill reload to reuse only the last trusted path/metadata snapshot, cache unchanged frontmatter, preserve disabled paths, avoid noisy missing-root diagnostics, and retain the previous Skill generation after reload failure.
 
 ## [0.80.10] - 2026-07-16
 

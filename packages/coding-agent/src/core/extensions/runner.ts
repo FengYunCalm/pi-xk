@@ -298,6 +298,10 @@ export class ExtensionRunner {
 	private abortFn: () => void = () => {};
 	private hasPendingMessagesFn: () => boolean = () => false;
 	private getContextUsageFn: () => ContextUsage | undefined = () => undefined;
+	private reloadSkillsAtSettledBoundaryFn: NonNullable<ExtensionContextActions["reloadSkillsAtSettledBoundary"]> =
+		async () => {
+			throw new Error("Skill-only reload is not bound");
+		};
 	private compactFn: (options?: CompactOptions) => void = () => {};
 	private summarizeSessionContextFn: (
 		options: SummarizeSessionContextOptions,
@@ -379,6 +383,8 @@ export class ExtensionRunner {
 		this.hasPendingMessagesFn = contextActions.hasPendingMessages;
 		this.shutdownHandler = contextActions.shutdown;
 		this.getContextUsageFn = contextActions.getContextUsage;
+		this.reloadSkillsAtSettledBoundaryFn =
+			contextActions.reloadSkillsAtSettledBoundary ?? this.reloadSkillsAtSettledBoundaryFn;
 		this.compactFn = contextActions.compact;
 		this.summarizeSessionContextFn = contextActions.summarizeSessionContext ?? this.summarizeSessionContextFn;
 		this.rolloverSessionFn = contextActions.rolloverSession ?? this.rolloverSessionFn;
@@ -761,6 +767,10 @@ export class ExtensionRunner {
 			getContextUsage: () => {
 				runner.assertActive();
 				return runner.getContextUsageFn();
+			},
+			reloadSkillsAtSettledBoundary: () => {
+				runner.assertActive();
+				return runner.reloadSkillsAtSettledBoundaryFn();
 			},
 			compact: (options) => {
 				runner.assertActive();

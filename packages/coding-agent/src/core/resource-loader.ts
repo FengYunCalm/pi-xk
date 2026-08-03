@@ -20,7 +20,7 @@ import { DefaultPackageManager, type PathMetadata, type ResolvedResource } from 
 import type { PromptTemplate } from "./prompt-templates.ts";
 import { loadPromptTemplates } from "./prompt-templates.ts";
 import { SettingsManager } from "./settings-manager.ts";
-import type { Skill } from "./skills.ts";
+import type { Skill, SkillLoadCache } from "./skills.ts";
 import { loadSkills } from "./skills.ts";
 import { createSourceInfo, type SourceInfo } from "./source-info.ts";
 import { resetTimings } from "./timings.ts";
@@ -35,6 +35,12 @@ export interface ResourceLoaderReloadOptions {
 	resolveProjectTrust?: (input: { extensionsResult: LoadExtensionsResult }) => Promise<boolean>;
 }
 
+export interface SkillReloadResult {
+	previousCount: number;
+	currentCount: number;
+	diagnostics: ResourceDiagnostic[];
+}
+
 export interface ResourceLoader {
 	getExtensions(): LoadExtensionsResult;
 	getSkills(): { skills: Skill[]; diagnostics: ResourceDiagnostic[] };
@@ -44,6 +50,7 @@ export interface ResourceLoader {
 	getSystemPrompt(): string | undefined;
 	getAppendSystemPrompt(): string[];
 	extendResources(paths: ResourceExtensionPaths): void;
+	reloadSkills(): Promise<SkillReloadResult>;
 	reload(options?: ResourceLoaderReloadOptions): Promise<void>;
 }
 
@@ -204,6 +211,10 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private systemPrompt?: string;
 	private appendSystemPrompt: string[];
 	private lastSkillPaths: string[];
+	private lastSkillMetadataByPath: Map<string, PathMetadata>;
+	private lastOptionalSkillPaths: string[];
+	private lastDisabledSkillPaths: string[];
+	private skillLoadCache: SkillLoadCache;
 	private extensionSkillSourceInfos: Map<string, SourceInfo>;
 	private extensionPromptSourceInfos: Map<string, SourceInfo>;
 	private extensionThemeSourceInfos: Map<string, SourceInfo>;
@@ -251,6 +262,10 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.agentsFiles = [];
 		this.appendSystemPrompt = [];
 		this.lastSkillPaths = [];
+		this.lastSkillMetadataByPath = new Map();
+		this.lastOptionalSkillPaths = [];
+		this.lastDisabledSkillPaths = [];
+		this.skillLoadCache = new Map();
 		this.extensionSkillSourceInfos = new Map();
 		this.extensionPromptSourceInfos = new Map();
 		this.extensionThemeSourceInfos = new Map();
@@ -335,6 +350,23 @@ export class DefaultResourceLoader implements ResourceLoader {
 		return this.loadCurrentExtensionSet({ includeInlineFactories: true });
 	}
 
+	async reloadSkills(): Promise<SkillReloadResult> {
+		const previousSkills = this.skills;
+		const previousDiagnostics = this.skillDiagnostics;
+		try {
+			this.updateSkillsFromPaths(this.lastSkillPaths, this.lastSkillMetadataByPath);
+			return {
+				previousCount: previousSkills.length,
+				currentCount: this.skills.length,
+				diagnostics: [...this.skillDiagnostics],
+			};
+		} catch (error) {
+			this.skills = previousSkills;
+			this.skillDiagnostics = previousDiagnostics;
+			throw error;
+		}
+	}
+
 	async reload(options?: ResourceLoaderReloadOptions): Promise<void> {
 		resetTimings("extensions");
 
@@ -396,6 +428,9 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const cliEnabledSkills = getEnabledPaths(cliExtensionPaths.skills);
 		const cliEnabledPrompts = getEnabledPaths(cliExtensionPaths.prompts);
 		const cliEnabledThemes = getEnabledPaths(cliExtensionPaths.themes);
+		const disabledSkillPaths = [...resolvedPaths.skills, ...cliExtensionPaths.skills]
+			.filter((resource) => !resource.enabled)
+			.map((resource) => this.mapSkillPath(resource, metadataByPath));
 
 		const extensionPaths = this.noExtensions
 			? cliEnabledExtensions
@@ -413,11 +448,21 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.extensionsResult = this.extensionsOverride ? this.extensionsOverride(extensionsResult) : extensionsResult;
 		this.applyExtensionSourceInfo(this.extensionsResult.extensions, metadataByPath);
 
-		const skillPaths = this.noSkills
+		const discoveredSkillPaths = this.noSkills
 			? this.mergePaths(cliEnabledSkills, this.additionalSkillPaths)
 			: this.mergePaths([...cliEnabledSkills, ...enabledSkills], this.additionalSkillPaths);
+		const defaultSkillRoots = this.noSkills
+			? []
+			: [
+					...(this.settingsManager.isProjectTrusted() ? [join(this.cwd, CONFIG_DIR_NAME, "skills")] : []),
+					join(this.agentDir, "skills"),
+				];
+		const skillPaths = this.mergePaths(discoveredSkillPaths, defaultSkillRoots);
 
 		this.lastSkillPaths = skillPaths;
+		this.lastSkillMetadataByPath = new Map(metadataByPath);
+		this.lastOptionalSkillPaths = defaultSkillRoots.map((path) => this.resolveResourcePath(path));
+		this.lastDisabledSkillPaths = disabledSkillPaths.map((path) => this.resolveResourcePath(path));
 		this.updateSkillsFromPaths(skillPaths, metadataByPath);
 		for (const p of this.additionalSkillPaths) {
 			if (isLocalPath(p)) {
@@ -622,7 +667,17 @@ export class DefaultResourceLoader implements ResourceLoader {
 				agentDir: this.agentDir,
 				skillPaths,
 				includeDefaults: false,
+				cache: this.skillLoadCache,
+				optionalSkillPaths: this.lastOptionalSkillPaths,
 			});
+		}
+		if (this.lastDisabledSkillPaths.length > 0) {
+			skillsResult = {
+				...skillsResult,
+				skills: skillsResult.skills.filter(
+					(skill) => !this.lastDisabledSkillPaths.some((path) => this.isUnderPath(skill.filePath, path)),
+				),
+			};
 		}
 		const resolvedSkills = this.skillsOverride ? this.skillsOverride(skillsResult) : skillsResult;
 		this.skills = resolvedSkills.skills.map((skill) => ({

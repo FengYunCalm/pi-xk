@@ -43,6 +43,7 @@ const resourceLoader: ResourceLoader = {
 Available: read, bash. Be concise.`,
 	getAppendSystemPrompt: () => [],
 	extendResources: () => {},
+	reloadSkills: async () => ({ previousCount: 0, currentCount: 0, diagnostics: [] }),
 	reload: async () => {},
 };
 

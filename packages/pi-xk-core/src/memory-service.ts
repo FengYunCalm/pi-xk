@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
+import type { EvidenceRefV2, MemoryReconstructionTraceV1, MemoryReviewDecisionV1 } from "./ambient-memory-contract.ts";
 import { ArtifactStore } from "./artifact-store.ts";
 import {
 	MEMORY_CAPTURE_SOURCE_SCHEMA,
@@ -35,6 +36,8 @@ import {
 	type MemoryPurgeResultV1,
 	type MemoryReadModelV1,
 	type MemoryReadResultV1,
+	type MemoryReviewApplyResultV1,
+	type MemoryReviewPublicationContextV1,
 	MemoryStore,
 	type MemoryWriteResult,
 } from "./memory-store.ts";
@@ -42,12 +45,21 @@ import { stableJsonStringify } from "./stable-json.ts";
 import { syncDirectory } from "./sync-directory.ts";
 
 const MEMORY_CONFIG_SCHEMA = "pi-xk.memory-config.v1";
+const MEMORY_CONFIG_V2_SCHEMA = "pi-xk.memory-config.v2";
 const EXPLICIT_MEMORY_PROMPT_VERSION = "pi-xk.memory-explicit.v1";
 const MEMORY_INDEX_ENTITY_CHUNK_SIZE = 256;
 const MEMORY_INDEX_EDGE_CHUNK_SIZE = 2_048;
 
 export interface MemoryConfigV1 {
 	enabled: boolean;
+	ambient: boolean;
+	evolution: boolean;
+}
+
+export interface MemoryConfigUpdateV1 {
+	enabled?: boolean;
+	ambient?: boolean;
+	evolution?: boolean;
 }
 
 export interface MemoryRememberOptions {
@@ -322,22 +334,35 @@ export class MemoryService {
 	async getConfig(): Promise<MemoryConfigV1> {
 		try {
 			const parsed = JSON.parse(await readFile(this.configPath, "utf8")) as unknown;
+			if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+				throw new MemoryValidationError("Memory config is invalid");
+			}
 			if (
-				typeof parsed !== "object" ||
-				parsed === null ||
-				Array.isArray(parsed) ||
-				Object.keys(parsed).sort().join(",") !== "enabled,schema" ||
+				Object.keys(parsed).sort().join(",") === "enabled,schema" &&
+				"schema" in parsed &&
+				parsed.schema === MEMORY_CONFIG_SCHEMA &&
+				"enabled" in parsed &&
+				typeof parsed.enabled === "boolean"
+			) {
+				return { enabled: parsed.enabled, ambient: true, evolution: true };
+			}
+			if (
+				Object.keys(parsed).sort().join(",") !== "ambient,enabled,evolution,schema" ||
 				!("schema" in parsed) ||
-				parsed.schema !== MEMORY_CONFIG_SCHEMA ||
+				parsed.schema !== MEMORY_CONFIG_V2_SCHEMA ||
 				!("enabled" in parsed) ||
-				typeof parsed.enabled !== "boolean"
+				typeof parsed.enabled !== "boolean" ||
+				!("ambient" in parsed) ||
+				typeof parsed.ambient !== "boolean" ||
+				!("evolution" in parsed) ||
+				typeof parsed.evolution !== "boolean"
 			) {
 				throw new MemoryValidationError("Memory config is invalid");
 			}
-			return { enabled: parsed.enabled };
+			return { enabled: parsed.enabled, ambient: parsed.ambient, evolution: parsed.evolution };
 		} catch (error) {
 			if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
-				return { enabled: true };
+				return { enabled: true, ambient: true, evolution: true };
 			}
 			throw error;
 		}
@@ -361,11 +386,20 @@ export class MemoryService {
 		}
 	}
 
-	async setConfig(config: MemoryConfigV1): Promise<void> {
-		if (typeof config.enabled !== "boolean") throw new MemoryValidationError("Memory config enabled must be boolean");
+	async setConfig(config: MemoryConfigUpdateV1): Promise<void> {
+		const keys = Object.keys(config);
+		if (
+			keys.length === 0 ||
+			keys.some((key) => !["enabled", "ambient", "evolution"].includes(key)) ||
+			Object.values(config).some((value) => typeof value !== "boolean")
+		) {
+			throw new MemoryValidationError("Memory config update is invalid");
+		}
+		const current = await this.getConfig();
+		const next = { ...current, ...config };
 		await this.replaceFile(
 			this.configPath,
-			`${JSON.stringify({ schema: MEMORY_CONFIG_SCHEMA, enabled: config.enabled }, null, "\t")}\n`,
+			`${JSON.stringify({ schema: MEMORY_CONFIG_V2_SCHEMA, ...next }, null, "\t")}\n`,
 		);
 	}
 
@@ -406,6 +440,146 @@ export class MemoryService {
 			this.lastIndexState = "absent";
 			return false;
 		}
+	}
+
+	private async prepareIndexForMutation(expectedHead: MemoryReadModelV1["head"]): Promise<boolean> {
+		try {
+			const readModel = (await this.store.loadReadModelSnapshot()).readModel;
+			if (readModel.head.sequence !== expectedHead.sequence || readModel.head.hash !== expectedHead.hash)
+				return false;
+			await this.ensureIndexForReadModel(readModel);
+			return true;
+		} catch {
+			await this.index?.close().catch(() => {});
+			this.index = undefined;
+			this.lastIndexState = "absent";
+			return false;
+		}
+	}
+
+	private async advanceProjectionManifest(
+		expectedHead: MemoryReadModelV1["head"],
+		head: MemoryReadModelV1["head"],
+	): Promise<void> {
+		try {
+			const path = join(this.memoryDirectory, "projections", "manifest.json");
+			const manifest = validateProjectionManifest(JSON.parse(await readFile(path, "utf8")) as unknown);
+			if (manifest.head.sequence !== expectedHead.sequence || manifest.head.hash !== expectedHead.hash) return;
+			await this.replaceFile(path, `${JSON.stringify({ ...manifest, head }, null, "\t")}\n`);
+		} catch (error) {
+			if (isRecord(error) && error.code === "ENOENT") return;
+			// Derived projection damage is reported by doctor and must not roll back a fact event.
+		}
+	}
+
+	private async projectionNeutralMutation<TResult>(
+		expectedHead: MemoryReadModelV1["head"],
+		mutation: () => Promise<TResult>,
+		resultHead: (result: TResult) => MemoryReadModelV1["head"],
+	): Promise<TResult> {
+		return await this.withProjectionMutation(async () => {
+			const updateIndex = await this.prepareIndexForMutation(expectedHead);
+			const result = await mutation();
+			const head = resultHead(result);
+			if (updateIndex) {
+				const readModel = (await this.store.loadReadModelSnapshot()).readModel;
+				await this.applyIndexDelta(expectedHead, readModel, {});
+			}
+			await this.advanceProjectionManifest(expectedHead, head);
+			return result;
+		});
+	}
+
+	async scheduleCapture(
+		source: Parameters<MemoryStore["scheduleCapture"]>[0],
+		options: MemoryMutationOptions,
+	): Promise<Awaited<ReturnType<MemoryStore["scheduleCapture"]>>> {
+		return await this.projectionNeutralMutation(
+			options.expectedHead,
+			async () => await this.store.scheduleCapture(source, options),
+			(result) => result.head,
+		);
+	}
+
+	async markGenerationStarted(
+		captureId: string,
+		attempt: number,
+		options: MemoryMutationOptions,
+	): Promise<Awaited<ReturnType<MemoryStore["markGenerationStarted"]>>> {
+		return await this.projectionNeutralMutation(
+			options.expectedHead,
+			async () => await this.store.markGenerationStarted(captureId, attempt, options),
+			(result) => result.head,
+		);
+	}
+
+	async markCaptureFailed(
+		failure: Parameters<MemoryStore["markCaptureFailed"]>[0],
+		options: MemoryMutationOptions,
+	): Promise<Awaited<ReturnType<MemoryStore["markCaptureFailed"]>>> {
+		return await this.projectionNeutralMutation(
+			options.expectedHead,
+			async () => await this.store.markCaptureFailed(failure, options),
+			(result) => result.head,
+		);
+	}
+
+	async markCaptureSkipped(
+		captureId: string,
+		resultArtifactId: string,
+		options: MemoryMutationOptions,
+	): Promise<Awaited<ReturnType<MemoryStore["markCaptureSkipped"]>>> {
+		return await this.projectionNeutralMutation(
+			options.expectedHead,
+			async () => await this.store.markCaptureSkipped(captureId, resultArtifactId, options),
+			(result) => result.head,
+		);
+	}
+
+	async recordProposal(
+		proposal: Parameters<MemoryStore["recordProposal"]>[0],
+		resultArtifactId: string,
+		options: MemoryMutationOptions,
+	): Promise<Awaited<ReturnType<MemoryStore["recordProposal"]>>> {
+		return await this.projectionNeutralMutation(
+			options.expectedHead,
+			async () => await this.store.recordProposal(proposal, resultArtifactId, options),
+			(result) => result.write.head,
+		);
+	}
+
+	async rejectProposal(
+		proposalId: string,
+		reason: string,
+		options: MemoryMutationOptions,
+	): Promise<Awaited<ReturnType<MemoryStore["rejectProposal"]>>> {
+		return await this.projectionNeutralMutation(
+			options.expectedHead,
+			async () => await this.store.rejectProposal(proposalId, reason, options),
+			(result) => result.head,
+		);
+	}
+
+	async recordReconstruction(
+		trace: MemoryReconstructionTraceV1,
+		options: MemoryMutationOptions,
+	): Promise<Awaited<ReturnType<MemoryStore["recordReconstruction"]>>> {
+		return await this.projectionNeutralMutation(
+			options.expectedHead,
+			async () => await this.store.recordReconstruction(trace, options),
+			(result) => result.write.head,
+		);
+	}
+
+	async recordMemoryReviewFailure(
+		failure: Parameters<MemoryStore["recordMemoryReviewFailure"]>[0],
+		options: MemoryMutationOptions,
+	): Promise<Awaited<ReturnType<MemoryStore["recordMemoryReviewFailure"]>>> {
+		return await this.projectionNeutralMutation(
+			options.expectedHead,
+			async () => await this.store.recordMemoryReviewFailure(failure, options),
+			(result) => result.head,
+		);
 	}
 
 	private async indexEntities(
@@ -548,7 +722,7 @@ export class MemoryService {
 
 	async applyProposal(proposalArtifactId: string, options: MemoryApplyOptions): Promise<MemoryApplyResultV1> {
 		return await this.withProjectionMutation(async () => {
-			const updateIndex = await this.indexCanApply(options.expectedHead);
+			const updateIndex = await this.prepareIndexForMutation(options.expectedHead);
 			const result = await this.store.applyProposal(proposalArtifactId, options);
 			if (updateIndex) {
 				const readModel = (await this.store.loadReadModelSnapshot()).readModel;
@@ -560,6 +734,28 @@ export class MemoryService {
 					cueIds: result.write.event.payload.cues.map((reference) => reference.cueId),
 					edgeIds: result.write.event.payload.edges.map((reference) => reference.edgeId),
 					removeMemoryIds: purgedMemoryIds,
+				});
+			}
+			return result;
+		});
+	}
+
+	async applyMemoryReviews(
+		decisions: readonly MemoryReviewDecisionV1[],
+		evidenceRefs: readonly EvidenceRefV2[],
+		traceArtifactId: string,
+		options: MemoryMutationOptions,
+		context: MemoryReviewPublicationContextV1 = {},
+	): Promise<MemoryReviewApplyResultV1> {
+		return await this.withProjectionMutation(async () => {
+			const updateIndex = await this.prepareIndexForMutation(options.expectedHead);
+			const result = await this.store.applyMemoryReviews(decisions, evidenceRefs, traceArtifactId, options, context);
+			if (updateIndex) {
+				const readModel = (await this.store.loadReadModelSnapshot()).readModel;
+				await this.applyIndexDelta(options.expectedHead, readModel, {
+					memoryIds: result.write.event.payload.revisions.map((reference) => reference.memoryId),
+					cueIds: result.write.event.payload.cues.map((reference) => reference.cueId),
+					edgeIds: result.write.event.payload.edges.map((reference) => reference.edgeId),
 				});
 			}
 			return result;
@@ -870,7 +1066,7 @@ export class MemoryService {
 			promptVersion: EXPLICIT_MEMORY_PROMPT_VERSION,
 			createdAt: recordedAt,
 		};
-		const scheduled = await this.store.scheduleCapture(source, {
+		const scheduled = await this.scheduleCapture(source, {
 			eventId: `evt_memory_schedule_${suffix}`,
 			idempotencyKey: `memory:schedule:${captureId}`,
 			expectedHead: replay.head,
@@ -932,7 +1128,7 @@ export class MemoryService {
 			sourceIds: [captureId, evidenceArtifact.artifactId],
 			createdAt: recordedAt,
 		});
-		const recorded = await this.store.recordProposal(proposal, resultArtifact.artifactId, {
+		const recorded = await this.recordProposal(proposal, resultArtifact.artifactId, {
 			eventId: `evt_memory_proposal_${suffix}`,
 			idempotencyKey: `memory:proposal:${proposal.proposalId}`,
 			expectedHead: scheduled.head,
@@ -948,10 +1144,10 @@ export class MemoryService {
 			confirmed: true,
 		});
 		try {
-			await this.repairProjections();
+			await this.synchronizeProjections({ memoryIds: [memoryId] });
 		} catch (error) {
 			try {
-				await this.store.markCaptureFailed(
+				await this.markCaptureFailed(
 					{
 						captureId,
 						stage: "projection",
@@ -1254,6 +1450,7 @@ export class MemoryService {
 				await this.applyIndexDelta(replay.head, readModel, { memoryIds: [memoryId] });
 			}
 		});
+		await this.synchronizeProjections({ memoryIds: [memoryId] });
 		return await this.store.readMemory(memoryId);
 	}
 
@@ -1277,6 +1474,7 @@ export class MemoryService {
 				await this.applyIndexDelta(replay.head, readModel, { memoryIds: [memoryId] });
 			}
 		});
+		await this.synchronizeProjections({ memoryIds: [memoryId] });
 		return await this.store.readMemory(memoryId);
 	}
 
@@ -1285,7 +1483,7 @@ export class MemoryService {
 		const memory = await this.store.readMemory(memoryId);
 		const replay = await this.store.replay();
 		const operationId = randomUUID().replaceAll("-", "");
-		return await this.withProjectionMutation(async () => {
+		const result = await this.withProjectionMutation(async () => {
 			const updateIndex = await this.indexCanApply(replay.head);
 			const result = await this.store.purgeMemory(memoryId, memory.revision.revision, reason, {
 				eventId: `evt_memory_purge_${operationId}`,
@@ -1301,6 +1499,8 @@ export class MemoryService {
 			}
 			return result;
 		});
+		await this.synchronizeProjections({ removeMemoryIds: [memoryId] });
+		return result;
 	}
 
 	async recordAccess(
@@ -1332,6 +1532,7 @@ export class MemoryService {
 					this.lastIndexState = "absent";
 				}
 			}
+			await this.advanceProjectionManifest(options.expectedHead, write.head);
 			return write;
 		});
 	}
@@ -1640,6 +1841,138 @@ export class MemoryService {
 			memory.revision.applicability,
 			"",
 		].join("\n");
+	}
+
+	private renderMemoryIndexLine(memory: MemoryReadResultV1): string {
+		return `- [${memory.revision.title}](memories/${memory.revision.memoryId}.md) - ${memory.revision.kind}, ${memory.state.trust}, ${memory.state.freshness}, ${memory.state.lifecycle}`;
+	}
+
+	async synchronizeProjections(changes: {
+		memoryIds?: readonly string[];
+		removeMemoryIds?: readonly string[];
+	}): Promise<{ markdownFiles: number }> {
+		return await this.withProjectionMutation(async () => {
+			const readModel = (await this.store.loadReadModelSnapshot()).readModel;
+			const changedMemoryIds = new Set(changes.memoryIds ?? []);
+			const removedMemoryIds = new Set(changes.removeMemoryIds ?? []);
+			for (const memoryId of changedMemoryIds) {
+				if (!readModel.memories.some((reference) => reference.memoryId === memoryId)) {
+					removedMemoryIds.add(memoryId);
+				}
+			}
+			const projectionsDirectory = join(this.memoryDirectory, "projections");
+			const memoriesDirectory = join(projectionsDirectory, "memories");
+			const manifestPath = join(projectionsDirectory, "manifest.json");
+			const indexPath = join(projectionsDirectory, "index.md");
+			await mkdir(memoriesDirectory, { recursive: true });
+
+			let manifest: MemoryProjectionManifestV1;
+			let indexMarkdown: string;
+			try {
+				manifest = validateProjectionManifest(JSON.parse(await readFile(manifestPath, "utf8")) as unknown);
+				indexMarkdown = await readFile(indexPath, "utf8");
+				if (sha256(indexMarkdown) !== manifest.indexDigest) {
+					throw new MemoryValidationError("Memory Markdown index does not match its projection manifest");
+				}
+			} catch (error) {
+				if (!isRecord(error) || error.code !== "ENOENT") throw error;
+				const unchanged = readModel.memories.filter((reference) => !changedMemoryIds.has(reference.memoryId));
+				if (unchanged.length > 0) {
+					throw new MemoryValidationError(
+						"Memory projections require explicit repair before incremental publication",
+					);
+				}
+				manifest = {
+					schema: "pi-xk.memory-projection-manifest.v1",
+					head: { sequence: 0, hash: null },
+					memoryCount: 0,
+					indexDigest: sha256(""),
+					memories: [],
+				};
+				indexMarkdown = "";
+			}
+
+			const currentById = new Map(readModel.memories.map((reference) => [reference.memoryId, reference] as const));
+			const manifestById = new Map(manifest.memories.map((entry) => [entry.memoryId, entry] as const));
+			for (const entry of manifest.memories) {
+				if (changedMemoryIds.has(entry.memoryId) || removedMemoryIds.has(entry.memoryId)) continue;
+				const current = currentById.get(entry.memoryId);
+				if (!current || current.revision !== entry.revision) {
+					throw new MemoryValidationError("Memory projection manifest has an unrelated stale revision");
+				}
+			}
+			for (const current of readModel.memories) {
+				if (changedMemoryIds.has(current.memoryId)) continue;
+				const projected = manifestById.get(current.memoryId);
+				if (!projected || projected.revision !== current.revision) {
+					throw new MemoryValidationError("Memory projection manifest is missing an unchanged revision");
+				}
+			}
+
+			const existingLines = indexMarkdown.split("\n");
+			const lineByMemoryId = new Map<string, string>();
+			for (const entry of manifest.memories) {
+				const href = `](memories/${entry.memoryId}.md) - `;
+				const matching = existingLines.filter((line) => line.includes(href));
+				if (matching.length !== 1) {
+					throw new MemoryValidationError(`Memory Markdown index entry is invalid: ${entry.memoryId}`);
+				}
+				lineByMemoryId.set(entry.memoryId, matching[0]!);
+			}
+
+			const targetReferences = readModel.memories.filter((reference) => changedMemoryIds.has(reference.memoryId));
+			const cueIds = new Set(readModel.cues.map((reference) => reference.cueId));
+			const changedMemories = await this.store.readMemoriesByReferences(targetReferences, (cueId) =>
+				cueIds.has(cueId),
+			);
+			for (const memory of changedMemories) {
+				const markdown = this.renderMemoryMarkdown(memory);
+				await this.replaceFile(join(memoriesDirectory, `${memory.revision.memoryId}.md`), markdown);
+				manifestById.set(memory.revision.memoryId, {
+					memoryId: memory.revision.memoryId,
+					revision: memory.revision.revision,
+					digest: sha256(markdown),
+				});
+				lineByMemoryId.set(memory.revision.memoryId, this.renderMemoryIndexLine(memory));
+			}
+			for (const memoryId of removedMemoryIds) {
+				manifestById.delete(memoryId);
+				lineByMemoryId.delete(memoryId);
+				await rm(join(memoriesDirectory, `${memoryId}.md`), { force: true });
+			}
+
+			const projectedMemories = readModel.memories.map((reference) => {
+				const entry = manifestById.get(reference.memoryId);
+				if (!entry || entry.revision !== reference.revision) {
+					throw new MemoryValidationError(`Memory projection is incomplete: ${reference.memoryId}`);
+				}
+				return entry;
+			});
+			const orderedLines = readModel.memories.map((reference) => {
+				const line = lineByMemoryId.get(reference.memoryId);
+				if (!line) throw new MemoryValidationError(`Memory Markdown index is incomplete: ${reference.memoryId}`);
+				return line;
+			});
+			const nextIndexMarkdown = [
+				"# Pi-XK Memory",
+				"",
+				"> Derived index. Artifact Store objects and the Memory event log are authoritative.",
+				"",
+				...orderedLines,
+				"",
+			].join("\n");
+			await this.replaceFile(indexPath, nextIndexMarkdown);
+			const nextManifest: MemoryProjectionManifestV1 = {
+				schema: "pi-xk.memory-projection-manifest.v1",
+				head: readModel.head,
+				memoryCount: projectedMemories.length,
+				indexDigest: sha256(nextIndexMarkdown),
+				memories: projectedMemories,
+			};
+			validateProjectionManifest(nextManifest);
+			await this.replaceFile(manifestPath, `${JSON.stringify(nextManifest, null, "\t")}\n`);
+			return { markdownFiles: changedMemories.length + 1 };
+		});
 	}
 
 	async repairProjections(): Promise<{ index: MemoryIndexStatusV1; markdownFiles: number }> {

@@ -60,6 +60,7 @@ This is a test skill.
 			getSystemPrompt: () => undefined,
 			getAppendSystemPrompt: () => [],
 			extendResources: () => {},
+			reloadSkills: async () => ({ previousCount: 0, currentCount: 0, diagnostics: [] }),
 			reload: async () => {},
 		};
 
@@ -93,6 +94,7 @@ This is a test skill.
 			getSystemPrompt: () => undefined,
 			getAppendSystemPrompt: () => [],
 			extendResources: () => {},
+			reloadSkills: async () => ({ previousCount: 1, currentCount: 1, diagnostics: [] }),
 			reload: async () => {},
 		};
 

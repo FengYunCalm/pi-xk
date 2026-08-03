@@ -26,6 +26,8 @@ export type ArtifactWritePhase =
 export interface ArtifactStoreOptions {
 	/** Test-only fault injection point for the durable object publication boundaries. */
 	onWritePhase?: (phase: ArtifactWritePhase) => void | Promise<void>;
+	/** Internal domain override for stores whose facts live outside a project root. */
+	artifactsDirectory?: string;
 }
 
 const ARTIFACT_ID_PREFIX = "sha256:";
@@ -302,7 +304,9 @@ export class ArtifactStore {
 	private readonly onWritePhase: ((phase: ArtifactWritePhase) => void | Promise<void>) | undefined;
 
 	constructor(projectRoot: string, options: ArtifactStoreOptions = {}) {
-		this.artifactsDirectory = join(resolve(projectRoot), ".pi-xk", "artifacts");
+		this.artifactsDirectory = options.artifactsDirectory
+			? resolve(options.artifactsDirectory)
+			: join(resolve(projectRoot), ".pi-xk", "artifacts");
 		this.onWritePhase = options.onWritePhase;
 	}
 

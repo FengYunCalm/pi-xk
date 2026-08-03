@@ -100,7 +100,7 @@ import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
-import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
+import type { ResourceExtensionPaths, ResourceLoader, SkillReloadResult } from "./resource-loader.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
 import {
 	COMPACTION_RECOVERY_PROMPT_VERSION,
@@ -2499,6 +2499,16 @@ export class AgentSession {
 		this.agent.state.model = refreshedModel;
 	}
 
+	async reloadSkillsAtSettledBoundary(): Promise<SkillReloadResult> {
+		if (!this._isAgentSettling) {
+			throw new Error("Skill-only reload is only valid during agent_settled");
+		}
+		const result = await this._resourceLoader.reloadSkills();
+		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
+		this.agent.state.systemPrompt = this._baseSystemPrompt;
+		return result;
+	}
+
 	private _bindExtensionCore(runner: ExtensionRunner): void {
 		const getCommands = (): SlashCommandInfo[] => {
 			const extensionCommands: SlashCommandInfo[] = runner.getRegisteredCommands().map((command) => ({
@@ -2603,6 +2613,7 @@ export class AgentSession {
 					this._extensionShutdownHandler?.();
 				},
 				getContextUsage: () => this.getContextUsage(),
+				reloadSkillsAtSettledBoundary: () => this.reloadSkillsAtSettledBoundary(),
 				compact: (options) => {
 					void (async () => {
 						try {

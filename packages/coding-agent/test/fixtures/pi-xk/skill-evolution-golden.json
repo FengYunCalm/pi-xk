@@ -1,0 +1,66 @@
+{
+	"schema": "pi-xk.skill-evolution-golden.v1",
+	"scenarios": [
+		{
+			"id": "project-skill-activation",
+			"events": [{ "type": "create", "settled": true, "evidence": true, "bundleValid": true }],
+			"expected": { "revision": 1, "active": true, "candidate": false, "needsReview": false }
+		},
+		{
+			"id": "insufficient-evidence-stays-candidate",
+			"events": [{ "type": "create", "settled": true, "evidence": false, "bundleValid": true }],
+			"expected": { "revision": 0, "active": false, "candidate": true }
+		},
+		{
+			"id": "two-failures-enter-cooldown",
+			"initial": { "revision": 1, "active": true },
+			"events": [
+				{ "type": "failure_use", "projectId": "project_origin" },
+				{ "type": "failure_use", "projectId": "project_origin" }
+			],
+			"expected": { "active": false, "needsReview": true, "failedUsesSinceRevision": 2 }
+		},
+		{
+			"id": "evidence-backed-revision-recovers-cooldown",
+			"initial": { "revision": 1, "active": false, "needsReview": true, "failedUsesSinceRevision": 2 },
+			"events": [{ "type": "revise", "settled": true, "evidence": true, "actualUse": true }],
+			"expected": { "revision": 2, "active": true, "needsReview": false, "failedUsesSinceRevision": 0 }
+		},
+		{
+			"id": "cross-project-promotion",
+			"initial": { "candidate": true, "originProject": "project_origin" },
+			"events": [
+				{ "type": "success_use", "projectId": "project_origin" },
+				{ "type": "success_use", "projectId": "project_second" },
+				{ "type": "success_use", "projectId": "project_second" },
+				{ "type": "promote" }
+			],
+			"expected": {
+				"revision": 1,
+				"active": true,
+				"candidate": false,
+				"promoted": true,
+				"successfulUses": 3,
+				"successProjects": ["project_origin", "project_second"]
+			}
+		},
+		{
+			"id": "unresolved-failure-blocks-promotion",
+			"initial": { "candidate": true, "originProject": "project_origin" },
+			"events": [
+				{ "type": "success_use", "projectId": "project_origin" },
+				{ "type": "success_use", "projectId": "project_second" },
+				{ "type": "success_use", "projectId": "project_second" },
+				{ "type": "failure_use", "projectId": "project_second" },
+				{ "type": "promote" }
+			],
+			"expected": { "active": false, "candidate": true, "promoted": false, "failedUsesSinceRevision": 1 }
+		},
+		{
+			"id": "model-lifecycle-deletion-rejected",
+			"initial": { "revision": 1, "active": true },
+			"events": [{ "type": "model_archive" }, { "type": "model_purge" }],
+			"expected": { "revision": 1, "active": true, "rejectedModelLifecycleActions": 2 }
+		}
+	]
+}

@@ -7,6 +7,8 @@
 - Goal V3 contracts with a stable Intent Anchor, revisioned Current Objective, controlled objective-only refinement, protected-field confirmation, and separate Objective/State projections.
 - L1 Segment Summary V2 titles exposed through verified Session Chain list/read flows while preserving L1 V1 compatibility.
 - Project-scoped Memory v1 with typed evidence graph revisions, three-dimensional trust/freshness/lifecycle state, stable Goal/L2 capture, explicit verified remember, D0–D3 model retrieval, SQLite FTS5/graph projections, controlled proposals, timeline/doctor commands, and model-requested compaction gates.
+- Ambient Memory v2 with model-controlled recall budgets, reconstruction traces, agent-run evidence, implicit keep, evidence-scoped Memory review, and immutable revise/supersede/dispute transitions.
+- Skill evolution v1 with project/global candidate facts, evidence-backed review and use tracking, cooldown and cross-project promotion gates, managed bundle projections, user-controlled rollback/archive/purge, and settled-boundary Skill-only reload.
 
 ### Changed
 
@@ -18,6 +20,7 @@
 - Goal revision feedback is explicitly user-role candidate data rather than contract authority, Task success requires concrete evidence, and compaction recovery follows the current logical trigger without inventing a user request from a Goal kickoff.
 - Session Chain append now uses a revisioned read-model checkpoint with an exact idempotency-key index, avoiding full event-log replay for ordinary head-matched writes while retaining full replay for retries, conflicts, recovery, and old checkpoints.
 - Memory capture now treats Artifact Store objects and the hash-chained Memory event log as facts while keeping read model, SQLite, History Cue, source cursors, heat, and Markdown as rebuildable projections; existing history is never automatically backfilled.
+- Ambient recall now leaves search optional to the model, enforces per-run knowledge budgets, records only actual D2/D3 reads, and publishes semantic Memory/Skill changes only after `agent_settled`; D0 never contains Memory or Skill正文。
 
 ### Fixed
 
@@ -48,6 +51,8 @@
 - Memory projection mutations now use cross-process locks and event-head CAS deltas; History Cue discovery persists a sealed-Segment cursor, stable refreshes avoid reopening old sessions, and repair publishes SQLite/Markdown/manifest from one rechecked read-model snapshot.
 - Contended file locks now avoid repeated temporary-file fsync/link cycles while the owner lock exists, preventing DrvFS contention from amplifying bounded retries.
 - Goal completion Memory now binds to the final event-time checkpoint State; retryable failed captures remain discoverable after cursor advancement, purge removes only exclusively owned proposal/result content, and doctor validates versioned source/History Cue cursors without guessing fact baselines.
+- Ambient Memory review now preserves old revisions during revise/supersede/dispute, rejects unread or stale CAS targets, and records indeterminate provider outcomes without automatic duplicate paid calls.
+- Skill publication now rejects unsafe bundles and non-managed collisions, records evidence-backed failures and cooldowns, and keeps the previous ResourceLoader generation when settled-boundary reload fails.
 
 ## [0.1.1]
 

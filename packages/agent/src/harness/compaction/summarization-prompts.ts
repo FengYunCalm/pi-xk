@@ -17,7 +17,15 @@ export type SummaryEvidenceKind =
 	| "memory-graph"
 	| "memory-proposal"
 	| "memory-proposal-record"
-	| "memory-doctor";
+	| "memory-budget"
+	| "memory-review"
+	| "memory-doctor"
+	| "skill-candidate-d1"
+	| "skill-candidate-d2"
+	| "skill-d2"
+	| "skill-timeline"
+	| "skill-review"
+	| "skill-doctor";
 
 export type ContextSummaryEvidenceKind = "compaction" | "turn-prefix" | "branch";
 

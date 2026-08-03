@@ -17,7 +17,7 @@ import type {
 import { registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { AgentSession, type AgentSessionEvent } from "../../src/core/agent-session.ts";
 import { AuthStorage } from "../../src/core/auth-storage.ts";
-import type { ExtensionRunner } from "../../src/core/extensions/index.ts";
+import type { ExtensionRunner, LoadExtensionsResult } from "../../src/core/extensions/index.ts";
 import { convertToLlm } from "../../src/core/messages.ts";
 import type { ModelRuntime } from "../../src/core/model-runtime.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
@@ -70,8 +70,14 @@ export interface HarnessOptions {
 	allowedToolNames?: string[];
 	excludedToolNames?: string[];
 	resourceLoader?: ResourceLoader;
+	resourceLoaderFactory?: (input: {
+		tempDir: string;
+		settingsManager: SettingsManager;
+		extensionsResult: LoadExtensionsResult | undefined;
+	}) => ResourceLoader | Promise<ResourceLoader>;
 	extensionFactories?: Array<InlineExtension | CreateTestExtensionsResultInput>;
 	withConfiguredAuth?: boolean;
+	persistedSession?: boolean;
 }
 
 export interface Harness {
@@ -110,7 +116,9 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 	const withConfiguredAuth = options.withConfiguredAuth ?? true;
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
-	const sessionManager = SessionManager.inMemory();
+	const sessionManager = options.persistedSession
+		? SessionManager.create(tempDir, join(tempDir, "sessions"))
+		: SessionManager.inMemory();
 	const settingsManager = SettingsManager.inMemory(options.settings);
 
 	const authStorage = AuthStorage.inMemory();
@@ -173,7 +181,9 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		? await createTestExtensionsResult(options.extensionFactories, tempDir)
 		: undefined;
 	const resourceLoader =
-		options.resourceLoader ?? createTestResourceLoader(extensionsResult ? { extensionsResult } : undefined);
+		options.resourceLoader ??
+		(await options.resourceLoaderFactory?.({ tempDir, settingsManager, extensionsResult })) ??
+		createTestResourceLoader(extensionsResult ? { extensionsResult } : undefined);
 
 	const modelRuntime = getModelRuntime(modelRegistry);
 	const session = new AgentSession({

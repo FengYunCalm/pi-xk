@@ -98,6 +98,14 @@ async function repositoryContext(projectRoot: string): Promise<RepositoryContext
 	return { root, repositoryId: `repo_${createHash("sha256").update(identityBasis).digest("hex").slice(0, 32)}` };
 }
 
+export async function resolveGitRepositoryId(projectRoot: string): Promise<string | null> {
+	try {
+		return (await repositoryContext(projectRoot)).repositoryId;
+	} catch {
+		return null;
+	}
+}
+
 async function appendPathDigest(
 	hash: ReturnType<typeof createHash>,
 	root: string,

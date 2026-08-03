@@ -2,7 +2,7 @@
 
 > **状态**：研究快照
 >
-> **日期**：2026-08-02（在 2026-07-19/21/28 快照上补充 Pi-XK Memory v1 架构结论）
+> **日期**：2026-08-04（在 2026-07-19/21/28 快照上补充 Pi-XK Memory v1、Ambient Memory v2 与 Skill evolution v1 架构结论）
 >
 > **用途**：Pi-XK 选型前的首要参考；不是允许直接安装依赖的清单。
 >
@@ -57,6 +57,18 @@ Pi-XK 没有直接采用任何候选。当前实现综合了 [Memory is Reconstr
 - v1 只在当前项目内工作，不做跨项目知识库、vector、Observation/Resource 自修改或自动 GC。
 
 完整契约见 [Memory v1](../pi-xk/memory-v1.md) 与 [ADR-0007](../adr/0007-memory-v1.md)。这意味着第三方 memory 项目的后续价值主要是 benchmark 和替代方案对照，不再是 Pi-XK 默认运行时依赖候选。
+
+## Ambient Memory v2 与 Skill evolution v1 的边界
+
+2026-08-04 的 Pi-XK 实现把“模型自主判断”限定为 recall/review 语义，不把第三方项目的自动写文件能力直接接入事实源：
+
+- Magic Context 的 capture/consolidate/recall、Graph Memory 论文的 cue/重建和 EvoMemory 的经验提纯继续作为设计参考；Pi-XK 保持 Artifact Store + hash-chained event 为事实源，SQLite/FTS/graph/heat/Markdown/Skill projection 都可删除重建。
+- `pi-observational-memory` 仍与 Pi-XK compaction recovery、Session Chain L1/L2 和 Memory review 触碰同一生命周期；只在隔离 profile 对照，不与 Ambient Memory 叠装。
+- Hermes/pi-memory/pi-ace-tool 等检索扩展只能作为 D1 adapter 或 benchmark 对照；不得把远程索引、第二 transcript 或 Markdown 文件提升为 Pi-XK Memory/Skill 事实。
+- Skill 自动沉淀采用 candidate -> evidence review -> project active -> global candidate -> two-repository promotion；模型不能 archive、purge、改 Goal、改权限或覆盖非 managed `SKILL.md`。
+- Pi ResourceLoader 只在 settled boundary 进行 Skill-only reload，当前 run 固定 generation；这借鉴了 Pi 生态的 resource lifecycle，但不引入第二 context manager 或 daemon。
+
+验收重点从“是否记住更多”改为：D0 是否无正文、D1-D3 是否按需、review 是否只处理已读取证据、unsupported verified/静默冲突是否为零、Skill reload 是否不改变工具集合、失败后是否可恢复且不重复未知付费调用。
 
 ## 2026-07-28 六项增量核验
 

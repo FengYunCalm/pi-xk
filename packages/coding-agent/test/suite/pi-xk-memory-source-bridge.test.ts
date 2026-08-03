@@ -130,20 +130,21 @@ function durableMemoryEnvelope(title: string): string {
 		schema: MEMORY_CAPTURE_RESPONSE_SCHEMA,
 		reason: "The Goal checkpoint contains a durable project fact.",
 		cues: [],
-		memories: [
+		reviews: [
 			{
-				memoryId: null,
-				expectedRevision: null,
-				kind: "fact",
-				title,
-				statement: `${title} remains recoverable after a retryable source failure.`,
-				applicability: "Pi-XK Memory stable-source recovery.",
-				trust: "model_inferred",
-				effectiveFrom: "2026-08-01T00:01:00.000Z",
-				cueKeys: [],
+				action: "create",
+				sourceMemories: [],
+				replacement: {
+					kind: "fact",
+					title,
+					statement: `${title} remains recoverable after a retryable source failure.`,
+					applicability: "Pi-XK Memory stable-source recovery.",
+					effectiveFrom: "2026-08-01T00:01:00.000Z",
+					cueKeys: [],
+				},
+				reason: "The source contains a durable recovery fact.",
 			},
 		],
-		edges: [],
 	});
 }
 

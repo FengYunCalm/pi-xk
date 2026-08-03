@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { type EvidenceRefV2, MEMORY_EVIDENCE_REF_V2_SCHEMA } from "./ambient-memory-contract.ts";
 import { ArtifactStore } from "./artifact-store.ts";
 import type { GoalCheckpointedEvent, GoalEvent } from "./contract.ts";
 import {
@@ -24,7 +25,7 @@ function exactKeys(value: Record<string, unknown>, expected: readonly string[]):
 	return actual.length === sortedExpected.length && actual.every((key, index) => key === sortedExpected[index]);
 }
 
-function invalidEvidence(evidence: EvidenceRefV1, message: string): never {
+function invalidEvidence(evidence: EvidenceRefV2, message: string): never {
 	throw new MemoryValidationError(`Memory evidence ${evidence.evidenceId} ${message}`);
 }
 
@@ -199,8 +200,127 @@ export async function resolveMemoryCompactionEvidence(
 	return invalidEvidence(evidence, "does not match a Session compaction entry");
 }
 
-export async function validateMemoryEvidenceOwnership(projectRoot: string, evidence: EvidenceRefV1): Promise<void> {
+export async function validateMemoryEvidenceOwnership(projectRoot: string, evidence: EvidenceRefV2): Promise<void> {
 	const artifacts = new ArtifactStore(projectRoot);
+	if (evidence.schema === MEMORY_EVIDENCE_REF_V2_SCHEMA) {
+		const locator = evidence.locator;
+		if (evidence.sourceId !== `${locator.sessionId}:${locator.requestEntryId}`) {
+			invalidEvidence(evidence, "does not match its Agent run entry range");
+		}
+		if (evidence.sourceDigest !== locator.rangeDigest) {
+			invalidEvidence(evidence, "sourceDigest does not match its Agent run rangeDigest");
+		}
+		let sessionPath: string;
+		let projectPath: string;
+		try {
+			[sessionPath, projectPath] = await Promise.all([
+				realpath(resolve(locator.sessionFile)),
+				realpath(resolve(projectRoot)),
+			]);
+		} catch (error) {
+			invalidEvidence(
+				evidence,
+				`Agent run Session path is unavailable: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+		let values: unknown[];
+		try {
+			values = (await readFile(sessionPath, "utf8"))
+				.split("\n")
+				.filter((line) => line.length > 0)
+				.map((line) => JSON.parse(line) as unknown);
+		} catch {
+			invalidEvidence(evidence, "Agent run Session JSONL is malformed or unreadable");
+		}
+		const header = values[0];
+		if (
+			!isRecord(header) ||
+			header.type !== "session" ||
+			header.id !== locator.sessionId ||
+			typeof header.cwd !== "string" ||
+			resolve(header.cwd) !== projectPath
+		) {
+			invalidEvidence(evidence, "does not match its native Session header and project");
+		}
+		if (locator.chainId !== null && locator.branchId !== null && locator.segmentId !== null) {
+			const replay = await new SessionChainStore(projectRoot).replayChain(locator.chainId);
+			const branch = replay.branches.find((candidate) => candidate.branchId === locator.branchId);
+			const segment = branch?.segments.find((candidate) => candidate.segmentId === locator.segmentId);
+			if (!branch || !segment) invalidEvidence(evidence, "has no matching Session Chain Segment");
+			const segmentPath =
+				segment.location.kind === "external-root"
+					? resolve(segment.location.absolutePath)
+					: join(
+							projectRoot,
+							".pi-xk",
+							"sessions",
+							"chains",
+							locator.chainId,
+							"branches",
+							locator.branchId,
+							"segments",
+							segment.location.fileName,
+						);
+			let canonicalSegmentPath: string;
+			try {
+				canonicalSegmentPath = await realpath(segmentPath);
+			} catch {
+				invalidEvidence(evidence, "Session Chain Segment file is unavailable");
+			}
+			if (canonicalSegmentPath !== sessionPath) {
+				invalidEvidence(evidence, "Session file does not match its Session Chain Segment");
+			}
+		}
+		const entries = values.slice(1);
+		const start = entries.findIndex((entry) => isRecord(entry) && entry.id === locator.requestEntryId);
+		const end = entries.findIndex((entry) => isRecord(entry) && entry.id === locator.terminalAssistantEntryId);
+		if (start < 0 || end < start) invalidEvidence(evidence, "has no matching Agent run entry range");
+		const matchedRange = entries.slice(start, end + 1);
+		const matchedIds = new Set(
+			matchedRange
+				.filter(isRecord)
+				.map((entry) => entry.id)
+				.filter((id): id is string => typeof id === "string"),
+		);
+		if (locator.toolResultEntryIds.some((entryId) => !matchedIds.has(entryId))) {
+			invalidEvidence(evidence, "does not contain every referenced tool result entry");
+		}
+		const request = matchedRange?.[0];
+		const terminal = matchedRange?.at(-1);
+		if (
+			!isRecord(request) ||
+			request.type !== "message" ||
+			!isRecord(request.message) ||
+			request.message.role !== "user"
+		) {
+			invalidEvidence(evidence, "does not start at a user request");
+		}
+		if (
+			!isRecord(terminal) ||
+			terminal.type !== "message" ||
+			!isRecord(terminal.message) ||
+			terminal.message.role !== "assistant" ||
+			terminal.message.stopReason === "error" ||
+			terminal.message.stopReason === "aborted" ||
+			terminal.message.stopReason === "length"
+		) {
+			invalidEvidence(evidence, "does not end at a successful terminal assistant response");
+		}
+		for (const toolResultEntryId of locator.toolResultEntryIds) {
+			const toolResult = matchedRange.find((entry) => isRecord(entry) && entry.id === toolResultEntryId);
+			if (
+				!isRecord(toolResult) ||
+				toolResult.type !== "message" ||
+				!isRecord(toolResult.message) ||
+				toolResult.message.role !== "toolResult"
+			) {
+				invalidEvidence(evidence, `tool result entry is not a tool result: ${toolResultEntryId}`);
+			}
+		}
+		const rangeDigest = `sha256:${createHash("sha256").update(stableJsonStringify(matchedRange)).digest("hex")}`;
+		if (rangeDigest !== locator.rangeDigest) invalidEvidence(evidence, "Agent run entry range digest is invalid");
+		return;
+	}
 	if (evidence.sourceType === "explicit") {
 		if (evidence.sourceId !== evidence.locator.commandId) {
 			invalidEvidence(evidence, "does not match its explicit command");

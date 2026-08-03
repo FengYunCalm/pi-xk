@@ -1,6 +1,6 @@
 # Pi-XK 文档
 
-Pi-XK 是 Pi 的维护型 fork 与扩展层。它在保留 Pi provider、Agent loop、原生 JSONL session、会话树和 compaction 的前提下，增加可持久化的 Goal、单 child Task、项目级 artifact、由多个物理 session Segment 组成的长期 Session Chain，以及项目级证据图 Memory。
+Pi-XK 是 Pi 的维护型 fork 与扩展层。它在保留 Pi provider、Agent loop、原生 JSONL session、会话树和 compaction 的前提下，增加可持久化的 Goal、单 child Task、项目级 artifact、由多个物理 session Segment 组成的长期 Session Chain，以及项目级证据图 Memory 和独立 Skill 事实域。
 
 本文档描述当前仓库已经实现的能力。未来路线、研究候选和已接受的设计决策分别保留在架构策划案、研究地图和 ADR 中，不作为当前功能承诺。
 
@@ -12,13 +12,14 @@ Pi-XK 是 Pi 的维护型 fork 与扩展层。它在保留 Pi provider、Agent l
 | Goal 连续执行 | 已实现 | active Goal 会自动继续，直到模型提交合格的 pause/end intent 或用户显式控制 |
 | Task Run v1 | 已实现 | 同一 parent 只运行一个 in-process child；无并发、DAG、retry、deadline 或 worktree 隔离 |
 | Session Chain v1.1 | 已实现 | 物理 Segment、L1 递进摘要、默认每 5 段 L2 Rollup、模型按需检索、恢复和 successor branch |
-| Memory v1 | 已实现 | 项目级有向证据图、Goal/L2 稳定边界捕获、显式 verified 记忆、D0–D3 时间/图检索、增量 SQLite/History Cue 投影和恢复 |
+| Memory v1/v2 | 已实现 | 项目级有向证据图、Goal/L2 稳定边界捕获、模型主导 D0–D3 recall、run ledger、Memory review/implicit keep、增量 SQLite/History Cue 投影和恢复 |
+| Skill evolution v1 | 已实现 | 项目/全局 candidate、证据化 review、项目 active projection、跨项目晋升门槛、cooldown、rollback 和 settled-boundary Skill-only reload |
 | 日常状态与管理 | 已实现 | `/xk status` 聚合 Chain/Goal/Task/Memory/恢复诊断；Chain 支持标题、归档和默认隐藏归档项 |
 | Artifact store | 已实现 | 项目级、内容寻址、单 artifact 最大 64 KiB；不是任意大文件仓库 |
 | Policy 与沙箱 | 未实现 | 扩展继承启动 Pi 的用户权限，不提供逐工具授权或无人值守隔离 |
 | 通用 Context controller 与跨项目知识库 | 未实现 | Memory v1 只在当前项目内工作；没有统一 token budget controller、跨项目/用户级知识合并或 vector 检索 |
 | 完整 TaskSupervisor | 未实现 | 不承诺并发、DAG、预算、deadline、RPC child、worktree 合并或 descendant 回收 |
-| Observation/Resource 反省闭环 | 未实现 | Memory proposal 只能修改 Memory 事实；不会自动修改 Skill、规则、依赖、权限或代码 |
+| Observation/Resource 反省闭环 | 部分实现 | Skill 只允许模型提交有证据的 candidate/review；不会自动修改规则、依赖、权限或代码，用户仍控制 archive/purge |
 
 `pi-xk-extension` 仍是私有 package，不发布到 npm。开发者可从可信 checkout 本地安装；固定版本通过独立 `pi-xk-v*` GitHub 二进制归档交付，归档内携带 Extension 与 Core。主要支持场景是个人本机、交互式 TUI、full-access profile。RPC、无人值守、共享多写者和不可信项目不是当前产品化承诺。
 
@@ -30,7 +31,8 @@ Pi-XK 是 Pi 的维护型 fork 与扩展层。它在保留 Pi provider、Agent l
 - 查看文件布局、恢复和故障处理：[运维与恢复](operations-and-recovery.md)
 - 评估安装后对现有 Pi 的影响：[兼容性与使用影响](compatibility-and-impact.md)
 - 理解 L1/L2 与模型按需读取：[Session Chain Rollup 与模型检索](session-chain-rollups-and-model-retrieval.md)
-- 使用项目级长期经验：[Memory v1：证据图与渐进式检索](memory-v1.md)
+- 使用项目级长期经验：[Memory v1/v2：证据图与渐进式检索](memory-v1.md)
+- 查看模型自主回忆和 Skill 演进：[Ambient Recall 与 Skill 演进](ambient-recall-and-skill-evolution.md)
 - 维护 upstream fork 边界：[Host patch 边界](host-patch-boundary.md)
 - 查阅完整未来路线：[Pi-XK 架构策划案](../pi-xk-architecture-proposal.md)
 - 查阅已接受决策：[ADR 索引](../adr/README.md)
@@ -48,6 +50,7 @@ flowchart LR
     Ext --> Task["Task 事件域和 Child SessionChain"]
     Ext --> Chain["SessionChain 拓扑和 Segment"]
     Ext --> Memory["Memory 事件域和证据图"]
+    Ext --> Skills["Skill 事实域和 ResourceLoader generation"]
     Ext --> Artifact["Artifact Store"]
     Goal --> Project["项目 .pi-xk/"]
     Task --> Project
@@ -65,12 +68,13 @@ flowchart LR
 - `Goal` 是带验收条件的持续目标，不是 session 摘要。
 - `Task` 是一个有边界的 child 执行，不等于 Goal，也不等于 Segment。
 - `Memory` 是跨 Goal、Task、branch 和重启的项目级证据图，不替代 Goal State、L1/L2 或 transcript。
+- `Skill` 是独立的有证据资源事实域；candidate/revision/projection 不取代 Memory，也不能改变 Goal 合同、system prompt 优先级或工具权限。
 - `Artifact` 保存带 provenance 的小型不可变结果；read model 和 catalog 都只是可重建投影。
 
 ## 必须先知道的边界
 
 1. **没有沙箱。** Pi-XK 与 Pi 进程拥有相同的文件、进程、网络和凭据访问能力。只在受信任的代码与项目中安装。
-2. **会产生额外模型调用。** Goal 草案、active Goal 连续运行、Task child、Session Chain 摘要和 Memory 稳定边界捕获都可能调用当前 provider，增加 token、费用和耗时；显式 remember/search/read 不调用模型。
+2. **会产生额外模型调用。** Goal 草案、active Goal 连续运行、Task child、Session Chain 摘要、Memory 稳定边界捕获和 Skill candidate/review 都可能调用当前 provider，增加 token、费用和耗时；显式 remember/search/read、Skill candidate/read、refresh 和 doctor 不调用模型。
 3. **会写入项目目录。** 启用后，Session Chain 会在项目根创建 `.pi-xk/sessions/`；确认 Goal、启动 Task 或形成 Memory 数据后还会创建对应领域目录和投影。
 4. **会改变部分交互流程。** Task 运行时普通输入进入 Pi follow-up 队列，待 Task 结束后按序处理；Goal/Chain 写命令仍会拒绝。hard rollover 失败时输入不会送给 provider；历史位置继续输入会创建 successor branch。
 5. **不要手工改事件日志或锁。** `events.jsonl` 是事实源。Chain 投影用 `/chain doctor repair-projections`，Memory 投影用 `/memory doctor repair-projections`；事实完整性分别用 deep doctor 检查；遗留写锁只能按 doctor 给出的 nonce 显式修复。
@@ -89,4 +93,4 @@ flowchart LR
 
 ## 版本基线
 
-当前文档对应 2026-08-03 的 Pi-XK Goal V3、compaction recovery、Session Chain v1.1、Memory v1、增量 append/checkpoint/projection 与既有 GitHub-only 发行实现。完整验收以当前 commit 实际执行 `npm run test:pi-xk` 的输出为准，不再在长期文档中固化会随回归测试增长而过期的计数；旧的 `42/97`、`55/119`、`63/157`、`93/241` 都不是当前完整证据。发布前还必须运行 `npm run check`、`./test.sh`、Session Chain 与 Memory 评估/benchmark、隔离归档 smoke、Windows/macOS 定向 CI 和 `git diff --check`。
+当前文档对应 2026-08-04 的 Pi-XK Goal V3、compaction recovery、Session Chain v1.1、Memory v1/v2、Ambient Recall、Skill evolution v1、增量 append/checkpoint/projection 与既有 GitHub-only 发行实现。完整验收以当前 commit 实际执行 `npm run test:pi-xk` 的输出为准，不再在长期文档中固化会随回归测试增长而过期的计数；旧的 `42/97`、`55/119`、`63/157`、`93/241` 都不是当前完整证据。发布前还必须运行 `npm run check`、`./test.sh`、Session Chain 与 Memory 评估/benchmark、隔离归档 smoke、Windows/macOS 定向 CI 和 `git diff --check`。

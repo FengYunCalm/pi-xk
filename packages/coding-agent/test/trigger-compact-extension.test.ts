@@ -18,6 +18,7 @@ function createContext(tokens: number | null, compact = vi.fn()): ExtensionConte
 		hasPendingMessages: () => false,
 		shutdown: vi.fn(),
 		getContextUsage: () => ({ tokens, contextWindow: 200_000, percent: tokens === null ? null : tokens / 2000 }),
+		reloadSkillsAtSettledBoundary: vi.fn(),
 		compact,
 		flushSession: vi.fn(),
 		summarizeSessionContext: vi.fn(),

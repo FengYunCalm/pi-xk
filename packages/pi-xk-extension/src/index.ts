@@ -19,16 +19,16 @@ export {
 } from "./memory-controller.ts";
 export { createPiXkMemoryExtension, type PiXkMemoryExtensionOptions } from "./memory-extension.ts";
 export {
-	type BuildMemoryCaptureProposalInput,
-	buildMemoryCaptureProposal,
+	type BuildMemoryCaptureReviewInput,
+	type BuiltMemoryCaptureReviewV2,
+	buildMemoryCaptureReview,
 	MEMORY_CAPTURE_PROMPT,
 	MEMORY_CAPTURE_PROMPT_VERSION,
 	MEMORY_CAPTURE_RESPONSE_SCHEMA,
-	type MemoryCaptureCueEnvelopeV1,
-	type MemoryCaptureEdgeEnvelopeV1,
-	type MemoryCaptureEndpointEnvelopeV1,
-	type MemoryCaptureEnvelopeV1,
-	type MemoryCaptureMemoryEnvelopeV1,
+	type MemoryCaptureCueEnvelopeV2,
+	type MemoryCaptureEnvelopeV2,
+	type MemoryCaptureReplacementEnvelopeV2,
+	type MemoryCaptureReviewEnvelopeV2,
 	parseMemoryCaptureEnvelope,
 } from "./memory-prompt.ts";
 export { MemorySourceBridge, type PublishedRollupSourceV1 } from "./memory-source-bridge.ts";

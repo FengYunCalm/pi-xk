@@ -97,6 +97,12 @@ describe("validateToolArguments", () => {
 		}
 	});
 
+	it("preserves values that already match a serialized union member", () => {
+		const { tool, toolCall } = createToolCallWithPlainSchema(Type.Union([Type.String(), Type.Null()]), null);
+
+		expect(validateToolArguments(tool, toolCall)).toEqual({ value: null });
+	});
+
 	it("rejects invalid coercions for serialized plain JSON schemas", () => {
 		const failingCases: Array<{
 			schema: Tool["parameters"];

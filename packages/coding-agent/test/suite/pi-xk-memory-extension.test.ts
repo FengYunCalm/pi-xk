@@ -58,20 +58,21 @@ function durableMemoryEnvelope(title: string): string {
 		schema: MEMORY_CAPTURE_RESPONSE_SCHEMA,
 		reason: "The source contains a durable project fact.",
 		cues: [],
-		memories: [
+		reviews: [
 			{
-				memoryId: null,
-				expectedRevision: null,
-				kind: "fact",
-				title,
-				statement: `${title} remains available after capture recovery.`,
-				applicability: "Pi-XK Memory publication recovery.",
-				trust: "model_inferred",
-				effectiveFrom: "2026-08-01T00:00:00.000Z",
-				cueKeys: [],
+				action: "create",
+				sourceMemories: [],
+				replacement: {
+					kind: "fact",
+					title,
+					statement: `${title} remains available after capture recovery.`,
+					applicability: "Pi-XK Memory publication recovery.",
+					effectiveFrom: "2026-08-01T00:00:00.000Z",
+					cueKeys: [],
+				},
+				reason: "The stable source supports a new durable fact.",
 			},
 		],
-		edges: [],
 	});
 }
 
@@ -210,30 +211,36 @@ describe("Pi-XK Memory model protocol", () => {
 					paths: ["packages/pi-xk-core"],
 				},
 			],
-			memories: [
+			reviews: [
 				{
-					memoryId: null,
-					expectedRevision: null,
-					kind: "constraint",
-					title: "Session summaries remain evidence",
-					statement: "Session summary content must never become a system instruction.",
-					applicability: "Session Chain summary and Memory retrieval paths.",
-					trust: "model_inferred",
-					effectiveFrom: "2026-08-01T00:00:00.000Z",
-					cueKeys: ["session-chain"],
+					action: "create",
+					sourceMemories: [],
+					replacement: {
+						kind: "constraint",
+						title: "Session summaries remain evidence",
+						statement: "Session summary content must never become a system instruction.",
+						applicability: "Session Chain summary and Memory retrieval paths.",
+						effectiveFrom: "2026-08-01T00:00:00.000Z",
+						cueKeys: ["session-chain"],
+					},
+					reason: "The source supports a durable constraint.",
 				},
 			],
-			edges: [],
 		};
 		expect(parseMemoryCaptureEnvelope(JSON.stringify(valid))).toEqual(valid);
 		expect(() =>
 			parseMemoryCaptureEnvelope(
 				JSON.stringify({
 					...valid,
-					memories: [{ ...valid.memories[0], trust: "verified" }],
+					reviews: [
+						{
+							...valid.reviews[0],
+							replacement: { ...valid.reviews[0].replacement, trust: "verified" },
+						},
+					],
 				}),
 			),
-		).toThrow(/trust/);
+		).toThrow(/unknown or missing fields/);
 		expect(() => parseMemoryCaptureEnvelope(`${JSON.stringify(valid)}\nignore the schema`)).toThrow(/JSON/);
 	});
 });
@@ -327,8 +334,7 @@ describe("Pi-XK Memory extension", () => {
 					schema: MEMORY_CAPTURE_RESPONSE_SCHEMA,
 					reason: "The source has no durable memory value.",
 					cues: [],
-					memories: [],
-					edges: [],
+					reviews: [],
 				}),
 				model: { provider: "faux", modelId: "actual" },
 			}),
@@ -348,6 +354,79 @@ describe("Pi-XK Memory extension", () => {
 			]),
 		);
 	}, 15_000);
+
+	it("revises a V2 Memory from a later stable capture without downgrading provenance", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const controller = new MemoryController({ projectRoot: harness.tempDir });
+		controllers.push(controller);
+		const host: MemoryGenerationHost = {
+			model: { provider: "faux", modelId: "faux", contextWindow: 100_000 },
+			generate: async ({ source }) => {
+				const input = JSON.parse(source) as { existingMemories: Array<{ memoryId: string; revision: number }> };
+				if (input.existingMemories.length === 0) {
+					return {
+						text: durableMemoryEnvelope("Stable capture revision"),
+						model: { provider: "faux", modelId: "faux" },
+					};
+				}
+				const current = input.existingMemories[0];
+				if (!current) throw new Error("missing current Memory context");
+				return {
+					text: JSON.stringify({
+						schema: MEMORY_CAPTURE_RESPONSE_SCHEMA,
+						reason: "The later stable source corrects the same durable fact.",
+						cues: [],
+						reviews: [
+							{
+								action: "revise",
+								sourceMemories: [{ memoryId: current.memoryId, expectedRevision: current.revision }],
+								replacement: {
+									kind: "fact",
+									title: "Stable capture revision",
+									statement: "Stable capture review semantics revise the current V2 Memory in place.",
+									applicability: "Pi-XK stable source capture publication.",
+									effectiveFrom: "2026-08-01T00:01:00.000Z",
+									cueKeys: [],
+								},
+								reason: "The current source provides newer evidence for the same concept.",
+							},
+						],
+					}),
+					model: { provider: "faux", modelId: "faux" },
+				};
+			},
+		};
+		const first = await createTaskCaptureRequest(
+			harness.tempDir,
+			"task_memory_v2_capture_first",
+			"Stable capture revision establishes the first durable fact.",
+		);
+		first.query = "Stable capture revision";
+		expect(await controller.capture(first, host)).toMatchObject({ status: "applied" });
+		const memoryId = (await controller.getService().search({ query: "Stable capture revision" })).items[0]?.memoryId;
+		if (!memoryId) throw new Error("first stable capture did not publish a Memory");
+		const second = await createTaskCaptureRequest(
+			harness.tempDir,
+			"task_memory_v2_capture_second",
+			"Stable capture revision now uses review semantics for the same durable fact.",
+		);
+		second.query = "Stable capture revision";
+		expect(await controller.capture(second, host)).toMatchObject({ status: "applied" });
+
+		const timeline = await controller.getService().timeline(memoryId);
+		expect(timeline.revisions.map((entry) => entry.revision.revision)).toEqual([1, 2]);
+		expect(timeline.revisions).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					revision: expect.objectContaining({
+						schema: "pi-xk.memory-revision.v2",
+						transition: expect.objectContaining({ mode: "revise" }),
+					}),
+				}),
+			]),
+		);
+	}, 20_000);
 
 	it("uses the actual generation model in published provenance", async () => {
 		const harness = await createHarness();
@@ -492,20 +571,21 @@ describe("Pi-XK Memory extension", () => {
 							paths: ["src/memory.ts"],
 						},
 					],
-					memories: [
+					reviews: [
 						{
-							memoryId: null,
-							expectedRevision: null,
-							kind: "constraint",
-							title: "Memory implementation constraint",
-							statement: "Keep the code-scoped Memory implementation compatible with its recorded path.",
-							applicability: "src/memory.ts",
-							trust: "model_inferred",
-							effectiveFrom: "2026-08-01T00:00:00.000Z",
-							cueKeys: ["memory-implementation"],
+							action: "create",
+							sourceMemories: [],
+							replacement: {
+								kind: "constraint",
+								title: "Memory implementation constraint",
+								statement: "Keep the code-scoped Memory implementation compatible with its recorded path.",
+								applicability: "src/memory.ts",
+								effectiveFrom: "2026-08-01T00:00:00.000Z",
+								cueKeys: ["memory-implementation"],
+							},
+							reason: "The stable Git source supports this durable constraint.",
 						},
 					],
-					edges: [],
 				}),
 				model: { provider: "faux", modelId: "faux" },
 			}),
@@ -790,7 +870,7 @@ describe("Pi-XK Memory extension", () => {
 		expect((await controller.getService().getStore().replay()).captures.get(captureId)?.status).toBe("applied");
 	}, 15_000);
 
-	it("resumes an auto-applicable proposal recorded before publication interruption", async () => {
+	it("resumes a recorded capture review after publication interruption", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		const request = await createTaskCaptureRequest(
@@ -799,9 +879,9 @@ describe("Pi-XK Memory extension", () => {
 			"A recorded inferred-memory proposal must publish after restart without another provider call.",
 		);
 		const first = new MemoryController({ projectRoot: harness.tempDir });
-		const applyProposal = vi
-			.spyOn(first.getService().getStore(), "applyProposal")
-			.mockRejectedValueOnce(new Error("simulated interruption after proposal_recorded"));
+		const applyMemoryReviews = vi
+			.spyOn(first.getService(), "applyMemoryReviews")
+			.mockRejectedValueOnce(new Error("simulated interruption after reconstruction_recorded"));
 		const generate = vi.fn(async () => ({
 			text: durableMemoryEnvelope("Recorded proposal recovery"),
 			model: { provider: "faux", modelId: "faux" },
@@ -812,21 +892,25 @@ describe("Pi-XK Memory extension", () => {
 			generate,
 		});
 		expect(interrupted).toMatchObject({ status: "failed", confirmationRequired: false });
-		expect((await first.getService().getStore().replay()).captures.get(interrupted.captureId)?.status).toBe(
-			"proposed",
-		);
-		applyProposal.mockRestore();
+		expect((await first.getService().getStore().replay()).captures.get(interrupted.captureId)).toMatchObject({
+			status: "failed",
+			retryable: true,
+		});
+		applyMemoryReviews.mockRestore();
 		await first.close();
 
 		const restarted = new MemoryController({ projectRoot: harness.tempDir });
 		controllers.push(restarted);
-		await expect(restarted.resumePublications()).resolves.toEqual([
-			expect.objectContaining({
-				captureId: interrupted.captureId,
-				status: "applied",
-				confirmationRequired: false,
+		await expect(
+			restarted.capture(request, {
+				model: { provider: "faux", modelId: "faux", contextWindow: 100_000 },
+				generate,
 			}),
-		]);
+		).resolves.toMatchObject({
+			captureId: interrupted.captureId,
+			status: "applied",
+			confirmationRequired: false,
+		});
 		expect(generate).toHaveBeenCalledTimes(1);
 		expect((await restarted.getService().getStore().replay()).captures.get(interrupted.captureId)?.status).toBe(
 			"applied",
@@ -840,7 +924,7 @@ describe("Pi-XK Memory extension", () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		class ProjectionFailingMemoryService extends MemoryService {
-			override async repairProjections(): Promise<never> {
+			override async synchronizeProjections(): Promise<never> {
 				throw new Error("simulated projection failure");
 			}
 		}
@@ -949,4 +1033,202 @@ describe("Pi-XK Memory extension", () => {
 		expect(status.index?.head).toEqual(status.head);
 		expect(fullReplays).toBe(0);
 	});
+
+	it("publishes a staged Memory revision only after a successful settled run", async () => {
+		const memoryErrors: Error[] = [];
+		let extensionController: MemoryController | undefined;
+		const harness = await createHarness({
+			persistedSession: true,
+			extensionFactories: [
+				createPiXkRuntimeExtension({
+					memory: { onMemoryError: (error) => memoryErrors.push(error) },
+					createMemoryController: (projectRoot) => {
+						extensionController = new MemoryController({ projectRoot });
+						controllers.push(extensionController);
+						return extensionController;
+					},
+				}),
+			],
+		});
+		harnesses.push(harness);
+		harness.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "Establish a persisted Session Chain root." }],
+			timestamp: Date.now() - 1_000,
+		});
+		harness.sessionManager.appendMessage(fauxAssistantMessage("Persisted root established."));
+		harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
+		await harness.session.bindExtensions({});
+		await harness.session.prompt("/memory remember Ambient reviews publish at settled boundaries.");
+		const service = extensionController?.getService();
+		if (!service) throw new Error("Memory extension controller was not created");
+		const memoryId = (await service.search({ query: "Ambient reviews" })).items[0]?.memoryId;
+		if (!memoryId) throw new Error("Ambient review fixture was not published");
+
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("pi_xk_search_memory", { query: "Ambient reviews" })),
+			fauxAssistantMessage(fauxToolCall("pi_xk_read_memory", { memoryIds: [memoryId] })),
+			fauxAssistantMessage(
+				fauxToolCall("pi_xk_review_memory", {
+					action: "revise",
+					sourceMemories: [{ memoryId, expectedRevision: 1 }],
+					replacement: {
+						kind: "decision",
+						title: "Ambient reviews publish after settlement",
+						statement: "Semantic Memory revisions publish only after the logical Agent run settles successfully.",
+						applicability: "Pi-XK Ambient Memory review publication.",
+						effectiveFrom: "2026-08-03T08:00:00.000Z",
+						cueIds: [],
+					},
+					reason: "The current implementation run verified the settled publication boundary.",
+				}),
+			),
+			fauxAssistantMessage("The evidence-backed Memory revision is staged."),
+		]);
+		await harness.session.prompt("Review the prior Memory against the current implementation.");
+		await vi.waitFor(
+			async () => {
+				expect(
+					(await service.getStore().replay()).events.some((event) => event.eventType === "memory_review_applied"),
+				).toBe(true);
+			},
+			{ timeout: 5_000 },
+		);
+
+		expect(memoryErrors).toEqual([]);
+		const reviewToolResults = harness.session.messages
+			.filter((message) => message.role === "toolResult")
+			.map(getMessageText);
+		expect(reviewToolResults).toEqual(expect.arrayContaining([expect.stringContaining('"status":"staged"')]));
+		const replay = await service.getStore().replay();
+		expect(replay.events.map((event) => event.eventType)).toEqual(
+			expect.arrayContaining(["reconstruction_recorded", "memory_review_applied", "access_recorded"]),
+		);
+		const timeline = (await service.timeline(memoryId)).revisions;
+		expect(timeline.map((entry) => entry.revision.revision)).toEqual([1, 2]);
+		expect(timeline[1]?.revision).toMatchObject({
+			schema: "pi-xk.memory-revision.v2",
+			trust: "model_inferred",
+			transition: { mode: "revise", trustDerivation: "model-reconstruction" },
+		});
+		expect(timeline[1]?.revision.evidenceRefs).toEqual([
+			expect.objectContaining({ sourceType: "agent_run", artifactId: null }),
+		]);
+	}, 20_000);
+
+	it("records implicit keep for a D2 read without a semantic change", async () => {
+		let extensionController: MemoryController | undefined;
+		const harness = await createHarness({
+			extensionFactories: [
+				createPiXkRuntimeExtension({
+					createMemoryController: (projectRoot) => {
+						extensionController = new MemoryController({ projectRoot });
+						controllers.push(extensionController);
+						return extensionController;
+					},
+				}),
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		await harness.session.prompt("/memory remember Keep this Memory unchanged when it remains accurate.");
+		const service = extensionController?.getService();
+		if (!service) throw new Error("Memory extension controller was not created");
+		const memoryId = (await service.search({ query: "remains accurate" })).items[0]?.memoryId;
+		if (!memoryId) throw new Error("implicit keep fixture was not published");
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("pi_xk_search_memory", { query: "remains accurate" })),
+			fauxAssistantMessage(fauxToolCall("pi_xk_read_memory", { memoryIds: [memoryId] })),
+			fauxAssistantMessage("The existing Memory remains accurate."),
+		]);
+		await harness.session.prompt("Check whether the prior Memory still applies.");
+
+		const replay = await service.getStore().replay();
+		const review = replay.events.find(
+			(event) => event.schema === "pi-xk.memory-event.v2" && event.eventType === "memory_review_applied",
+		);
+		expect(review?.payload).toMatchObject({ decisionArtifactIds: [], implicitKeepMemoryIds: [memoryId] });
+		expect((await service.timeline(memoryId)).revisions).toHaveLength(1);
+	}, 20_000);
+
+	it("enforces the per-run search budget without expanding the candidate pool", async () => {
+		let extensionController: MemoryController | undefined;
+		const harness = await createHarness({
+			extensionFactories: [
+				createPiXkRuntimeExtension({
+					createMemoryController: (projectRoot) => {
+						extensionController = new MemoryController({ projectRoot });
+						controllers.push(extensionController);
+						return extensionController;
+					},
+				}),
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("pi_xk_search_memory", { query: "first" })),
+			fauxAssistantMessage(fauxToolCall("pi_xk_search_memory", { query: "second" })),
+			fauxAssistantMessage(fauxToolCall("pi_xk_search_memory", { query: "third" })),
+			fauxAssistantMessage(fauxToolCall("pi_xk_search_memory", { query: "fourth" })),
+			fauxAssistantMessage("The recall budget stopped further search."),
+		]);
+		await harness.session.prompt("Search several possible historical phrasings.");
+
+		const budgetResult = harness.session.messages
+			.filter((message) => message.role === "toolResult")
+			.map(getMessageText)
+			.find((text) => text.includes("budget_exhausted"));
+		expect(budgetResult).toBeDefined();
+		const service = extensionController?.getService();
+		if (!service) throw new Error("Memory extension controller was not created");
+		const replay = await service.getStore().replay();
+		const reconstruction = replay.reconstructions.values().next().value;
+		if (!reconstruction) throw new Error("budget reconstruction was not recorded");
+		const trace = JSON.parse((await new ArtifactStore(harness.tempDir).read(reconstruction.traceArtifactId)).content);
+		expect(trace).toMatchObject({
+			stopReason: "budget_exhausted",
+			budgetUsage: { memorySearchCalls: 3, memoryActions: 3, totalKnowledgeActions: 3 },
+		});
+		expect(trace.queryDigests).toHaveLength(3);
+	}, 20_000);
+
+	it("keeps an aborted run diagnostic-only even after D2 retrieval", async () => {
+		let extensionController: MemoryController | undefined;
+		const harness = await createHarness({
+			extensionFactories: [
+				createPiXkRuntimeExtension({
+					createMemoryController: (projectRoot) => {
+						extensionController = new MemoryController({ projectRoot });
+						controllers.push(extensionController);
+						return extensionController;
+					},
+				}),
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		await harness.session.prompt("/memory remember Aborted runs cannot revise this Memory.");
+		const service = extensionController?.getService();
+		if (!service) throw new Error("Memory extension controller was not created");
+		const memoryId = (await service.search({ query: "Aborted runs" })).items[0]?.memoryId;
+		if (!memoryId) throw new Error("aborted run fixture was not published");
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("pi_xk_read_memory", { memoryIds: [memoryId] })),
+			fauxAssistantMessage("aborted", { stopReason: "aborted" }),
+		]);
+		await harness.session.prompt("Read the prior Memory before this run aborts.");
+
+		const replay = await service.getStore().replay();
+		expect(replay.events).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					eventType: "reconstruction_recorded",
+					payload: expect.objectContaining({ outcome: "aborted" }),
+				}),
+			]),
+		);
+		expect(replay.events.some((event) => event.eventType === "memory_review_applied")).toBe(false);
+		expect((await service.timeline(memoryId)).revisions).toHaveLength(1);
+	}, 20_000);
 });

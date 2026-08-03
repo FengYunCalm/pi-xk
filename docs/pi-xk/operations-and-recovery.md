@@ -41,6 +41,13 @@
       manifest.json
       index.md
       memories/<memoryId>.md
+  skills/                            # 项目 Skill facts/read model/index
+    events.jsonl
+    skill-read-model.json
+    index.sqlite
+    pending/
+    locks/
+  .pi/skills/<name>/                 # 受管项目 Skill active projection
   sessions/
     catalog.json
     chains/<chainId>/
@@ -62,6 +69,8 @@
 
 Pi-XK 不创建项目级 `.pi` 目录来保存自己的领域状态。项目 `.pi/settings.json` 仍可能存在，因为它是 Pi 的项目级 package/settings 入口。
 
+用户级 Skill facts 位于 `<PI_CODING_AGENT_DIR>/pi-xk/skills/`，其 active projection 位于 `<PI_CODING_AGENT_DIR>/skills/<name>/`。项目和全局 Skill projection 都带 managed marker；非 Pi-XK 同名目录不能被覆盖。
+
 ## 2. 文件职责
 
 | 文件 | 是否事实源 | 能否手工删除重建 | 说明 |
@@ -78,6 +87,9 @@ Pi-XK 不创建项目级 `.pi` 目录来保存自己的领域状态。项目 `.p
 | Memory read model/checkpoint | 投影 | 通过 replay 重建 | 普通 status/search 的快速路径，不参与裁决 |
 | Memory `index.sqlite` / Markdown | 投影 | `/memory doctor repair-projections` | FTS5、图、时间、heat 和人类可读视图 |
 | Memory `source-cursors.json` / `history-cue-cursor.json` / pending result | 恢复数据 | 由 source bridge/controller 管理 | 控制自动发现基线、sealed Segment 增量扫描并复用已生成结果；不是 Memory 事实 |
+| Skill `events.jsonl` 与 revision/candidate/bundle artifact | 是 | 否 | 项目或全局 Skill 的 candidate、revision、use evidence、promotion 和 lifecycle 事实 |
+| Skill read model / `index.sqlite` | 投影 | Skill doctor repair-projections | 候选、active revision、使用次数、stale/cooldown 和搜索索引 |
+| Skill `pending/`、managed projection | 恢复/投影 | Skill doctor 或 settled reload | bundle 发布和 ResourceLoader generation；不参与事实裁决 |
 | Chain `events.jsonl` | 是 | 否 | chain/branch/segment/rollover 拓扑 |
 | managed Segment JSONL | 是 | 否 | 完整 Pi session；sealed 后不可变 |
 | L1/L2 Artifact object | 是 | 否 | 内容寻址的 Segment summary、Chain Rollup、checkpoint 或 result 内容 |
@@ -101,6 +113,9 @@ Pi-XK 不创建项目级 `.pi` 目录来保存自己的领域状态。项目 `.p
 | `/chain rollup backfill [limit]` | 显式生成最早缺失的完整 L2 窗口，可能调用 provider |
 | 第一次加载 Memory v1 | 默认启用并记录当前 Goal/Chain head 作为自动捕获 baseline；建立不复制正文的 History Cue cursor/cache；不批量调用模型回填旧历史 |
 | 新 Goal checkpoint/completion 或 L2 publication | 后台发现稳定来源并产生 Memory capture；可能调用 provider |
+| 成功 `agent_settled` | 固化 reconstruction/Skill-use trace；模型 review 通过 Host CAS 后才发布 Memory/Skill revision |
+| `pi_xk_review_skills` 产生新候选或 revision | 写入 Skill facts；有证据且 bundle 通过校验后才激活，不直接改非 managed Skill |
+| Skill publication 成功 | 下一 settled boundary 执行 resource-only reload；不发送 shutdown/start，不改变 tools/settings/extensions |
 | `/memory remember <text>` | 不调用模型，创建用户确认的 verified Memory |
 | `/memory backfill [limit]` | 显式、有限额捕获历史 eligible Goal/L2 source；默认一个、最多 20 |
 | compaction | Pi 写带可选标题、原因和 recovery version 的原生 compaction entry；active Goal 另写 checkpoint evidence reference |
@@ -253,12 +268,23 @@ V3 State 的 `recent_work_log` 最多保留 20 条重要记录。`tried_and_reje
 | --- | --- |
 | 新 stable source | 后台串行 capture；模型结果 canonical read-back 后记录 proposal/application |
 | `/memory remember` | 直接写 verified Memory，不调用 provider |
-| 模型提出 Memory 变更 | 只记录 CAS 保护 proposal，不直接 apply |
+| 模型提出 Memory review | 只处理本 run 已读取或有本 run evidence 支持的 `keep/revise/supersede/dispute/create`；Host 在 settled 后发布 |
 | `/memory config off` | 停止 capture、proposal apply 和 access 写入；既有 Memory 保持只读 |
 | SQLite/Markdown 更新失败 | Memory fact 保持已提交；doctor 可重建投影 |
 | generation started 后结果未知 | 标记 indeterminate，不自动重复 provider 调用 |
 | archive/invalidate | 新 lifecycle revision；旧 artifact 保留 |
 | purge | 显式确认、引用检查和 tombstone 后才清理独占 artifact |
+
+### Skill
+
+| 事件 | 结果 |
+| --- | --- |
+| `pi_xk_search_skill_candidates` / `read` | 只读 D1 元数据或候选 bundle；正文标记为历史候选，不是系统指令 |
+| 成功 run 提交 Skill review | Host 校验证据、路径、大小、名称和 expected revision；不足时保持 candidate |
+| 项目 Skill 首次成功且 evidence 完整 | 可发布项目 active projection；全局只进入 candidate |
+| 两次连续 evidence-backed failure | active Skill 进入 `needs_review` cooldown，不删除旧 bundle |
+| Skill rollback/archive/purge | 只接受用户命令；rollback 是复制旧 bundle 的新 revision |
+| projection/reload 失败 | 保留旧 Skill generation；doctor repair 后在下一个 settled boundary 重试 |
 
 Goal completion 的稳定来源不是结束后仍可编辑的 `goal-state.md`，而是 `goal_ended` 前最后一个 `turn_end` checkpoint 所引用的 event-time State artifact。checkpoint artifact、metadata、合同 revision 或 State grammar 不一致时，Memory capture 拒绝该来源。
 
@@ -438,6 +464,22 @@ owner 仍存活、PID 状态无法确认、metadata malformed 或 nonce 已变�
 
 `stale` 表示相关 scope path 与捕获基线不一致或来源消失；无关 dirty 文件不会触发。`unknown` 表示 Git/source 无法确定。`/memory refresh <id>` 只重新计算投影和 freshness，不调用模型、不会把旧结论改成 current。
 
+### Ambient recall budget exhausted
+
+这是单次 run 的有界保护，不是 Memory 损坏。模型收到结构化 `budget_exhausted` 后应停止搜索，基于已读证据继续或说明缺口；Host 不会扩大候选池，也不会跨 run 复制 ledger。普通无历史问题不应为了消耗预算而搜索。
+
+### Skill candidate 不会激活
+
+先运行 `/skill status`、`/skill candidates` 和 `/skill doctor`。常见原因是缺少成功 run evidence、bundle 超过大小/文件限制、名称碰撞、expected revision 冲突、项目路径已 stale 或连续失败进入 cooldown。候选不会直接进入 system prompt；补足证据后由新的 settled boundary 复核。
+
+### Skill reload failed 或看不到新 Skill
+
+确认 Skill facts/event 已发布、managed projection marker 未损坏，并检查 `/skill doctor` 的 projection/reload 诊断。当前 run 不会热换 Skill；发布后只在下一个 settled boundary resource-only reload。失败时继续使用旧 generation，不要手工覆盖 `.pi/skills` 或删除旧 projection。
+
+### Skill 同名覆盖被拒绝
+
+Pi-XK 只管理带 marker 且属于同一 lineage 的路径。非 managed 同名 Skill、symlink、路径逃逸和不同 Skill ID 的名称冲突都必须换名或由用户显式整理；模型不能覆盖现有用户 Skill。
+
 ## 11. 更新与移除
 
 受支持的本地管理入口为：
@@ -451,4 +493,4 @@ npm run pi-xk:uninstall
 
 可用 `--agent-dir <path>` 指定隔离 profile；`--dry-run` 不构建也不写 settings。install/upgrade 会构建并运行 runtime preflight，uninstall 只删除该 checkout 的 package 引用。然后正常退出并重启 Pi。不要在 active Goal 或 running Task 中热切换不兼容代码；reload 会触发保守暂停/取消语义。
 
-移除扩展只删除 Pi settings 中的 package 引用，不删除项目数据，包括 Memory event、artifact、SQLite 和 Markdown。若需要归档项目，优先保留 `.pi-xk/` 和原生 session；确认不再需要且备份可用后，才单独处理这些目录。
+移除扩展只删除 Pi settings 中的 package 引用，不删除项目数据，包括 Memory/Skill event、artifact、SQLite、Markdown 和 managed projection。若需要归档项目，优先保留 `.pi-xk/`、`.pi/skills/` 中的 managed projection 和原生 session；确认不再需要且备份可用后，才单独处理这些目录。

@@ -1,8 +1,8 @@
-# Pi-XK Memory v1：项目级证据图与渐进式检索
+# Pi-XK Memory v1/v2：项目级证据图与渐进式检索
 
-Memory v1 为当前项目保存跨 Goal、Task、Session Chain、compaction 和重启可检索的长期经验。它使用有类型、有方向、带时间与 provenance 的图；模型负责判断和提炼，Host 负责验证、CAS、发布、恢复和用户确认。
+Memory v1 为当前项目保存跨 Goal、Task、Session Chain、compaction 和重启可检索的长期经验；Ambient Memory v2 在不改写 v1 事实源的前提下增加模型主导的 recall ledger、review 演进和 agent-run evidence。它使用有类型、有方向、带时间与 provenance 的图；模型负责判断和提炼，Host 负责验证、CAS、发布、恢复和用户确认。
 
-它不是第二套 transcript、跨项目知识库、自动自我修改系统或通用 context controller。完整决策理由见 [ADR-0007](../adr/0007-memory-v1.md)。
+它不是第二套 transcript、跨项目知识库、自动自我修改系统或通用 context controller。完整 v1 决策见 [ADR-0007](../adr/0007-memory-v1.md)，Ambient Recall/Skill 边界见 [ADR-0008](../adr/0008-ambient-memory-v2-and-skill-v1.md) 和 [Ambient Recall 与 Skill 演进](ambient-recall-and-skill-evolution.md)。
 
 ## 1. 心智模型
 
@@ -128,7 +128,7 @@ Goal checkpoint 使用事件引用的 event-time State artifact。Goal completio
 
 ## 6. 模型捕获与确认边界
 
-模型捕获 prompt 只允许返回严格 JSON：Cue、Memory 和 Edge。模型不得返回 verified，新 Memory 默认 `model_inferred`，冲突使用 `disputed`。
+模型捕获和 settled review 只允许返回严格 JSON：Cue、Memory、Edge 或 review action。模型不得返回 verified，新 Memory 默认 `model_inferred`，冲突使用 `disputed`。模型主导的按需检索、预算和 `keep/revise/supersede/dispute/create` 语义见 [Ambient Recall 与 Skill 演进](ambient-recall-and-skill-evolution.md)。
 
 自动应用：
 
@@ -142,6 +142,8 @@ Goal checkpoint 使用事件引用的 event-time State artifact。Goal completio
 - 任何 verified 变更；
 - archive、invalidate、detach evidence、purge；
 - 模型主动调用 `pi_xk_propose_memory_change` 创建的 proposal。
+
+旧 `pi_xk_propose_memory_change` 不再进入新模型 manifest；V1 proposal 仍可由用户审计和处理。新 run 使用 `pi_xk_review_memory`，Host 只在 `agent_settled` 后发布语义 revision。
 
 查看 proposal：
 
@@ -301,7 +303,8 @@ purge 的 tombstone 会列出目标 Memory 的 revision/edge/evidence，以及�
 | `pi_xk_search_memory` | 只读 D1 | 默认 12、最大 50；不返回正文 |
 | `pi_xk_read_memory` | 只读 D2 | 一次 1–5 条；完整 provenance/evidence ownership 校验 |
 | `pi_xk_expand_memory_evidence` | 只读 D3 | 一条 Memory、最多 3 个 evidence |
-| `pi_xk_propose_memory_change` | 只写 proposal | 不直接 apply，不绕过 CAS/确认 |
+| `pi_xk_review_memory` | 受限语义 review | 只能处理本 run 已读取或有本 run evidence 支持的 Memory；Host 负责 CAS 和发布 |
+| `pi_xk_propose_memory_change` | V1 遗留 proposal | 不进入新 manifest，历史 proposal 仍可由用户审计 |
 | `pi_xk_request_compaction` | 登记本 run 请求 | settled 后由 Host gate；不写 Memory、不创建 user message |
 
 模型应在依赖历史决定、约束、偏好、经验、未决事项或既有设计原因时先搜索；无关的一次性问题不应加载 Memory。
@@ -411,3 +414,9 @@ npm run evaluate:pi-xk-memory
 - 不提供 Artifact GC、自动 retention 或后台 daemon；
 - 不提供 Policy、沙箱或新的权限边界；
 - 不应与 Magic Context、pi-observational-memory、DCP、Hermes 等另一套 context/memory 主机制在同一可写 profile 叠装。
+
+## 18. Ambient Memory v2 与 Skill
+
+Memory 的 v2 revision 增加 transition 和 review provenance；每个 run 的 reconstruction trace 只保存检索/读取 ID、revision、evidence、预算和停止原因，不复制 transcript。成功 settled 后未被显式修订的已读项记录 implicit `keep`；error、abort、length 或截断 run 不发布语义 revision。模型不可 archive、invalidate、detach 或 purge。
+
+项目和全局 Skill 是独立事实域，不把 Skill 正文注入 D0。Skill candidate、实际受管读取、使用结果、cooldown、跨项目晋升和 settled-boundary resource-only reload 见 [Ambient Recall 与 Skill 演进](ambient-recall-and-skill-evolution.md)。Skill reload 失败保留旧 generation；projection repair 只重建派生数据，不改写 Memory/Skill artifact 或 event。

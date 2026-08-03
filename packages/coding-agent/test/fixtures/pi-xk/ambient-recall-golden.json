@@ -1,0 +1,131 @@
+{
+	"schema": "pi-xk.ambient-recall-golden.v1",
+	"scenarios": [
+		{
+			"id": "unrelated-one-shot",
+			"recallExpected": false,
+			"candidateAvailable": false,
+			"actions": [],
+			"stopReason": "not_needed",
+			"outcome": "succeeded",
+			"semanticPublication": false,
+			"budgetAccepted": true
+		},
+		{
+			"id": "memory-progressive-disclosure",
+			"recallExpected": true,
+			"candidateAvailable": true,
+			"actions": [
+				{ "type": "memory_search" },
+				{ "type": "memory_read", "memoryIds": ["memory_release_boundary"] },
+				{
+					"type": "memory_review",
+					"mode": "keep",
+					"sourceMemoryIds": ["memory_release_boundary"]
+				}
+			],
+			"stopReason": "sufficient",
+			"outcome": "succeeded",
+			"semanticPublication": false,
+			"budgetAccepted": true
+		},
+		{
+			"id": "memory-conflict-review",
+			"recallExpected": true,
+			"candidateAvailable": true,
+			"actions": [
+				{ "type": "memory_search" },
+				{ "type": "memory_read", "memoryIds": ["memory_current", "memory_legacy"] },
+				{
+					"type": "memory_evidence",
+					"memoryId": "memory_current",
+					"evidenceIds": ["evidence_current", "evidence_legacy"]
+				},
+				{
+					"type": "memory_review",
+					"mode": "dispute",
+					"sourceMemoryIds": ["memory_current", "memory_legacy"]
+				}
+			],
+			"stopReason": "conflict_found",
+			"outcome": "succeeded",
+			"semanticPublication": true,
+			"budgetAccepted": true
+		},
+		{
+			"id": "skill-candidate-use",
+			"recallExpected": true,
+			"candidateAvailable": true,
+			"actions": [
+				{ "type": "skill_search" },
+				{ "type": "skill_read" },
+				{ "type": "skill_review", "mode": "keep" }
+			],
+			"stopReason": "sufficient",
+			"outcome": "succeeded",
+			"semanticPublication": false,
+			"budgetAccepted": true
+		},
+		{
+			"id": "failed-run-does-not-publish",
+			"recallExpected": true,
+			"candidateAvailable": true,
+			"actions": [
+				{ "type": "memory_search" },
+				{ "type": "memory_read", "memoryIds": ["memory_failed_run"] },
+				{
+					"type": "memory_review",
+					"mode": "revise",
+					"sourceMemoryIds": ["memory_failed_run"]
+				}
+			],
+			"stopReason": "run_failed",
+			"outcome": "error",
+			"semanticPublication": false,
+			"budgetAccepted": true
+		},
+		{
+			"id": "exact-total-budget",
+			"recallExpected": true,
+			"candidateAvailable": false,
+			"actions": [
+				{ "type": "memory_search" },
+				{ "type": "memory_search" },
+				{ "type": "memory_search" },
+				{ "type": "memory_read", "memoryIds": ["memory_1", "memory_2", "memory_3", "memory_4", "memory_5"] },
+				{ "type": "memory_evidence", "memoryId": "memory_1", "evidenceIds": ["evidence_1"] },
+				{ "type": "memory_evidence", "memoryId": "memory_2", "evidenceIds": ["evidence_2"] },
+				{ "type": "memory_evidence", "memoryId": "memory_3", "evidenceIds": ["evidence_3"] },
+				{ "type": "memory_evidence", "memoryId": "memory_4", "evidenceIds": ["evidence_4"] },
+				{ "type": "skill_search" },
+				{ "type": "skill_read" }
+			],
+			"stopReason": "sufficient",
+			"outcome": "succeeded",
+			"semanticPublication": false,
+			"budgetAccepted": true
+		},
+		{
+			"id": "over-total-budget",
+			"recallExpected": true,
+			"candidateAvailable": false,
+			"actions": [
+				{ "type": "memory_search" },
+				{ "type": "memory_search" },
+				{ "type": "memory_search" },
+				{ "type": "memory_read", "memoryIds": ["memory_1"] },
+				{ "type": "memory_evidence", "memoryId": "memory_1", "evidenceIds": ["evidence_1"] },
+				{ "type": "memory_evidence", "memoryId": "memory_1", "evidenceIds": ["evidence_2"] },
+				{ "type": "memory_evidence", "memoryId": "memory_1", "evidenceIds": ["evidence_3"] },
+				{ "type": "memory_evidence", "memoryId": "memory_1", "evidenceIds": ["evidence_4"] },
+				{ "type": "skill_search" },
+				{ "type": "skill_read" },
+				{ "type": "skill_search" }
+			],
+			"stopReason": "budget_exhausted",
+			"outcome": "succeeded",
+			"semanticPublication": false,
+			"budgetAccepted": false
+		}
+	]
+}

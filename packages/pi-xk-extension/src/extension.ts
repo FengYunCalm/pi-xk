@@ -1,4 +1,8 @@
+import { createHash } from "node:crypto";
+import { resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { SkillService } from "pi-xk-core";
 import { createPiXkGoalExtension, getPiXkSessionChainGateState, type PiXkGoalExtensionOptions } from "./index.ts";
 import { MemoryController, type MemoryGenerationHost } from "./memory-controller.ts";
 import { createPiXkMemoryExtension, type PiXkMemoryExtensionOptions } from "./memory-extension.ts";
@@ -42,6 +46,33 @@ function memoryGenerationHost(host: SessionChainHost): MemoryGenerationHost {
 
 /** Compose the public Pi-XK Goal/Task controls with the project Session Chain. */
 export function createPiXkRuntimeExtension(options: PiXkRuntimeExtensionOptions = {}): ExtensionFactory {
+	const skillAgentDir = resolve(options.memory?.agentDir ?? getAgentDir());
+	const skillProjectId = (projectRoot: string): string =>
+		`project_${createHash("sha256").update(projectRoot).digest("hex").slice(0, 32)}`;
+	const projectSkillServices = new Map<string, SkillService>();
+	const globalSkillServices = new Map<string, SkillService>();
+	const projectSkillServiceFor = (projectRoot: string): SkillService => {
+		const existing = projectSkillServices.get(projectRoot);
+		if (existing) return existing;
+		const service =
+			options.memory?.createProjectSkillService?.(projectRoot) ??
+			new SkillService(projectRoot, { scope: "project", projectId: skillProjectId(projectRoot) });
+		projectSkillServices.set(projectRoot, service);
+		return service;
+	};
+	const globalSkillServiceFor = (projectRoot: string): SkillService => {
+		const existing = globalSkillServices.get(projectRoot);
+		if (existing) return existing;
+		const service =
+			options.memory?.createGlobalSkillService?.(projectRoot, skillAgentDir) ??
+			new SkillService(projectRoot, {
+				scope: "global",
+				agentDir: skillAgentDir,
+				projectId: skillProjectId(projectRoot),
+			});
+		globalSkillServices.set(projectRoot, service);
+		return service;
+	};
 	const memoryControllers = new Map<string, MemoryController>();
 	const memoryControllerFor = (projectRoot: string): MemoryController => {
 		const existing = memoryControllers.get(projectRoot);
@@ -94,6 +125,8 @@ export function createPiXkRuntimeExtension(options: PiXkRuntimeExtensionOptions 
 		...options.memory,
 		createController: memoryControllerFor,
 		createSourceBridge: memoryBridgeFor,
+		createProjectSkillService: projectSkillServiceFor,
+		createGlobalSkillService: globalSkillServiceFor,
 		getCompactionGateState: async (ctx) => {
 			const gates = await getPiXkSessionChainGateState(ctx);
 			const activeGate = Object.entries(gates).find(([, blocked]) => blocked);
@@ -108,6 +141,8 @@ export function createPiXkRuntimeExtension(options: PiXkRuntimeExtensionOptions 
 		onProjectClosed: async (projectRoot, controller, bridge) => {
 			if (memoryControllers.get(projectRoot) === controller) memoryControllers.delete(projectRoot);
 			if (memoryBridges.get(projectRoot) === bridge) memoryBridges.delete(projectRoot);
+			projectSkillServices.delete(projectRoot);
+			globalSkillServices.delete(projectRoot);
 			await options.memory?.onProjectClosed?.(projectRoot, controller, bridge);
 		},
 	});
@@ -125,7 +160,10 @@ export function createPiXkRuntimeExtension(options: PiXkRuntimeExtensionOptions 
 					return;
 				}
 				ctx.ui.notify(
-					await renderPiXkRuntimeStatus(ctx, controllerFor(ctx.cwd), memoryControllerFor(ctx.cwd).getService()),
+					await renderPiXkRuntimeStatus(ctx, controllerFor(ctx.cwd), memoryControllerFor(ctx.cwd).getService(), {
+						project: projectSkillServiceFor(ctx.cwd),
+						global: globalSkillServiceFor(ctx.cwd),
+					}),
 					"info",
 				);
 			},

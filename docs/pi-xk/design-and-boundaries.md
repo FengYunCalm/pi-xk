@@ -9,7 +9,7 @@ Pi-XK 解决的是长期 Agent 工作中的可验证状态问题：目标如何�
 它不重新实现 Pi 的核心运行时。当前原则是：
 
 1. Pi 继续拥有 provider、Agent loop、tool transcript、原生 session tree、model 配置、TUI 和 compaction。
-2. Pi-XK 只为 Goal、Task、Session Chain、Memory 和 Artifact 建立独立领域事实源。
+2. Pi-XK 只为 Goal、Task、Session Chain、Memory、Skill 和 Artifact 建立独立领域事实源。
 3. 领域间通过不可变 ID、event reference 和 artifact reference 连接，不复制另一事实域的完整正文。
 4. 所有 read model、catalog 和 cache 都可从事实源重建，不能参与最终裁决。
 5. 运行时失败应留下可诊断状态，不通过静默重写历史来伪装成功。
@@ -24,6 +24,7 @@ Pi-XK 解决的是长期 Agent 工作中的可验证状态问题：目标如何�
 | L1 Segment Summary | Pi-XK Artifact Store | 保存单个 sealed Segment 的增量与 carry-forward | 不是 transcript 或系统指令 |
 | L2 Chain Rollup | Pi-XK Artifact Store | 汇总一个 branch 固定窗口内的有序 L1 evidence | 不是通用长期 memory |
 | Project Memory | Pi-XK Memory event log + Artifact Store | 保存跨 Goal、Task、branch 和重启的项目级证据图 | 不是 Goal State、摘要、第二 transcript 或跨项目知识库 |
+| Skill facts | Pi-XK Skill event log + Artifact Store | 保存项目/全局 candidate、revision、use evidence、promotion 和 managed projection provenance | 不是 Memory 正文、system instruction、权限授予者或任意可执行代码仓库 |
 | Memory Cue/Edge | Pi-XK Memory event log + Artifact Store | 提供规范化关键词和有向、多关系关联 | 标题和热度都不能单独升级为可信事实 |
 | Compaction | Pi | 在同一个物理 session 内压缩送给 provider 的上下文，并为下一次真实 run 提供一次性恢复上下文 | 不是 rollover、新用户请求或独立续跑器 |
 | Goal | Pi-XK | 保存稳定 Intent Anchor、可受控演进的 Current Objective、约束、验收、生命周期和执行状态 | 不是 prompt、摘要或 Task 列表 |
@@ -50,6 +51,8 @@ flowchart TD
     Rollup --> Memory
     Memory --> MemoryArtifact["Memory revision / Cue / Edge artifacts"]
     Memory --> MemoryIndex["SQLite / read model / Markdown projections"]
+    Memory --> Recall["Ambient recall ledger / review"]
+    Recall --> Skills["Skill candidate / revision / projection"]
 ```
 
 一个 Task 可以从普通 session 或 active Goal 中启动。Task V2 记录 parent 的 `chainId/branchId/segmentId/entryId`，并创建独立 child chain。它不会把 child transcript 复制回 parent；parent 只得到小型 link 和最终 result envelope。
@@ -63,6 +66,7 @@ flowchart TD
 | Task | `.pi-xk/tasks/<taskId>/events.jsonl` | 无 | `task-read-model.json` |
 | Session Chain | `.pi-xk/sessions/chains/<chainId>/events.jsonl` + Segment JSONL + L1/L2 artifacts | 当前 writable head Segment | `chain-read-model.json`、catalog、Rollup Markdown、pending/runtime state |
 | Memory | `.pi-xk/memory/events.jsonl` + Memory/Cue/Edge/proposal/source artifacts | `memory-config.json` 只控制 enabled/off | `memory-read-model*.json`、`index.sqlite`、History Cue、source cursor、Markdown |
+| Skill | `.pi-xk/skills/events.jsonl` 或 profile `pi-xk/skills/events.jsonl` + Skill/candidate/bundle/use artifacts | `skill-config.json` 只控制 enabled/off | Skill read model、`index.sqlite`、pending、managed `.pi/skills`/profile `skills` projection |
 | Artifact | `.pi-xk/artifacts/objects/...` 的内容寻址对象 | 无 | manifest/index 类视图 |
 
 Goal event log 裁决合同 revision 与 lifecycle；`goal-objective.md` 是只读合同投影；`goal-state.md` 是模型执行进度的可变权威文件。Objective 保存 Intent Anchor、Current Objective 和受保护合同字段，State 保存证据、完成/未决项、失败路径、阻塞和下一动作。模型必须在完成或暂停前更新 state，再由 runtime 把 lifecycle intent 与 checkpoint evidence 关联。
@@ -208,9 +212,9 @@ Chain 的确定性首条用户输入标题、`/chain rename`、archive 与 `/cha
 
 完整契约见[Session Chain Rollup 与模型检索](session-chain-rollups-and-model-retrieval.md)。
 
-## 8. Memory v1 设计边界
+## 8. Memory v1/v2 与 Skill 设计边界
 
-Memory v1 是当前项目内的长期证据层。它使用有类型、有方向、带时间与 provenance 的多重图，并把以下三维状态分开处理：
+Memory v1/v2 是当前项目内的长期证据层。它使用有类型、有方向、带时间与 provenance 的多重图，并把以下三维状态分开处理：
 
 - trust：`verified`、`model_inferred`、`disputed`；
 - freshness：`current`、`stale`、`unknown`，根据来源和相关 Git path 动态计算；
@@ -226,20 +230,22 @@ Capture 使用确定性 identity、Artifact Store canonical read-back、event/re
 
 ### 模型检索与权限
 
-Memory 采用渐进式披露：
+Memory 采用渐进式披露，且模型可以自主跳过搜索：
 
 1. D0 system manifest 最多 2 KiB，只含状态计数、capture 诊断和工具可用性；
 2. D1 `pi_xk_search_memory` 返回标题、kind、三维状态、关系提示、History Cue 和分页，不返回 statement；
 3. D2 `pi_xk_read_memory` 一次读取最多 5 条完整验证 Memory；
 4. D3 `pi_xk_expand_memory_evidence` 为一条 Memory 展开最多 3 个来源。
 
-所有 D2/D3 内容都是不可信历史证据，不是系统指令。`pi_xk_propose_memory_change` 只记录 CAS 保护的 proposal，不直接 apply；修改既有事实、verified 状态、生命周期、evidence detach 和 purge 都需要用户显式确认或命令。Memory 与 active Goal 冲突时，只能走现有 Goal revision 流程。
+所有 D2/D3 内容都是不可信历史证据，不是系统指令。新 run 使用 `pi_xk_review_memory` 处理本 run 已读取的 `keep/revise/supersede/dispute/create`，成功 `agent_settled` 后才发布；旧 `pi_xk_propose_memory_change` 仅保持历史可读。每个 run 有 10 total knowledge、8 Memory、3 search、10 unique read、6 evidence 和 4 Skill candidate action 上限。Memory 与 active Goal 冲突时，只能走现有 Goal revision 流程。
+
+Skill 是单独事实域。模型可以搜索/读取 candidate，并在成功 run 后提交 `pi_xk_review_skills`；Host 验证 bundle、evidence、scope、名称、路径、大小和 CAS。项目 Skill 可在证据充分后激活，全局 Skill 只能先进入 candidate，并在两个 repository、三次成功使用且无 failure 后晋升。连续两次失败进入 cooldown；模型不能 archive、purge、覆盖非 managed Skill 或改变工具权限。managed Skill projection 只在 settled boundary 做 resource-only reload，失败继续使用旧 generation。
 
 ### 检索投影和限制
 
 Node 使用 `node:sqlite` worker，Bun 使用 `bun:sqlite` worker；两者共享 FTS5/图 schema。D1 以 FTS5 和一至二跳邻接候选做 RRF 融合，候选池最多 200。heat 只做至多 10% 的排序修正，不能改变事实状态或删除数据。SQLite、read model、History Cue 和 Markdown 都可重建；v1 不启用 embedding/vector。
 
-Memory v1 只在当前项目内工作，不提供跨项目/用户级知识库、通用 context budget controller、自动 Task result 扫描、Observation/Resource 自修改、自动 retention/GC 或新的安全权限。完整使用和恢复契约见 [Memory v1](memory-v1.md)与 [ADR-0007](../adr/0007-memory-v1.md)。
+Memory/Skill v1/v2 仍不提供通用跨域 context budget controller、自动 Task result 全量扫描、自动 retention/GC 或新的安全权限。Skill 的跨项目晋升是受限 candidate 流程，不是跨项目知识库。完整契约见 [Memory v1/v2](memory-v1.md)、[Ambient Recall 与 Skill 演进](ambient-recall-and-skill-evolution.md)、[ADR-0007](../adr/0007-memory-v1.md) 与 [ADR-0008](../adr/0008-ambient-memory-v2-and-skill-v1.md)。
 
 ## 9. Artifact 边界
 
@@ -299,7 +305,7 @@ Artifact store 保存 checkpoint provenance、Task result、Session Chain summar
 - 多 Task 并发、DAG、retry、deadline、budget、worktree 和 RPC child；
 - 通用跨域 L0/L1/L2 Context controller；Session Chain 专用 L1/L2 已实现；
 - 跨项目/用户级知识库、vector/embedding 检索和通用 context budget controller；项目级 Memory v1 已实现；
-- Observation/Resource 自修改、memory-derived 自动反省或跨域 proposal；Memory proposal 只管理 Memory 事实；
+- 通用 Observation/Resource 自修改、memory-derived 全局反省或跨域任意 proposal；当前只实现有证据、受 Host 校验的 Memory review 与 Skill candidate/revision；
 - artifact retention/GC 和正式备份工具；
 - 多机调度、共享写入、高可用或远程服务；
 - 发布级 npm package、稳定跨版本迁移和无人值守 SLA。

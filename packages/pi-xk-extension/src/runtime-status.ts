@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { GoalStore, type MemoryService, TaskStore } from "pi-xk-core";
+import { DEFAULT_AMBIENT_RECALL_BUDGET, GoalStore, type MemoryService, type SkillService, TaskStore } from "pi-xk-core";
 import { getGoalRequiredAcceptanceStatus, readGoalStateSection } from "./goal-status.ts";
 import { isPiXkSessionLink, isPiXkTaskLink, PI_XK_SESSION_LINK_CUSTOM_TYPE } from "./index.ts";
 import { formatSessionChainRollupPublicationStatus, type SessionChainController } from "./session-chain-controller.ts";
@@ -124,12 +124,20 @@ export async function renderPiXkRuntimeStatus(
 	ctx: ExtensionContext,
 	controller: SessionChainController,
 	memory: MemoryService,
+	skills?: { project: SkillService; global: SkillService },
 ): Promise<string> {
-	const [chain, goal, task, memoryStatus] = await Promise.all([
+	const [chain, goal, task, memoryStatus, memoryReadModel, projectSkills, globalSkills] = await Promise.all([
 		chainStatus(ctx, controller),
 		goalStatus(ctx),
 		taskStatus(ctx),
 		memory.status().catch((error: unknown) => ({ error: error instanceof Error ? error.message : String(error) })),
+		memory
+			.getStore()
+			.loadReadModelSnapshot()
+			.then((snapshot) => snapshot.readModel)
+			.catch(() => null),
+		skills?.project.status().catch(() => null) ?? null,
+		skills?.global.status().catch(() => null) ?? null,
 	]);
 	const memoryFailed = "error" in memoryStatus;
 	const diagnostics = [
@@ -141,9 +149,17 @@ export async function renderPiXkRuntimeStatus(
 	const memoryLine = memoryFailed
 		? "Memory: unavailable"
 		: `Memory: ${memoryStatus.index?.memoryCount ?? 0} · pending ${memoryStatus.captures.scheduled + memoryStatus.captures.generating + memoryStatus.captures.proposed} · failed ${memoryStatus.captures.failed} · stale ${memoryStatus.index?.stateCounts.freshness.stale ?? 0} · disputed ${memoryStatus.index?.stateCounts.trust.disputed ?? 0}`;
+	const latestReconstruction = memoryReadModel?.reconstructions.at(-1);
+	const recallLine = `Recall: budget ${DEFAULT_AMBIENT_RECALL_BUDGET.maxTotalKnowledgeActions} total / ${DEFAULT_AMBIENT_RECALL_BUDGET.maxMemoryActions} Memory / ${DEFAULT_AMBIENT_RECALL_BUDGET.maxSkillCandidateActions} Skill · latest ${latestReconstruction ? `${latestReconstruction.runId} ${latestReconstruction.outcome}` : "none"}`;
+	const skillLine =
+		projectSkills && globalSkills
+			? `Skills: active ${projectSkills.facts.active + globalSkills.facts.active} · candidates ${projectSkills.facts.candidates + globalSkills.facts.candidates} · stale ${projectSkills.facts.stale + globalSkills.facts.stale} · cooldown ${projectSkills.facts.needsReview + globalSkills.facts.needsReview} · publication failures ${projectSkills.facts.publicationFailures + globalSkills.facts.publicationFailures}`
+			: "Skills: unavailable";
 	const recovery =
 		diagnostics.length === 0
 			? "Recovery: clear"
 			: `Recovery: ${diagnostics.length} diagnostic(s) · ${diagnostics.slice(0, 3).join(", ")}${diagnostics.length > 3 ? ", ..." : ""}`;
-	return ["Pi-XK status", ...chain.lines, goal.line, task.line, memoryLine, recovery].join("\n");
+	return ["Pi-XK status", ...chain.lines, goal.line, task.line, memoryLine, recallLine, skillLine, recovery].join(
+		"\n",
+	);
 }

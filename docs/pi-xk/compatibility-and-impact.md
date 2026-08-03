@@ -137,6 +137,10 @@ sealed Segment 不重写。从历史 Segment 或 tree 位置继续会创建 succ
 
 Memory facts 由 `.pi-xk/memory/events.jsonl` 与 `.pi-xk/artifacts/objects/` 中的 revision/Cue/Edge/proposal/source artifact 共同构成。`index.sqlite`、read model、History Cue、source cursor 和 Markdown 是可重建或可重新发现的投影/恢复数据。自动捕获和显式 backfill 会增加 artifact/event/SQLite 空间；archive/invalidate 不删除历史，purge 也保留 tombstone。当前没有自动 retention 或 Artifact GC。
 
+Ambient Memory v2 还会在成功 `agent_settled` 边界写入 reconstruction trace、Memory review 和 agent-run evidence。模型自主搜索不代表每轮都会产生事件：无 Memory 使用的普通 run 不写 access/reconstruction；只有 D2/D3 实际读取才计入访问。`error`、`abort`、`length` 或截断 run 不发布语义 revision。
+
+项目 Skill facts 位于 `.pi-xk/skills/`，全局 Skill facts 位于 profile 的 `pi-xk/skills/`；`.pi/skills/` 和 profile `skills/` 是可重建的 managed projection。候选不足、bundle 越界、非 managed 同名或 stale/cooldown 时不会进入下一轮 Skill generation。Skill-only reload 只在 settled boundary 发生，不重载 settings、extensions、prompts、themes、providers，不改变 tools，不发送 shutdown/start。
+
 ## 8. Goal 对日常 session 操作的影响
 
 | 操作 | active Goal 的结果 | 原因 |
@@ -185,7 +189,9 @@ Compaction 后不会把最后一条用户提示词再次发送。overflow 在同
 
 当模型判断当前问题依赖“之前、继续、原始要求、待办、历史约束或 Goal/Task 恢复”时，可先调用只读列表工具查看 L1 标题和 L1/L2 范围，再读取相关摘要。工具调用会增加本地读取和一个 tool round，但不会触发 provider 摘要生成、backfill 或修复。摘要内的命令和伪系统提示仅作为不可信历史证据返回，不能扩大工具权限。
 
-当问题依赖跨 Goal/branch 的决定、约束、偏好、经验、未决事项或设计原因时，模型先用 `pi_xk_search_memory` 获取 D1 候选，再按需读取最多 5 条 D2，只有 D2 不足、stale 或 disputed 时才展开最多 3 个 D3 evidence。Memory 内容同样是历史证据，不是系统指令。D2/D3 的实际读取才记录 access；单纯搜索曝光不增加 heat。
+当问题依赖跨 Goal/branch 的决定、约束、偏好、经验、未决事项或设计原因时，模型自主用 `pi_xk_search_memory` 获取 D1 候选，再按需读取最多 5 条 D2，只有 D2 不足、stale 或 disputed 时才展开最多 3 个 D3 evidence。Memory 内容同样是历史证据，不是系统指令。D2/D3 的实际读取才记录 access；单纯搜索曝光不增加 heat。单次 run 共享 10 个知识动作、8 个 Memory 动作、3 次 Memory search、10 个 unique read、6 个 evidence 和 4 个 Skill candidate action 预算。
+
+模型也可自主搜索和读取 Skill candidate，但只有成功 settled 后提交的 `pi_xk_review_skills` 才可能生成 candidate/revision。Skill 正文不注入 D0；模型必须说明适用/偏离条件和验证证据，Host 负责 bundle、CAS、证据和 projection。
 
 V3 Goal 的普通 system guidance 也只提供 `goal-objective.md`、`goal-state.md` 路径、合同 revision 和 mismatch/修订反馈，不复制原始用户要求或完整合同。Objective 是只读合同投影；State 是执行台账，实质进展必须在 run 结束前回写。被用户要求修改的 revision feedback 只作为下一次修订 run 的 user-role JSON 数据，不能自行改变合同、system 规则、工具权限或授权；provider error/aborted 后仍可恢复，成功响应后不再注入。revision CAS 冲突会终止旧 run 并重新 preflight。模型只有在新证据使 Current Objective 的表述过时时才应提案，不能静默改变 Intent Anchor、验收、约束或授权。
 
@@ -245,7 +251,7 @@ Pi-XK 为此增加的 Host API 还包括 `queueUserMessage`：extension 可以�
 
 Goal V1/V2 和 Task V1 的读取兼容已经实现，但这不代表任意未来版本都可直接降级。新 Goal 使用 V3；旧 Goal 首次迁移需用户确认，历史 event/hash 不重写。写入 Goal event v2、Session Chain L1 V2 或其他新 schema 后，旧代码可能无法继续写同一状态。没有明确 migration/rollback 说明时，不应让新旧 Pi-XK 版本交替写同一个项目状态。
 
-Memory v1 不自动回填升级前的 Goal/L2。升级后先记录当前 source head 作为 baseline，之后的新稳定边界才自动捕获；历史来源使用有限额 `/memory backfill [limit]`。一旦写入 `pi-xk.memory-event.v1` 和对应 artifact，旧版本可以忽略该目录，但不能安全管理、修复或继续写 Memory；SQLite/Markdown 可以重建，event/artifact 不能通过降级删除。
+Memory v1/v2 不自动回填升级前的 Goal/L2。升级后先记录当前 source head 作为 baseline，之后的新稳定边界才自动捕获；历史来源使用有限额 `/memory backfill [limit]`。Skill facts/候选同样不自动批量生成，跨项目晋升必须显式满足 evidence 门槛。一旦写入 `pi-xk.memory-event.v1`、`pi-xk.skill-event.v1` 和对应 artifact，旧版本可以忽略这些目录，但不能安全管理、修复或继续写 Memory/Skill；SQLite/Markdown/projection 可以重建，event/artifact 不能通过降级删除。
 
 ## 15. 决策清单
 
@@ -255,6 +261,7 @@ Memory v1 不自动回填升级前的 Goal/L2。升级后先记录当前 source 
 - 接受项目新增 `.pi-xk/` 和 managed session 数据；
 - 接受 Goal、Task、rollover 带来的额外 provider 调用；
 - 接受 Memory 稳定边界捕获带来的额外 provider 调用，或预先执行 `/memory config off`；
+- 接受成功 run 的 Ambient Memory review 和 Skill candidate/reload 可能增加 provider 调用，或预先关闭 `/memory config ambient off`、`/memory config evolution off` 和 `/skill config off`；
 - 接受默认每 5 个 sealed Segment 的 L2 调用，或预先执行 `/chain rollup config off`；
 - 不需要同一 parent 的并发 Task、worktree 隔离或无人值守预算；
 - 不会让多个进程并行写同一 session；

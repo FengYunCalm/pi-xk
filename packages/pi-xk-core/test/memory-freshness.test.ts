@@ -4,7 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
-import { captureGitFreshnessBasis, resolveGitFreshness, verifyGitEvidenceLocator } from "../src/index.ts";
+import {
+	captureGitFreshnessBasis,
+	resolveGitFreshness,
+	resolveGitRepositoryId,
+	verifyGitEvidenceLocator,
+} from "../src/index.ts";
 
 const execFile = promisify(execFileCallback);
 const tempDirs: string[] = [];
@@ -76,5 +81,19 @@ describe("Memory Git freshness", () => {
 				scopePaths: ["src/missing.ts"],
 			}),
 		).rejects.toThrow();
+	});
+
+	it("uses the repository remote as a stable cross-worktree identity", async () => {
+		const first = await createRepository();
+		const second = await createRepository();
+		await execFile("git", ["remote", "add", "origin", "https://example.invalid/shared/repository.git"], {
+			cwd: first,
+		});
+		await execFile("git", ["remote", "add", "origin", "https://example.invalid/shared/repository.git"], {
+			cwd: second,
+		});
+
+		expect(await resolveGitRepositoryId(first)).toBe(await resolveGitRepositoryId(second));
+		expect(await resolveGitRepositoryId(join(first, "missing"))).toBeNull();
 	});
 });

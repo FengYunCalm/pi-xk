@@ -59,6 +59,47 @@ Skill content here.`,
 			expect(skills.some((s) => s.name === "test-skill")).toBe(true);
 		});
 
+		it("should reload only the current Skill path snapshot", async () => {
+			const skillsDir = join(agentDir, "skills");
+			mkdirSync(skillsDir, { recursive: true });
+			writeFileSync(
+				join(skillsDir, "first.md"),
+				`---
+name: first-skill
+description: First Skill generation
+---
+First generation.`,
+			);
+			const loader = new DefaultResourceLoader({ cwd, agentDir });
+			await loader.reload();
+			const originalExtensions = loader.getExtensions();
+			const originalPrompts = loader.getPrompts();
+
+			writeFileSync(
+				join(skillsDir, "first.md"),
+				`---
+name: first-skill
+description: Updated first Skill generation
+---
+Updated first generation.`,
+			);
+			writeFileSync(
+				join(skillsDir, "second.md"),
+				`---
+name: second-skill
+description: Second Skill generation
+---
+Second generation.`,
+			);
+			const reloaded = await loader.reloadSkills();
+
+			expect(reloaded).toMatchObject({ previousCount: 1, currentCount: 2, diagnostics: [] });
+			expect(loader.getSkills().skills.map((skill) => skill.name)).toEqual(["first-skill", "second-skill"]);
+			expect(loader.getSkills().skills[0]?.description).toBe("Updated first Skill generation");
+			expect(loader.getExtensions()).toBe(originalExtensions);
+			expect(loader.getPrompts().prompts).toBe(originalPrompts.prompts);
+		});
+
 		it("should ignore extra markdown files in auto-discovered skill dirs", async () => {
 			const skillDir = join(agentDir, "skills", "pi-skills", "browser-tools");
 			mkdirSync(skillDir, { recursive: true });

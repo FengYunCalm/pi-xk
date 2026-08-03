@@ -2,10 +2,32 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Dirent } from "node:fs";
 import { open, readdir, readFile, rename, rm, stat } from "node:fs/promises";
 import { basename, extname, join, resolve } from "node:path";
+import {
+	type EvidenceRefV2,
+	MEMORY_EDGE_V2_SCHEMA,
+	MEMORY_EVENT_V2_SCHEMA,
+	MEMORY_READ_MODEL_V2_SCHEMA,
+	MEMORY_RECONSTRUCTION_TRACE_SCHEMA,
+	MEMORY_REVIEW_DECISION_SCHEMA,
+	MEMORY_REVISION_V2_SCHEMA,
+	type MemoryEdge,
+	type MemoryEdgeV2,
+	type MemoryReconstructionTraceV1,
+	type MemoryReviewDecisionV1,
+	type MemoryRevision,
+	type MemoryRevisionV2,
+	validateEvidenceRefV2,
+	validateMemoryEdge,
+	validateMemoryEdgeV2,
+	validateMemoryReconstructionTraceV1,
+	validateMemoryReviewDecisionV1,
+	validateMemoryRevision,
+	validateMemoryRevisionV2,
+} from "./ambient-memory-contract.ts";
 import { ArtifactNotFoundError, ArtifactStore, validateArtifactMetadata } from "./artifact-store.ts";
 import {
 	type CueNodeV1,
-	type EvidenceRefV1,
+	type GitFreshnessBasisV1,
 	MEMORY_CAPTURE_SOURCE_SCHEMA,
 	MEMORY_CHANGE_PROPOSAL_SCHEMA,
 	MEMORY_CUE_SCHEMA,
@@ -57,6 +79,8 @@ export type MemoryEventType =
 	| "evidence_detached"
 	| "memory_purged"
 	| "access_recorded";
+
+export type MemoryEventTypeV2 = "reconstruction_recorded" | "memory_review_applied" | "memory_review_failed";
 
 export interface CaptureScheduledPayloadV1 {
 	captureId: string;
@@ -174,6 +198,32 @@ export interface AccessRecordedPayloadV1 {
 	evidenceIds: string[];
 }
 
+export interface ReconstructionRecordedPayloadV2 {
+	runId: string;
+	traceArtifactId: string;
+	outcome: MemoryReconstructionTraceV1["outcome"];
+}
+
+export interface MemoryReviewAppliedPayloadV2 {
+	runId: string;
+	captureId: string | null;
+	traceArtifactId: string;
+	decisionArtifactIds: string[];
+	revisions: PublishedMemoryRevisionRefV1[];
+	cues: PublishedCueRefV1[];
+	edges: PublishedEdgeRefV1[];
+	implicitKeepMemoryIds: string[];
+}
+
+export interface MemoryReviewFailedPayloadV2 {
+	runId: string;
+	traceArtifactId: string;
+	stage: "validation" | "artifact" | "publication" | "projection";
+	errorCode: string;
+	retryable: false;
+	message: string;
+}
+
 export type MemoryEventPayloadV1 =
 	| CaptureScheduledPayloadV1
 	| GenerationStartedPayloadV1
@@ -187,6 +237,11 @@ export type MemoryEventPayloadV1 =
 	| MemoryPurgedPayloadV1
 	| AccessRecordedPayloadV1;
 
+export type MemoryEventPayloadV2 =
+	| ReconstructionRecordedPayloadV2
+	| MemoryReviewAppliedPayloadV2
+	| MemoryReviewFailedPayloadV2;
+
 export interface MemoryEventPayloadMapV1 {
 	capture_scheduled: CaptureScheduledPayloadV1;
 	generation_started: GenerationStartedPayloadV1;
@@ -199,6 +254,12 @@ export interface MemoryEventPayloadMapV1 {
 	evidence_detached: EvidenceDetachedPayloadV1;
 	memory_purged: MemoryPurgedPayloadV1;
 	access_recorded: AccessRecordedPayloadV1;
+}
+
+export interface MemoryEventPayloadMapV2 {
+	reconstruction_recorded: ReconstructionRecordedPayloadV2;
+	memory_review_applied: MemoryReviewAppliedPayloadV2;
+	memory_review_failed: MemoryReviewFailedPayloadV2;
 }
 
 interface MemoryEventBaseV1 {
@@ -220,14 +281,46 @@ export type MemoryEventV1 = {
 	};
 }[MemoryEventType];
 
+interface MemoryEventBaseV2 {
+	schema: typeof MEMORY_EVENT_V2_SCHEMA;
+	eventId: string;
+	sequence: number;
+	actor: MemoryActor;
+	timestamp: string;
+	prevHash: string | null;
+	schemaVersion: 2;
+	idempotencyKey: string;
+	hash: string;
+}
+
+export type MemoryEventV2 = {
+	[TEventType in MemoryEventTypeV2]: MemoryEventBaseV2 & {
+		eventType: TEventType;
+		payload: MemoryEventPayloadMapV2[TEventType];
+	};
+}[MemoryEventTypeV2];
+
+export type MemoryEvent = MemoryEventV1 | MemoryEventV2;
+
 type EventWithoutHash = {
 	[TEventType in MemoryEventType]: Omit<Extract<MemoryEventV1, { eventType: TEventType }>, "hash">;
 }[MemoryEventType];
+
+type EventWithoutHashV2 = {
+	[TEventType in MemoryEventTypeV2]: Omit<Extract<MemoryEventV2, { eventType: TEventType }>, "hash">;
+}[MemoryEventTypeV2];
 
 interface HashableMemoryEventV1 extends Omit<MemoryEventBaseV1, "hash"> {
 	eventType: MemoryEventType;
 	payload: MemoryEventPayloadV1;
 }
+
+interface HashableMemoryEventV2 extends Omit<MemoryEventBaseV2, "hash"> {
+	eventType: MemoryEventTypeV2;
+	payload: MemoryEventPayloadV2;
+}
+
+type HashableMemoryEvent = HashableMemoryEventV1 | HashableMemoryEventV2;
 
 export type MemoryCaptureStatus =
 	| "scheduled"
@@ -253,12 +346,15 @@ export interface MemoryCaptureProjectionV1 {
 
 export interface MemoryReplay {
 	head: MemoryHead;
-	events: MemoryEventV1[];
+	events: MemoryEvent[];
 	captures: Map<string, MemoryCaptureProjectionV1>;
 	memories: Map<string, PublishedMemoryRevisionRefV1>;
 	cues: Map<string, PublishedCueRefV1>;
 	edges: Map<string, PublishedEdgeRefV1>;
 	proposals: Map<string, ProposalRecordedPayloadV1>;
+	reconstructions: Map<string, ReconstructionRecordedPayloadV2>;
+	reviewedRunIds: Set<string>;
+	failedReviewRunIds: Set<string>;
 	purgedSourceDigests: Set<string>;
 	tailDiagnostic?: MemoryTailDiagnostic;
 }
@@ -270,7 +366,7 @@ export interface MemoryAccessProjectionV1 {
 }
 
 export interface MemoryReadResultV1 {
-	revision: MemoryRevisionV1;
+	revision: MemoryRevision;
 	artifactId: string;
 	state: MemoryStateV1;
 }
@@ -290,6 +386,28 @@ export interface MemoryApplyResultV1 {
 	edges: MemoryEdgeV1[];
 }
 
+export type MemoryEdgeResult = MemoryEdge;
+
+export interface MemoryReconstructionRecordResultV1 {
+	write: MemoryWriteResult<"reconstruction_recorded">;
+	trace: MemoryReconstructionTraceV1;
+	traceArtifactId: string;
+}
+
+export interface MemoryReviewApplyResultV1 {
+	write: MemoryWriteResult<"memory_review_applied">;
+	decisions: MemoryReviewDecisionV1[];
+	revisions: MemoryRevisionV2[];
+	cues: CueNodeV1[];
+	edges: MemoryEdgeV2[];
+}
+
+export interface MemoryReviewPublicationContextV1 {
+	captureId?: string;
+	cues?: readonly CueNodeV1[];
+	freshnessBasisByDecisionId?: ReadonlyMap<string, GitFreshnessBasisV1>;
+}
+
 export interface MemoryPurgeCleanupDiagnosticV1 {
 	artifactId: string;
 	errorCode: string;
@@ -304,7 +422,7 @@ export interface MemoryPurgeResultV1 {
 }
 
 export interface MemoryReadModelV1 {
-	schema: typeof MEMORY_READ_MODEL_SCHEMA;
+	schema: typeof MEMORY_READ_MODEL_SCHEMA | typeof MEMORY_READ_MODEL_V2_SCHEMA;
 	head: MemoryHead;
 	eventCount: number;
 	captures: MemoryCaptureProjectionV1[];
@@ -316,6 +434,9 @@ export interface MemoryReadModelV1 {
 	purgedSourceDigests: string[];
 	accessRunIds: string[];
 	accesses: MemoryAccessProjectionV1[];
+	reconstructions: ReconstructionRecordedPayloadV2[];
+	reviewedRunIds: string[];
+	failedReviewRunIds: string[];
 	counts: {
 		scheduled: number;
 		generating: number;
@@ -363,8 +484,10 @@ export interface MemoryApplyOptions extends MemoryMutationOptions {
 	confirmed?: boolean;
 }
 
-export interface MemoryWriteResult<TEventType extends MemoryEventType = MemoryEventType> {
-	event: Extract<MemoryEventV1, { eventType: TEventType }>;
+export interface MemoryWriteResult<
+	TEventType extends MemoryEventType | MemoryEventTypeV2 = MemoryEventType | MemoryEventTypeV2,
+> {
+	event: Extract<MemoryEvent, { eventType: TEventType }>;
 	head: MemoryHead;
 }
 
@@ -398,7 +521,7 @@ export interface MemoryStoreOptions {
 export interface MemoryDeepInspectionV1 {
 	replay: MemoryReplay;
 	referencedArtifactIds: string[];
-	evidenceRefs: EvidenceRefV1[];
+	evidenceRefs: EvidenceRefV2[];
 	orphanArtifactIds: string[];
 	purgedArtifactIdsPresent: string[];
 	purgedArtifactIdsMissing: string[];
@@ -512,6 +635,14 @@ function sha(value: unknown, field: string): string {
 		throw new MemoryValidationError(`${field} must be a SHA-256 identifier`);
 	}
 	return value;
+}
+
+function digestValue(value: unknown): string {
+	return `sha256:${createHash("sha256").update(stableJsonStringify(value)).digest("hex")}`;
+}
+
+function derivedIdentifier(prefix: "memory" | "edge", value: string): string {
+	return `${prefix}_${createHash("sha256").update(value).digest("hex").slice(0, 32)}`;
 }
 
 function integer(value: unknown, field: string): number {
@@ -839,7 +970,75 @@ function parsePayload(eventType: MemoryEventType, value: unknown): MemoryEventPa
 	};
 }
 
-function calculateHash(event: HashableMemoryEventV1): string {
+function parsePayloadV2(eventType: MemoryEventTypeV2, value: unknown): MemoryEventPayloadV2 {
+	if (!isRecord(value)) throw new MemoryValidationError("Memory v2 event payload must be an object");
+	if (eventType === "reconstruction_recorded") {
+		exact(value, ["runId", "traceArtifactId", "outcome"], "reconstruction_recorded payload");
+		if (
+			!(typeof value.outcome === "string" && ["succeeded", "error", "aborted", "incomplete"].includes(value.outcome))
+		) {
+			throw new MemoryValidationError("reconstruction_recorded outcome is invalid");
+		}
+		return {
+			runId: requiredString(value.runId, "runId", 160),
+			traceArtifactId: sha(value.traceArtifactId, "traceArtifactId"),
+			outcome: value.outcome as MemoryReconstructionTraceV1["outcome"],
+		};
+	}
+	if (eventType === "memory_review_applied") {
+		exact(
+			value,
+			[
+				"runId",
+				"captureId",
+				"traceArtifactId",
+				"decisionArtifactIds",
+				"revisions",
+				"cues",
+				"edges",
+				"implicitKeepMemoryIds",
+			],
+			"memory_review_applied payload",
+		);
+		if (!Array.isArray(value.revisions) || !Array.isArray(value.cues) || !Array.isArray(value.edges)) {
+			throw new MemoryValidationError("memory_review_applied fact references must be arrays");
+		}
+		return {
+			runId: requiredString(value.runId, "runId", 160),
+			captureId: value.captureId === null ? null : requiredString(value.captureId, "captureId", 160),
+			traceArtifactId: sha(value.traceArtifactId, "traceArtifactId"),
+			decisionArtifactIds: artifactArray(value.decisionArtifactIds, "decisionArtifactIds"),
+			revisions: value.revisions.map((entry, index) => publishedRevisionRef(entry, `revisions[${index}]`)),
+			cues: value.cues.map((entry, index) => publishedCueRef(entry, `cues[${index}]`)),
+			edges: value.edges.map((entry, index) => publishedEdgeRef(entry, `edges[${index}]`)),
+			implicitKeepMemoryIds: stringArray(value.implicitKeepMemoryIds, "implicitKeepMemoryIds"),
+		};
+	}
+	exact(
+		value,
+		["runId", "traceArtifactId", "stage", "errorCode", "retryable", "message"],
+		"memory_review_failed payload",
+	);
+	if (
+		!(
+			typeof value.stage === "string" &&
+			["validation", "artifact", "publication", "projection"].includes(value.stage)
+		)
+	) {
+		throw new MemoryValidationError("memory_review_failed stage is invalid");
+	}
+	if (value.retryable !== false) throw new MemoryValidationError("memory_review_failed must be non-retryable");
+	return {
+		runId: requiredString(value.runId, "runId", 160),
+		traceArtifactId: sha(value.traceArtifactId, "traceArtifactId"),
+		stage: value.stage as MemoryReviewFailedPayloadV2["stage"],
+		errorCode: requiredString(value.errorCode, "errorCode", 160),
+		retryable: false,
+		message: requiredString(value.message, "message", 2048),
+	};
+}
+
+function calculateHash(event: HashableMemoryEvent): string {
 	return `sha256:${createHash("sha256").update(stableJsonStringify(event)).digest("hex")}`;
 }
 
@@ -849,11 +1048,17 @@ function createEvent<TEventType extends MemoryEventType>(
 	return { ...input, hash: calculateHash(input) } as Extract<MemoryEventV1, { eventType: TEventType }>;
 }
 
-function headFor(event: MemoryEventV1 | undefined): MemoryHead {
+function createEventV2<TEventType extends MemoryEventTypeV2>(
+	input: Extract<EventWithoutHashV2, { eventType: TEventType }>,
+): Extract<MemoryEventV2, { eventType: TEventType }> {
+	return { ...input, hash: calculateHash(input) } as Extract<MemoryEventV2, { eventType: TEventType }>;
+}
+
+function headFor(event: MemoryEvent | undefined): MemoryHead {
 	return event ? { sequence: event.sequence, hash: event.hash } : { sequence: 0, hash: null };
 }
 
-function parseEvent(value: unknown, lineNumber: number): MemoryEventV1 {
+function parseEvent(value: unknown, lineNumber: number): MemoryEvent {
 	if (!isRecord(value)) throw new MemoryCorruptionError(`Memory event ${lineNumber} is not an object`);
 	const fields = [
 		"schema",
@@ -870,43 +1075,57 @@ function parseEvent(value: unknown, lineNumber: number): MemoryEventV1 {
 	];
 	try {
 		exact(value, fields, `Memory event ${lineNumber}`);
-		if (value.schema !== MEMORY_EVENT_SCHEMA || value.schemaVersion !== 1)
-			throw new MemoryValidationError("schema is unsupported");
-		if (
-			![
-				"capture_scheduled",
-				"generation_started",
-				"capture_failed",
-				"capture_skipped",
-				"proposal_recorded",
-				"memory_change_applied",
-				"proposal_rejected",
-				"memory_lifecycle_changed",
-				"evidence_detached",
-				"memory_purged",
-				"access_recorded",
-			].includes(String(value.eventType))
-		) {
+		const isV1 = value.schema === MEMORY_EVENT_SCHEMA && value.schemaVersion === 1;
+		const isV2 = value.schema === MEMORY_EVENT_V2_SCHEMA && value.schemaVersion === 2;
+		if (!isV1 && !isV2) throw new MemoryValidationError("schema is unsupported");
+		const v1Types = [
+			"capture_scheduled",
+			"generation_started",
+			"capture_failed",
+			"capture_skipped",
+			"proposal_recorded",
+			"memory_change_applied",
+			"proposal_rejected",
+			"memory_lifecycle_changed",
+			"evidence_detached",
+			"memory_purged",
+			"access_recorded",
+		] as const;
+		const v2Types = ["reconstruction_recorded", "memory_review_applied", "memory_review_failed"] as const;
+		if (isV1 && !v1Types.includes(value.eventType as (typeof v1Types)[number])) {
 			throw new MemoryValidationError("eventType is unsupported");
 		}
-		const eventType = value.eventType as MemoryEventType;
+		if (isV2 && !v2Types.includes(value.eventType as (typeof v2Types)[number])) {
+			throw new MemoryValidationError("eventType is unsupported");
+		}
 		const sequence = integer(value.sequence, "sequence");
 		const prevHash = value.prevHash === null ? null : sha(value.prevHash, "prevHash");
-		const withoutHash: HashableMemoryEventV1 = {
-			schema: MEMORY_EVENT_SCHEMA,
+		const common = {
 			eventId: requiredString(value.eventId, "eventId"),
 			sequence,
-			eventType,
 			actor: actor(value.actor),
 			timestamp: timestamp(value.timestamp),
 			prevHash,
-			payload: parsePayload(eventType, value.payload),
-			schemaVersion: 1,
 			idempotencyKey: requiredString(value.idempotencyKey, "idempotencyKey"),
 		};
+		const withoutHash: HashableMemoryEvent = isV1
+			? {
+					schema: MEMORY_EVENT_SCHEMA,
+					...common,
+					eventType: value.eventType as MemoryEventType,
+					payload: parsePayload(value.eventType as MemoryEventType, value.payload),
+					schemaVersion: 1,
+				}
+			: {
+					schema: MEMORY_EVENT_V2_SCHEMA,
+					...common,
+					eventType: value.eventType as MemoryEventTypeV2,
+					payload: parsePayloadV2(value.eventType as MemoryEventTypeV2, value.payload),
+					schemaVersion: 2,
+				};
 		const hash = sha(value.hash, "hash");
 		if (calculateHash(withoutHash) !== hash) throw new MemoryValidationError("hash mismatch");
-		return { ...withoutHash, hash } as MemoryEventV1;
+		return { ...withoutHash, hash } as MemoryEvent;
 	} catch (error) {
 		throw new MemoryCorruptionError(
 			`Memory event ${lineNumber} is invalid: ${error instanceof Error ? error.message : "unknown error"}`,
@@ -914,11 +1133,25 @@ function parseEvent(value: unknown, lineNumber: number): MemoryEventV1 {
 	}
 }
 
-function projectCaptures(events: readonly MemoryEventV1[]): Map<string, MemoryCaptureProjectionV1> {
+function projectCaptures(events: readonly MemoryEvent[]): Map<string, MemoryCaptureProjectionV1> {
 	const captures = new Map<string, MemoryCaptureProjectionV1>();
 	const proposals = new Map<string, string | null>();
 	const resolvedProposals = new Set<string>();
 	for (const event of events) {
+		if (event.schema === MEMORY_EVENT_V2_SCHEMA) {
+			if (event.eventType === "memory_review_applied" && event.payload.captureId !== null) {
+				const capture = captures.get(event.payload.captureId);
+				if (
+					!capture ||
+					(capture.status !== "generating" && !(capture.status === "failed" && capture.retryable === true)) ||
+					event.payload.runId !== capture.captureId
+				) {
+					throw new MemoryCorruptionError("memory_review_applied does not match a generating capture");
+				}
+				captures.set(capture.captureId, { ...capture, status: "applied", errorCode: null, retryable: null });
+			}
+			continue;
+		}
 		if (event.eventType === "capture_scheduled") {
 			if (captures.has(event.payload.captureId)) {
 				throw new MemoryCorruptionError("capture_scheduled duplicates captureId");
@@ -1032,21 +1265,83 @@ function assertPurgeMatchesCurrentMemory(
 	}
 }
 
-function projectFacts(events: readonly MemoryEventV1[]): {
+function projectFacts(events: readonly MemoryEvent[]): {
 	memories: Map<string, PublishedMemoryRevisionRefV1>;
 	cues: Map<string, PublishedCueRefV1>;
 	edges: Map<string, PublishedEdgeRefV1>;
 	proposals: Map<string, ProposalRecordedPayloadV1>;
+	reconstructions: Map<string, ReconstructionRecordedPayloadV2>;
+	reviewedRunIds: Set<string>;
+	failedReviewRunIds: Set<string>;
 	purgedSourceDigests: Set<string>;
 } {
 	const memories = new Map<string, PublishedMemoryRevisionRefV1>();
 	const cues = new Map<string, PublishedCueRefV1>();
 	const edges = new Map<string, PublishedEdgeRefV1>();
 	const proposals = new Map<string, ProposalRecordedPayloadV1>();
+	const reconstructions = new Map<string, ReconstructionRecordedPayloadV2>();
+	const reviewedRunIds = new Set<string>();
+	const failedReviewRunIds = new Set<string>();
 	const purgedSourceDigests = new Set<string>();
 	const resolvedProposals = new Set<string>();
 	const accessRuns = new Set<string>();
 	for (const event of events) {
+		if (event.schema === MEMORY_EVENT_V2_SCHEMA) {
+			if (event.eventType === "reconstruction_recorded") {
+				if (reconstructions.has(event.payload.runId)) {
+					throw new MemoryCorruptionError("reconstruction_recorded duplicates runId");
+				}
+				reconstructions.set(event.payload.runId, event.payload);
+			} else if (event.eventType === "memory_review_applied") {
+				const reconstruction = reconstructions.get(event.payload.runId);
+				if (
+					!reconstruction ||
+					reconstruction.traceArtifactId !== event.payload.traceArtifactId ||
+					reconstruction.outcome !== "succeeded" ||
+					reviewedRunIds.has(event.payload.runId) ||
+					failedReviewRunIds.has(event.payload.runId)
+				) {
+					throw new MemoryCorruptionError(
+						"memory_review_applied requires one successful unresolved reconstruction",
+					);
+				}
+				reviewedRunIds.add(event.payload.runId);
+				for (const cue of event.payload.cues) {
+					const current = cues.get(cue.cueId);
+					if ((current?.revision ?? 0) + 1 !== cue.revision) {
+						throw new MemoryCorruptionError(`memory_review_applied breaks cue sequence for ${cue.cueId}`);
+					}
+					cues.set(cue.cueId, cue);
+				}
+				for (const revision of event.payload.revisions) {
+					const current = memories.get(revision.memoryId);
+					if ((current?.revision ?? 0) + 1 !== revision.revision) {
+						throw new MemoryCorruptionError(
+							`memory_review_applied breaks revision sequence for ${revision.memoryId}`,
+						);
+					}
+					memories.set(revision.memoryId, revision);
+				}
+				for (const edge of event.payload.edges) {
+					if (edges.has(edge.edgeId)) {
+						throw new MemoryCorruptionError(`memory_review_applied duplicates edge ${edge.edgeId}`);
+					}
+					edges.set(edge.edgeId, edge);
+				}
+			} else {
+				const reconstruction = reconstructions.get(event.payload.runId);
+				if (
+					!reconstruction ||
+					reconstruction.traceArtifactId !== event.payload.traceArtifactId ||
+					reviewedRunIds.has(event.payload.runId) ||
+					failedReviewRunIds.has(event.payload.runId)
+				) {
+					throw new MemoryCorruptionError("memory_review_failed requires one unresolved reconstruction");
+				}
+				failedReviewRunIds.add(event.payload.runId);
+			}
+			continue;
+		}
 		if (event.eventType === "capture_scheduled") {
 			if (purgedSourceDigests.has(event.payload.sourceDigest)) {
 				throw new MemoryCorruptionError("capture_scheduled reuses a purged source digest");
@@ -1177,7 +1472,16 @@ function projectFacts(events: readonly MemoryEventV1[]): {
 			}
 		}
 	}
-	return { memories, cues, edges, proposals, purgedSourceDigests };
+	return {
+		memories,
+		cues,
+		edges,
+		proposals,
+		reconstructions,
+		reviewedRunIds,
+		failedReviewRunIds,
+		purgedSourceDigests,
+	};
 }
 
 function replayRaw(raw: string): MemoryReplay {
@@ -1211,9 +1515,10 @@ function replayRaw(raw: string): MemoryReplay {
 	};
 }
 
-function accessProjections(events: readonly MemoryEventV1[]): Map<string, MemoryAccessProjectionV1> {
+function accessProjections(events: readonly MemoryEvent[]): Map<string, MemoryAccessProjectionV1> {
 	const accesses = new Map<string, MemoryAccessProjectionV1>();
 	for (const event of events) {
+		if (event.schema === MEMORY_EVENT_V2_SCHEMA) continue;
 		if (event.eventType === "access_recorded") {
 			for (const memoryId of event.payload.memoryIds) {
 				const current = accesses.get(memoryId);
@@ -1245,7 +1550,7 @@ function buildReadModel(replay: MemoryReplay): MemoryReadModelV1 {
 	};
 	for (const capture of captures) counts[capture.status] += 1;
 	return {
-		schema: MEMORY_READ_MODEL_SCHEMA,
+		schema: MEMORY_READ_MODEL_V2_SCHEMA,
 		head: replay.head,
 		eventCount: replay.events.length,
 		captures,
@@ -1254,17 +1559,29 @@ function buildReadModel(replay: MemoryReplay): MemoryReadModelV1 {
 		edges: [...replay.edges.values()].sort((left, right) => left.edgeId.localeCompare(right.edgeId)),
 		proposals: [...replay.proposals.values()].sort((left, right) => left.proposalId.localeCompare(right.proposalId)),
 		resolvedProposalIds: replay.events
-			.filter((event) => event.eventType === "memory_change_applied" || event.eventType === "proposal_rejected")
+			.filter(
+				(event): event is Extract<MemoryEventV1, { eventType: "memory_change_applied" | "proposal_rejected" }> =>
+					event.schema === MEMORY_EVENT_SCHEMA &&
+					(event.eventType === "memory_change_applied" || event.eventType === "proposal_rejected"),
+			)
 			.map((event) => event.payload.proposalId)
 			.sort(),
 		purgedSourceDigests: [...replay.purgedSourceDigests].sort(),
 		accessRunIds: replay.events
-			.filter((event) => event.eventType === "access_recorded")
+			.filter(
+				(event): event is Extract<MemoryEventV1, { eventType: "access_recorded" }> =>
+					event.schema === MEMORY_EVENT_SCHEMA && event.eventType === "access_recorded",
+			)
 			.map((event) => event.payload.runId)
 			.sort(),
 		accesses: [...accessProjections(replay.events).values()].sort((left, right) =>
 			left.memoryId.localeCompare(right.memoryId),
 		),
+		reconstructions: [...replay.reconstructions.values()].sort((left, right) =>
+			left.runId.localeCompare(right.runId),
+		),
+		reviewedRunIds: [...replay.reviewedRunIds].sort(),
+		failedReviewRunIds: [...replay.failedReviewRunIds].sort(),
 		counts,
 	};
 }
@@ -1349,29 +1666,34 @@ function accessProjection(value: unknown, field: string): MemoryAccessProjection
 	};
 }
 
+function reconstructionProjection(value: unknown): ReconstructionRecordedPayloadV2 {
+	return parsePayloadV2("reconstruction_recorded", value) as ReconstructionRecordedPayloadV2;
+}
+
 function validateReadModel(value: unknown): MemoryReadModelV1 {
 	if (!isRecord(value)) throw new MemoryValidationError("Memory read model must be an object");
-	exact(
-		value,
-		[
-			"schema",
-			"head",
-			"eventCount",
-			"captures",
-			"memories",
-			"cues",
-			"edges",
-			"proposals",
-			"resolvedProposalIds",
-			"purgedSourceDigests",
-			"accessRunIds",
-			"accesses",
-			"counts",
-		],
-		"Memory read model",
-	);
-	if (value.schema !== MEMORY_READ_MODEL_SCHEMA)
+	const baseFields = [
+		"schema",
+		"head",
+		"eventCount",
+		"captures",
+		"memories",
+		"cues",
+		"edges",
+		"proposals",
+		"resolvedProposalIds",
+		"purgedSourceDigests",
+		"accessRunIds",
+		"accesses",
+		"counts",
+	] as const;
+	if (value.schema === MEMORY_READ_MODEL_SCHEMA) {
+		exact(value, baseFields, "Memory read model");
+	} else if (value.schema === MEMORY_READ_MODEL_V2_SCHEMA) {
+		exact(value, [...baseFields, "reconstructions", "reviewedRunIds", "failedReviewRunIds"], "Memory read model");
+	} else {
 		throw new MemoryValidationError("Memory read model schema is unsupported");
+	}
 	if (!isRecord(value.head)) throw new MemoryValidationError("Memory read model head must be an object");
 	exact(value.head, ["sequence", "hash"], "Memory read model head");
 	const sequence = nonNegativeInteger(value.head.sequence, "Memory read model head sequence");
@@ -1408,6 +1730,18 @@ function validateReadModel(value: unknown): MemoryReadModelV1 {
 	const accesses = projectionArray(value.accesses, "Memory read model accesses").map((entry, index) =>
 		accessProjection(entry, `Memory read model accesses[${index}]`),
 	);
+	const reconstructions =
+		value.schema === MEMORY_READ_MODEL_V2_SCHEMA
+			? projectionArray(value.reconstructions, "Memory read model reconstructions").map(reconstructionProjection)
+			: [];
+	const reviewedRunIds =
+		value.schema === MEMORY_READ_MODEL_V2_SCHEMA
+			? projectionStrings(value.reviewedRunIds, "Memory read model reviewedRunIds", true)
+			: [];
+	const failedReviewRunIds =
+		value.schema === MEMORY_READ_MODEL_V2_SCHEMA
+			? projectionStrings(value.failedReviewRunIds, "Memory read model failedReviewRunIds", true)
+			: [];
 	if (!isRecord(value.counts)) throw new MemoryValidationError("Memory read model counts must be an object");
 	const countKeys = Object.keys(value.counts).sort().join(",");
 	const legacyCountKeys = ["scheduled", "generating", "failed", "proposed", "applied", "rejected"].sort().join(",");
@@ -1442,6 +1776,16 @@ function validateReadModel(value: unknown): MemoryReadModelV1 {
 	sortedUnique(edges, (entry) => entry.edgeId, "Memory read model edge IDs");
 	sortedUnique(proposals, (entry) => entry.proposalId, "Memory read model proposal IDs");
 	sortedUnique(accesses, (entry) => entry.memoryId, "Memory read model access memory IDs");
+	sortedUnique(reconstructions, (entry) => entry.runId, "Memory read model reconstruction run IDs");
+	const reconstructionRunIds = new Set(reconstructions.map((entry) => entry.runId));
+	for (const runId of [...reviewedRunIds, ...failedReviewRunIds]) {
+		if (!reconstructionRunIds.has(runId)) {
+			throw new MemoryValidationError("Memory read model review references missing reconstruction");
+		}
+	}
+	if (reviewedRunIds.some((runId) => failedReviewRunIds.includes(runId))) {
+		throw new MemoryValidationError("Memory read model run cannot be both reviewed and failed");
+	}
 	let memoryIndex = 0;
 	for (const access of accesses) {
 		while (memories[memoryIndex] && memories[memoryIndex]!.memoryId.localeCompare(access.memoryId) < 0) {
@@ -1452,7 +1796,7 @@ function validateReadModel(value: unknown): MemoryReadModelV1 {
 		}
 	}
 	return {
-		schema: MEMORY_READ_MODEL_SCHEMA,
+		schema: value.schema,
 		head: { sequence, hash },
 		eventCount,
 		captures,
@@ -1464,6 +1808,9 @@ function validateReadModel(value: unknown): MemoryReadModelV1 {
 		purgedSourceDigests,
 		accessRunIds,
 		accesses,
+		reconstructions,
+		reviewedRunIds,
+		failedReviewRunIds,
 		counts,
 	};
 }
@@ -1513,6 +1860,9 @@ function applyEventTail(readModel: MemoryReadModelV1, raw: string): MemoryReadMo
 	const purgedSourceDigests = new Set(readModel.purgedSourceDigests);
 	const accessRunIds = new Set(readModel.accessRunIds);
 	const accesses = new Map(readModel.accesses.map((entry) => [entry.memoryId, { ...entry }]));
+	const reconstructions = new Map(readModel.reconstructions.map((entry) => [entry.runId, { ...entry }]));
+	const reviewedRunIds = new Set(readModel.reviewedRunIds);
+	const failedReviewRunIds = new Set(readModel.failedReviewRunIds);
 	const counts = { ...readModel.counts };
 	let sequence = readModel.head.sequence;
 	let previousHash = readModel.head.hash;
@@ -1525,7 +1875,7 @@ function applyEventTail(readModel: MemoryReadModelV1, raw: string): MemoryReadMo
 	};
 
 	for (const line of raw.split("\n").filter((entry) => entry.length > 0)) {
-		let event: MemoryEventV1;
+		let event: MemoryEvent;
 		try {
 			event = parseEvent(JSON.parse(line) as unknown, sequence + 1);
 		} catch (error) {
@@ -1537,7 +1887,72 @@ function applyEventTail(readModel: MemoryReadModelV1, raw: string): MemoryReadMo
 			throw new MemoryCorruptionError(`Memory event ${sequence + 1} breaks the incremental tail`);
 		}
 
-		if (event.eventType === "capture_scheduled") {
+		if (event.schema === MEMORY_EVENT_V2_SCHEMA) {
+			if (event.eventType === "reconstruction_recorded") {
+				if (reconstructions.has(event.payload.runId)) {
+					throw new MemoryCorruptionError("reconstruction_recorded duplicates runId");
+				}
+				reconstructions.set(event.payload.runId, event.payload);
+			} else if (event.eventType === "memory_review_applied") {
+				const reconstruction = reconstructions.get(event.payload.runId);
+				if (
+					!reconstruction ||
+					reconstruction.traceArtifactId !== event.payload.traceArtifactId ||
+					reconstruction.outcome !== "succeeded" ||
+					reviewedRunIds.has(event.payload.runId) ||
+					failedReviewRunIds.has(event.payload.runId)
+				) {
+					throw new MemoryCorruptionError(
+						"memory_review_applied requires one successful unresolved reconstruction",
+					);
+				}
+				reviewedRunIds.add(event.payload.runId);
+				if (event.payload.captureId !== null) {
+					const capture = captures.get(event.payload.captureId);
+					if (
+						!capture ||
+						(capture.status !== "generating" && !(capture.status === "failed" && capture.retryable === true)) ||
+						event.payload.runId !== capture.captureId
+					) {
+						throw new MemoryCorruptionError("memory_review_applied does not match a generating capture");
+					}
+					replaceCapture({ ...capture, status: "applied", errorCode: null, retryable: null });
+				}
+				for (const cue of event.payload.cues) {
+					const current = cues.get(cue.cueId);
+					if ((current?.revision ?? 0) + 1 !== cue.revision) {
+						throw new MemoryCorruptionError(`memory_review_applied breaks cue sequence for ${cue.cueId}`);
+					}
+					cues.set(cue.cueId, cue);
+				}
+				for (const revision of event.payload.revisions) {
+					const current = memories.get(revision.memoryId);
+					if ((current?.revision ?? 0) + 1 !== revision.revision) {
+						throw new MemoryCorruptionError(
+							`memory_review_applied breaks revision sequence for ${revision.memoryId}`,
+						);
+					}
+					memories.set(revision.memoryId, revision);
+				}
+				for (const edge of event.payload.edges) {
+					if (edges.has(edge.edgeId)) {
+						throw new MemoryCorruptionError(`memory_review_applied duplicates edge ${edge.edgeId}`);
+					}
+					edges.set(edge.edgeId, edge);
+				}
+			} else {
+				const reconstruction = reconstructions.get(event.payload.runId);
+				if (
+					!reconstruction ||
+					reconstruction.traceArtifactId !== event.payload.traceArtifactId ||
+					reviewedRunIds.has(event.payload.runId) ||
+					failedReviewRunIds.has(event.payload.runId)
+				) {
+					throw new MemoryCorruptionError("memory_review_failed requires one unresolved reconstruction");
+				}
+				failedReviewRunIds.add(event.payload.runId);
+			}
+		} else if (event.eventType === "capture_scheduled") {
 			if (captures.has(event.payload.captureId))
 				throw new MemoryCorruptionError("capture_scheduled duplicates captureId");
 			if (purgedSourceDigests.has(event.payload.sourceDigest)) {
@@ -1721,7 +2136,7 @@ function applyEventTail(readModel: MemoryReadModelV1, raw: string): MemoryReadMo
 			}
 			accesses.delete(event.payload.memoryId);
 			purgedSourceDigests.add(event.payload.sourceDigest);
-		} else {
+		} else if (event.eventType === "access_recorded") {
 			if (accessRunIds.has(event.payload.runId)) throw new MemoryCorruptionError("access_recorded duplicates runId");
 			accessRunIds.add(event.payload.runId);
 			const evidenceIds = new Set<string>();
@@ -1756,7 +2171,7 @@ function applyEventTail(readModel: MemoryReadModelV1, raw: string): MemoryReadMo
 	}
 
 	return validateReadModel({
-		schema: MEMORY_READ_MODEL_SCHEMA,
+		schema: MEMORY_READ_MODEL_V2_SCHEMA,
 		head: { sequence, hash: previousHash },
 		eventCount: sequence,
 		captures: [...captures.values()].sort((left, right) => left.captureId.localeCompare(right.captureId)),
@@ -1768,11 +2183,14 @@ function applyEventTail(readModel: MemoryReadModelV1, raw: string): MemoryReadMo
 		purgedSourceDigests: [...purgedSourceDigests].sort(),
 		accessRunIds: [...accessRunIds].sort(),
 		accesses: [...accesses.values()].sort((left, right) => left.memoryId.localeCompare(right.memoryId)),
+		reconstructions: [...reconstructions.values()].sort((left, right) => left.runId.localeCompare(right.runId)),
+		reviewedRunIds: [...reviewedRunIds].sort(),
+		failedReviewRunIds: [...failedReviewRunIds].sort(),
 		counts,
 	});
 }
 
-function sameIdempotentContent(existing: MemoryEventV1, proposed: MemoryEventV1): boolean {
+function sameIdempotentContent(existing: MemoryEvent, proposed: MemoryEvent): boolean {
 	return (
 		existing.eventType === proposed.eventType &&
 		stableJsonStringify(existing.payload) === stableJsonStringify(proposed.payload)
@@ -1874,7 +2292,7 @@ export class MemoryStore {
 		}
 	}
 
-	private async appendEvent(event: MemoryEventV1): Promise<void> {
+	private async appendEvent(event: MemoryEvent): Promise<void> {
 		const handle = await open(this.paths.eventsPath, "a", 0o600);
 		try {
 			await handle.writeFile(`${stableJsonStringify(event)}\n`);
@@ -2064,15 +2482,15 @@ export class MemoryStore {
 		}
 	}
 
-	private retry<TEventType extends MemoryEventType>(
+	private retry<TEventType extends MemoryEventType | MemoryEventTypeV2>(
 		replay: MemoryReplay,
-		proposed: Extract<MemoryEventV1, { eventType: TEventType }>,
+		proposed: Extract<MemoryEvent, { eventType: TEventType }>,
 	): MemoryWriteResult<TEventType> | undefined {
 		const existing = replay.events.find((event) => event.idempotencyKey === proposed.idempotencyKey);
 		if (!existing) return undefined;
 		if (!sameIdempotentContent(existing, proposed)) throw new MemoryIdempotencyConflictError(proposed.idempotencyKey);
 		return {
-			event: existing as Extract<MemoryEventV1, { eventType: TEventType }>,
+			event: existing as Extract<MemoryEvent, { eventType: TEventType }>,
 			head: headFor(existing),
 		};
 	}
@@ -2143,8 +2561,501 @@ export class MemoryStore {
 		});
 	}
 
+	private async appendV2<TEventType extends MemoryEventTypeV2>(
+		eventType: TEventType,
+		payload: MemoryEventPayloadMapV2[TEventType],
+		options: MemoryMutationOptions,
+	): Promise<MemoryWriteResult<TEventType>> {
+		return await withFileWriteLock(this.lockOptions(), async () => {
+			const eventId = requiredString(options.eventId, "eventId");
+			const eventActor = actor(options.actor ?? "runtime");
+			const eventTimestamp = timestamp(options.timestamp ?? new Date().toISOString());
+			const idempotencyKey = requiredString(options.idempotencyKey, "idempotencyKey");
+			const parsedPayload = parsePayloadV2(eventType, payload) as MemoryEventPayloadMapV2[TEventType];
+			const createForHead = (head: MemoryHead): Extract<MemoryEventV2, { eventType: TEventType }> =>
+				createEventV2({
+					schema: MEMORY_EVENT_V2_SCHEMA,
+					eventId,
+					sequence: head.sequence + 1,
+					eventType,
+					actor: eventActor,
+					timestamp: eventTimestamp,
+					prevHash: head.hash,
+					payload: parsedPayload,
+					schemaVersion: 2,
+					idempotencyKey,
+				} as unknown as Extract<EventWithoutHashV2, { eventType: TEventType }>);
+			const projected = await this.inspectReadModelFastPath().catch((error: unknown) => {
+				if (isErrno(error, "ENOENT")) return undefined;
+				throw error;
+			});
+			if (projected && !projected.idempotencyKeys.includes(idempotencyKey)) {
+				this.assertHead(options.expectedHead, projected.readModel.head);
+				const event = createForHead(projected.readModel.head);
+				let nextReadModel: MemoryReadModelV1;
+				try {
+					nextReadModel = applyEventTail(projected.readModel, `${stableJsonStringify(event)}\n`);
+				} catch (error) {
+					if (error instanceof MemoryCorruptionError) throw new MemoryValidationError(error.message);
+					throw error;
+				}
+				await this.appendEvent(event);
+				await this.writeReadModelProjection(nextReadModel, (await stat(this.paths.eventsPath)).size, [
+					...projected.idempotencyKeys,
+					idempotencyKey,
+				]);
+				return { event, head: nextReadModel.head };
+			}
+			const replay = await this.readReplay();
+			if (replay.tailDiagnostic) throw new MemoryRecoveryRequiredError();
+			const event = createForHead(replay.head);
+			const retry = this.retry(replay, event);
+			if (retry) return retry;
+			this.assertHead(options.expectedHead, replay.head);
+			let next: MemoryReplay;
+			try {
+				next = replayRaw(
+					`${replay.events.map((entry) => stableJsonStringify(entry)).join("\n")}${replay.events.length > 0 ? "\n" : ""}${stableJsonStringify(event)}\n`,
+				);
+			} catch (error) {
+				if (error instanceof MemoryCorruptionError) throw new MemoryValidationError(error.message);
+				throw error;
+			}
+			await this.appendEvent(event);
+			await this.writeReadModel(next);
+			return { event, head: next.head };
+		});
+	}
+
 	async replay(): Promise<MemoryReplay> {
 		return await this.readReplay();
+	}
+
+	async recordReconstruction(
+		traceInput: MemoryReconstructionTraceV1,
+		options: MemoryMutationOptions,
+	): Promise<MemoryReconstructionRecordResultV1> {
+		const trace = validateMemoryReconstructionTraceV1(traceInput);
+		const metadata = await this.artifacts.put({
+			contentType: "application/json",
+			value: trace,
+			producer: MEMORY_RECONSTRUCTION_TRACE_SCHEMA,
+			sensitivity: "internal",
+			sourceIds: [trace.runId, trace.sessionId],
+			createdAt: trace.settledAt,
+		});
+		const canonical = validateMemoryReconstructionTraceV1(
+			JSON.parse((await this.artifacts.read(metadata.artifactId)).content) as unknown,
+		);
+		const write = await this.appendV2(
+			"reconstruction_recorded",
+			{ runId: canonical.runId, traceArtifactId: metadata.artifactId, outcome: canonical.outcome },
+			options,
+		);
+		return { write, trace: canonical, traceArtifactId: metadata.artifactId };
+	}
+
+	private async readReconstruction(traceArtifactId: string): Promise<MemoryReconstructionTraceV1> {
+		const stored = await this.artifacts.read(traceArtifactId);
+		if (stored.metadata.producer !== MEMORY_RECONSTRUCTION_TRACE_SCHEMA) {
+			throw new MemoryValidationError("Memory reconstruction artifact producer is invalid");
+		}
+		return validateMemoryReconstructionTraceV1(JSON.parse(stored.content) as unknown);
+	}
+
+	private reviewRevisionReference(revision: MemoryRevisionV2, artifactId: string): PublishedMemoryRevisionRefV1 {
+		return {
+			memoryId: revision.memoryId,
+			revision: revision.revision,
+			artifactId,
+			trust: revision.trust,
+			lifecycle: revision.lifecycle,
+			sourceDigest: revision.sourceDigest,
+			evidenceIds: revision.evidenceRefs.map((evidence) => evidence.evidenceId),
+		};
+	}
+
+	private async publishReviewCue(cue: CueNodeV1): Promise<{ cue: CueNodeV1; reference: PublishedCueRefV1 }> {
+		const stored = await this.artifacts.put({
+			contentType: "application/json",
+			value: cue,
+			producer: MEMORY_CUE_SCHEMA,
+			sensitivity: "internal",
+			sourceIds: [cue.cueId, ...cue.scope.paths],
+			createdAt: cue.provenance.recordedAt,
+		});
+		const canonical = validateCueNodeV1(
+			JSON.parse((await this.artifacts.read(stored.artifactId)).content) as unknown,
+		);
+		return {
+			cue: canonical,
+			reference: {
+				cueId: canonical.cueId,
+				revision: canonical.revision,
+				artifactId: stored.artifactId,
+				key: canonical.key,
+			},
+		};
+	}
+
+	private async publishReviewRevision(
+		revision: MemoryRevisionV2,
+	): Promise<{ revision: MemoryRevisionV2; reference: PublishedMemoryRevisionRefV1 }> {
+		const stored = await this.artifacts.put({
+			contentType: "application/json",
+			value: revision,
+			producer: MEMORY_REVISION_V2_SCHEMA,
+			sensitivity: "internal",
+			sourceIds: [
+				revision.transition.reviewId,
+				...new Set(revision.evidenceRefs.map((evidence) => evidence.sourceId)),
+			],
+			createdAt: revision.provenance.recordedAt,
+		});
+		const canonical = validateMemoryRevisionV2(
+			JSON.parse((await this.artifacts.read(stored.artifactId)).content) as unknown,
+		);
+		return { revision: canonical, reference: this.reviewRevisionReference(canonical, stored.artifactId) };
+	}
+
+	private async publishReviewEdge(edge: MemoryEdgeV2): Promise<{ edge: MemoryEdgeV2; reference: PublishedEdgeRefV1 }> {
+		const stored = await this.artifacts.put({
+			contentType: "application/json",
+			value: edge,
+			producer: MEMORY_EDGE_V2_SCHEMA,
+			sensitivity: "internal",
+			sourceIds: [...new Set(edge.evidenceRefs.map((evidence) => evidence.sourceId))],
+			createdAt: edge.provenance.recordedAt,
+		});
+		const canonical = validateMemoryEdgeV2(
+			JSON.parse((await this.artifacts.read(stored.artifactId)).content) as unknown,
+		);
+		return {
+			edge: canonical,
+			reference: {
+				edgeId: canonical.edgeId,
+				artifactId: stored.artifactId,
+				from: canonical.from,
+				to: canonical.to,
+				relation: canonical.relation,
+			},
+		};
+	}
+
+	async applyMemoryReviews(
+		decisionInputs: readonly MemoryReviewDecisionV1[],
+		evidenceInputs: readonly EvidenceRefV2[],
+		traceArtifactId: string,
+		options: MemoryMutationOptions,
+		context: MemoryReviewPublicationContextV1 = {},
+	): Promise<MemoryReviewApplyResultV1> {
+		if (decisionInputs.length > 100) throw new MemoryValidationError("Memory review decisions must be bounded");
+		const decisions = decisionInputs.map(validateMemoryReviewDecisionV1);
+		if (new Set(decisions.map((decision) => decision.decisionId)).size !== decisions.length) {
+			throw new MemoryValidationError("Memory review decision IDs must be unique");
+		}
+		const evidenceRefs = evidenceInputs.map(validateEvidenceRefV2);
+		const evidenceById = new Map(evidenceRefs.map((evidence) => [evidence.evidenceId, evidence]));
+		if (evidenceById.size !== evidenceRefs.length)
+			throw new MemoryValidationError("Memory review evidence IDs must be unique");
+		const cues = (context.cues ?? []).map(validateCueNodeV1);
+		if (new Set(cues.map((cue) => cue.cueId)).size !== cues.length) {
+			throw new MemoryValidationError("Memory review cue IDs must be unique");
+		}
+		if (new Set(cues.map((cue) => cue.key)).size !== cues.length) {
+			throw new MemoryValidationError("Memory review cue keys must be unique");
+		}
+		const trace = await this.readReconstruction(traceArtifactId);
+		if (trace.outcome !== "succeeded") {
+			throw new MemoryValidationError("Memory semantic review requires a successful settled run");
+		}
+		const decisionIds = decisions.map((decision) => decision.decisionId).sort();
+		if (stableJsonStringify(decisionIds) !== stableJsonStringify([...trace.decisions].sort())) {
+			throw new MemoryValidationError("Memory review decisions do not match the reconstruction trace");
+		}
+		if (decisions.some((decision) => decision.runId !== trace.runId)) {
+			throw new MemoryValidationError("Memory review decision runId does not match its reconstruction");
+		}
+		const captureId = context.captureId ?? null;
+		if (captureId !== null && captureId !== trace.runId) {
+			throw new MemoryValidationError("Memory capture review runId must equal captureId");
+		}
+		const readModel = (await this.loadReadModelSnapshot()).readModel;
+		const reconstruction = readModel.reconstructions.find((entry) => entry.runId === trace.runId);
+		if (!reconstruction || reconstruction.traceArtifactId !== traceArtifactId) {
+			throw new MemoryValidationError("Memory reconstruction must be recorded before review publication");
+		}
+		if (readModel.reviewedRunIds.includes(trace.runId)) {
+			const replay = await this.replay();
+			const existingReview = replay.events.find(
+				(event): event is Extract<MemoryEventV2, { eventType: "memory_review_applied" }> =>
+					event.schema === MEMORY_EVENT_V2_SCHEMA &&
+					event.eventType === "memory_review_applied" &&
+					event.payload.runId === trace.runId,
+			);
+			if (!existingReview) throw new MemoryCorruptionError("Reviewed Memory run has no publication event");
+			if (existingReview.payload.traceArtifactId !== traceArtifactId) {
+				throw new MemoryIdempotencyConflictError(options.idempotencyKey);
+			}
+			if (existingReview.payload.captureId !== captureId) {
+				throw new MemoryIdempotencyConflictError(options.idempotencyKey);
+			}
+			const existingDecisions: MemoryReviewDecisionV1[] = [];
+			for (const artifactId of existingReview.payload.decisionArtifactIds) {
+				existingDecisions.push(
+					validateMemoryReviewDecisionV1(JSON.parse((await this.artifacts.read(artifactId)).content) as unknown),
+				);
+			}
+			if (stableJsonStringify(existingDecisions) !== stableJsonStringify(decisions)) {
+				throw new MemoryIdempotencyConflictError(options.idempotencyKey);
+			}
+			const existingRevisions: MemoryRevisionV2[] = [];
+			for (const reference of existingReview.payload.revisions) {
+				existingRevisions.push(
+					validateMemoryRevisionV2(
+						JSON.parse((await this.artifacts.read(reference.artifactId)).content) as unknown,
+					),
+				);
+			}
+			const existingCues: CueNodeV1[] = [];
+			for (const reference of existingReview.payload.cues) {
+				existingCues.push(
+					validateCueNodeV1(JSON.parse((await this.artifacts.read(reference.artifactId)).content) as unknown),
+				);
+			}
+			if (stableJsonStringify(existingCues) !== stableJsonStringify(cues)) {
+				throw new MemoryIdempotencyConflictError(options.idempotencyKey);
+			}
+			const existingEdges: MemoryEdgeV2[] = [];
+			for (const reference of existingReview.payload.edges) {
+				existingEdges.push(
+					validateMemoryEdgeV2(JSON.parse((await this.artifacts.read(reference.artifactId)).content) as unknown),
+				);
+			}
+			return {
+				write: { event: existingReview, head: headFor(existingReview) },
+				decisions: existingDecisions,
+				revisions: existingRevisions,
+				cues: existingCues,
+				edges: existingEdges,
+			};
+		}
+		this.assertHead(options.expectedHead, readModel.head);
+		if (readModel.failedReviewRunIds.includes(trace.runId)) {
+			throw new MemoryValidationError("Memory reconstruction review is already resolved");
+		}
+		const memories = new Map(readModel.memories.map((entry) => [entry.memoryId, entry]));
+		if (captureId !== null) {
+			const capture = readModel.captures.find((entry) => entry.captureId === captureId);
+			if (
+				!capture ||
+				(capture.status !== "generating" && !(capture.status === "failed" && capture.retryable === true))
+			) {
+				throw new MemoryValidationError("Memory capture review requires a generating capture");
+			}
+		}
+		const existingCueIds = new Set(readModel.cues.map((entry) => entry.cueId));
+		const existingCueKeys = new Set(readModel.cues.map((entry) => entry.key));
+		for (const cue of cues) {
+			if (cue.revision !== 1 || existingCueIds.has(cue.cueId) || existingCueKeys.has(cue.key)) {
+				throw new MemoryValidationError(`Memory review cue conflicts with current facts: ${cue.cueId}`);
+			}
+		}
+		const cueIds = new Set([...existingCueIds, ...cues.map((cue) => cue.cueId)]);
+		const traceReads = new Map(trace.readRevisions.map((entry) => [entry.memoryId, entry.revision]));
+		const touchedMemoryIds = new Set<string>();
+		const revisions: MemoryRevisionV2[] = [];
+		const edges: MemoryEdgeV2[] = [];
+		const explicitlyReviewed = new Set<string>();
+
+		for (const decision of decisions) {
+			const selectedEvidence = decision.evidenceIds.map((evidenceId) => {
+				const evidence = evidenceById.get(evidenceId);
+				if (!evidence || !trace.evidenceIds.includes(evidenceId)) {
+					throw new MemoryValidationError(`Memory review references unavailable evidence: ${evidenceId}`);
+				}
+				return evidence;
+			});
+			for (const source of decision.sourceMemories) {
+				const current = memories.get(source.memoryId);
+				if (!current || current.revision !== source.expectedRevision) {
+					throw new MemoryRevisionConflictError(
+						source.memoryId,
+						source.expectedRevision,
+						current?.revision ?? null,
+					);
+				}
+				if (traceReads.get(source.memoryId) !== source.expectedRevision) {
+					throw new MemoryValidationError(`Memory review source was not read in this run: ${source.memoryId}`);
+				}
+				explicitlyReviewed.add(source.memoryId);
+			}
+			if (decision.action === "keep") continue;
+			if (selectedEvidence.length === 0) {
+				throw new MemoryValidationError(`${decision.action} requires evidence from the current run`);
+			}
+			const replacement = decision.replacement;
+			if (!replacement) throw new MemoryValidationError(`${decision.action} requires replacement semantics`);
+			for (const cueId of replacement.cueIds) {
+				if (!cueIds.has(cueId)) throw new MemoryValidationError(`Memory review references missing cue: ${cueId}`);
+			}
+			const sourceDigest = digestValue({
+				schema: MEMORY_REVIEW_DECISION_SCHEMA,
+				decision,
+				evidenceRefs: selectedEvidence,
+			});
+			const sourceRevisions = decision.sourceMemories.map((source) => ({
+				memoryId: source.memoryId,
+				revision: source.expectedRevision,
+			}));
+			const targetMemoryId =
+				decision.action === "revise"
+					? decision.sourceMemories[0]!.memoryId
+					: derivedIdentifier("memory", decision.decisionId);
+			const currentTarget = memories.get(targetMemoryId);
+			const currentTargetRevision = currentTarget ? (await this.readMemory(targetMemoryId)).revision : undefined;
+			if (decision.action === "revise" && decision.sourceMemories.length !== 1) {
+				throw new MemoryValidationError("revise requires exactly one source Memory");
+			}
+			if (decision.action !== "revise" && currentTarget) {
+				throw new MemoryRevisionConflictError(targetMemoryId, null, currentTarget.revision);
+			}
+			if (touchedMemoryIds.has(targetMemoryId)) {
+				throw new MemoryValidationError(`Memory review modifies a Memory more than once: ${targetMemoryId}`);
+			}
+			touchedMemoryIds.add(targetMemoryId);
+			revisions.push(
+				validateMemoryRevisionV2({
+					schema: MEMORY_REVISION_V2_SCHEMA,
+					memoryId: targetMemoryId,
+					revision: (currentTarget?.revision ?? 0) + 1,
+					...replacement,
+					trust: decision.action === "dispute" ? "disputed" : "model_inferred",
+					lifecycle: "active",
+					effectiveTo: null,
+					evidenceRefs: selectedEvidence,
+					freshnessBasis:
+						context.freshnessBasisByDecisionId?.get(decision.decisionId) ??
+						currentTargetRevision?.freshnessBasis ??
+						null,
+					sourceDigest,
+					supersedesRevision: currentTarget?.revision ?? null,
+					provenance: decision.provenance,
+					transition: {
+						mode: decision.action,
+						reviewId: decision.decisionId,
+						sourceRevisions,
+						trustDerivation: decision.action === "dispute" ? "conflict-detected" : "model-reconstruction",
+					},
+				}),
+			);
+
+			if (decision.action === "supersede") {
+				for (const source of decision.sourceMemories) {
+					if (touchedMemoryIds.has(source.memoryId)) {
+						throw new MemoryValidationError(`Memory review modifies a Memory more than once: ${source.memoryId}`);
+					}
+					touchedMemoryIds.add(source.memoryId);
+					const current = await this.readMemory(source.memoryId);
+					const derivation =
+						current.revision.trust === "verified"
+							? "host-verified"
+							: current.revision.trust === "disputed"
+								? "conflict-detected"
+								: "model-reconstruction";
+					revisions.push(
+						validateMemoryRevisionV2({
+							...current.revision,
+							schema: MEMORY_REVISION_V2_SCHEMA,
+							revision: current.revision.revision + 1,
+							lifecycle: "superseded",
+							effectiveFrom: replacement.effectiveFrom,
+							effectiveTo: null,
+							sourceDigest,
+							supersedesRevision: current.revision.revision,
+							provenance: decision.provenance,
+							transition: {
+								mode: "supersede",
+								reviewId: decision.decisionId,
+								sourceRevisions,
+								trustDerivation: derivation,
+							},
+						}),
+					);
+				}
+			}
+			if (decision.action === "supersede" || decision.action === "dispute") {
+				for (const source of decision.sourceMemories) {
+					edges.push(
+						validateMemoryEdgeV2({
+							schema: MEMORY_EDGE_V2_SCHEMA,
+							edgeId: derivedIdentifier("edge", `${decision.decisionId}:${source.memoryId}`),
+							from: { kind: "memory", id: targetMemoryId },
+							to: { kind: "memory", id: source.memoryId },
+							relation: decision.action === "supersede" ? "supersedes" : "contradicts",
+							effectiveFrom: replacement.effectiveFrom,
+							effectiveTo: null,
+							evidenceRefs: selectedEvidence,
+							sourceDigest,
+							provenance: decision.provenance,
+						}),
+					);
+				}
+			}
+		}
+
+		const implicitKeepMemoryIds = [...traceReads.keys()]
+			.filter((memoryId) => !explicitlyReviewed.has(memoryId))
+			.sort();
+		const decisionArtifacts: string[] = [];
+		await Promise.all(
+			evidenceRefs.map(async (evidence) => await validateMemoryEvidenceOwnership(this.projectRoot, evidence)),
+		);
+		for (const decision of decisions) {
+			const stored = await this.artifacts.put({
+				contentType: "application/json",
+				value: decision,
+				producer: MEMORY_REVIEW_DECISION_SCHEMA,
+				sensitivity: "internal",
+				sourceIds: [decision.runId, decision.decisionId],
+				createdAt: decision.provenance.recordedAt,
+			});
+			validateMemoryReviewDecisionV1(JSON.parse((await this.artifacts.read(stored.artifactId)).content) as unknown);
+			decisionArtifacts.push(stored.artifactId);
+		}
+		const publishedRevisions = await Promise.all(
+			revisions.map(async (revision) => await this.publishReviewRevision(revision)),
+		);
+		const publishedCues = await Promise.all(cues.map(async (cue) => await this.publishReviewCue(cue)));
+		const publishedEdges = await Promise.all(edges.map(async (edge) => await this.publishReviewEdge(edge)));
+		const write = await this.appendV2(
+			"memory_review_applied",
+			{
+				runId: trace.runId,
+				captureId,
+				traceArtifactId,
+				decisionArtifactIds: decisionArtifacts,
+				revisions: publishedRevisions.map((entry) => entry.reference),
+				cues: publishedCues.map((entry) => entry.reference),
+				edges: publishedEdges.map((entry) => entry.reference),
+				implicitKeepMemoryIds,
+			},
+			options,
+		);
+		return {
+			write,
+			decisions,
+			revisions: publishedRevisions.map((entry) => entry.revision),
+			cues: publishedCues.map((entry) => entry.cue),
+			edges: publishedEdges.map((entry) => entry.edge),
+		};
+	}
+
+	async recordMemoryReviewFailure(
+		payload: MemoryReviewFailedPayloadV2,
+		options: MemoryMutationOptions,
+	): Promise<MemoryWriteResult<"memory_review_failed">> {
+		return await this.appendV2("memory_review_failed", payload, options);
 	}
 
 	async loadReadModelSnapshot(): Promise<MemoryReadModelLoadResult> {
@@ -2776,7 +3687,7 @@ export class MemoryStore {
 		reference: PublishedMemoryRevisionRefV1,
 		cueExists: (cueId: string) => boolean,
 	): Promise<MemoryReadResultV1> {
-		const revision = validateMemoryRevisionV1(
+		const revision = validateMemoryRevision(
 			JSON.parse((await this.artifacts.read(reference.artifactId)).content) as unknown,
 		);
 		if (
@@ -2854,11 +3765,16 @@ export class MemoryStore {
 			artifactIds.set(memoryId, current);
 		};
 		for (const event of replay.events) {
-			if (event.eventType === "memory_change_applied") {
+			if (event.schema === MEMORY_EVENT_V2_SCHEMA && event.eventType === "memory_review_applied") {
+				for (const revision of event.payload.revisions) append(revision.memoryId, revision.artifactId);
+			} else if (event.schema === MEMORY_EVENT_SCHEMA && event.eventType === "memory_change_applied") {
 				for (const revision of event.payload.revisions) {
 					append(revision.memoryId, revision.artifactId);
 				}
-			} else if (event.eventType === "memory_lifecycle_changed" || event.eventType === "evidence_detached") {
+			} else if (
+				event.schema === MEMORY_EVENT_SCHEMA &&
+				(event.eventType === "memory_lifecycle_changed" || event.eventType === "evidence_detached")
+			) {
 				append(event.payload.memoryId, event.payload.revisionArtifactId);
 			}
 		}
@@ -2870,7 +3786,7 @@ export class MemoryStore {
 		for (const [memoryId, artifactIds] of this.timelineArtifactIds(replay)) {
 			const timeline: MemoryTimelineEntryV1[] = [];
 			for (const [index, artifactId] of artifactIds.entries()) {
-				const revision = validateMemoryRevisionV1(
+				const revision = validateMemoryRevision(
 					JSON.parse((await this.artifacts.read(artifactId)).content) as unknown,
 				);
 				if (revision.memoryId !== memoryId || revision.revision !== index + 1) {
@@ -2999,10 +3915,8 @@ export class MemoryStore {
 		return results;
 	}
 
-	private async readEdgeReference(reference: PublishedEdgeRefV1): Promise<{ edge: MemoryEdgeV1; artifactId: string }> {
-		const edge = validateMemoryEdgeV1(
-			JSON.parse((await this.artifacts.read(reference.artifactId)).content) as unknown,
-		);
+	private async readEdgeReference(reference: PublishedEdgeRefV1): Promise<{ edge: MemoryEdge; artifactId: string }> {
+		const edge = validateMemoryEdge(JSON.parse((await this.artifacts.read(reference.artifactId)).content) as unknown);
 		if (
 			edge.edgeId !== reference.edgeId ||
 			stableJsonStringify(edge.from) !== stableJsonStringify(reference.from) ||
@@ -3017,32 +3931,32 @@ export class MemoryStore {
 	private async readEdgeFromReplay(
 		replay: MemoryFactProjection,
 		edgeId: string,
-	): Promise<{ edge: MemoryEdgeV1; artifactId: string }> {
+	): Promise<{ edge: MemoryEdge; artifactId: string }> {
 		const reference = replay.edges.get(edgeId);
 		if (!reference) throw new MemoryNotFoundError(edgeId);
 		return await this.readEdgeReference(reference);
 	}
 
-	async readEdge(edgeId: string): Promise<{ edge: MemoryEdgeV1; artifactId: string }> {
+	async readEdge(edgeId: string): Promise<{ edge: MemoryEdge; artifactId: string }> {
 		return await this.readEdgeFromReplay(this.factProjection((await this.loadReadModelSnapshot()).readModel), edgeId);
 	}
 
-	async readEdges(edgeIds?: readonly string[]): Promise<Array<{ edge: MemoryEdgeV1; artifactId: string }>> {
+	async readEdges(edgeIds?: readonly string[]): Promise<Array<{ edge: MemoryEdge; artifactId: string }>> {
 		const replay = this.factProjection((await this.loadReadModelSnapshot()).readModel);
 		const selected = edgeIds ? [...edgeIds] : [...replay.edges.keys()].sort();
 		if (new Set(selected).size !== selected.length) throw new MemoryValidationError("Edge IDs must be unique");
-		const results: Array<{ edge: MemoryEdgeV1; artifactId: string }> = [];
+		const results: Array<{ edge: MemoryEdge; artifactId: string }> = [];
 		for (const edgeId of selected) results.push(await this.readEdgeFromReplay(replay, edgeId));
 		return results;
 	}
 
 	async readEdgesByReferences(
 		references: readonly PublishedEdgeRefV1[],
-	): Promise<Array<{ edge: MemoryEdgeV1; artifactId: string }>> {
+	): Promise<Array<{ edge: MemoryEdge; artifactId: string }>> {
 		if (new Set(references.map((reference) => reference.edgeId)).size !== references.length) {
 			throw new MemoryValidationError("Edge references must be unique");
 		}
-		const results: Array<{ edge: MemoryEdgeV1; artifactId: string }> = [];
+		const results: Array<{ edge: MemoryEdge; artifactId: string }> = [];
 		for (const reference of references) results.push(await this.readEdgeReference(reference));
 		return results;
 	}
@@ -3052,22 +3966,53 @@ export class MemoryStore {
 	}
 
 	private async publishDerivedRevision(
-		revision: MemoryRevisionV1,
-	): Promise<{ revision: MemoryRevisionV1; artifactId: string }> {
+		revision: MemoryRevision,
+	): Promise<{ revision: MemoryRevision; artifactId: string }> {
 		const stored = await this.artifacts.put({
 			contentType: "application/json",
 			value: revision,
-			producer: MEMORY_REVISION_SCHEMA,
+			producer: revision.schema === MEMORY_REVISION_V2_SCHEMA ? MEMORY_REVISION_V2_SCHEMA : MEMORY_REVISION_SCHEMA,
 			sensitivity: "internal",
 			sourceIds: [revision.memoryId, ...revision.evidenceRefs.map((evidence) => evidence.sourceId)],
 			createdAt: revision.provenance.recordedAt,
 		});
 		return {
-			revision: validateMemoryRevisionV1(
+			revision: validateMemoryRevision(
 				JSON.parse((await this.artifacts.read(stored.artifactId)).content) as unknown,
 			),
 			artifactId: stored.artifactId,
 		};
+	}
+
+	private derivedRevision(
+		current: MemoryRevision,
+		changes: Pick<MemoryRevision, "lifecycle" | "evidenceRefs" | "effectiveFrom" | "provenance">,
+		reason: string,
+	): MemoryRevision {
+		const base = {
+			...current,
+			revision: current.revision + 1,
+			...changes,
+			effectiveTo: null,
+			supersedesRevision: current.revision,
+		};
+		if (current.schema === MEMORY_REVISION_SCHEMA) return validateMemoryRevisionV1(base);
+		const trustDerivation =
+			current.trust === "verified"
+				? "host-verified"
+				: current.trust === "disputed"
+					? "conflict-detected"
+					: "model-reconstruction";
+		return validateMemoryRevisionV2({
+			...base,
+			schema: MEMORY_REVISION_V2_SCHEMA,
+			transition: {
+				mode: "revise",
+				reviewId: `review_host_${createHash("sha256").update(`${current.memoryId}:${current.revision}:${reason}`).digest("hex").slice(0, 24)}`,
+				sourceRevisions: [{ memoryId: current.memoryId, revision: current.revision }],
+				trustDerivation,
+			},
+		});
 	}
 
 	async changeMemoryLifecycle(
@@ -3090,20 +4035,23 @@ export class MemoryStore {
 			throw new MemoryValidationError("Memory already has the requested lifecycle");
 		const current = await this.readMemory(memoryId);
 		const recordedAt = timestamp(options.timestamp ?? new Date().toISOString());
-		const published = await this.publishDerivedRevision({
-			...current.revision,
-			revision: current.revision.revision + 1,
-			lifecycle,
-			effectiveFrom: recordedAt,
-			effectiveTo: null,
-			supersedesRevision: current.revision.revision,
-			provenance: {
-				producer: options.actor === "user" ? "user" : "pi-xk",
-				model: null,
-				promptVersion: null,
-				recordedAt,
-			},
-		});
+		const published = await this.publishDerivedRevision(
+			this.derivedRevision(
+				current.revision,
+				{
+					lifecycle,
+					evidenceRefs: current.revision.evidenceRefs,
+					effectiveFrom: recordedAt,
+					provenance: {
+						producer: options.actor === "user" ? "user" : "pi-xk",
+						model: null,
+						promptVersion: null,
+						recordedAt,
+					},
+				},
+				reason,
+			),
+		);
 		return await this.append(
 			"memory_lifecycle_changed",
 			{
@@ -3139,20 +4087,23 @@ export class MemoryStore {
 			throw new MemoryValidationError(`Memory evidence does not exist: ${evidenceId}`);
 		}
 		const recordedAt = timestamp(options.timestamp ?? new Date().toISOString());
-		const published = await this.publishDerivedRevision({
-			...current.revision,
-			revision: current.revision.revision + 1,
-			evidenceRefs: current.revision.evidenceRefs.filter((evidence) => evidence.evidenceId !== evidenceId),
-			effectiveFrom: recordedAt,
-			effectiveTo: null,
-			supersedesRevision: current.revision.revision,
-			provenance: {
-				producer: options.actor === "user" ? "user" : "pi-xk",
-				model: null,
-				promptVersion: null,
-				recordedAt,
-			},
-		});
+		const published = await this.publishDerivedRevision(
+			this.derivedRevision(
+				current.revision,
+				{
+					lifecycle: current.revision.lifecycle,
+					evidenceRefs: current.revision.evidenceRefs.filter((evidence) => evidence.evidenceId !== evidenceId),
+					effectiveFrom: recordedAt,
+					provenance: {
+						producer: options.actor === "user" ? "user" : "pi-xk",
+						model: null,
+						promptVersion: null,
+						recordedAt,
+					},
+				},
+				reason,
+			),
+		);
 		return await this.append(
 			"evidence_detached",
 			{
@@ -3170,7 +4121,11 @@ export class MemoryStore {
 	private revisionArtifactIds(replay: MemoryReplay, memoryId: string): string[] {
 		const result = new Set<string>();
 		for (const event of replay.events) {
-			if (event.eventType === "memory_change_applied") {
+			if (event.schema === MEMORY_EVENT_V2_SCHEMA && event.eventType === "memory_review_applied") {
+				for (const revision of event.payload.revisions) {
+					if (revision.memoryId === memoryId) result.add(revision.artifactId);
+				}
+			} else if (event.schema === MEMORY_EVENT_SCHEMA && event.eventType === "memory_change_applied") {
 				for (const revision of event.payload.revisions) {
 					if (revision.memoryId === memoryId) result.add(revision.artifactId);
 				}
@@ -3220,7 +4175,7 @@ export class MemoryStore {
 	private async assertNoActiveInboundEdges(replay: MemoryReplay, memoryId: string, asOf: string): Promise<void> {
 		for (const edgeReference of replay.edges.values()) {
 			if (edgeReference.to.kind !== "memory" || edgeReference.to.id !== memoryId) continue;
-			const edge = validateMemoryEdgeV1(
+			const edge = validateMemoryEdge(
 				JSON.parse((await this.artifacts.read(edgeReference.artifactId)).content) as unknown,
 			);
 			if (edge.effectiveTo === null || Date.parse(edge.effectiveTo) > Date.parse(asOf)) {
@@ -3271,7 +4226,9 @@ export class MemoryStore {
 					if (
 						metadata.producer.startsWith("pi-xk.memory") &&
 						metadata.producer !== MEMORY_REVISION_SCHEMA &&
-						metadata.producer !== MEMORY_EDGE_SCHEMA
+						metadata.producer !== MEMORY_EDGE_SCHEMA &&
+						metadata.producer !== MEMORY_REVISION_V2_SCHEMA &&
+						metadata.producer !== MEMORY_EDGE_V2_SCHEMA
 					) {
 						continue;
 					}
@@ -3327,8 +4284,12 @@ export class MemoryStore {
 		const contentArtifactIds = this.exclusiveProposalContentArtifactIds(replay, memoryId);
 		for (const artifactId of revisionArtifactIds) {
 			const stored = await this.artifacts.read(artifactId);
-			const revision = validateMemoryRevisionV1(JSON.parse(stored.content) as unknown);
-			if (stored.metadata.producer !== MEMORY_REVISION_SCHEMA || revision.memoryId !== memoryId) {
+			const revision = validateMemoryRevision(JSON.parse(stored.content) as unknown);
+			if (
+				(stored.metadata.producer !== MEMORY_REVISION_SCHEMA &&
+					stored.metadata.producer !== MEMORY_REVISION_V2_SCHEMA) ||
+				revision.memoryId !== memoryId
+			) {
 				throw new MemoryValidationError(
 					"Memory purge revision artifact is not exclusively owned by the target Memory",
 				);
@@ -3430,8 +4391,8 @@ export class MemoryStore {
 		);
 		const purgedArtifactIdsPresent: string[] = [];
 		const purgedArtifactIdsMissing: string[] = [];
-		const evidenceRefs = new Map<string, EvidenceRefV1>();
-		const rememberEvidence = (evidence: EvidenceRefV1): void => {
+		const evidenceRefs = new Map<string, EvidenceRefV2>();
+		const rememberEvidence = (evidence: EvidenceRefV2): void => {
 			const current = evidenceRefs.get(evidence.evidenceId);
 			if (current && stableJsonStringify(current) !== stableJsonStringify(evidence)) {
 				throw new MemoryCorruptionError(`Memory evidence ID has conflicting definitions: ${evidence.evidenceId}`);
@@ -3451,6 +4412,74 @@ export class MemoryStore {
 		};
 
 		for (const event of replay.events) {
+			if (event.schema === MEMORY_EVENT_V2_SCHEMA) {
+				const traceStored = await readArtifact(event.payload.traceArtifactId);
+				if (!traceStored) continue;
+				const trace = validateMemoryReconstructionTraceV1(JSON.parse(traceStored.content) as unknown);
+				if (trace.runId !== event.payload.runId) {
+					throw new MemoryCorruptionError("Memory reconstruction artifact does not match its event");
+				}
+				if (event.eventType === "reconstruction_recorded") {
+					if (trace.outcome !== event.payload.outcome) {
+						throw new MemoryCorruptionError("Memory reconstruction outcome does not match its event");
+					}
+					continue;
+				}
+				if (event.eventType === "memory_review_applied") {
+					for (const artifactId of event.payload.decisionArtifactIds) {
+						const stored = await readArtifact(artifactId);
+						if (!stored) continue;
+						const decision = validateMemoryReviewDecisionV1(JSON.parse(stored.content) as unknown);
+						if (decision.runId !== event.payload.runId || !trace.decisions.includes(decision.decisionId)) {
+							throw new MemoryCorruptionError("Memory review decision artifact does not match its event");
+						}
+					}
+					for (const reference of event.payload.revisions) {
+						const stored = await readArtifact(reference.artifactId, purgedArtifactIds.has(reference.artifactId));
+						if (!stored) continue;
+						const revision = validateMemoryRevisionV2(JSON.parse(stored.content) as unknown);
+						if (
+							revision.memoryId !== reference.memoryId ||
+							revision.revision !== reference.revision ||
+							revision.trust !== reference.trust ||
+							revision.lifecycle !== reference.lifecycle ||
+							revision.sourceDigest !== reference.sourceDigest ||
+							stableJsonStringify(revision.evidenceRefs.map((evidence) => evidence.evidenceId)) !==
+								stableJsonStringify(reference.evidenceIds)
+						) {
+							throw new MemoryCorruptionError("Memory v2 revision artifact does not match its event");
+						}
+						for (const evidence of revision.evidenceRefs) rememberEvidence(evidence);
+					}
+					for (const reference of event.payload.cues) {
+						const stored = await readArtifact(reference.artifactId);
+						if (!stored) continue;
+						const cue = validateCueNodeV1(JSON.parse(stored.content) as unknown);
+						if (
+							cue.cueId !== reference.cueId ||
+							cue.revision !== reference.revision ||
+							cue.key !== reference.key
+						) {
+							throw new MemoryCorruptionError("Memory v2 cue artifact does not match its event");
+						}
+					}
+					for (const reference of event.payload.edges) {
+						const stored = await readArtifact(reference.artifactId, purgedArtifactIds.has(reference.artifactId));
+						if (!stored) continue;
+						const edge = validateMemoryEdgeV2(JSON.parse(stored.content) as unknown);
+						if (
+							edge.edgeId !== reference.edgeId ||
+							stableJsonStringify(edge.from) !== stableJsonStringify(reference.from) ||
+							stableJsonStringify(edge.to) !== stableJsonStringify(reference.to) ||
+							edge.relation !== reference.relation
+						) {
+							throw new MemoryCorruptionError("Memory v2 edge artifact does not match its event");
+						}
+						for (const evidence of edge.evidenceRefs) rememberEvidence(evidence);
+					}
+				}
+				continue;
+			}
 			if (event.eventType === "capture_scheduled") {
 				const stored = await readArtifact(event.payload.sourceArtifactId);
 				if (!stored) continue;
@@ -3482,7 +4511,7 @@ export class MemoryStore {
 				for (const reference of event.payload.revisions) {
 					const stored = await readArtifact(reference.artifactId, purgedArtifactIds.has(reference.artifactId));
 					if (!stored) continue;
-					const revision = validateMemoryRevisionV1(JSON.parse(stored.content) as unknown);
+					const revision = validateMemoryRevision(JSON.parse(stored.content) as unknown);
 					if (
 						revision.memoryId !== reference.memoryId ||
 						revision.revision !== reference.revision ||
@@ -3510,7 +4539,7 @@ export class MemoryStore {
 				for (const reference of event.payload.edges) {
 					const stored = await readArtifact(reference.artifactId, purgedArtifactIds.has(reference.artifactId));
 					if (!stored) continue;
-					const edge = validateMemoryEdgeV1(JSON.parse(stored.content) as unknown);
+					const edge = validateMemoryEdge(JSON.parse(stored.content) as unknown);
 					if (
 						edge.edgeId !== reference.edgeId ||
 						stableJsonStringify(edge.from) !== stableJsonStringify(reference.from) ||
@@ -3530,7 +4559,7 @@ export class MemoryStore {
 					purgedArtifactIds.has(event.payload.revisionArtifactId),
 				);
 				if (!stored) continue;
-				const revision = validateMemoryRevisionV1(JSON.parse(stored.content) as unknown);
+				const revision = validateMemoryRevision(JSON.parse(stored.content) as unknown);
 				if (revision.memoryId !== event.payload.memoryId || revision.revision !== event.payload.toRevision) {
 					throw new MemoryCorruptionError("Memory derived revision artifact does not match its event");
 				}

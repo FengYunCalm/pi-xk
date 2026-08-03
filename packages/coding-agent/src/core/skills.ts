@@ -85,6 +85,24 @@ export interface LoadSkillsResult {
 	diagnostics: ResourceDiagnostic[];
 }
 
+interface SkillFileLoadResult {
+	skill: Skill | null;
+	diagnostics: ResourceDiagnostic[];
+}
+
+interface SkillLoadCacheEntry {
+	source: string;
+	content: string;
+	result: SkillFileLoadResult;
+}
+
+export type SkillLoadCache = Map<string, SkillLoadCacheEntry>;
+
+interface SkillLoadContext {
+	cache: SkillLoadCache;
+	seenPaths: Set<string>;
+}
+
 /**
  * Validate skill name per Agent Skills spec.
  * Returns array of validation error messages (empty if valid).
@@ -176,6 +194,7 @@ function loadSkillsFromDirInternal(
 	includeRootFiles: boolean,
 	ignoreMatcher?: IgnoreMatcher,
 	rootDir?: string,
+	context?: SkillLoadContext,
 ): LoadSkillsResult {
 	const skills: Skill[] = [];
 	const diagnostics: ResourceDiagnostic[] = [];
@@ -212,7 +231,7 @@ function loadSkillsFromDirInternal(
 				continue;
 			}
 
-			const result = loadSkillFromFile(fullPath, source);
+			const result = loadSkillFromFile(fullPath, source, context);
 			if (result.skill) {
 				skills.push(result.skill);
 			}
@@ -253,7 +272,7 @@ function loadSkillsFromDirInternal(
 			}
 
 			if (isDirectory) {
-				const subResult = loadSkillsFromDirInternal(fullPath, source, false, ig, root);
+				const subResult = loadSkillsFromDirInternal(fullPath, source, false, ig, root, context);
 				skills.push(...subResult.skills);
 				diagnostics.push(...subResult.diagnostics);
 				continue;
@@ -263,7 +282,7 @@ function loadSkillsFromDirInternal(
 				continue;
 			}
 
-			const result = loadSkillFromFile(fullPath, source);
+			const result = loadSkillFromFile(fullPath, source, context);
 			if (result.skill) {
 				skills.push(result.skill);
 			}
@@ -274,14 +293,14 @@ function loadSkillsFromDirInternal(
 	return { skills, diagnostics };
 }
 
-function loadSkillFromFile(
-	filePath: string,
-	source: string,
-): { skill: Skill | null; diagnostics: ResourceDiagnostic[] } {
+function loadSkillFromFile(filePath: string, source: string, context?: SkillLoadContext): SkillFileLoadResult {
 	const diagnostics: ResourceDiagnostic[] = [];
 
 	try {
 		const rawContent = readFileSync(filePath, "utf-8");
+		context?.seenPaths.add(filePath);
+		const cached = context?.cache.get(filePath);
+		if (cached?.source === source && cached.content === rawContent) return cached.result;
 		const { frontmatter } = parseFrontmatter<SkillFrontmatter>(rawContent);
 		const skillDir = dirname(filePath);
 		const parentDirName = basename(skillDir);
@@ -303,10 +322,12 @@ function loadSkillFromFile(
 
 		// Still load the skill even with warnings (unless description is completely missing)
 		if (!frontmatter.description || frontmatter.description.trim() === "") {
-			return { skill: null, diagnostics };
+			const result = { skill: null, diagnostics };
+			context?.cache.set(filePath, { source, content: rawContent, result });
+			return result;
 		}
 
-		return {
+		const result = {
 			skill: {
 				name,
 				description: frontmatter.description,
@@ -317,6 +338,8 @@ function loadSkillFromFile(
 			},
 			diagnostics,
 		};
+		context?.cache.set(filePath, { source, content: rawContent, result });
+		return result;
 	} catch (error) {
 		const message = error instanceof Error ? error.message : "failed to parse skill file";
 		diagnostics.push({ type: "warning", message, path: filePath });
@@ -378,6 +401,10 @@ export interface LoadSkillsOptions {
 	skillPaths: string[];
 	/** Include default skills directories. */
 	includeDefaults: boolean;
+	/** Reuse parsed frontmatter only when the complete Skill file content is unchanged. */
+	cache?: SkillLoadCache;
+	/** Paths that may not exist yet and should not emit discovery diagnostics. */
+	optionalSkillPaths?: string[];
 }
 
 /**
@@ -386,10 +413,14 @@ export interface LoadSkillsOptions {
  */
 export function loadSkills(options: LoadSkillsOptions): LoadSkillsResult {
 	const { agentDir, skillPaths, includeDefaults } = options;
+	const context = options.cache ? { cache: options.cache, seenPaths: new Set<string>() } : undefined;
 
 	// Resolve agentDir - if not provided, use default from config
 	const resolvedCwd = resolvePath(options.cwd);
 	const resolvedAgentDir = resolvePath(agentDir ?? getAgentDir());
+	const optionalSkillPaths = new Set(
+		(options.optionalSkillPaths ?? []).map((path) => resolvePath(path, resolvedCwd, { trim: true })),
+	);
 
 	const skillMap = new Map<string, Skill>();
 	const realPathSet = new Set<string>();
@@ -428,8 +459,19 @@ export function loadSkills(options: LoadSkillsOptions): LoadSkillsResult {
 	}
 
 	if (includeDefaults) {
-		addSkills(loadSkillsFromDirInternal(join(resolvedAgentDir, "skills"), "user", true));
-		addSkills(loadSkillsFromDirInternal(resolve(resolvedCwd, CONFIG_DIR_NAME, "skills"), "project", true));
+		addSkills(
+			loadSkillsFromDirInternal(join(resolvedAgentDir, "skills"), "user", true, undefined, undefined, context),
+		);
+		addSkills(
+			loadSkillsFromDirInternal(
+				resolve(resolvedCwd, CONFIG_DIR_NAME, "skills"),
+				"project",
+				true,
+				undefined,
+				undefined,
+				context,
+			),
+		);
 	}
 
 	const userSkillsDir = join(resolvedAgentDir, "skills");
@@ -455,7 +497,9 @@ export function loadSkills(options: LoadSkillsOptions): LoadSkillsResult {
 	for (const rawPath of skillPaths) {
 		const resolvedPath = resolvePath(rawPath, resolvedCwd, { trim: true });
 		if (!existsSync(resolvedPath)) {
-			allDiagnostics.push({ type: "warning", message: "skill path does not exist", path: resolvedPath });
+			if (!optionalSkillPaths.has(resolvedPath)) {
+				allDiagnostics.push({ type: "warning", message: "skill path does not exist", path: resolvedPath });
+			}
 			continue;
 		}
 
@@ -463,9 +507,9 @@ export function loadSkills(options: LoadSkillsOptions): LoadSkillsResult {
 			const stats = statSync(resolvedPath);
 			const source = getSource(resolvedPath);
 			if (stats.isDirectory()) {
-				addSkills(loadSkillsFromDirInternal(resolvedPath, source, true));
+				addSkills(loadSkillsFromDirInternal(resolvedPath, source, true, undefined, undefined, context));
 			} else if (stats.isFile() && resolvedPath.endsWith(".md")) {
-				const result = loadSkillFromFile(resolvedPath, source);
+				const result = loadSkillFromFile(resolvedPath, source, context);
 				if (result.skill) {
 					addSkills({ skills: [result.skill], diagnostics: result.diagnostics });
 				} else {
@@ -477,6 +521,11 @@ export function loadSkills(options: LoadSkillsOptions): LoadSkillsResult {
 		} catch (error) {
 			const message = error instanceof Error ? error.message : "failed to read skill path";
 			allDiagnostics.push({ type: "warning", message, path: resolvedPath });
+		}
+	}
+	if (context) {
+		for (const path of context.cache.keys()) {
+			if (!context.seenPaths.has(path)) context.cache.delete(path);
 		}
 	}
 

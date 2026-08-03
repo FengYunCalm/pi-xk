@@ -226,6 +226,7 @@ export function createTestResourceLoader(options: CreateTestResourceLoaderOption
 		getSystemPrompt: () => undefined,
 		getAppendSystemPrompt: () => [],
 		extendResources: () => {},
+		reloadSkills: async () => ({ previousCount: 0, currentCount: 0, diagnostics: [] }),
 		reload: async () => {},
 	};
 }

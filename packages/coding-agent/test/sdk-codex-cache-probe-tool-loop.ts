@@ -180,6 +180,7 @@ function createMinimalResourceLoader(systemPrompt: string): ResourceLoader {
 		getSystemPrompt: () => systemPrompt,
 		getAppendSystemPrompt: () => [],
 		extendResources: () => {},
+		reloadSkills: async () => ({ previousCount: 0, currentCount: 0, diagnostics: [] }),
 		reload: async () => {},
 	};
 }

@@ -53,6 +53,7 @@ import type { ReadonlyFooterDataProvider } from "../footer-data-provider.ts";
 import type { KeybindingsManager } from "../keybindings.ts";
 import type { CustomMessage } from "../messages.ts";
 import type { ModelRegistry } from "../model-registry.ts";
+import type { SkillReloadResult } from "../resource-loader.ts";
 import type {
 	BranchSummaryEntry,
 	CompactionEntry,
@@ -380,6 +381,8 @@ export interface ExtensionContext {
 	shutdown(): void;
 	/** Get current context usage for the active model. */
 	getContextUsage(): ContextUsage | undefined;
+	/** Reload only Skills for the next logical Agent run. Valid only during agent_settled. */
+	reloadSkillsAtSettledBoundary(): Promise<SkillReloadResult>;
 	/** Trigger compaction without awaiting completion. */
 	compact(options?: CompactOptions): void;
 	/** Summarize supplied messages with the current model without modifying the transcript. */
@@ -1713,6 +1716,7 @@ export interface ExtensionContextActions {
 	hasPendingMessages: () => boolean;
 	shutdown: () => void;
 	getContextUsage: () => ContextUsage | undefined;
+	reloadSkillsAtSettledBoundary?: () => Promise<SkillReloadResult>;
 	compact: (options?: CompactOptions) => void;
 	summarizeSessionContext?: (options: SummarizeSessionContextOptions) => Promise<SummarizeSessionContextResult>;
 	rolloverSession?: (options: RolloverSessionOptions) => Promise<RolloverSessionResult>;
