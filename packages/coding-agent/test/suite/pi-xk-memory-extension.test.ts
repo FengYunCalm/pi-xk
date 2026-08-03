@@ -666,7 +666,7 @@ describe("Pi-XK Memory extension", () => {
 			{ timeout: 5_000 },
 		);
 
-		expect(memoryErrors, memoryErrors.map((error) => error.stack ?? error.message).join("\n")).toEqual([]);
+		expect(memoryErrors).toEqual([]);
 		expect(requestCounts).toEqual([1, 1]);
 		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")[0]).toMatchObject({
 			title: "Documentation transition",
@@ -1086,7 +1086,8 @@ describe("Pi-XK Memory extension", () => {
 			fauxAssistantMessage("The evidence-backed Memory revision is staged."),
 		]);
 		await harness.session.prompt("Review the prior Memory against the current implementation.");
-		expect(memoryErrors).toEqual([]);
+		if (memoryErrors.length > 0) console.error(memoryErrors.map((error) => error.stack ?? error.message).join("\n"));
+		expect(memoryErrors, memoryErrors.map((error) => error.stack ?? error.message).join("\n")).toEqual([]);
 		const replay = await service.getStore().replay();
 		expect(replay.events.some((event) => event.eventType === "memory_review_applied")).toBe(true);
 		const reviewToolResults = harness.session.messages
