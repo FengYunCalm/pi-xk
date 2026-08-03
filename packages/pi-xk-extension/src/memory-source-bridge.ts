@@ -390,12 +390,24 @@ export class MemorySourceBridge {
 		}> = [];
 		for (const chainId of await this.chainIds()) {
 			try {
-				available.push({ chainId, replay: await this.chains.replayChain(chainId) });
+				available.push({ chainId, replay: await this.replayChain(chainId) });
 			} catch (error) {
 				if (!isSessionChainNotFoundError(error)) throw error;
 			}
 		}
 		return available;
+	}
+
+	private async replayChain(chainId: string): Promise<Awaited<ReturnType<SessionChainStore["replayChain"]>>> {
+		for (let attempt = 0; attempt < 4; attempt += 1) {
+			try {
+				return await this.chains.replayChain(chainId);
+			} catch (error) {
+				if (!isSessionChainNotFoundError(error) || attempt === 3) throw error;
+				await new Promise<void>((resolve) => setTimeout(resolve, (attempt + 1) * 25));
+			}
+		}
+		throw new Error(`Session Chain replay exhausted its retry budget: ${chainId}`);
 	}
 
 	private async currentCursor(): Promise<MemorySourceCursorV1 | MemorySourceCursorV2 | null> {
@@ -494,7 +506,7 @@ export class MemorySourceBridge {
 		const chains: MemorySourceCursorV2["chains"] = {};
 		for (const [chainId, stored] of Object.entries(cursor.chains)) {
 			if (!chainIds.has(chainId)) throw new Error(`Memory source cursor Chain event log is missing: ${chainId}`);
-			const replay = await this.chains.replayChain(chainId);
+			const replay = await this.replayChain(chainId);
 			const sequence = typeof stored === "number" ? stored : stored.sequence;
 			const actual = this.sourceHeadAt(replay.events, sequence, `Chain ${chainId}`);
 			if (typeof stored !== "number" && actual.hash !== stored.hash) {
@@ -510,7 +522,7 @@ export class MemorySourceBridge {
 		const replays = new Map<string, Awaited<ReturnType<SessionChainStore["replayChain"]>>>();
 		for (const [chainId, head] of Object.entries(cursor.chains)) {
 			if (!chainIds.has(chainId)) throw new Error(`Memory history cue source chain is missing: ${chainId}`);
-			const replay = await this.chains.replayChain(chainId);
+			const replay = await this.replayChain(chainId);
 			const event = replay.events.find((candidate) => candidate.sequence === head.sequence);
 			if (!event || event.hash !== head.hash) {
 				throw new Error(`Memory history cue chain cursor no longer matches its event log: ${chainId}`);
@@ -522,7 +534,7 @@ export class MemorySourceBridge {
 			if (key !== historySegmentKey(storedSegment.chainId, storedSegment.branchId, storedSegment.segmentId)) {
 				throw new Error(`Memory history cue segment key is invalid: ${storedSegment.segmentId}`);
 			}
-			const replay = replays.get(storedSegment.chainId) ?? (await this.chains.replayChain(storedSegment.chainId));
+			const replay = replays.get(storedSegment.chainId) ?? (await this.replayChain(storedSegment.chainId));
 			replays.set(storedSegment.chainId, replay);
 			const branch = replay.branches.find((candidate) => candidate.branchId === storedSegment.branchId);
 			const segment = branch?.segments.find((candidate) => candidate.segmentId === storedSegment.segmentId);
@@ -728,7 +740,7 @@ export class MemorySourceBridge {
 		source: PublishedRollupSourceV1,
 		trigger: "chain_rollup" | "backfill",
 	): Promise<MemoryCaptureRequest> {
-		const replay = await this.chains.replayChain(source.chainId);
+		const replay = await this.replayChain(source.chainId);
 		const branch = replay.branches.find((candidate) => candidate.branchId === source.branchId);
 		const publication = branch?.rollups.find(
 			(candidate) => candidate.windowIndex === source.windowIndex && candidate.artifactId === source.artifactId,
