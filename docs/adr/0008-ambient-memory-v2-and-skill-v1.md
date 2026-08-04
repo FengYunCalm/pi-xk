@@ -40,11 +40,13 @@ Memory v1 已提供项目级、有证据的 D0-D3 检索，但模型仍需要显
 
 原 `pi_xk_propose_memory_change`、V1 proposal 和历史事件继续可读，但不再出现在模型 manifest；用户仍可通过命令审查遗留 proposal。模型不可 archive、invalidate、detach 或 purge。
 
-Memory revision v2 增加 transition、reviewId、source revisions 和 trust derivation；`agent_run` evidence 只引用原生 Pi entry 范围、digest、Goal/Chain identity 和工具结果 ID，不复制 transcript。run 为 error、abort 或截断时不发布语义 revision，只保留运行诊断。
+Memory revision v2 增加 transition、reviewId、source revisions 和 trust derivation；`agent_run` evidence 只引用原生 Pi entry 范围、digest、Goal/Chain identity 和工具结果 ID，不复制 transcript。新写入使用 V3 evidence：它从 durable Pi-XK Goal binding 记录 `goalId`，读取时重新核对 session binding 与 Goal 事实；V2 历史 evidence 继续可读。run 为 error、abort 或截断时不发布语义 revision，只保留运行诊断。
+
+Pi 原生 follow-up 会在同一个 `agent.prompt()` 内排空，再触发一次 `agent_settled`。因此 queued follow-up 共享同一个 logical run、recall ledger 和 reconstruction trace，不会因 extension 重新执行 `before_agent_start` 而产生第二次 trace、review 或 publication。
 
 ### 3. 捕获只在稳定边界整合既有 Memory
 
-Goal checkpoint/completion、L2 publication、显式 backfill 先用有限候选搜索同主题 current Memory，再要求捕获模型返回 review action。重复 capture 使用 source digest、prompt version 和结果 artifact 幂等；CAS 冲突至多在新的稳定边界重新生成，连续冲突进入 cooldown。`generation_started` 后无 durable result pointer 的状态为 indeterminate，禁止未知结果的自动付费重试。
+Goal checkpoint/completion、L2 publication、显式 backfill 先用有限候选搜索同主题 current Memory，再要求捕获模型返回 review action。重复 capture 使用 source digest、prompt version 和结果 artifact 幂等；revision CAS 冲突会丢弃旧 pending result，并仅在下一稳定边界用独立 attempt reconstruction 重新生成。前两次冲突可重试，第三次写入不可自动重试的 `memory_capture_revision_conflict_cooldown`，避免持续付费重试。`generation_started` 后无 durable result pointer 的状态为 indeterminate，禁止未知结果的自动付费重试。
 
 标题、L1 和 compaction cue 仍只是历史定位信息，不直接创建 Memory。
 
@@ -97,7 +99,7 @@ reconstruction/skill-use trace
 
 ## 验证门
 
-1. V1/V2 Memory revision、proposal、event 混合 replay 与未知版本拒绝。
+1. V1/V2 Memory revision、proposal、event 混合 replay、V2/V3 `agent_run` evidence 读取与未知版本拒绝。
 2. 自主搜索、主动跳过、预算边界、隐式 keep、revise/supersede/dispute/create 和 CAS 冲突。
 3. error/abort/length/compaction/queued message 不发布语义 revision。
 4. Skill 创建、实际受管读取证据、更新、cooldown、stale、rollback、名称碰撞和两项目晋升。

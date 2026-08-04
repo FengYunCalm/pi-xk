@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { release, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -22,8 +22,27 @@ function positiveInteger(value, field) {
 	return parsed;
 }
 
+function nonNegativeNumber(value, field) {
+	const parsed = Number(value);
+	if (!Number.isFinite(parsed) || parsed < 0 || value.trim().length === 0) {
+		throw new Error(`${field} must be a non-negative number`);
+	}
+	return parsed;
+}
+
+function isRecord(value) {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function parseArguments(argv) {
-	const options = { counts: DEFAULT_COUNTS, runs: DEFAULT_RUNS, json: false, measure: null };
+	const options = {
+		counts: DEFAULT_COUNTS,
+		runs: DEFAULT_RUNS,
+		json: false,
+		measure: null,
+		baselinePath: null,
+		maxRegressionPercent: 15,
+	};
 	for (let index = 0; index < argv.length; index++) {
 		const argument = argv[index];
 		if (argument === "--json") {
@@ -47,6 +66,19 @@ function parseArguments(argv) {
 			const edgeCount = positiveInteger(argv[++index] ?? "", "measure edge count");
 			const runs = positiveInteger(argv[++index] ?? "", "measure runs");
 			options.measure = { memoryCount, edgeCount, runs };
+			continue;
+		}
+		if (argument === "--baseline") {
+			const path = argv[++index];
+			if (!path) throw new Error("--baseline requires a JSON result path");
+			options.baselinePath = resolve(path);
+			continue;
+		}
+		if (argument === "--max-regression-percent") {
+			options.maxRegressionPercent = nonNegativeNumber(
+				argv[++index] ?? "",
+				"max regression percent",
+			);
 			continue;
 		}
 		throw new Error(`unknown argument: ${argument}`);
@@ -212,6 +244,67 @@ function markdown(results, environment) {
 	].join("\n");
 }
 
+function baselineKey(result) {
+	return `${result.memoryCount}:${result.edgeCount}`;
+}
+
+function validateBaselineResult(value) {
+	if (!isRecord(value)) throw new Error("memory benchmark baseline result must be an object");
+	for (const field of [
+		"memoryCount",
+		"edgeCount",
+		"rebuildMs",
+		"d0P95Ms",
+		"d1P95Ms",
+		"d2P95Ms",
+		"graphP95Ms",
+		"peakRssMiB",
+	]) {
+		if (typeof value[field] !== "number" || !Number.isFinite(value[field])) {
+			throw new Error(`memory benchmark baseline result has invalid ${field}`);
+		}
+	}
+	return value;
+}
+
+async function loadBaseline(path, environment) {
+	const parsed = JSON.parse(await readFile(path, "utf8"));
+	if (!isRecord(parsed) || !isRecord(parsed.environment) || !Array.isArray(parsed.results)) {
+		throw new Error("memory benchmark baseline must be JSON output from this benchmark");
+	}
+	if (parsed.environment.platform !== environment.platform || parsed.environment.node !== environment.node) {
+		throw new Error(
+			`memory benchmark baseline environment differs: ${parsed.environment.platform} ${parsed.environment.node} vs ${environment.platform} ${environment.node}`,
+		);
+	}
+	return parsed.results.map(validateBaselineResult);
+}
+
+function regressionFailures(results, baselineResults, maxRegressionPercent) {
+	if (!baselineResults) return [];
+	const baselineByKey = new Map(baselineResults.map((result) => [baselineKey(result), result]));
+	const metrics = ["rebuildMs", "d0P95Ms", "d1P95Ms", "d2P95Ms", "graphP95Ms", "peakRssMiB"];
+	const failures = [];
+	for (const result of results) {
+		const baseline = baselineByKey.get(baselineKey(result));
+		if (!baseline) {
+			failures.push(`${result.memoryCount}: baseline is missing ${result.edgeCount} edges`);
+			continue;
+		}
+		for (const metric of metrics) {
+			const current = result[metric];
+			const previous = baseline[metric];
+			if (previous === 0 ? current > 0 : current > previous * (1 + maxRegressionPercent / 100)) {
+				const percent = previous === 0 ? "infinite" : `${(((current / previous) - 1) * 100).toFixed(1)}%`;
+				failures.push(
+					`${result.memoryCount}: ${metric} regressed ${percent} (${current.toFixed(3)} vs ${previous.toFixed(3)}; limit ${maxRegressionPercent}%)`,
+				);
+			}
+		}
+	}
+	return failures;
+}
+
 const options = parseArguments(process.argv.slice(2));
 if (options.measure) {
 	process.stdout.write(JSON.stringify(await measure(options.measure)));
@@ -221,7 +314,10 @@ if (options.measure) {
 const results = options.counts.map((memoryCount) =>
 	runMeasurement(memoryCount, Math.min(MAX_EDGES, memoryCount * 5), options.runs),
 );
-const failures = results.flatMap((result) => [
+const environment = { platform: process.platform, release: release(), node: process.version };
+const baselineResults = options.baselinePath ? await loadBaseline(options.baselinePath, environment) : null;
+const failures = [
+	...results.flatMap((result) => [
 	...(result.d0P95Ms >= 10 ? [`${result.memoryCount}: D0 p95 ${result.d0P95Ms.toFixed(3)} ms`] : []),
 	...(result.d1P95Ms >= 100 ? [`${result.memoryCount}: D1 p95 ${result.d1P95Ms.toFixed(3)} ms`] : []),
 	...(result.d2P95Ms >= 25 ? [`${result.memoryCount}: D2 p95 ${result.d2P95Ms.toFixed(3)} ms`] : []),
@@ -229,11 +325,23 @@ const failures = results.flatMap((result) => [
 	...(result.memoryCount === 100_000 && result.peakRssMiB > 512
 		? [`${result.memoryCount}: peak RSS ${result.peakRssMiB.toFixed(1)} MiB`]
 		: []),
-]);
-const environment = { platform: process.platform, release: release(), node: process.version };
+	]),
+	...regressionFailures(results, baselineResults, options.maxRegressionPercent),
+];
 process.stdout.write(
 	options.json
-		? `${JSON.stringify({ environment, results, failures }, null, 2)}\n`
+		? `${JSON.stringify(
+				{
+					environment,
+					results,
+					baseline: options.baselinePath
+						? { path: options.baselinePath, maxRegressionPercent: options.maxRegressionPercent }
+						: null,
+					failures,
+				},
+				null,
+				2,
+			)}\n`
 		: `${markdown(results, environment)}${failures.length > 0 ? `\n\nFailures:\n${failures.join("\n")}` : ""}\n`,
 );
 if (failures.length > 0) process.exitCode = 1;

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { type AgentRunEvidenceRefV2, type EvidenceRefV2, validateEvidenceRefV2 } from "./ambient-memory-contract.ts";
+import { type AgentRunEvidenceRef, type EvidenceRefV2, validateEvidenceRefV2 } from "./ambient-memory-contract.ts";
 import { captureGitFreshnessBasis, resolveGitFreshness, resolveGitRepositoryId } from "./memory-freshness.ts";
 import {
 	SKILL_CANDIDATE_SCHEMA,
@@ -407,7 +407,7 @@ export class SkillService {
 
 	async publishReview(
 		decisionInput: SkillReviewDecisionV1,
-		runEvidence: AgentRunEvidenceRefV2,
+		runEvidence: AgentRunEvidenceRef,
 		reviewEvidenceInput: readonly EvidenceRefV2[] = [],
 	): Promise<SkillReviewPublicationV1> {
 		if (!(await this.getConfig()).enabled) throw new SkillValidationError("Skill evolution is disabled");

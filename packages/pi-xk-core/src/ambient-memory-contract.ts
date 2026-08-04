@@ -17,6 +17,7 @@ import {
 } from "./memory-contract.ts";
 
 export const MEMORY_EVIDENCE_REF_V2_SCHEMA = "pi-xk.memory-evidence-ref.v2";
+export const MEMORY_EVIDENCE_REF_V3_SCHEMA = "pi-xk.memory-evidence-ref.v3";
 export const MEMORY_EDGE_V2_SCHEMA = "pi-xk.memory-edge.v2";
 export const MEMORY_EVENT_V2_SCHEMA = "pi-xk.memory-event.v2";
 export const MEMORY_READ_MODEL_V2_SCHEMA = "pi-xk.memory-read-model.v2";
@@ -90,7 +91,27 @@ export interface AgentRunEvidenceRefV2 {
 	locator: AgentRunEvidenceLocatorV2;
 }
 
-export type EvidenceRefV2 = EvidenceRefV1 | AgentRunEvidenceRefV2;
+export interface AgentRunEvidenceLocatorV3 extends AgentRunEvidenceLocatorV2 {
+	goalId: string | null;
+}
+
+export interface AgentRunEvidenceRefV3 {
+	schema: typeof MEMORY_EVIDENCE_REF_V3_SCHEMA;
+	evidenceId: string;
+	sourceType: "agent_run";
+	sourceId: string;
+	artifactId: string | null;
+	sourceDigest: string;
+	recordedAt: string;
+	locator: AgentRunEvidenceLocatorV3;
+}
+
+export type AgentRunEvidenceRef = AgentRunEvidenceRefV2 | AgentRunEvidenceRefV3;
+
+export type EvidenceRefV3 = EvidenceRefV1 | AgentRunEvidenceRef;
+
+// Retain the existing public name while accepting the append-only V3 evidence schema.
+export type EvidenceRefV2 = EvidenceRefV3;
 
 export interface MemorySemanticDraftV1 {
 	kind: MemoryKind;
@@ -319,11 +340,74 @@ export function validateAgentRunEvidenceRefV2(value: unknown): AgentRunEvidenceR
 	};
 }
 
+export function validateAgentRunEvidenceRefV3(value: unknown): AgentRunEvidenceRefV3 {
+	const input = record(value, "agent run evidence");
+	exact(
+		input,
+		["schema", "evidenceId", "sourceType", "sourceId", "artifactId", "sourceDigest", "recordedAt", "locator"],
+		"agent run evidence",
+	);
+	if (input.schema !== MEMORY_EVIDENCE_REF_V3_SCHEMA || input.sourceType !== "agent_run") {
+		throw new MemoryValidationError("agent run evidence schema or sourceType is invalid");
+	}
+	const locator = record(input.locator, "agent run locator");
+	exact(
+		locator,
+		[
+			"projectId",
+			"sessionId",
+			"sessionFile",
+			"goalId",
+			"chainId",
+			"branchId",
+			"segmentId",
+			"requestEntryId",
+			"terminalAssistantEntryId",
+			"toolResultEntryIds",
+			"rangeDigest",
+		],
+		"agent run locator",
+	);
+	const nullableId = (entry: unknown, field: string): string | null => (entry === null ? null : id(entry, field));
+	const goalId = nullableId(locator.goalId, "agent run goalId");
+	const chainId = nullableId(locator.chainId, "agent run chainId");
+	const branchId = nullableId(locator.branchId, "agent run branchId");
+	const segmentId = nullableId(locator.segmentId, "agent run segmentId");
+	if (
+		[chainId, branchId, segmentId].some((entry) => entry === null) &&
+		[chainId, branchId, segmentId].some((entry) => entry !== null)
+	) {
+		throw new MemoryValidationError("agent run Chain identity must be entirely present or absent");
+	}
+	return {
+		schema: MEMORY_EVIDENCE_REF_V3_SCHEMA,
+		evidenceId: id(input.evidenceId, "agent run evidenceId"),
+		sourceType: "agent_run",
+		sourceId: id(input.sourceId, "agent run sourceId"),
+		artifactId: input.artifactId === null ? null : digest(input.artifactId, "agent run artifactId"),
+		sourceDigest: digest(input.sourceDigest, "agent run sourceDigest"),
+		recordedAt: iso(input.recordedAt, "agent run recordedAt"),
+		locator: {
+			projectId: id(locator.projectId, "agent run projectId"),
+			sessionId: id(locator.sessionId, "agent run sessionId"),
+			sessionFile: text(locator.sessionFile, "agent run sessionFile", 4_096, true),
+			goalId,
+			chainId,
+			branchId,
+			segmentId,
+			requestEntryId: id(locator.requestEntryId, "agent run requestEntryId"),
+			terminalAssistantEntryId: id(locator.terminalAssistantEntryId, "agent run terminalAssistantEntryId"),
+			toolResultEntryIds: uniqueIds(locator.toolResultEntryIds, "agent run toolResultEntryIds", 100),
+			rangeDigest: digest(locator.rangeDigest, "agent run rangeDigest"),
+		},
+	};
+}
+
 export function validateEvidenceRefV2(value: unknown): EvidenceRefV2 {
 	const input = record(value, "evidence");
-	return input.schema === MEMORY_EVIDENCE_REF_V2_SCHEMA
-		? validateAgentRunEvidenceRefV2(input)
-		: validateEvidenceRefV1(input);
+	if (input.schema === MEMORY_EVIDENCE_REF_V2_SCHEMA) return validateAgentRunEvidenceRefV2(input);
+	if (input.schema === MEMORY_EVIDENCE_REF_V3_SCHEMA) return validateAgentRunEvidenceRefV3(input);
+	return validateEvidenceRefV1(input);
 }
 
 function semanticDraft(value: unknown): MemorySemanticDraftV1 {

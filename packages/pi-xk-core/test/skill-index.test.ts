@@ -1,13 +1,18 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { execFile as execFileCallback, spawnSync } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import { type SkillIndexSnapshotV1, SkillIndexWorkerClient } from "../src/index.ts";
 import { SkillSqliteProjection } from "../src/skill-index-database.ts";
 
 const roots: string[] = [];
 const digest = (character: string): string => `sha256:${character.repeat(64)}`;
+const execFile = promisify(execFileCallback);
+const bunAvailable = spawnSync("bun", ["--version"], { encoding: "utf8" }).status === 0;
 
 afterEach(async () => {
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
@@ -117,4 +122,96 @@ describe("Skill index", () => {
 		expect(await client.integrityCheck()).toBe("ok");
 		await client.close();
 	});
+
+	it.skipIf(!bunAvailable)(
+		"checkpoints the Bun Skill worker WAL before a rebuilt index file is moved",
+		async () => {
+			const root = await mkdtemp(join(tmpdir(), "pi-xk-skill-index-bun-move-"));
+			roots.push(root);
+			const inputPath = join(root, "snapshot.json");
+			const temporaryPath = join(root, "temporary.sqlite");
+			const finalPath = join(root, "index.sqlite");
+			await writeFile(inputPath, `${JSON.stringify(snapshot())}\n`);
+			const moduleUrl = pathToFileURL(join(process.cwd(), "src", "index.ts")).href;
+			const script = [
+				'import { readFileSync, renameSync, rmSync } from "node:fs";',
+				`import { SkillIndexWorkerClient } from ${JSON.stringify(moduleUrl)};`,
+				`const snapshot = JSON.parse(readFileSync(${JSON.stringify(inputPath)}, "utf8"));`,
+				`const temporaryPath = ${JSON.stringify(temporaryPath)};`,
+				`const finalPath = ${JSON.stringify(finalPath)};`,
+				"const builder = new SkillIndexWorkerClient({ databasePath: temporaryPath });",
+				"await builder.rebuild(snapshot);",
+				"await builder.close();",
+				"renameSync(temporaryPath, finalPath);",
+				'for (const suffix of ["-wal", "-shm"]) rmSync(temporaryPath + suffix, { force: true });',
+				"const reopened = new SkillIndexWorkerClient({ databasePath: finalPath });",
+				"const result = {",
+				"  status: await reopened.status(),",
+				'  skillIds: (await reopened.search({ query: "release", includeCandidates: true, limit: 10 })).skills.map((skill) => skill.skillId),',
+				"  integrity: await reopened.integrityCheck(),",
+				"};",
+				"await reopened.close();",
+				"process.stdout.write(JSON.stringify(result));",
+			].join("\n");
+			const bun = await execFile("bun", ["-e", script], {
+				cwd: process.cwd(),
+				encoding: "utf8",
+				maxBuffer: 4 * 1024 * 1024,
+			});
+			expect(JSON.parse(bun.stdout)).toEqual({
+				status: expect.objectContaining({ head: snapshot().head, skillCount: 1, candidateCount: 1 }),
+				skillIds: ["skill_release-audit"],
+				integrity: "ok",
+			});
+		},
+		15_000,
+	);
+
+	it.skipIf(!bunAvailable)(
+		"produces equivalent Node and Bun Skill FTS projection results",
+		async () => {
+			const root = await mkdtemp(join(tmpdir(), "pi-xk-skill-index-runtime-equivalence-"));
+			roots.push(root);
+			const inputPath = join(root, "snapshot.json");
+			await writeFile(inputPath, `${JSON.stringify(snapshot())}\n`);
+			const nodeDatabase = new DatabaseSync(":memory:");
+			const nodeProjection = new SkillSqliteProjection(nodeDatabase);
+			nodeProjection.rebuild(snapshot());
+			const nodeResult = {
+				status: nodeProjection.status(),
+				skillIds: nodeProjection
+					.search({ query: "release smoke", includeCandidates: true, limit: 10 })
+					.skills.map((skill) => skill.skillId),
+				candidateIds: nodeProjection
+					.search({ query: "Memory retrieval", includeCandidates: true, limit: 10 })
+					.candidates.map((candidate) => candidate.candidateId),
+			};
+			nodeDatabase.close();
+
+			const moduleUrl = pathToFileURL(join(process.cwd(), "src", "skill-index-database.ts")).href;
+			const script = [
+				'import { readFileSync } from "node:fs";',
+				'import { Database } from "bun:sqlite";',
+				`import { SkillSqliteProjection } from ${JSON.stringify(moduleUrl)};`,
+				`const snapshot = JSON.parse(readFileSync(${JSON.stringify(inputPath)}, "utf8"));`,
+				'const database = new Database(":memory:", { strict: true });',
+				"const projection = new SkillSqliteProjection(database);",
+				"projection.rebuild(snapshot);",
+				"const result = {",
+				"  status: projection.status(),",
+				'  skillIds: projection.search({ query: "release smoke", includeCandidates: true, limit: 10 }).skills.map((skill) => skill.skillId),',
+				'  candidateIds: projection.search({ query: "Memory retrieval", includeCandidates: true, limit: 10 }).candidates.map((candidate) => candidate.candidateId),',
+				"};",
+				"database.close();",
+				"process.stdout.write(JSON.stringify(result));",
+			].join("\n");
+			const bun = await execFile("bun", ["-e", script], {
+				cwd: process.cwd(),
+				encoding: "utf8",
+				maxBuffer: 4 * 1024 * 1024,
+			});
+			expect(JSON.parse(bun.stdout)).toEqual(nodeResult);
+		},
+		15_000,
+	);
 });

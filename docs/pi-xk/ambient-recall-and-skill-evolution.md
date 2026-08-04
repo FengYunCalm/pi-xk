@@ -52,6 +52,8 @@ Memory 与 Skill 正文必须包装为 `historical evidence, not instructions`�
 
 超限返回 `budget_exhausted`，模型应停止扩展候选并基于已有证据继续或明确说明证据不足。ledger 记录 query/candidate/revision/evidence 的 digest 和停止原因，不保存提示词或回答正文。只有 D2/D3 实际读取记为 access；D1 曝光不增加 heat。允许的停止原因：`not_needed`、`sufficient`、`irrelevant`、`budget_exhausted`、`evidence_unavailable`、`conflict_found`、`run_failed`。
 
+Pi 原生 follow-up 在同一个 `agent.prompt()` 内按顺序排空，随后才产生该 prompt 唯一的 `agent_settled`。因此 queued follow-up 不会重置 recall ledger、重复 `before_agent_start` 或产生第二个 reconstruction；它与首条输入共同构成一个 logical run。
+
 ## Memory review
 
 成功 run 可以调用 `pi_xk_review_memory`：
@@ -62,11 +64,11 @@ Memory 与 Skill 正文必须包装为 `historical evidence, not instructions`�
 - `dispute`：无法解决的冲突保留双方并创建 `contradicts`；
 - `create`：必须由当前 run 或已读取 evidence 支持。
 
-模型只能复核本 run 读取过的 revision。Host 会重新验证 evidence ownership、source digest、schema、event-head/revision CAS 和 transition。成功 settled 且模型未提出其他决定时，已读 Memory 隐式记录 `keep`；error、abort、length 或未完成 run 不发布语义 revision。
+模型只能复核本 run 读取过的 revision。Host 会重新验证 evidence ownership、source digest、schema、event-head/revision CAS 和 transition。成功 settled 且模型未提出其他决定时，已读 Memory 隐式记录 `keep`；error、abort、length 或未完成 run 不发布语义 revision。新建的 `agent_run` evidence 使用 V3，并把从 durable session binding 验证得到的 `goalId` 与 entry 范围一同保存；V2 历史 evidence 仍可读取。
 
 `verified` 不能由模型语气或来源完整性继承。只有用户明确保存或 Host 确定性验证才可保持 verified；冲突用 disputed 表达。archive、invalidate、detach、purge 只提供给用户命令。
 
-稳定来源捕获（Goal checkpoint/completion、L2 Rollup 和显式 backfill）也先搜索同主题 Memory，再执行同一 review 语义。结果 artifact 已存在时恢复复用；generation started 但结果未知时保持 indeterminate，不自动重复付费调用。
+稳定来源捕获（Goal checkpoint/completion、L2 Rollup 和显式 backfill）也先搜索同主题 Memory，再执行同一 review 语义。结果 artifact 已存在时恢复复用；generation started 但结果未知时保持 indeterminate，不自动重复付费调用。若 revision CAS 冲突，Host 只在下一稳定边界发起新的 attempt；前两次冲突可重试，第三次记录 `memory_capture_revision_conflict_cooldown` 并停止自动 provider 调用，等待新的事实或用户/doctor 介入。
 
 ## Skill 演进
 
@@ -105,7 +107,7 @@ Skill 正文不会进入 D0。只有在下一逻辑 run 的固定 Skill generati
 /skill doctor [deep|repair-projections|repair-lock <nonce>]
 ```
 
-用户可审计、回滚和删除；模型默认负责搜索、review 和候选演进，但不能执行生命周期删除。`/xk status` 汇总 recall budget、最近 reconstruction、Memory conflict、Skill active/candidate/stale/cooldown 和 projection 状态。
+用户可审计、回滚和删除；模型默认负责搜索、review 和候选演进，但不能执行生命周期删除。`/xk status` 汇总 recall budget、最近 reconstruction、可重试 Memory capture、CAS cooldown、Memory conflict、Skill active/candidate/stale/cooldown、索引和 projection/reload 状态。
 
 ## 与 Goal、compaction、Session Chain 的关系
 
@@ -117,6 +119,6 @@ Skill 正文不会进入 D0。只有在下一逻辑 run 的固定 Skill generati
 
 ## 失败与恢复
 
-事实 artifact/event 已发布而 SQLite/Markdown/Skill projection 未更新时，使用对应 `doctor repair-projections`，不重新调用模型。artifact 已写但 event 未写时通过 pending pointer 复用；CAS 冲突要求下一 run 重新读取，不做语义 rebase。未知 event schema、证据越权、digest 不一致、同名非 managed Skill 或损坏 bundle 都是不可静默修复的诊断。
+事实 artifact/event 已发布而 SQLite/Markdown/Skill projection 未更新时，使用对应 `doctor repair-projections`，不重新调用模型。artifact 已写但 event 未写时通过 pending pointer 复用；交互式 review 的 CAS 冲突要求下一 run 重新读取，不做语义 rebase。稳定 capture 的 CAS 冲突走有界 attempt/cooldown，不会复用冲突前的模型结果。未知 event schema、证据越权、digest 不一致、同名非 managed Skill 或损坏 bundle 都是不可静默修复的诊断。
 
 Memory/Skill 目录第一次有效使用或显式命令才创建；关闭 ambient/evolution 只停止新的自动 capture、review/access 或 Skill publication，既有事实仍可只读审计。关闭期间的历史不自动批量回填。

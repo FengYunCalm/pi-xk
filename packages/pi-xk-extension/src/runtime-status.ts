@@ -126,7 +126,17 @@ export async function renderPiXkRuntimeStatus(
 	memory: MemoryService,
 	skills?: { project: SkillService; global: SkillService },
 ): Promise<string> {
-	const [chain, goal, task, memoryStatus, memoryReadModel, projectSkills, globalSkills] = await Promise.all([
+	const [
+		chain,
+		goal,
+		task,
+		memoryStatus,
+		memoryReadModel,
+		projectSkills,
+		globalSkills,
+		projectSkillReadModel,
+		globalSkillReadModel,
+	] = await Promise.all([
 		chainStatus(ctx, controller),
 		goalStatus(ctx),
 		taskStatus(ctx),
@@ -138,22 +148,52 @@ export async function renderPiXkRuntimeStatus(
 			.catch(() => null),
 		skills?.project.status().catch(() => null) ?? null,
 		skills?.global.status().catch(() => null) ?? null,
+		skills?.project
+			.getStore()
+			.loadReadModel()
+			.catch(() => null) ?? null,
+		skills?.global
+			.getStore()
+			.loadReadModel()
+			.catch(() => null) ?? null,
 	]);
 	const memoryFailed = "error" in memoryStatus;
+	const captures = memoryReadModel?.captures ?? [];
+	const retryableMemoryFailures = captures.filter(
+		(capture) => capture.status === "failed" && capture.retryable === true,
+	).length;
+	const memoryConflictCooldowns = captures.filter(
+		(capture) => capture.errorCode === "memory_capture_revision_conflict_cooldown",
+	).length;
+	const skillPublicationFailures = [projectSkillReadModel, globalSkillReadModel].flatMap(
+		(readModel) => readModel?.publicationFailures ?? [],
+	);
+	const skillProjectionState = skillPublicationFailures.some(
+		(failure) => failure.stage === "projection" || failure.stage === "promotion",
+	)
+		? "pending repair"
+		: "current";
+	const skillReloadState = skillPublicationFailures.some((failure) => failure.stage === "reload")
+		? "pending repair"
+		: "current";
 	const diagnostics = [
 		...chain.diagnostics,
 		...goal.diagnostics,
 		...task.diagnostics,
 		...(memoryFailed ? [`memory_status_failed:${memoryStatus.error}`] : []),
+		...(!memoryFailed && retryableMemoryFailures > 0 ? ["memory_capture_failed_retryable"] : []),
+		...(!memoryFailed && memoryConflictCooldowns > 0 ? ["memory_capture_revision_conflict_cooldown"] : []),
+		...(skillProjectionState === "current" ? [] : ["skill_projection_pending_repair"]),
+		...(skillReloadState === "current" ? [] : ["skill_reload_pending_repair"]),
 	];
 	const memoryLine = memoryFailed
 		? "Memory: unavailable"
-		: `Memory: ${memoryStatus.index?.memoryCount ?? 0} · pending ${memoryStatus.captures.scheduled + memoryStatus.captures.generating + memoryStatus.captures.proposed} · failed ${memoryStatus.captures.failed} · stale ${memoryStatus.index?.stateCounts.freshness.stale ?? 0} · disputed ${memoryStatus.index?.stateCounts.trust.disputed ?? 0}`;
+		: `Memory: ${memoryStatus.index?.memoryCount ?? 0} · pending ${memoryStatus.captures.scheduled + memoryStatus.captures.generating + memoryStatus.captures.proposed} · failed ${memoryStatus.captures.failed} (retryable ${retryableMemoryFailures}, cooldown ${memoryConflictCooldowns}) · stale ${memoryStatus.index?.stateCounts.freshness.stale ?? 0} · disputed ${memoryStatus.index?.stateCounts.trust.disputed ?? 0} · index ${memoryStatus.indexState}`;
 	const latestReconstruction = memoryReadModel?.reconstructions.at(-1);
 	const recallLine = `Recall: budget ${DEFAULT_AMBIENT_RECALL_BUDGET.maxTotalKnowledgeActions} total / ${DEFAULT_AMBIENT_RECALL_BUDGET.maxMemoryActions} Memory / ${DEFAULT_AMBIENT_RECALL_BUDGET.maxSkillCandidateActions} Skill · latest ${latestReconstruction ? `${latestReconstruction.runId} ${latestReconstruction.outcome}` : "none"}`;
 	const skillLine =
 		projectSkills && globalSkills
-			? `Skills: active ${projectSkills.facts.active + globalSkills.facts.active} · candidates ${projectSkills.facts.candidates + globalSkills.facts.candidates} · stale ${projectSkills.facts.stale + globalSkills.facts.stale} · cooldown ${projectSkills.facts.needsReview + globalSkills.facts.needsReview} · publication failures ${projectSkills.facts.publicationFailures + globalSkills.facts.publicationFailures}`
+			? `Skills: active ${projectSkills.facts.active + globalSkills.facts.active} · candidates ${projectSkills.facts.candidates + globalSkills.facts.candidates} · stale ${projectSkills.facts.stale + globalSkills.facts.stale} · cooldown ${projectSkills.facts.needsReview + globalSkills.facts.needsReview} · promotion eligible ${(projectSkillReadModel?.promotionEligibleSkillIds.length ?? 0) + (globalSkillReadModel?.promotionEligibleSkillIds.length ?? 0)} · index ${projectSkills.indexState}/${globalSkills.indexState} · projection ${skillProjectionState} · reload ${skillReloadState}`
 			: "Skills: unavailable";
 	const recovery =
 		diagnostics.length === 0

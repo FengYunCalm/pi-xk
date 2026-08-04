@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { release, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -21,8 +21,28 @@ function positiveInteger(value, field) {
 	return parsed;
 }
 
+function nonNegativeNumber(value, field) {
+	const parsed = Number(value);
+	if (!Number.isFinite(parsed) || parsed < 0 || value.trim().length === 0) {
+		throw new Error(`${field} must be a non-negative number`);
+	}
+	return parsed;
+}
+
+function isRecord(value) {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function parseArguments(argv) {
-	const options = { counts: DEFAULT_COUNTS, runs: DEFAULT_RUNS, json: false, measureIndex: null, measureReload: null };
+	const options = {
+		counts: DEFAULT_COUNTS,
+		runs: DEFAULT_RUNS,
+		json: false,
+		measureIndex: null,
+		measureReload: null,
+		baselinePath: null,
+		maxRegressionPercent: 15,
+	};
 	for (let index = 0; index < argv.length; index += 1) {
 		const argument = argv[index];
 		if (argument === "--json") {
@@ -51,6 +71,19 @@ function parseArguments(argv) {
 				skillCount: positiveInteger(argv[++index] ?? "", "reload Skill count"),
 				runs: positiveInteger(argv[++index] ?? "", "reload runs"),
 			};
+			continue;
+		}
+		if (argument === "--baseline") {
+			const path = argv[++index];
+			if (!path) throw new Error("--baseline requires a JSON result path");
+			options.baselinePath = resolve(path);
+			continue;
+		}
+		if (argument === "--max-regression-percent") {
+			options.maxRegressionPercent = nonNegativeNumber(
+				argv[++index] ?? "",
+				"max regression percent",
+			);
 			continue;
 		}
 		throw new Error(`unknown argument: ${argument}`);
@@ -230,6 +263,83 @@ function markdown(indexResults, reloadResult, environment) {
 	].join("\n");
 }
 
+function validateIndexBaseline(value) {
+	if (!isRecord(value)) throw new Error("Skill benchmark index baseline result must be an object");
+	for (const field of ["skillCount", "candidateCount", "rebuildMs", "statusP95Ms", "d1P95Ms", "candidateD1P95Ms"]) {
+		if (typeof value[field] !== "number" || !Number.isFinite(value[field])) {
+			throw new Error(`Skill benchmark index baseline result has invalid ${field}`);
+		}
+	}
+	return value;
+}
+
+function validateReloadBaseline(value) {
+	if (!isRecord(value)) throw new Error("Skill benchmark reload baseline result must be an object");
+	for (const field of ["skillCount", "reloadP95Ms", "loadedSkills"]) {
+		if (typeof value[field] !== "number" || !Number.isFinite(value[field])) {
+			throw new Error(`Skill benchmark reload baseline result has invalid ${field}`);
+		}
+	}
+	return value;
+}
+
+async function loadBaseline(path, environment) {
+	const parsed = JSON.parse(await readFile(path, "utf8"));
+	if (!isRecord(parsed) || !isRecord(parsed.environment) || !Array.isArray(parsed.indexResults)) {
+		throw new Error("Skill benchmark baseline must be JSON output from this benchmark");
+	}
+	if (parsed.environment.platform !== environment.platform || parsed.environment.node !== environment.node) {
+		throw new Error(
+			`Skill benchmark baseline environment differs: ${parsed.environment.platform} ${parsed.environment.node} vs ${environment.platform} ${environment.node}`,
+		);
+	}
+	return { indexResults: parsed.indexResults.map(validateIndexBaseline), reloadResult: validateReloadBaseline(parsed.reloadResult) };
+}
+
+function regressionFailures(indexResults, reloadResult, baseline, maxRegressionPercent) {
+	if (!baseline) return [];
+	const previousByCount = new Map(baseline.indexResults.map((result) => [result.skillCount, result]));
+	const metrics = ["rebuildMs", "statusP95Ms", "d1P95Ms", "candidateD1P95Ms"];
+	const failures = [];
+	for (const result of indexResults) {
+		const previous = previousByCount.get(result.skillCount);
+		if (!previous || previous.candidateCount !== result.candidateCount) {
+			failures.push(`${result.skillCount}: baseline is missing the matching candidate population`);
+			continue;
+		}
+		for (const metric of metrics) {
+			const current = result[metric];
+			const baselineValue = previous[metric];
+			if (baselineValue === 0 ? current > 0 : current > baselineValue * (1 + maxRegressionPercent / 100)) {
+				const percent =
+					baselineValue === 0 ? "infinite" : `${(((current / baselineValue) - 1) * 100).toFixed(1)}%`;
+				failures.push(
+					`${result.skillCount}: ${metric} regressed ${percent} (${current.toFixed(3)} vs ${baselineValue.toFixed(3)}; limit ${maxRegressionPercent}%)`,
+				);
+			}
+		}
+	}
+	if (
+		baseline.reloadResult.skillCount !== reloadResult.skillCount ||
+		baseline.reloadResult.loadedSkills !== reloadResult.loadedSkills
+	) {
+		failures.push("Skill reload baseline does not match the current Skill population");
+	} else if (
+		baseline.reloadResult.reloadP95Ms === 0
+			? reloadResult.reloadP95Ms > 0
+			: reloadResult.reloadP95Ms > baseline.reloadResult.reloadP95Ms * (1 + maxRegressionPercent / 100)
+	) {
+		const percent =
+			baseline.reloadResult.reloadP95Ms === 0
+				? "infinite"
+				: `${(((reloadResult.reloadP95Ms / baseline.reloadResult.reloadP95Ms) - 1) * 100).toFixed(1)}%`;
+		failures.push(
+			`reload: reloadP95Ms regressed ${percent} (${reloadResult.reloadP95Ms.toFixed(3)} vs ${baseline.reloadResult.reloadP95Ms.toFixed(3)}; limit ${maxRegressionPercent}%)`,
+		);
+	}
+	return failures;
+}
+
 const options = parseArguments(process.argv.slice(2));
 if (options.measureIndex) {
 	process.stdout.write(JSON.stringify(measureIndex(options.measureIndex)));
@@ -255,9 +365,23 @@ if (reloadResult.loadedSkills !== RELOAD_SKILL_COUNT) {
 }
 if (reloadResult.reloadP95Ms >= 50) failures.push(`resource reload p95 ${reloadResult.reloadP95Ms.toFixed(3)} ms`);
 const environment = { platform: process.platform, release: release(), node: process.version };
+const baseline = options.baselinePath ? await loadBaseline(options.baselinePath, environment) : null;
+failures.push(...regressionFailures(indexResults, reloadResult, baseline, options.maxRegressionPercent));
 process.stdout.write(
 	options.json
-		? `${JSON.stringify({ environment, indexResults, reloadResult, failures }, null, 2)}\n`
+		? `${JSON.stringify(
+				{
+					environment,
+					indexResults,
+					reloadResult,
+					baseline: options.baselinePath
+						? { path: options.baselinePath, maxRegressionPercent: options.maxRegressionPercent }
+						: null,
+					failures,
+				},
+				null,
+				2,
+			)}\n`
 		: `${markdown(indexResults, reloadResult, environment)}${failures.length > 0 ? `\n\nFailures:\n${failures.join("\n")}` : ""}\n`,
 );
 if (failures.length > 0) process.exitCode = 1;

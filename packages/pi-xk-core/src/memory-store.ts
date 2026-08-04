@@ -1058,6 +1058,10 @@ function headFor(event: MemoryEvent | undefined): MemoryHead {
 	return event ? { sequence: event.sequence, hash: event.hash } : { sequence: 0, hash: null };
 }
 
+function captureReviewRunIdMatches(captureId: string, attempt: number | null, runId: string): boolean {
+	return runId === captureId || (attempt !== null && attempt > 1 && runId === `${captureId}:attempt:${attempt}`);
+}
+
 function parseEvent(value: unknown, lineNumber: number): MemoryEvent {
 	if (!isRecord(value)) throw new MemoryCorruptionError(`Memory event ${lineNumber} is not an object`);
 	const fields = [
@@ -1144,7 +1148,7 @@ function projectCaptures(events: readonly MemoryEvent[]): Map<string, MemoryCapt
 				if (
 					!capture ||
 					(capture.status !== "generating" && !(capture.status === "failed" && capture.retryable === true)) ||
-					event.payload.runId !== capture.captureId
+					!captureReviewRunIdMatches(capture.captureId, capture.attempt, event.payload.runId)
 				) {
 					throw new MemoryCorruptionError("memory_review_applied does not match a generating capture");
 				}
@@ -1912,7 +1916,7 @@ function applyEventTail(readModel: MemoryReadModelV1, raw: string): MemoryReadMo
 					if (
 						!capture ||
 						(capture.status !== "generating" && !(capture.status === "failed" && capture.retryable === true)) ||
-						event.payload.runId !== capture.captureId
+						!captureReviewRunIdMatches(capture.captureId, capture.attempt, event.payload.runId)
 					) {
 						throw new MemoryCorruptionError("memory_review_applied does not match a generating capture");
 					}
@@ -2777,7 +2781,7 @@ export class MemoryStore {
 			throw new MemoryValidationError("Memory review decision runId does not match its reconstruction");
 		}
 		const captureId = context.captureId ?? null;
-		if (captureId !== null && captureId !== trace.runId) {
+		if (captureId !== null && trace.runId !== captureId && !trace.runId.startsWith(`${captureId}:attempt:`)) {
 			throw new MemoryValidationError("Memory capture review runId must equal captureId");
 		}
 		const readModel = (await this.loadReadModelSnapshot()).readModel;
@@ -2849,7 +2853,8 @@ export class MemoryStore {
 			const capture = readModel.captures.find((entry) => entry.captureId === captureId);
 			if (
 				!capture ||
-				(capture.status !== "generating" && !(capture.status === "failed" && capture.retryable === true))
+				(capture.status !== "generating" && !(capture.status === "failed" && capture.retryable === true)) ||
+				!captureReviewRunIdMatches(capture.captureId, capture.attempt, trace.runId)
 			) {
 				throw new MemoryValidationError("Memory capture review requires a generating capture");
 			}

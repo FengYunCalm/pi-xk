@@ -756,6 +756,10 @@ describe("Pi-XK Session Chain extension", () => {
 		expect(status).toContain("Rollup: 0 published · idle");
 		expect(status).toContain("Goal: Inspect runtime status · ended · acceptance 1/1");
 		expect(status).toContain("Task: task_runtime_status · pending · verification");
+		expect(status).toContain("Memory: 0 · pending 0 · failed 0 (retryable 0, cooldown 0)");
+		expect(status).toContain(
+			"Skills: active 0 · candidates 0 · stale 0 · cooldown 0 · promotion eligible 0 · index absent/absent · projection current · reload current",
+		);
 		expect(status).toContain("Recovery: clear");
 		expect(harness.providerCalls()).toBe(0);
 	});

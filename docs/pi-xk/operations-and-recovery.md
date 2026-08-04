@@ -266,12 +266,13 @@ V3 State 的 `recent_work_log` 最多保留 20 条重要记录。`tried_and_reje
 
 | 事件 | 结果 |
 | --- | --- |
-| 新 stable source | 后台串行 capture；模型结果 canonical read-back 后记录 proposal/application |
+| 新 stable source | 后台串行 capture；模型结果 canonical read-back 后记录 proposal/application；若 revision CAS 冲突，后续稳定边界才会建立独立 attempt |
 | `/memory remember` | 直接写 verified Memory，不调用 provider |
 | 模型提出 Memory review | 只处理本 run 已读取或有本 run evidence 支持的 `keep/revise/supersede/dispute/create`；Host 在 settled 后发布 |
 | `/memory config off` | 停止 capture、proposal apply 和 access 写入；既有 Memory 保持只读 |
 | SQLite/Markdown 更新失败 | Memory fact 保持已提交；doctor 可重建投影 |
 | generation started 后结果未知 | 标记 indeterminate，不自动重复 provider 调用 |
+| 连续 revision CAS 冲突 | 前两次在后续 stable-source scan 重试；第三次标记 `memory_capture_revision_conflict_cooldown`，停止自动调用 |
 | archive/invalidate | 新 lifecycle revision；旧 artifact 保留 |
 | purge | 显式确认、引用检查和 tombstone 后才清理独占 artifact |
 
@@ -311,10 +312,12 @@ Memory publication 的恢复边界：
 1. 已有模型 result artifact：重新验证并复用，不再次调用 provider。
 2. `proposal_recorded` 已存在且无需确认：下一次 stable-source scan 完成 apply，不再次调用 provider。
 3. `memory_change_applied` 已写但 read model/SQLite/Markdown 未更新：重放 event tail、应用 event-head CAS delta，或 repair projections。
-4. 已知 `capture_failed` 且 `retryable: true`、没有 pending result：后续 stable-source scan 为同一 capture 开始下一 attempt；即使 source cursor 已前移也会重新发现来源。
+4. 已知 `capture_failed` 且 `retryable: true`、没有 pending result：后续 stable-source scan 为同一 capture 开始下一 attempt；即使 source cursor 已前移也会重新发现来源。revision CAS 冲突会删除冲突前的 pending result，以新的 attempt runId 重新生成，不会把旧语义结果发布到新 revision。
 5. 已知 `capture_failed` 且 `retryable: false`：先修正来源、provenance、schema 或配置，不自动重试。
 6. `generation_started` 后没有 result artifact：结果未知，保持 indeterminate；只能在确认 provider 幂等性或用户显式判断后处理。
 7. source digest、evidence ownership、schema 或 CAS 无效：报告不可重试事实错误，不移动 cursor 伪装成功。
+
+连续 revision CAS 冲突的自动路径是有界的：第一次和第二次冲突分别等待下一个 stable-source scan，第三次写入 `memory_capture_revision_conflict_cooldown` 并停止自动 provider 调用。`/xk status` 会分别显示 retryable failure 与 cooldown；cooldown 不应通过删除 pending/event 或手工改写 capture 状态解除，应先检查 competing revision、来源和 evidence，再在新的稳定边界重新评估。
 
 SQLite 缺失、损坏或与 event head 不一致时：
 
@@ -450,6 +453,10 @@ owner 仍存活、PID 状态无法确认、metadata malformed 或 nonce 已变�
 
 如果 doctor 显示 `capture_failed_retryable`，这是结果已知的失败，下一次匹配 stable-source boundary 可以安全开始新 attempt；`capture_failed_non_retryable` 则要求先修正来源或配置。两者都不等同于 indeterminate。
 
+### Memory 显示 revision-conflict cooldown
+
+这表示同一 stable source 的 Memory revision CAS 已连续三次冲突。前两次冲突只会在后续稳定边界建立新的 attempt；第三次不再自动调用 provider，也不会复用旧 pending result。使用 `/xk status` 确认 `memory_capture_revision_conflict_cooldown`，再用 `/memory doctor deep` 核对当前 revision、来源证据和并发写入；保留事件和 artifact，等待具有新证据的稳定来源或显式的人工决策。
+
 ### Memory index missing/corrupt/stale
 
 先运行 `/memory doctor` 区分事实错误和投影错误。仅当 event/artifact 验证通过时执行 `/memory doctor repair-projections`。不要通过删除 `events.jsonl` 或 artifact 让 SQLite 看起来一致。
@@ -480,7 +487,20 @@ owner 仍存活、PID 状态无法确认、metadata malformed 或 nonce 已变�
 
 Pi-XK 只管理带 marker 且属于同一 lineage 的路径。非 managed 同名 Skill、symlink、路径逃逸和不同 Skill ID 的名称冲突都必须换名或由用户显式整理；模型不能覆盖现有用户 Skill。
 
-## 11. 更新与移除
+## 11. 性能基线
+
+Memory 和 Skill benchmark 可以在同一机器、同一 Node 版本上生成冻结基线，再用默认 15% 上限比较同一规模。JSON 基线必须由静默 npm 命令生成，避免 npm 的脚本横幅污染 JSON：
+
+```bash
+npm run --silent benchmark:pi-xk-memory -- --runs 3 --json > /tmp/pi-xk-memory-baseline.json
+npm run --silent benchmark:pi-xk-memory -- --runs 3 --json --baseline /tmp/pi-xk-memory-baseline.json
+npm run --silent benchmark:pi-xk-skills -- --runs 3 --json > /tmp/pi-xk-skill-baseline.json
+npm run --silent benchmark:pi-xk-skills -- --runs 3 --json --baseline /tmp/pi-xk-skill-baseline.json
+```
+
+`--baseline` 会拒绝格式损坏、缺失当前规模或 platform/Node 不一致的结果；可用 `--max-regression-percent <N>` 收紧或放宽阈值。基线只用于同环境回归判断，不是跨平台 SLA，也不替代 deep doctor 的事实校验。
+
+## 12. 更新与移除
 
 受支持的本地管理入口为：
 

@@ -10,13 +10,16 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { formatHistoricalEvidence, getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
-	type AgentRunEvidenceRefV2,
+	type AgentRunEvidenceRef,
+	type AgentRunEvidenceRefV3,
 	type AmbientRecallBudgetUsageV1,
 	ArtifactStore,
 	DEFAULT_AMBIENT_RECALL_BUDGET,
 	type EvidenceRefV2,
+	GoalNotFoundError,
+	GoalStore,
 	MEMORY_EVENT_V2_SCHEMA,
-	MEMORY_EVIDENCE_REF_V2_SCHEMA,
+	MEMORY_EVIDENCE_REF_V3_SCHEMA,
 	MEMORY_RECONSTRUCTION_TRACE_SCHEMA,
 	MEMORY_REVIEW_DECISION_SCHEMA,
 	MEMORY_REVIEW_PROMPT_VERSION,
@@ -48,6 +51,7 @@ import {
 	validateSkillReviewDecisionV1,
 } from "pi-xk-core";
 import { Type } from "typebox";
+import { PI_XK_SESSION_LINK_CUSTOM_TYPE } from "./checkpoint-extension.ts";
 import { MemoryController, type MemoryGenerationHost } from "./memory-controller.ts";
 import { MemorySourceBridge } from "./memory-source-bridge.ts";
 import {
@@ -55,6 +59,7 @@ import {
 	PI_XK_SESSION_CHAIN_LINK_CUSTOM_TYPE,
 	type PiXkSessionChainBindingV1,
 } from "./session-chain-controller.ts";
+import { isPiXkSessionLink } from "./session-link.ts";
 
 const MEMORY_STATUS_KEY = "pi-xk-memory";
 const MEMORY_COMPACTION_PROMPT = [
@@ -95,6 +100,7 @@ interface AmbientRunLedger {
 	sessionId: string;
 	startedAt: string;
 	initialEntryIds: Set<string>;
+	goalId: string | null;
 	binding: PiXkSessionChainBindingV1 | null;
 	queryDigests: string[];
 	candidateIds: Set<string>;
@@ -105,7 +111,7 @@ interface AmbientRunLedger {
 	budgetUsage: AmbientRecallBudgetUsageV1;
 	stopReason: RecallStopReason | null;
 	outcome: MemoryRunOutcome;
-	agentRunEvidence: AgentRunEvidenceRefV2 | null;
+	agentRunEvidence: AgentRunEvidenceRef | null;
 	skillCandidateIds: Set<string>;
 	skillCandidateReads: Map<string, { scope: "project" | "global"; skillId: string; revision: number }>;
 	skillReviewReads: Map<string, { scope: "project" | "global"; skillId: string; revision: number; name: string }>;
@@ -180,6 +186,28 @@ async function currentDurableChainBinding(ctx: ExtensionContext): Promise<PiXkSe
 			throw replayError;
 		}
 	}
+}
+
+async function currentDurableGoalId(ctx: ExtensionContext): Promise<string | null> {
+	const branch = ctx.sessionManager.getBranch();
+	for (let index = branch.length - 1; index >= 0; index -= 1) {
+		const entry = branch[index];
+		if (
+			entry?.type !== "custom" ||
+			entry.customType !== PI_XK_SESSION_LINK_CUSTOM_TYPE ||
+			!isPiXkSessionLink(entry.data)
+		) {
+			continue;
+		}
+		try {
+			await new GoalStore(ctx.cwd).replayGoal(entry.data.goalId);
+			return entry.data.goalId;
+		} catch (error) {
+			if (error instanceof GoalNotFoundError) return null;
+			throw error;
+		}
+	}
+	return null;
 }
 
 function createBudgetUsage(): AmbientRecallBudgetUsageV1 {
@@ -272,7 +300,7 @@ function successfulRunEvidence(
 	ledger: AmbientRunLedger,
 	branch: readonly SessionEntry[],
 	sessionFile: string | undefined,
-): AgentRunEvidenceRefV2 | null {
+): AgentRunEvidenceRefV3 | null {
 	if (ledger.outcome !== "succeeded" || !sessionFile) return null;
 	let requestIndex = branch.findIndex(
 		(entry) => !ledger.initialEntryIds.has(entry.id) && entry.type === "message" && entry.message.role === "user",
@@ -307,7 +335,7 @@ function successfulRunEvidence(
 	const rangeDigest = digestText(stableJsonStringify(persistedRange));
 	const evidenceId = `evidence_agent_run_${rangeDigest.slice("sha256:".length, "sha256:".length + 32)}`;
 	return {
-		schema: MEMORY_EVIDENCE_REF_V2_SCHEMA,
+		schema: MEMORY_EVIDENCE_REF_V3_SCHEMA,
 		evidenceId,
 		sourceType: "agent_run",
 		sourceId: `${ledger.sessionId}:${request.id}`,
@@ -318,6 +346,7 @@ function successfulRunEvidence(
 			projectId: projectId(projectRoot),
 			sessionId: ledger.sessionId,
 			sessionFile: resolve(sessionFile),
+			goalId: ledger.goalId,
 			chainId: ledger.binding?.chainId ?? null,
 			branchId: ledger.binding?.branchId ?? null,
 			segmentId: ledger.binding?.segmentId ?? null,
@@ -1888,12 +1917,14 @@ export function createPiXkMemoryExtension(options: PiXkMemoryExtensionOptions = 
 		});
 
 		pi.onCritical("before_agent_start", async (event, ctx) => {
+			const [goalId, binding] = await Promise.all([currentDurableGoalId(ctx), currentDurableChainBinding(ctx)]);
 			const ledger: AmbientRunLedger = {
 				runId: `run_${randomUUID().replaceAll("-", "")}`,
 				sessionId: ctx.sessionManager.getSessionId(),
 				startedAt: new Date().toISOString(),
 				initialEntryIds: new Set(ctx.sessionManager.getBranch().map((entry) => entry.id)),
-				binding: await currentDurableChainBinding(ctx),
+				goalId,
+				binding,
 				queryDigests: [],
 				candidateIds: new Set(),
 				readRevisions: new Map(),

@@ -12,6 +12,7 @@ import {
 	type MemoryReconstructionTraceV1,
 	type MemoryReviewAction,
 	type MemoryReviewDecisionV1,
+	MemoryRevisionConflictError,
 	type MemoryScopeV1,
 	MemoryValidationError,
 	normalizeMemoryCueKey,
@@ -337,7 +338,11 @@ export function buildMemoryCaptureReview(
 		for (const source of review.sourceMemories) {
 			const current = input.existingMemories.get(source.memoryId);
 			if (!current || current.revision.revision !== source.expectedRevision) {
-				throw new MemoryValidationError(`Memory capture revision is stale or unauthorized: ${source.memoryId}`);
+				throw new MemoryRevisionConflictError(
+					source.memoryId,
+					source.expectedRevision,
+					current?.revision.revision ?? null,
+				);
 			}
 			if (current.revision.lifecycle !== "active") {
 				throw new MemoryValidationError(`Memory capture cannot review non-active Memory: ${source.memoryId}`);

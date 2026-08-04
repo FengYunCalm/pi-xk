@@ -1,7 +1,12 @@
 import { createHash } from "node:crypto";
 import { readFile, realpath } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { type EvidenceRefV2, MEMORY_EVIDENCE_REF_V2_SCHEMA } from "./ambient-memory-contract.ts";
+import {
+	type AgentRunEvidenceRefV3,
+	type EvidenceRefV2,
+	MEMORY_EVIDENCE_REF_V2_SCHEMA,
+	MEMORY_EVIDENCE_REF_V3_SCHEMA,
+} from "./ambient-memory-contract.ts";
 import { ArtifactStore } from "./artifact-store.ts";
 import type { GoalCheckpointedEvent, GoalEvent } from "./contract.ts";
 import {
@@ -27,6 +32,10 @@ function exactKeys(value: Record<string, unknown>, expected: readonly string[]):
 
 function invalidEvidence(evidence: EvidenceRefV2, message: string): never {
 	throw new MemoryValidationError(`Memory evidence ${evidence.evidenceId} ${message}`);
+}
+
+function isAgentRunEvidenceV3(evidence: EvidenceRefV2): evidence is AgentRunEvidenceRefV3 {
+	return evidence.schema === MEMORY_EVIDENCE_REF_V3_SCHEMA;
 }
 
 function chainRollupSourceDigest(input: {
@@ -202,7 +211,7 @@ export async function resolveMemoryCompactionEvidence(
 
 export async function validateMemoryEvidenceOwnership(projectRoot: string, evidence: EvidenceRefV2): Promise<void> {
 	const artifacts = new ArtifactStore(projectRoot);
-	if (evidence.schema === MEMORY_EVIDENCE_REF_V2_SCHEMA) {
+	if (evidence.schema === MEMORY_EVIDENCE_REF_V2_SCHEMA || evidence.schema === MEMORY_EVIDENCE_REF_V3_SCHEMA) {
 		const locator = evidence.locator;
 		if (evidence.sourceId !== `${locator.sessionId}:${locator.requestEntryId}`) {
 			invalidEvidence(evidence, "does not match its Agent run entry range");
@@ -283,6 +292,34 @@ export async function validateMemoryEvidenceOwnership(projectRoot: string, evide
 		const start = entries.findIndex((entry) => isRecord(entry) && entry.id === locator.requestEntryId);
 		const end = entries.findIndex((entry) => isRecord(entry) && entry.id === locator.terminalAssistantEntryId);
 		if (start < 0 || end < start) invalidEvidence(evidence, "has no matching Agent run entry range");
+		if (isAgentRunEvidenceV3(evidence)) {
+			const goalId = evidence.locator.goalId;
+			let boundGoalId: string | null = null;
+			for (let index = start - 1; index >= 0; index -= 1) {
+				const entry = entries[index];
+				if (!isRecord(entry) || entry.type !== "custom" || entry.customType !== "pi-xk.session-link") continue;
+				const data = entry.data;
+				if (
+					isRecord(data) &&
+					data.schema === "pi-xk.session-link.v1" &&
+					data.kind === "goal_binding" &&
+					typeof data.goalId === "string"
+				) {
+					boundGoalId = data.goalId;
+					break;
+				}
+			}
+			if (boundGoalId !== goalId) {
+				invalidEvidence(evidence, "Goal identity does not match the native Session binding");
+			}
+			if (goalId !== null) {
+				try {
+					await new GoalStore(projectRoot).replayGoal(goalId);
+				} catch {
+					invalidEvidence(evidence, "Goal identity does not resolve in the current project");
+				}
+			}
+		}
 		const matchedRange = entries.slice(start, end + 1);
 		const matchedIds = new Set(
 			matchedRange

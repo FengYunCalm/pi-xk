@@ -53,6 +53,9 @@
 - Goal completion Memory now binds to the final event-time checkpoint State; retryable failed captures remain discoverable after cursor advancement, purge removes only exclusively owned proposal/result content, and doctor validates versioned source/History Cue cursors without guessing fact baselines.
 - Ambient Memory review now preserves old revisions during revise/supersede/dispute, rejects unread or stale CAS targets, and records indeterminate provider outcomes without automatic duplicate paid calls.
 - Skill publication now rejects unsafe bundles and non-managed collisions, records evidence-backed failures and cooldowns, and keeps the previous ResourceLoader generation when settled-boundary reload fails.
+- New agent-run evidence records and verifies the durable Goal binding while preserving V2 evidence read compatibility; native queued follow-up remains one logical run and cannot duplicate recall publication.
+- Stable Memory capture now discards stale pending results after a revision CAS conflict, uses distinct later attempts, and enters an explicit cooldown after the third consecutive conflict instead of repeatedly calling the provider.
+- `/xk status` now exposes retryable Memory failures, capture cooldowns, index health, Skill promotion eligibility, and pending projection/reload repair diagnostics.
 
 ## [0.1.1]
 

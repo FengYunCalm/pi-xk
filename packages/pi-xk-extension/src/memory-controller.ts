@@ -14,8 +14,10 @@ import {
 	type MemoryChangeProposalV1,
 	type MemoryEvidenceSourceType,
 	type MemoryExpectedRevisionV1,
+	MemoryHeadConflictError,
 	MemoryLockedError,
 	type MemoryReadResultV1,
+	MemoryRevisionConflictError,
 	type MemoryScopeV1,
 	MemoryService,
 	MemoryValidationError,
@@ -98,7 +100,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function captureFailure(
 	error: unknown,
 	stage: "source" | "generation" | "validation" | "artifact" | "publication" | "projection",
+	attempt: number,
 ) {
+	if (error instanceof MemoryRevisionConflictError) {
+		return attempt >= 3
+			? { errorCode: "memory_capture_revision_conflict_cooldown", retryable: false }
+			: { errorCode: "memory_capture_revision_conflict", retryable: true };
+	}
+	if (error instanceof MemoryHeadConflictError) {
+		return { errorCode: "memory_capture_event_head_conflict", retryable: true };
+	}
 	if (error instanceof MemoryValidationError) return { errorCode: "memory_capture_invalid", retryable: false };
 	if (stage === "source") return { errorCode: "memory_capture_context_failed", retryable: true };
 	if (stage === "validation") {
@@ -464,7 +475,7 @@ export class MemoryController {
 		) {
 			return;
 		}
-		const classification = captureFailure(error, stage);
+		const classification = captureFailure(error, stage, capture.attempt ?? 0);
 		await this.service.markCaptureFailed(
 			{
 				captureId,
@@ -481,6 +492,39 @@ export class MemoryController {
 				timestamp: this.now(),
 			},
 		);
+	}
+
+	private async closeConflictedReconstruction(
+		traceArtifactId: string,
+		runId: string,
+		error: MemoryRevisionConflictError,
+	): Promise<void> {
+		for (let attempt = 0; attempt < 2; attempt += 1) {
+			const replay = await this.service.getStore().replay();
+			if (replay.failedReviewRunIds.has(runId) || replay.reviewedRunIds.has(runId)) return;
+			try {
+				await this.service.recordMemoryReviewFailure(
+					{
+						runId,
+						traceArtifactId,
+						stage: "validation",
+						errorCode: "memory_capture_revision_conflict",
+						retryable: false,
+						message: limitedMessage(error),
+					},
+					{
+						eventId: `evt_memory_review_failed_${suffix(sha256(runId))}`,
+						idempotencyKey: `memory:review-failed:${runId}`,
+						expectedHead: replay.head,
+						actor: "runtime",
+						timestamp: this.now(),
+					},
+				);
+				return;
+			} catch (failure) {
+				if (!(failure instanceof MemoryHeadConflictError) || attempt === 1) throw failure;
+			}
+		}
 	}
 
 	private async resumeProposedCapture(captureId: string): Promise<MemoryCaptureResultV1> {
@@ -570,10 +614,13 @@ export class MemoryController {
 			};
 		}
 		const selectedModel = host.model ? `${host.model.provider}/${host.model.modelId}` : null;
-		let pending = await this.readPending(captureId, selectedModel);
 		if (capture.status === "failed" && capture.retryable !== true) {
 			return { captureId, status: "failed", proposalId: capture.proposalId, confirmationRequired: false };
 		}
+		if (capture.status === "failed" && capture.errorCode === "memory_capture_revision_conflict") {
+			await rm(this.pendingPath(captureId), { force: true });
+		}
+		let pending = await this.readPending(captureId, selectedModel);
 		if (capture.status === "generating" && !pending) {
 			return { captureId, status: "indeterminate", proposalId: null, confirmationRequired: false };
 		}
@@ -658,8 +705,11 @@ export class MemoryController {
 			const envelope = parseMemoryCaptureEnvelope(result.content);
 			const currentMemories = await this.existingContext(request.query);
 			const existingCues = await this.service.getStore().readCues();
+			const currentCapture = (await this.service.getStore().replay()).captures.get(captureId);
+			const attempt = currentCapture?.attempt ?? 1;
+			const reviewRunId = attempt > 1 ? `${captureId}:attempt:${attempt}` : captureId;
 			review = buildMemoryCaptureReview(envelope, {
-				captureId,
+				captureId: reviewRunId,
 				sourceDigest: captureDigest,
 				evidence: this.evidence(request, captureDigest),
 				recordedAt: pending.updatedAt,
@@ -672,6 +722,9 @@ export class MemoryController {
 			});
 		} catch (error) {
 			await this.recordFailure(captureId, "validation", error);
+			if (error instanceof MemoryRevisionConflictError) {
+				await rm(this.pendingPath(captureId), { force: true });
+			}
 			return { captureId, status: "failed", proposalId: null, confirmationRequired: false };
 		}
 		if (!review) {
@@ -689,8 +742,8 @@ export class MemoryController {
 		try {
 			const store = this.service.getStore();
 			const reconstruction = await this.service.recordReconstruction(review.trace, {
-				eventId: `evt_memory_reconstruction_${suffix(sha256(captureId))}`,
-				idempotencyKey: `memory:reconstruction:${captureId}`,
+				eventId: `evt_memory_reconstruction_${suffix(sha256(review.trace.runId))}`,
+				idempotencyKey: `memory:reconstruction:${review.trace.runId}`,
 				expectedHead: (await store.replay()).head,
 				actor: "runtime",
 				timestamp: review.trace.settledAt,
@@ -700,8 +753,8 @@ export class MemoryController {
 				review.evidenceRefs as EvidenceRefV2[],
 				reconstruction.traceArtifactId,
 				{
-					eventId: `evt_memory_review_${suffix(sha256(captureId))}`,
-					idempotencyKey: `memory:review:${captureId}`,
+					eventId: `evt_memory_review_${suffix(sha256(review.trace.runId))}`,
+					idempotencyKey: `memory:review:${review.trace.runId}`,
 					expectedHead: (await store.replay()).head,
 					actor: "model",
 					timestamp: review.trace.settledAt,
@@ -732,7 +785,21 @@ export class MemoryController {
 				await rm(this.pendingPath(captureId), { force: true });
 				return { captureId, status: "applied", proposalId: null, confirmationRequired: false };
 			}
-			await this.recordFailure(captureId, "publication", error);
+			if (error instanceof MemoryRevisionConflictError) {
+				const reconstruction = replay.reconstructions.get(review.trace.runId);
+				if (reconstruction) {
+					try {
+						await this.closeConflictedReconstruction(reconstruction.traceArtifactId, review.trace.runId, error);
+					} catch (diagnosticError) {
+						await this.recordFailure(captureId, "publication", diagnosticError);
+						return { captureId, status: "failed", proposalId: null, confirmationRequired: false };
+					}
+				}
+				await this.recordFailure(captureId, "validation", error);
+				await rm(this.pendingPath(captureId), { force: true });
+			} else {
+				await this.recordFailure(captureId, "publication", error);
+			}
 			return { captureId, status: "failed", proposalId: null, confirmationRequired: false };
 		}
 	}

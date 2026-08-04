@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
 	type AgentRunEvidenceRefV2,
+	type AgentRunEvidenceRefV3,
 	type MemoryReconstructionTraceV1,
 	type MemoryReviewDecisionV1,
 	type MemoryRevisionV2,
 	MemoryValidationError,
+	validateAgentRunEvidenceRefV3,
+	validateEvidenceRefV2,
 	validateMemoryReconstructionTraceV1,
 	validateMemoryReviewDecisionV1,
 	validateMemoryRevisionV2,
@@ -32,6 +35,17 @@ function agentRunEvidence(): AgentRunEvidenceRefV2 {
 			terminalAssistantEntryId: "entry_assistant_1",
 			toolResultEntryIds: ["entry_tool_1"],
 			rangeDigest: digest("b"),
+		},
+	};
+}
+
+function agentRunEvidenceV3(goalId: string | null = "goal_memory_provenance"): AgentRunEvidenceRefV3 {
+	return {
+		...agentRunEvidence(),
+		schema: "pi-xk.memory-evidence-ref.v3",
+		locator: {
+			...agentRunEvidence().locator,
+			goalId,
 		},
 	};
 }
@@ -125,6 +139,18 @@ describe("Ambient Memory contracts", () => {
 		expect(validateMemoryReviewDecisionV1(reviewDecision())).toEqual(reviewDecision());
 		expect(validateMemoryReconstructionTraceV1(trace())).toEqual(trace());
 		expect(validateMemoryRevisionV2(revision())).toEqual(revision());
+	});
+
+	it("keeps v2 Agent-run evidence readable and requires Goal identity in v3", () => {
+		expect(validateEvidenceRefV2(agentRunEvidence())).toEqual(agentRunEvidence());
+		expect(validateEvidenceRefV2(agentRunEvidenceV3())).toEqual(agentRunEvidenceV3());
+		expect(validateAgentRunEvidenceRefV3(agentRunEvidenceV3(null))).toEqual(agentRunEvidenceV3(null));
+		expect(() =>
+			validateAgentRunEvidenceRefV3({
+				...agentRunEvidenceV3(),
+				locator: agentRunEvidence().locator,
+			}),
+		).toThrow("unknown or missing fields");
 	});
 
 	it("rejects destructive model review actions and unsupported verified derivations", () => {

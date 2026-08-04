@@ -8,12 +8,16 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	ArtifactStore,
 	captureGitFreshnessBasis,
+	type GoalContractV2,
+	GoalStore,
+	MemoryRevisionConflictError,
 	MemoryService,
 	MemoryStore,
 	MemoryValidationError,
 	stableJsonStringify,
 	TaskStore,
 } from "../../../pi-xk-core/src/index.ts";
+import { PI_XK_SESSION_LINK_CUSTOM_TYPE } from "../../../pi-xk-extension/src/checkpoint-extension.ts";
 import { createPiXkRuntimeExtension } from "../../../pi-xk-extension/src/extension.ts";
 import {
 	type MemoryCaptureRequest,
@@ -27,6 +31,7 @@ import {
 	parseMemoryCaptureEnvelope,
 } from "../../../pi-xk-extension/src/memory-prompt.ts";
 import { PI_XK_SESSION_CHAIN_LINK_CUSTOM_TYPE } from "../../../pi-xk-extension/src/session-chain-controller.ts";
+import { createPiXkGoalBinding } from "../../../pi-xk-extension/src/session-link.ts";
 import { createHarness, getMessageText, type Harness } from "./harness.ts";
 import { contextSummaryEvidence } from "./summary-evidence-fixtures.ts";
 
@@ -189,6 +194,54 @@ async function createTaskCaptureRequest(
 		content: canonical.content,
 		scope: { goalId: null, chainId: null, branchId: null, paths: [] },
 	};
+}
+
+async function seedActiveGoal(harness: Harness, goalId: string): Promise<void> {
+	const contract: GoalContractV2 = {
+		schema: "pi-xk.goal.contract.v2",
+		goalId,
+		title: "Preserve Ambient Memory provenance",
+		objective: "Bind successful Agent-run evidence to the active Goal.",
+		constraints: ["Do not rewrite historical evidence"],
+		acceptance: [
+			{
+				id: "A-1",
+				kind: "test",
+				description: "Agent-run evidence records the Goal identity",
+				command: "npm run test:pi-xk",
+				required: true,
+			},
+		],
+		capabilities: { filesystem: "unrestricted", network: "unrestricted", spawn: "unrestricted" },
+		budgets: { tokens: 0, costCents: 0, wallSeconds: 0 },
+		ownerSessionId: harness.sessionManager.getSessionId(),
+		createdAt: "2026-08-04T08:00:00.000Z",
+		schemaVersion: 2,
+		nonGoals: [],
+		doneCondition: "The provenance test passes.",
+		pauseCondition: "The Goal Store cannot be verified.",
+		finalReport: "Report the evidence schema and Goal identity.",
+		executionAuthorization: "The test may create isolated Goal facts.",
+	};
+	const store = new GoalStore(harness.tempDir);
+	const created = await store.createGoal(contract, {
+		eventId: `evt_create_${goalId}`,
+		idempotencyKey: `goal:create:${goalId}`,
+		actor: "user",
+		timestamp: contract.createdAt,
+	});
+	await store.appendLifecycleEvent(
+		goalId,
+		{ eventType: "goal_activated", payload: { sessionId: harness.sessionManager.getSessionId() } },
+		{
+			eventId: `evt_activate_${goalId}`,
+			idempotencyKey: `goal:activate:${goalId}`,
+			expectedHead: created.head,
+			actor: "user",
+			timestamp: contract.createdAt,
+		},
+	);
+	harness.sessionManager.appendCustomEntry(PI_XK_SESSION_LINK_CUSTOM_TYPE, createPiXkGoalBinding(goalId, 0));
 }
 
 afterEach(async () => {
@@ -921,6 +974,61 @@ describe("Pi-XK Memory extension", () => {
 		).rejects.toMatchObject({ code: "ENOENT" });
 	}, 15_000);
 
+	it("regenerates semantic CAS conflicts across restarts and enters cooldown after three attempts", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const request = await createTaskCaptureRequest(
+			harness.tempDir,
+			"task_revision_conflict_cooldown",
+			"A stable source whose semantic Memory context changes during publication.",
+		);
+		const generate = vi.fn(async () => ({
+			text: durableMemoryEnvelope("Revision conflict cooldown"),
+			model: { provider: "faux", modelId: "faux" },
+		}));
+		const host: MemoryGenerationHost = {
+			model: { provider: "faux", modelId: "faux", contextWindow: 100_000 },
+			generate,
+		};
+		const runConflictAttempt = async (): Promise<Awaited<ReturnType<MemoryController["capture"]>>> => {
+			const controller = new MemoryController({ projectRoot: harness.tempDir });
+			vi.spyOn(controller.getService(), "applyMemoryReviews").mockRejectedValueOnce(
+				new MemoryRevisionConflictError("memory_concurrent", 1, 2),
+			);
+			try {
+				return await controller.capture(request, host);
+			} finally {
+				await controller.close();
+			}
+		};
+
+		await expect(runConflictAttempt()).resolves.toMatchObject({ status: "failed" });
+		await expect(runConflictAttempt()).resolves.toMatchObject({ status: "failed" });
+		await expect(runConflictAttempt()).resolves.toMatchObject({ status: "failed" });
+
+		const restarted = new MemoryController({ projectRoot: harness.tempDir });
+		try {
+			await expect(restarted.capture(request, host)).resolves.toMatchObject({ status: "failed" });
+			const replay = await restarted.getService().getStore().replay();
+			const { captureId } = captureIdentity(request);
+			expect(replay.captures.get(captureId)).toMatchObject({
+				status: "failed",
+				attempt: 3,
+				errorCode: "memory_capture_revision_conflict_cooldown",
+				retryable: false,
+			});
+			expect([...replay.reconstructions.keys()].sort()).toEqual([
+				captureId,
+				`${captureId}:attempt:2`,
+				`${captureId}:attempt:3`,
+			]);
+			expect(replay.failedReviewRunIds).toEqual(new Set(replay.reconstructions.keys()));
+		} finally {
+			await restarted.close();
+		}
+		expect(generate).toHaveBeenCalledTimes(3);
+	}, 20_000);
+
 	it("keeps an applied capture when projection publication fails", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -1109,6 +1217,61 @@ describe("Pi-XK Memory extension", () => {
 		]);
 	}, 20_000);
 
+	it("publishes v3 Agent-run evidence with the durable Goal identity", async () => {
+		let extensionController: MemoryController | undefined;
+		const harness = await createHarness({
+			persistedSession: true,
+			extensionFactories: [
+				createPiXkMemoryExtension({
+					createController: (projectRoot) => {
+						extensionController = new MemoryController({ projectRoot });
+						controllers.push(extensionController);
+						return extensionController;
+					},
+				}),
+			],
+		});
+		harnesses.push(harness);
+		const goalId = "goal_memory_provenance";
+		await seedActiveGoal(harness, goalId);
+		await harness.session.bindExtensions({});
+		await harness.session.prompt("/memory remember Agent-run evidence preserves its Goal identity.");
+		const service = extensionController?.getService();
+		if (!service) throw new Error("Memory extension controller was not created");
+		const memoryId = (await service.search({ query: "Goal identity" })).items[0]?.memoryId;
+		if (!memoryId) throw new Error("Goal provenance fixture was not published");
+
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("pi_xk_read_memory", { memoryIds: [memoryId] })),
+			fauxAssistantMessage(
+				fauxToolCall("pi_xk_review_memory", {
+					action: "revise",
+					sourceMemories: [{ memoryId, expectedRevision: 1 }],
+					replacement: {
+						kind: "fact",
+						title: "Agent-run evidence preserves Goal identity",
+						statement: "Successful Ambient Memory revisions retain the active Goal identity.",
+						applicability: "Pi-XK Agent runs with an active Goal binding.",
+						effectiveFrom: "2026-08-04T08:00:00.000Z",
+						cueIds: [],
+					},
+					reason: "The current run verifies the Goal provenance contract.",
+				}),
+			),
+			fauxAssistantMessage("Goal provenance verified."),
+		]);
+		await harness.session.prompt("Review the provenance Memory under this Goal.");
+
+		const timeline = (await service.timeline(memoryId)).revisions;
+		expect(timeline[1]?.revision.evidenceRefs).toEqual([
+			expect.objectContaining({
+				schema: "pi-xk.memory-evidence-ref.v3",
+				sourceType: "agent_run",
+				locator: expect.objectContaining({ goalId }),
+			}),
+		]);
+	}, 20_000);
+
 	it("omits an uncommitted Session Chain locator from Agent-run evidence", async () => {
 		const memoryErrors: Error[] = [];
 		let extensionController: MemoryController | undefined;
@@ -1290,5 +1453,142 @@ describe("Pi-XK Memory extension", () => {
 		);
 		expect(replay.events.some((event) => event.eventType === "memory_review_applied")).toBe(false);
 		expect((await service.timeline(memoryId)).revisions).toHaveLength(1);
+	}, 20_000);
+
+	it("keeps a length-truncated run diagnostic-only even after D2 retrieval", async () => {
+		let extensionController: MemoryController | undefined;
+		const harness = await createHarness({
+			extensionFactories: [
+				createPiXkRuntimeExtension({
+					createMemoryController: (projectRoot) => {
+						extensionController = new MemoryController({ projectRoot });
+						controllers.push(extensionController);
+						return extensionController;
+					},
+				}),
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		await harness.session.prompt("/memory remember Truncated runs cannot revise this Memory.");
+		const service = extensionController?.getService();
+		if (!service) throw new Error("Memory extension controller was not created");
+		const memoryId = (await service.search({ query: "Truncated runs" })).items[0]?.memoryId;
+		if (!memoryId) throw new Error("truncated run fixture was not published");
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("pi_xk_read_memory", { memoryIds: [memoryId] })),
+			fauxAssistantMessage("truncated", { stopReason: "length" }),
+		]);
+		await harness.session.prompt("Read the prior Memory before this run reaches its output limit.");
+
+		const replay = await service.getStore().replay();
+		expect(replay.events).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					eventType: "reconstruction_recorded",
+					payload: expect.objectContaining({ outcome: "incomplete" }),
+				}),
+			]),
+		);
+		expect(replay.events.some((event) => event.eventType === "memory_review_applied")).toBe(false);
+		expect((await service.timeline(memoryId)).revisions).toHaveLength(1);
+	}, 20_000);
+
+	it("publishes one Memory review when a queued follow-up is drained in the same logical run", async () => {
+		const memoryErrors: Error[] = [];
+		let extensionController: MemoryController | undefined;
+		const harness = await createHarness({
+			persistedSession: true,
+			extensionFactories: [
+				createPiXkRuntimeExtension({
+					memory: { onMemoryError: (error) => memoryErrors.push(error) },
+					createMemoryController: (projectRoot) => {
+						extensionController = new MemoryController({ projectRoot });
+						controllers.push(extensionController);
+						return extensionController;
+					},
+				}),
+			],
+		});
+		harnesses.push(harness);
+		harness.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "Establish a persisted Session Chain root." }],
+			timestamp: Date.now() - 1_000,
+		});
+		harness.sessionManager.appendMessage(fauxAssistantMessage("Persisted root established."));
+		harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
+		await harness.session.bindExtensions({});
+		await harness.session.prompt("/memory remember Queued follow-ups publish exactly one semantic revision.");
+		const service = extensionController?.getService();
+		if (!service) throw new Error("Memory extension controller was not created");
+		const memoryId = (await service.search({ query: "Queued follow-ups" })).items[0]?.memoryId;
+		if (!memoryId) throw new Error("queued follow-up fixture was not published");
+		let queued = false;
+		harness.setResponses([
+			() => {
+				if (!queued) {
+					queued = true;
+					harness.session.agent.followUp({
+						role: "user",
+						content: [{ type: "text", text: "queued verification" }],
+						timestamp: Date.now(),
+					});
+				}
+				return fauxAssistantMessage(fauxToolCall("pi_xk_read_memory", { memoryIds: [memoryId] }));
+			},
+			fauxAssistantMessage(
+				fauxToolCall("pi_xk_review_memory", {
+					action: "revise",
+					sourceMemories: [{ memoryId, expectedRevision: 1 }],
+					replacement: {
+						kind: "fact",
+						title: "Queued follow-ups publish once",
+						statement: "A queued follow-up is drained before one Memory review publication.",
+						applicability: "Ambient Memory logical runs with queued user input.",
+						effectiveFrom: "2026-08-04T08:00:00.000Z",
+						cueIds: [],
+					},
+					reason: "The current logical run includes the queued verification.",
+				}),
+			),
+			fauxAssistantMessage("Review staged before the queued follow-up."),
+			fauxAssistantMessage("Queued follow-up handled."),
+		]);
+		await harness.session.prompt("Review the queued follow-up publication behavior.");
+
+		const replay = await service.getStore().replay();
+		expect(memoryErrors).toEqual([]);
+		expect(
+			replay.events.filter(
+				(event) => event.schema === "pi-xk.memory-event.v2" && event.eventType === "memory_review_applied",
+			),
+		).toHaveLength(1);
+		expect((await service.timeline(memoryId)).revisions).toHaveLength(2);
+	}, 20_000);
+
+	it("does not write reconstruction or access facts for an ordinary run without knowledge actions", async () => {
+		let extensionController: MemoryController | undefined;
+		const harness = await createHarness({
+			extensionFactories: [
+				createPiXkRuntimeExtension({
+					createMemoryController: (projectRoot) => {
+						extensionController = new MemoryController({ projectRoot });
+						controllers.push(extensionController);
+						return extensionController;
+					},
+				}),
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		harness.setResponses([fauxAssistantMessage("A one-off answer without project-history lookup.")]);
+		await harness.session.prompt("Answer this one-off question without using project history.");
+
+		const service = extensionController?.getService();
+		if (!service) throw new Error("Memory extension controller was not created");
+		const replay = await service.getStore().replay();
+		expect(replay.events.some((event) => event.eventType === "reconstruction_recorded")).toBe(false);
+		expect(replay.events.some((event) => event.eventType === "access_recorded")).toBe(false);
 	}, 20_000);
 });

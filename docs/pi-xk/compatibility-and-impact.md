@@ -109,6 +109,7 @@ Pi-XK 会在以下情况消费、延迟或拒绝用户输入：
 - provider failure retry 没有当前文档可配置的次数上限，Goal 会保持 active，直到生命周期改变或 runtime 退出；
 - L2 无效响应自动尝试最多 3 次；Rollup provider/I/O/event publication 的临时失败保持可重试，不与无效响应共用该上限；
 - Memory 自动 capture 只处理启用后的新 stable source；第一次加载不批量回填旧历史；
+- Memory stable capture 的 revision CAS 冲突只会在后续稳定边界重试；前两次可重试，第三次进入 cooldown，不会无限追加 provider 调用；
 - `/memory remember`、search/read/expand、refresh 和 doctor 不调用模型；`pi_xk_propose_memory_change` 也只记录 proposal；
 - `generation_started` 后结果未知的 Memory capture 不自动重试，以避免重复付费调用；
 - 当前没有强制 cost/token budget controller，provider 账单仍需外部监控。
@@ -137,7 +138,7 @@ sealed Segment 不重写。从历史 Segment 或 tree 位置继续会创建 succ
 
 Memory facts 由 `.pi-xk/memory/events.jsonl` 与 `.pi-xk/artifacts/objects/` 中的 revision/Cue/Edge/proposal/source artifact 共同构成。`index.sqlite`、read model、History Cue、source cursor 和 Markdown 是可重建或可重新发现的投影/恢复数据。自动捕获和显式 backfill 会增加 artifact/event/SQLite 空间；archive/invalidate 不删除历史，purge 也保留 tombstone。当前没有自动 retention 或 Artifact GC。
 
-Ambient Memory v2 还会在成功 `agent_settled` 边界写入 reconstruction trace、Memory review 和 agent-run evidence。模型自主搜索不代表每轮都会产生事件：无 Memory 使用的普通 run 不写 access/reconstruction；只有 D2/D3 实际读取才计入访问。`error`、`abort`、`length` 或截断 run 不发布语义 revision。
+Ambient Memory v2 还会在成功 `agent_settled` 边界写入 reconstruction trace、Memory review 和 agent-run evidence。新 evidence V3 会记录并验证 durable Goal binding；V2 历史 evidence 保持可读。模型自主搜索不代表每轮都会产生事件：无 Memory 使用的普通 run 不写 access/reconstruction；只有 D2/D3 实际读取才计入访问。Pi 原生 queued follow-up 在同一个 logical run 内排空，因此不会创建第二个 ledger、trace 或 settled publication。`error`、`abort`、`length` 或截断 run 不发布语义 revision。
 
 项目 Skill facts 位于 `.pi-xk/skills/`，全局 Skill facts 位于 profile 的 `pi-xk/skills/`；`.pi/skills/` 和 profile `skills/` 是可重建的 managed projection。候选不足、bundle 越界、非 managed 同名或 stale/cooldown 时不会进入下一轮 Skill generation。Skill-only reload 只在 settled boundary 发生，不重载 settings、extensions、prompts、themes、providers，不改变 tools，不发送 shutdown/start。
 
@@ -218,7 +219,7 @@ peak RSS 包含 Node 进程和已加载 runtime 的基线，不是纯 session �
 
 另有 `npm run benchmark:session-chain-events -- --counts 100,1000 --runs 3 --json` 专门验证 checkpointed read model。它要求已消费完整 event log 后的重复 manifest/status 加载走 `fast` 模式，读取并验证 checkpoint 对应的最后一条 event，且读取量小于完整日志的 10%；该 benchmark 不替代 deep doctor 的线性事实校验。
 
-Memory 使用 `npm run benchmark:pi-xk-memory` 测量合成 100/1,000/10,000/100,000 Memory 及图边场景，并用 `npm run evaluate:pi-xk-memory` 检查语义 fixture。它们是当前 commit/机器的回归证据，不是 Node/Bun、Windows/macOS 的正式 SLA。普通 D0/status/search 应走 checkpointed read model 与 SQLite，不完整 replay event log；deep doctor 和全量 projection rebuild 仍允许线性增长。
+Memory 使用 `npm run benchmark:pi-xk-memory` 测量合成 100/1,000/10,000/100,000 Memory 及图边场景，并用 `npm run evaluate:pi-xk-memory` 检查语义 fixture；Skill 使用 `npm run benchmark:pi-xk-skills` 覆盖候选检索与 resource-only reload。两者可用 `--baseline <json>` 比较同 platform/Node、同规模的结果，默认拒绝超过 15% 的退化。它们是当前 commit/机器的回归证据，不是 Node/Bun、Windows/macOS 的正式 SLA。普通 D0/status/search 应走 checkpointed read model 与 SQLite，不完整 replay event log；deep doctor 和全量 projection rebuild 仍允许线性增长。
 
 ## 13. 第三方扩展兼容
 
