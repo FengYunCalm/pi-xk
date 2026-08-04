@@ -10,12 +10,16 @@ type FakeExtensionRunner = {
 	emit: ReturnType<typeof vi.fn<(event: EmitEvent) => Promise<void>>>;
 };
 
+type PrintModeBindings = {
+	onError?: (error: { extensionPath: string; event: string; error: string }) => void;
+};
+
 type FakeSession = {
 	sessionManager: { getHeader: () => object | undefined };
 	agent: { waitForIdle: () => Promise<void> };
 	state: { messages: AssistantMessage[] };
 	extensionRunner: FakeExtensionRunner;
-	bindExtensions: ReturnType<typeof vi.fn>;
+	bindExtensions: ReturnType<typeof vi.fn<(bindings: PrintModeBindings) => Promise<void>>>;
 	subscribe: ReturnType<typeof vi.fn>;
 	prompt: ReturnType<typeof vi.fn>;
 	reload: ReturnType<typeof vi.fn>;
@@ -137,6 +141,34 @@ describe("runPrintMode", () => {
 		expect(exitCode).toBe(1);
 		expect(errorSpy).toHaveBeenCalledWith("provider failure");
 		expect(session.extensionRunner.emit).toHaveBeenCalledTimes(1);
+		expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
+	});
+
+	it("returns non-zero when an extension command reports an error", async () => {
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "done" }));
+		const { session } = runtimeHost;
+		let reportError: PrintModeBindings["onError"];
+		session.bindExtensions.mockImplementation(async (bindings) => {
+			reportError = bindings.onError;
+		});
+		session.prompt.mockImplementation(async () => {
+			reportError?.({
+				extensionPath: "command:chain",
+				event: "command",
+				error: "Session Chain Segment has no body entries to summarize",
+			});
+		});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+			initialMessage: "/chain rollover",
+		});
+
+		expect(exitCode).toBe(1);
+		expect(errorSpy).toHaveBeenCalledWith(
+			"Extension error (command:chain): Session Chain Segment has no body entries to summarize",
+		);
 		expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
 	});
 });

@@ -67,6 +67,7 @@ interface ChainRuntimeOptions {
 	sessionManager?: SessionManager;
 	initializeSession?: (sessionManager: SessionManager) => void;
 	uiContext?: ExtensionUIContext;
+	extensionErrors?: string[];
 }
 
 async function createChainRuntime(
@@ -145,6 +146,7 @@ async function createChainRuntime(
 				switchSession: (sessionPath, switchOptions) => runtime.switchSession(sessionPath, switchOptions),
 				reload: () => runtime.session.reload(),
 			},
+			onError: (error) => options.extensionErrors?.push(error.error),
 		});
 	};
 	runtime.setRebindSession(bind);
@@ -298,6 +300,49 @@ describe("Pi-XK Session Chain extension", () => {
 			),
 		).toBeNull();
 		expect(existsSync(join(harness.projectRoot, ".pi-xk", "sessions", "chains"))).toBe(false);
+	});
+
+	it("registers the Chain summary reader with an object JSON Schema", async () => {
+		const harness = await createChainRuntime(createPiXkSessionChainExtension());
+		harnesses.push(harness);
+
+		const summaryReader = harness.runtime.session
+			.getAllTools()
+			.find((tool) => tool.name === "pi_xk_read_chain_summary");
+
+		expect(summaryReader?.parameters).toMatchObject({ type: "object" });
+	});
+
+	it("rejects mixed Chain summary selectors", async () => {
+		const harness = await createChainRuntime(createPiXkSessionChainExtension(), {
+			initializeSession: (sessionManager) => {
+				sessionManager.appendMessage({
+					role: "user",
+					content: [{ type: "text", text: "summary selector fixture" }],
+					timestamp: Date.now(),
+				});
+				sessionManager.appendMessage(fauxAssistantMessage("summary selector fixture response"));
+				sessionManager.flushDurable();
+			},
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(
+				fauxToolCall("pi_xk_read_chain_summary", {
+					artifactId: "artifact_invalid_selector",
+					level: "l2",
+					latest: true,
+				}),
+			),
+			fauxAssistantMessage("mixed selector was rejected"),
+		]);
+
+		await harness.runtime.session.prompt("Read an invalidly selected summary.");
+
+		const result = harness.runtime.session.messages.filter((message) => message.role === "toolResult").at(-1);
+		const text = result?.content.find((part) => part.type === "text")?.text ?? "";
+		expect(result?.isError).toBe(true);
+		expect(text).toContain("summary selector must use artifactId or one level selector, not both");
 	});
 
 	it("adopts an existing persisted Pi transcript as an external root without copying it", async () => {
@@ -796,6 +841,38 @@ describe("Pi-XK Session Chain extension", () => {
 		expect(binding?.ordinal).toBe(2);
 		expect(harness.providerCalls()).toBe(1);
 		expect(notifications.at(-1)).toBe(`Session Chain advanced to S2 (${binding?.segmentId})`);
+	});
+
+	it("reports an empty Segment rollover as a print-mode extension error", async () => {
+		const extensionErrors: string[] = [];
+		const harness = await createChainRuntime(createPiXkSessionChainExtension(), {
+			extensionErrors,
+			initializeSession: (sessionManager) => {
+				sessionManager.appendMessage({
+					role: "user",
+					content: [{ type: "text", text: "print rollover source" }],
+					timestamp: Date.now(),
+				});
+				sessionManager.appendMessage(fauxAssistantMessage("print rollover source response"));
+				sessionManager.flushDurable();
+			},
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(
+				sessionChainL1Evidence("Print rollover fixture", "Print rollover delta.", "Print rollover carry-forward."),
+			),
+		]);
+
+		await harness.runtime.session.prompt("/chain rollover prepare empty-segment fixture");
+		await harness.runtime.session.prompt("/chain rollover reject empty-segment fixture");
+
+		const binding = new SessionChainController({ projectRoot: harness.projectRoot }).getCurrentBinding(
+			harness.runtime.session.sessionManager,
+		);
+		expect(binding?.ordinal).toBe(2);
+		expect(harness.providerCalls()).toBe(1);
+		expect(extensionErrors).toContain("Session Chain Segment has no body entries to summarize");
 	});
 
 	it("does not carry a source compaction recovery prompt into the successor Segment", async () => {

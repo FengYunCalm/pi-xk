@@ -520,13 +520,15 @@ const SUMMARY_TITLE_IMPERATIVE =
 const SUMMARY_TITLE_COMPLETION_CLAIM =
 	/(?:^(?:completed|done|finished|shipped)\b|\b(?:completed|done|finished|fixed|resolved|shipped)\s*$|已完成|完成了|修复完成|已修复|已解决|交付完成)/iu;
 
-export function validateSegmentSummaryTitle(value: unknown): string {
+export interface SegmentSummaryTitleValidationOptions {
+	truncateOverlong?: boolean;
+}
+
+export function validateSegmentSummaryTitle(
+	value: unknown,
+	options: SegmentSummaryTitleValidationOptions = {},
+): string {
 	const title = requireNonEmptyString(value, "title").trim();
-	if ([...title].length > SUMMARY_TITLE_MAX_CODE_POINTS) {
-		throw new SessionChainValidationError(
-			`title must not exceed ${SUMMARY_TITLE_MAX_CODE_POINTS} Unicode code points`,
-		);
-	}
 	if (SUMMARY_TITLE_CONTROL_CHARACTERS.test(title) || /[\r\n]/u.test(title)) {
 		throw new SessionChainValidationError("title must be a single line without control characters");
 	}
@@ -541,6 +543,13 @@ export function validateSegmentSummaryTitle(value: unknown): string {
 	}
 	if (SUMMARY_TITLE_COMPLETION_CLAIM.test(title)) {
 		throw new SessionChainValidationError("title must not contain an unverified completion claim");
+	}
+	const codePoints = [...title];
+	if (codePoints.length > SUMMARY_TITLE_MAX_CODE_POINTS) {
+		if (options.truncateOverlong) return codePoints.slice(0, SUMMARY_TITLE_MAX_CODE_POINTS).join("").trimEnd();
+		throw new SessionChainValidationError(
+			`title must not exceed ${SUMMARY_TITLE_MAX_CODE_POINTS} Unicode code points`,
+		);
 	}
 	return title;
 }

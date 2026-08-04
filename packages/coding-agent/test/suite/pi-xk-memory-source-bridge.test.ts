@@ -13,7 +13,10 @@ import {
 	MemoryController,
 	type MemoryGenerationHost,
 } from "../../../pi-xk-extension/src/memory-controller.ts";
-import { MEMORY_CAPTURE_RESPONSE_SCHEMA } from "../../../pi-xk-extension/src/memory-prompt.ts";
+import {
+	MEMORY_CAPTURE_PROMPT_VERSION,
+	MEMORY_CAPTURE_RESPONSE_SCHEMA,
+} from "../../../pi-xk-extension/src/memory-prompt.ts";
 import { MemorySourceBridge } from "../../../pi-xk-extension/src/memory-source-bridge.ts";
 import { SessionChainRollupManager } from "../../../pi-xk-extension/src/session-chain-rollup.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
@@ -478,6 +481,96 @@ describe("Pi-XK Memory source bridge", () => {
 			expect.objectContaining({ status: "applied" }),
 		]);
 		expect(generate).toHaveBeenCalledTimes(1);
+	});
+
+	it("retries only legacy V2 invalid captures after their source cursor has advanced", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const service = new MemoryService(harness.tempDir);
+		services.push(service);
+		const capture = vi.fn(async (request: MemoryCaptureRequest) => ({
+			captureId: `capture_${request.sourceId}`,
+			status: "applied" as const,
+			proposalId: null,
+			confirmationRequired: false,
+		}));
+		const bridge = new MemorySourceBridge({
+			projectRoot: harness.tempDir,
+			controller: { getService: () => service, capture, resumePublications: async () => [] },
+		});
+		await bridge.initialize();
+		await createCheckpoint(harness.tempDir, harness.sessionManager.getSessionId(), "_legacy_invalid");
+		await bridge.captureStableSources({ model: undefined, generate: vi.fn() });
+		expect(capture).toHaveBeenCalledTimes(1);
+
+		const sourceId = "evt_goal_checkpoint_legacy_invalid";
+		const scheduled = await service.getStore().scheduleCapture(
+			{
+				schema: "pi-xk.memory-capture-source.v1",
+				captureId: "capture_legacy_invalid",
+				trigger: "goal_checkpoint",
+				sourceIds: [sourceId],
+				sourceDigest: `sha256:${"a".repeat(64)}`,
+				promptVersion: "pi-xk.memory-capture-v2",
+				createdAt: "2026-08-01T00:01:00.000Z",
+			},
+			{
+				eventId: "evt_memory_schedule_legacy_invalid",
+				idempotencyKey: "memory:schedule:legacy-invalid",
+				expectedHead: (await service.getStore().replay()).head,
+			},
+		);
+		await service.getStore().markCaptureFailed(
+			{
+				captureId: "capture_legacy_invalid",
+				stage: "validation",
+				errorCode: "memory_capture_invalid",
+				retryable: false,
+				message: "legacy prompt omitted the cue enum",
+			},
+			{
+				eventId: "evt_memory_failed_legacy_invalid",
+				idempotencyKey: "memory:failed:legacy-invalid",
+				expectedHead: scheduled.head,
+			},
+		);
+
+		await bridge.captureStableSources({ model: undefined, generate: vi.fn() });
+		expect(capture).toHaveBeenCalledTimes(2);
+
+		const upgraded = await service.getStore().scheduleCapture(
+			{
+				schema: "pi-xk.memory-capture-source.v1",
+				captureId: "capture_legacy_invalid_v3",
+				trigger: "goal_checkpoint",
+				sourceIds: [sourceId],
+				sourceDigest: `sha256:${"b".repeat(64)}`,
+				promptVersion: MEMORY_CAPTURE_PROMPT_VERSION,
+				createdAt: "2026-08-01T00:02:00.000Z",
+			},
+			{
+				eventId: "evt_memory_schedule_legacy_invalid_v3",
+				idempotencyKey: "memory:schedule:legacy-invalid-v3",
+				expectedHead: (await service.getStore().replay()).head,
+			},
+		);
+		await service.getStore().markCaptureFailed(
+			{
+				captureId: "capture_legacy_invalid_v3",
+				stage: "validation",
+				errorCode: "memory_capture_invalid",
+				retryable: false,
+				message: "a current prompt validation failure is not retryable",
+			},
+			{
+				eventId: "evt_memory_failed_legacy_invalid_v3",
+				idempotencyKey: "memory:failed:legacy-invalid-v3",
+				expectedHead: upgraded.head,
+			},
+		);
+
+		await bridge.captureStableSources({ model: undefined, generate: vi.fn() });
+		expect(capture).toHaveBeenCalledTimes(2);
 	});
 
 	it("rejects a source cursor that advances beyond its Goal event log", async () => {

@@ -55,6 +55,7 @@
 - Skill publication now rejects unsafe bundles and non-managed collisions, records evidence-backed failures and cooldowns, and keeps the previous ResourceLoader generation when settled-boundary reload fails.
 - New agent-run evidence records and verifies the durable Goal binding while preserving V2 evidence read compatibility; native queued follow-up remains one logical run and cannot duplicate recall publication.
 - Stable Memory capture now discards stale pending results after a revision CAS conflict, uses distinct later attempts, and enters an explicit cooldown after the third consecutive conflict instead of repeatedly calling the provider.
+- Stable Memory capture now preserves an invalid persisted provider envelope as evidence and permits one schema-only format repair; exhausted, mismatched, or interrupted repairs cannot relax validation or trigger duplicate provider calls.
 - `/xk status` now exposes retryable Memory failures, capture cooldowns, index health, Skill promotion eligibility, and pending projection/reload repair diagnostics.
 
 ## [0.1.1]

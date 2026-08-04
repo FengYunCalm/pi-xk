@@ -924,6 +924,269 @@ describe("Pi-XK Memory extension", () => {
 		expect((await controller.getService().getStore().replay()).captures.get(captureId)?.status).toBe("applied");
 	}, 15_000);
 
+	it("repairs one persisted capture-format failure without relaxing the envelope contract", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const controller = new MemoryController({ projectRoot: harness.tempDir });
+		controllers.push(controller);
+		const request = await createTaskCaptureRequest(
+			harness.tempDir,
+			"task_capture_format_repair",
+			"A stable source whose first provider response uses a Memory kind as a cue kind.",
+		);
+		const generate = vi.fn(async (input: Parameters<MemoryGenerationHost["generate"]>[0]) => {
+			if (generate.mock.calls.length === 1) {
+				return {
+					text: JSON.stringify({
+						schema: MEMORY_CAPTURE_RESPONSE_SCHEMA,
+						reason: "The source supports a durable constraint.",
+						cues: [
+							{
+								key: "capture-format",
+								kind: "constraint",
+								label: "Capture format",
+								aliases: [],
+								paths: [],
+							},
+						],
+						reviews: [],
+					}),
+					model: { provider: "faux", modelId: "faux" },
+				};
+			}
+			expect(input.instructions).toContain("cue kind is a navigation category");
+			const repairInput = JSON.parse(input.source) as {
+				schema: string;
+				rejectedResult: { validationMessage: string };
+			};
+			expect(repairInput.schema).toBe("pi-xk.memory-capture-format-repair-input.v1");
+			expect(repairInput.rejectedResult.validationMessage).toContain("cue kind is invalid");
+			return {
+				text: durableMemoryEnvelope("Capture format repair"),
+				model: { provider: "faux", modelId: "faux" },
+			};
+		});
+
+		await expect(
+			controller.capture(request, {
+				model: { provider: "faux", modelId: "faux", contextWindow: 100_000 },
+				generate,
+			}),
+		).resolves.toMatchObject({ status: "applied" });
+		expect(generate).toHaveBeenCalledTimes(2);
+		const replay = await controller.getService().getStore().replay();
+		const capture = replay.captures.get(captureIdentity(request).captureId);
+		expect(capture).toMatchObject({ status: "applied", attempt: 2 });
+		expect(replay.events).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					eventType: "capture_failed",
+					payload: expect.objectContaining({
+						errorCode: "memory_capture_format_repair_requested",
+						retryable: true,
+					}),
+				}),
+			]),
+		);
+	}, 15_000);
+
+	it("stops after one capture-format repair attempt", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const controller = new MemoryController({ projectRoot: harness.tempDir });
+		controllers.push(controller);
+		const request = await createTaskCaptureRequest(
+			harness.tempDir,
+			"task_capture_format_exhausted",
+			"A stable source whose provider cannot produce the required capture envelope.",
+		);
+		const generate = vi.fn(async () => ({
+			text: "not a JSON envelope",
+			model: { provider: "faux", modelId: "faux" },
+		}));
+
+		await expect(
+			controller.capture(request, {
+				model: { provider: "faux", modelId: "faux", contextWindow: 100_000 },
+				generate,
+			}),
+		).resolves.toMatchObject({ status: "failed" });
+		expect(generate).toHaveBeenCalledTimes(2);
+		expect(
+			(await controller.getService().getStore().replay()).captures.get(captureIdentity(request).captureId),
+		).toMatchObject({
+			status: "failed",
+			attempt: 2,
+			errorCode: "memory_capture_format_repair_exhausted",
+			retryable: false,
+		});
+	}, 15_000);
+
+	it("does not repeat a format-repair provider call after restart when its outcome is indeterminate", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const request = await createTaskCaptureRequest(
+			harness.tempDir,
+			"task_capture_format_repair_indeterminate",
+			"A stable source whose format repair may already have reached the provider before restart.",
+		);
+		const { captureId, captureDigest } = captureIdentity(request);
+		const service = new MemoryService(harness.tempDir);
+		const scheduled = await service.getStore().scheduleCapture(
+			{
+				schema: "pi-xk.memory-capture-source.v1",
+				captureId,
+				trigger: request.trigger,
+				sourceIds: [request.sourceId, request.artifactId],
+				sourceDigest: captureDigest,
+				promptVersion: MEMORY_CAPTURE_PROMPT_VERSION,
+				createdAt: request.recordedAt,
+			},
+			{
+				eventId: "evt_memory_format_repair_indeterminate_schedule",
+				idempotencyKey: `memory:schedule:${captureId}`,
+				expectedHead: { sequence: 0, hash: null },
+			},
+		);
+		const firstGeneration = await service.getStore().markGenerationStarted(captureId, 1, {
+			eventId: "evt_memory_format_repair_indeterminate_generation_1",
+			idempotencyKey: `memory:generation:${captureId}:1`,
+			expectedHead: scheduled.head,
+		});
+		const invalidResult = await new ArtifactStore(harness.tempDir).put({
+			contentType: "text/plain",
+			text: "not a JSON envelope",
+			producer: MEMORY_CAPTURE_PROMPT_VERSION,
+			sensitivity: "internal",
+			sourceIds: [captureId, request.artifactId],
+			createdAt: "2026-08-01T00:00:01.000Z",
+		});
+		await mkdir(join(harness.tempDir, ".pi-xk", "memory", "pending"), { recursive: true });
+		await writeFile(
+			join(harness.tempDir, ".pi-xk", "memory", "pending", `${captureId}.json`),
+			`${JSON.stringify({
+				schema: "pi-xk.memory-capture-pending.v3",
+				captureId,
+				resultArtifactId: invalidResult.artifactId,
+				model: "faux/faux",
+				updatedAt: "2026-08-01T00:00:01.000Z",
+				formatRepair: { validationMessage: "Memory capture response must be one JSON object" },
+			})}\n`,
+		);
+		const failed = await service.getStore().markCaptureFailed(
+			{
+				captureId,
+				stage: "validation",
+				errorCode: "memory_capture_format_repair_requested",
+				retryable: true,
+				message: "Memory capture response must be one JSON object",
+			},
+			{
+				eventId: "evt_memory_format_repair_indeterminate_failed",
+				idempotencyKey: `memory:failed:${captureId}:1:validation`,
+				expectedHead: firstGeneration.head,
+			},
+		);
+		await service.getStore().markGenerationStarted(captureId, 2, {
+			eventId: "evt_memory_format_repair_indeterminate_generation_2",
+			idempotencyKey: `memory:generation:${captureId}:2`,
+			expectedHead: failed.head,
+		});
+		await service.close();
+
+		const controller = new MemoryController({ projectRoot: harness.tempDir });
+		controllers.push(controller);
+		const generate = vi.fn(async () => {
+			throw new Error("format repair provider must not be called after restart");
+		});
+		await expect(
+			controller.capture(request, {
+				model: { provider: "faux", modelId: "faux", contextWindow: 100_000 },
+				generate,
+			}),
+		).resolves.toMatchObject({ captureId, status: "indeterminate" });
+		expect(generate).not.toHaveBeenCalled();
+	}, 15_000);
+
+	it("rejects a format-repair marker that is not backed by the capture failure state", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const request = await createTaskCaptureRequest(
+			harness.tempDir,
+			"task_capture_format_repair_tampered",
+			"A stable source whose pending repair marker does not match its durable capture state.",
+		);
+		const { captureId, captureDigest } = captureIdentity(request);
+		const service = new MemoryService(harness.tempDir);
+		const scheduled = await service.getStore().scheduleCapture(
+			{
+				schema: "pi-xk.memory-capture-source.v1",
+				captureId,
+				trigger: request.trigger,
+				sourceIds: [request.sourceId, request.artifactId],
+				sourceDigest: captureDigest,
+				promptVersion: MEMORY_CAPTURE_PROMPT_VERSION,
+				createdAt: request.recordedAt,
+			},
+			{
+				eventId: "evt_memory_format_repair_tampered_schedule",
+				idempotencyKey: `memory:schedule:${captureId}`,
+				expectedHead: { sequence: 0, hash: null },
+			},
+		);
+		const generating = await service.getStore().markGenerationStarted(captureId, 1, {
+			eventId: "evt_memory_format_repair_tampered_generation",
+			idempotencyKey: `memory:generation:${captureId}:1`,
+			expectedHead: scheduled.head,
+		});
+		const result = await new ArtifactStore(harness.tempDir).put({
+			contentType: "text/plain",
+			text: durableMemoryEnvelope("Tampered repair marker"),
+			producer: MEMORY_CAPTURE_PROMPT_VERSION,
+			sensitivity: "internal",
+			sourceIds: [captureId, request.artifactId],
+			createdAt: "2026-08-01T00:00:01.000Z",
+		});
+		await mkdir(join(harness.tempDir, ".pi-xk", "memory", "pending"), { recursive: true });
+		await writeFile(
+			join(harness.tempDir, ".pi-xk", "memory", "pending", `${captureId}.json`),
+			`${JSON.stringify({
+				schema: "pi-xk.memory-capture-pending.v3",
+				captureId,
+				resultArtifactId: result.artifactId,
+				model: "faux/faux",
+				updatedAt: "2026-08-01T00:00:01.000Z",
+				formatRepair: { validationMessage: "forged format repair marker" },
+			})}\n`,
+		);
+		await service.getStore().markCaptureFailed(
+			{
+				captureId,
+				stage: "publication",
+				errorCode: "memory_capture_publication_failed",
+				retryable: true,
+				message: "simulated publication interruption",
+			},
+			{
+				eventId: "evt_memory_format_repair_tampered_failed",
+				idempotencyKey: `memory:failed:${captureId}:1:publication`,
+				expectedHead: generating.head,
+			},
+		);
+		await service.close();
+
+		const controller = new MemoryController({ projectRoot: harness.tempDir });
+		controllers.push(controller);
+		const generate = vi.fn();
+		await expect(
+			controller.capture(request, {
+				model: { provider: "faux", modelId: "faux", contextWindow: 100_000 },
+				generate,
+			}),
+		).rejects.toThrow("format repair marker does not match capture state");
+		expect(generate).not.toHaveBeenCalled();
+	}, 15_000);
+
 	it("resumes a recorded capture review after publication interruption", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -1215,6 +1478,61 @@ describe("Pi-XK Memory extension", () => {
 		expect(timeline[1]?.revision.evidenceRefs).toEqual([
 			expect.objectContaining({ sourceType: "agent_run", artifactId: null }),
 		]);
+	}, 20_000);
+
+	it("rejects an invented review cue before settlement without recording a review failure", async () => {
+		const memoryErrors: Error[] = [];
+		let extensionController: MemoryController | undefined;
+		const harness = await createHarness({
+			extensionFactories: [
+				createPiXkMemoryExtension({
+					onMemoryError: (error) => memoryErrors.push(error),
+					createController: (projectRoot) => {
+						extensionController = new MemoryController({ projectRoot });
+						controllers.push(extensionController);
+						return extensionController;
+					},
+				}),
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		await harness.session.prompt("/memory remember D2 cue provenance is required for semantic reviews.");
+		const service = extensionController?.getService();
+		if (!service) throw new Error("Memory extension controller was not created");
+		const memoryId = (await service.search({ query: "D2 cue provenance" })).items[0]?.memoryId;
+		if (!memoryId) throw new Error("review cue fixture was not published");
+
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("pi_xk_read_memory", { memoryIds: [memoryId] })),
+			fauxAssistantMessage(
+				fauxToolCall("pi_xk_review_memory", {
+					action: "create",
+					sourceMemories: [],
+					replacement: {
+						kind: "fact",
+						title: "Invented cue must be rejected",
+						statement: "A model cannot invent a cue identifier during a semantic Memory review.",
+						applicability: "Ambient Memory review tool validation.",
+						effectiveFrom: "2026-08-05T00:00:00.000Z",
+						cueIds: ["cue_invented_by_model"],
+					},
+					reason: "Exercise immediate cue provenance validation.",
+				}),
+			),
+			fauxAssistantMessage("The invalid semantic review was rejected before settlement."),
+		]);
+		await harness.session.prompt("Attempt an invalid Memory review cue.");
+
+		const reviewResult = harness.session.messages
+			.filter((message) => message.role === "toolResult")
+			.map((message) => ({ message, text: getMessageText(message) }))
+			.find(({ text }) => text.includes("cue was not returned by a D2 read"));
+		expect(reviewResult?.message.isError).toBe(true);
+		expect(memoryErrors).toEqual([]);
+		const replay = await service.getStore().replay();
+		expect(replay.events.some((event) => event.eventType === "memory_review_failed")).toBe(false);
+		expect((await service.timeline(memoryId)).revisions).toHaveLength(1);
 	}, 20_000);
 
 	it("publishes v3 Agent-run evidence with the durable Goal identity", async () => {

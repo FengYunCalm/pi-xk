@@ -105,6 +105,7 @@ interface AmbientRunLedger {
 	queryDigests: string[];
 	candidateIds: Set<string>;
 	readRevisions: Map<string, number>;
+	readCueIds: Set<string>;
 	evidenceIds: Set<string>;
 	evidenceRefs: Map<string, EvidenceRefV2>;
 	decisions: Map<string, MemoryReviewDecisionV1>;
@@ -1422,6 +1423,7 @@ export function createPiXkMemoryExtension(options: PiXkMemoryExtensionOptions = 
 					});
 				for (const memory of result.memories) {
 					ledger.readRevisions.set(memory.revision.memoryId, memory.revision.revision);
+					for (const cueId of memory.revision.cueIds) ledger.readCueIds.add(cueId);
 					for (const evidence of memory.revision.evidenceRefs) {
 						ledger.evidenceRefs.set(evidence.evidenceId, evidence);
 					}
@@ -1489,6 +1491,7 @@ export function createPiXkMemoryExtension(options: PiXkMemoryExtensionOptions = 
 			promptGuidelines: [
 				"Do not archive, invalidate, purge, or detach evidence through semantic review.",
 				"Use revise for the same concept, supersede for a replacement concept, and dispute when evidence conflicts.",
+				"Use only cue IDs returned by D2 reads in this run. If no D2 read returned a cue ID, create Memory with cueIds: [].",
 			],
 			executionMode: "sequential",
 			parameters: Type.Object({
@@ -1543,6 +1546,13 @@ export function createPiXkMemoryExtension(options: PiXkMemoryExtensionOptions = 
 				for (const evidenceId of params.evidenceIds ?? []) {
 					if (!ledger.evidenceIds.has(evidenceId)) {
 						throw new MemoryValidationError(`Memory review evidence was not expanded in this run: ${evidenceId}`);
+					}
+				}
+				for (const cueId of params.replacement?.cueIds ?? []) {
+					if (!ledger.readCueIds.has(cueId)) {
+						throw new MemoryValidationError(
+							`Memory review cue was not returned by a D2 read in this run: ${cueId}`,
+						);
 					}
 				}
 				const semanticInput = {
@@ -1928,6 +1938,7 @@ export function createPiXkMemoryExtension(options: PiXkMemoryExtensionOptions = 
 				queryDigests: [],
 				candidateIds: new Set(),
 				readRevisions: new Map(),
+				readCueIds: new Set(),
 				evidenceIds: new Set(),
 				evidenceRefs: new Map(),
 				decisions: new Map(),

@@ -97,6 +97,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 			},
 			onError: (err) => {
 				console.error(`Extension error (${err.extensionPath}): ${err.error}`);
+				exitCode = 1;
 			},
 		});
 

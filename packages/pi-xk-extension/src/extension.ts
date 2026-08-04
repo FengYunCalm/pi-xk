@@ -4,11 +4,11 @@ import type { ExtensionAPI, ExtensionContext, ExtensionFactory } from "@earendil
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { SkillService } from "pi-xk-core";
 import { createPiXkGoalExtension, getPiXkSessionChainGateState, type PiXkGoalExtensionOptions } from "./index.ts";
-import { MemoryController, type MemoryGenerationHost } from "./memory-controller.ts";
+import { MemoryController } from "./memory-controller.ts";
 import { createPiXkMemoryExtension, type PiXkMemoryExtensionOptions } from "./memory-extension.ts";
 import { MemorySourceBridge } from "./memory-source-bridge.ts";
 import { renderPiXkRuntimeStatus } from "./runtime-status.ts";
-import { SessionChainController, type SessionChainHost } from "./session-chain-controller.ts";
+import { SessionChainController } from "./session-chain-controller.ts";
 import { createPiXkSessionChainExtension, type PiXkSessionChainExtensionOptions } from "./session-chain-extension.ts";
 
 export interface PiXkRuntimeExtensionOptions {
@@ -17,31 +17,6 @@ export interface PiXkRuntimeExtensionOptions {
 	memory?: Omit<PiXkMemoryExtensionOptions, "createController" | "createSourceBridge" | "getCompactionGateState">;
 	createController?: (projectRoot: string) => SessionChainController;
 	createMemoryController?: (projectRoot: string) => MemoryController;
-}
-
-function memoryGenerationHost(host: SessionChainHost): MemoryGenerationHost {
-	const modelId = host.model?.id ?? host.model?.modelId;
-	return {
-		model:
-			host.model?.provider && modelId
-				? { provider: host.model.provider, modelId, contextWindow: host.model.contextWindow }
-				: undefined,
-		generate: async (input) => {
-			const generated = await host.summarizeSessionContext({
-				messages: [
-					{
-						role: "user",
-						content: [{ type: "text", text: input.source }],
-						timestamp: Date.now(),
-					},
-				],
-				customInstructions: input.instructions,
-				replaceInstructions: true,
-				maxOutputTokens: input.maxOutputTokens,
-			});
-			return { text: generated.summary, model: generated.model };
-		},
-	};
 }
 
 /** Compose the public Pi-XK Goal/Task controls with the project Session Chain. */
@@ -93,18 +68,8 @@ export function createPiXkRuntimeExtension(options: PiXkRuntimeExtensionOptions 
 	const controllerFor = (projectRoot: string): SessionChainController => {
 		const existing = controllers.get(projectRoot);
 		if (existing) return existing;
-		const controller =
-			options.createController?.(projectRoot) ??
-			new SessionChainController({
-				projectRoot,
-				onRollupPublished: (source, host) => {
-					void memoryBridgeFor(projectRoot)
-						.capturePublishedRollup(source, memoryGenerationHost(host))
-						.catch((error) =>
-							options.memory?.onMemoryError?.(error instanceof Error ? error : new Error(String(error))),
-						);
-				},
-			});
+		// Memory discovers durable rollup_published events with a fresh settled or started session context.
+		const controller = options.createController?.(projectRoot) ?? new SessionChainController({ projectRoot });
 		controllers.set(projectRoot, controller);
 		return controller;
 	};

@@ -69,6 +69,12 @@ export const PI_XK_SESSION_CHAIN_MARKER_SCHEMA = "pi-xk.session-chain-marker.v1"
 export const SESSION_CHAIN_SUMMARY_PROMPT_VERSION = "session-chain-summary-v3";
 export const SESSION_CHAIN_ROOT_SUMMARY = "No previous Session Chain segment.";
 
+const SESSION_CHAIN_L1_REPAIR_PROMPT = [
+	SESSION_CHAIN_L1_SUMMARIZATION_PROMPT,
+	"The previous response was rejected before any Session Chain state changed because it was not exact JSON evidence.",
+	"Retry now with exactly one valid pi.summary-evidence.v1 session-chain-l1 JSON object and no prose, Markdown fence, explanation, or extra characters.",
+].join("\n");
+
 export const SESSION_CHAIN_SOFT_BYTES = 16 * 1024 * 1024;
 export const SESSION_CHAIN_SOFT_ENTRIES = 4_000;
 export const SESSION_CHAIN_HARD_BYTES = 64 * 1024 * 1024;
@@ -475,6 +481,14 @@ function isSummaryOutMarker(value: unknown): value is PiXkSessionChainSummaryOut
 
 function hashText(value: string): string {
 	return `sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
+}
+
+function isRetryableL1SummaryProtocolError(error: unknown): boolean {
+	if (!(error instanceof SessionChainControllerError)) return false;
+	return (
+		error.message.startsWith("Session Chain summarizer response is not valid JSON evidence:") ||
+		error.message === "Session Chain summarizer JSON payload has invalid fields"
+	);
 }
 
 function flushSessionDurably(manager: SessionManager): void {
@@ -1560,13 +1574,23 @@ export class SessionChainController {
 		await this.assertSummaryInProvenance(sourceManager, binding);
 		const selection = this.buildSummarySelection(sourceManager, binding, segment, sourceLeafId);
 		const maxOutputTokens = summaryBudget(host.model.contextWindow);
-		const generated = await host.summarizeSessionContext({
-			messages: selection.messages,
-			previousSummary: selection.baseSummary,
-			customInstructions: SESSION_CHAIN_L1_SUMMARIZATION_PROMPT,
-			replaceInstructions: true,
-			maxOutputTokens,
-		});
+		const summarize = async (customInstructions: string): Promise<SessionChainSummarizeResult> =>
+			await host.summarizeSessionContext({
+				messages: selection.messages,
+				previousSummary: selection.baseSummary,
+				customInstructions,
+				replaceInstructions: true,
+				maxOutputTokens,
+			});
+		let generated = await summarize(SESSION_CHAIN_L1_SUMMARIZATION_PROMPT);
+		let envelope: ReturnType<typeof parseSummaryEnvelope>;
+		try {
+			envelope = parseSummaryEnvelope(generated.summary);
+		} catch (error) {
+			if (!isRetryableL1SummaryProtocolError(error)) throw error;
+			generated = await summarize(SESSION_CHAIN_L1_REPAIR_PROMPT);
+			envelope = parseSummaryEnvelope(generated.summary);
+		}
 		await this.assertSummaryInProvenance(sourceManager, binding);
 		const afterSelection = this.buildSummarySelection(sourceManager, binding, segment, sourceLeafId);
 		if (
@@ -1576,7 +1600,6 @@ export class SessionChainController {
 		) {
 			throw new SessionChainControllerError("Session Chain source changed while its summary was being generated");
 		}
-		const envelope = parseSummaryEnvelope(generated.summary);
 		const estimatedOutputTokens = Math.ceil(Buffer.byteLength(generated.summary, "utf8") / 4);
 		if (Math.max(generated.usage.output, estimatedOutputTokens) > maxOutputTokens) {
 			throw new SessionChainControllerError("Session Chain summary output exceeded its fixed token budget");

@@ -28,7 +28,7 @@ export const SESSION_CHAIN_L1_SUMMARIZATION_PROMPT = [
 	"payload must contain exactly title, segmentDeltaMarkdown, and carryForwardMarkdown as non-empty strings.",
 	"segmentDeltaMarkdown describes only this Segment's verified work, failures, decisions, and state changes.",
 	"carryForwardMarkdown integrates the prior cumulative state with this Segment delta for the next Segment, removing obsolete facts when supported by evidence.",
-	"The title is a single-line noun phrase of at most 60 Unicode code points, with no Markdown, control characters, commands, role instructions, or unsupported completion claim.",
+	"The title is a single-line noun phrase of 40 Unicode code points or fewer (hard limit 60), with no Markdown, control characters, commands, role instructions, or unsupported completion claim.",
 ].join("\n");
 
 export const SESSION_CHAIN_L2_SUMMARIZATION_PROMPT = [
@@ -61,6 +61,16 @@ function isNonEmptyString(value: unknown): value is string {
 
 function hashText(value: string): string {
 	return `sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
+}
+
+function parseSummaryTitle(value: unknown): string {
+	try {
+		return validateSegmentSummaryTitle(value, { truncateOverlong: true });
+	} catch (error) {
+		throw new SessionChainControllerError(
+			`Session Chain summarizer returned an invalid title: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
 }
 
 export function rollupSourceDigest(input: {
@@ -100,14 +110,7 @@ function parseLegacySummaryEnvelope(summary: string): ParsedSummaryEnvelope {
 			"Session Chain summarizer returned an invalid summary envelope; expected title, segment-delta, and carry-forward blocks",
 		);
 	}
-	let title: string;
-	try {
-		title = validateSegmentSummaryTitle(match[1]);
-	} catch (error) {
-		throw new SessionChainControllerError(
-			`Session Chain summarizer returned an invalid title: ${error instanceof Error ? error.message : String(error)}`,
-		);
-	}
+	const title = parseSummaryTitle(match[1]);
 	return { title, segmentDeltaMarkdown, carryForwardMarkdown };
 }
 
@@ -138,14 +141,7 @@ export function parseSummaryEnvelope(
 	) {
 		throw new SessionChainControllerError("Session Chain summarizer JSON payload has invalid fields");
 	}
-	let title: string;
-	try {
-		title = validateSegmentSummaryTitle(value.title);
-	} catch (error) {
-		throw new SessionChainControllerError(
-			`Session Chain summarizer returned an invalid title: ${error instanceof Error ? error.message : String(error)}`,
-		);
-	}
+	const title = parseSummaryTitle(value.title);
 	return {
 		title,
 		segmentDeltaMarkdown: value.segmentDeltaMarkdown.trim(),

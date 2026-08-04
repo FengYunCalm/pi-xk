@@ -28,13 +28,15 @@ import {
 } from "pi-xk-core";
 import {
 	buildMemoryCaptureReview,
+	MEMORY_CAPTURE_FORMAT_REPAIR_PROMPT,
 	MEMORY_CAPTURE_PROMPT,
 	MEMORY_CAPTURE_PROMPT_VERSION,
 	parseMemoryCaptureEnvelope,
 } from "./memory-prompt.ts";
 
 const MEMORY_CAPTURE_PENDING_V1_SCHEMA = "pi-xk.memory-capture-pending.v1";
-const MEMORY_CAPTURE_PENDING_SCHEMA = "pi-xk.memory-capture-pending.v2";
+const MEMORY_CAPTURE_PENDING_V2_SCHEMA = "pi-xk.memory-capture-pending.v2";
+const MEMORY_CAPTURE_PENDING_SCHEMA = "pi-xk.memory-capture-pending.v3";
 
 export interface MemoryGenerationHost {
 	model: { provider: string; modelId: string; contextWindow: number } | undefined;
@@ -64,12 +66,17 @@ export interface MemoryCaptureResultV1 {
 	confirmationRequired: boolean;
 }
 
-interface PendingCaptureResultV2 {
+interface PendingCaptureFormatRepairV1 {
+	validationMessage: string;
+}
+
+interface PendingCaptureResultV3 {
 	schema: typeof MEMORY_CAPTURE_PENDING_SCHEMA;
 	captureId: string;
 	resultArtifactId: string;
 	model: string;
 	updatedAt: string;
+	formatRepair: PendingCaptureFormatRepairV1 | null;
 }
 
 type MemoryGitContext = {
@@ -97,6 +104,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+class MemoryCaptureFormatError extends Error {
+	constructor(error: unknown) {
+		super(limitedMessage(error));
+		this.name = "MemoryCaptureFormatError";
+	}
+}
+
 function captureFailure(
 	error: unknown,
 	stage: "source" | "generation" | "validation" | "artifact" | "publication" | "projection",
@@ -109,6 +123,11 @@ function captureFailure(
 	}
 	if (error instanceof MemoryHeadConflictError) {
 		return { errorCode: "memory_capture_event_head_conflict", retryable: true };
+	}
+	if (error instanceof MemoryCaptureFormatError) {
+		return attempt < 2
+			? { errorCode: "memory_capture_format_repair_requested", retryable: true }
+			: { errorCode: "memory_capture_format_repair_exhausted", retryable: false };
 	}
 	if (error instanceof MemoryValidationError) return { errorCode: "memory_capture_invalid", retryable: false };
 	if (stage === "source") return { errorCode: "memory_capture_context_failed", retryable: true };
@@ -276,7 +295,7 @@ export class MemoryController {
 		return join(this.pendingDirectory, `${captureId}.json`);
 	}
 
-	private async replacePending(pending: PendingCaptureResultV2): Promise<void> {
+	private async replacePending(pending: PendingCaptureResultV3): Promise<void> {
 		await mkdir(this.pendingDirectory, { recursive: true });
 		const path = this.pendingPath(pending.captureId);
 		const temporary = join(this.pendingDirectory, `.${pending.captureId}-${randomUUID()}.tmp`);
@@ -294,7 +313,7 @@ export class MemoryController {
 		}
 	}
 
-	private async readPending(captureId: string, legacyModel: string | null): Promise<PendingCaptureResultV2 | null> {
+	private async readPending(captureId: string, legacyModel: string | null): Promise<PendingCaptureResultV3 | null> {
 		let value: unknown;
 		try {
 			value = JSON.parse(await readFile(this.pendingPath(captureId), "utf8")) as unknown;
@@ -323,23 +342,55 @@ export class MemoryController {
 			if (!legacyModel) {
 				throw new MemoryValidationError(`Legacy Memory pending capture requires a selected model: ${captureId}`);
 			}
-			const upgraded: PendingCaptureResultV2 = {
+			const upgraded: PendingCaptureResultV3 = {
 				schema: MEMORY_CAPTURE_PENDING_SCHEMA,
 				captureId,
 				resultArtifactId,
 				model: legacyModel,
 				updatedAt,
+				formatRepair: null,
+			};
+			await this.replacePending(upgraded);
+			return upgraded;
+		}
+		if (
+			value.schema === MEMORY_CAPTURE_PENDING_V2_SCHEMA &&
+			Object.keys(value).sort().join(",") === "captureId,model,resultArtifactId,schema,updatedAt" &&
+			typeof value.model === "string" &&
+			value.model.trim().length > 0
+		) {
+			const upgraded: PendingCaptureResultV3 = {
+				schema: MEMORY_CAPTURE_PENDING_SCHEMA,
+				captureId,
+				resultArtifactId,
+				model: value.model,
+				updatedAt,
+				formatRepair: null,
 			};
 			await this.replacePending(upgraded);
 			return upgraded;
 		}
 		if (
 			value.schema !== MEMORY_CAPTURE_PENDING_SCHEMA ||
-			Object.keys(value).sort().join(",") !== "captureId,model,resultArtifactId,schema,updatedAt" ||
+			Object.keys(value).sort().join(",") !== "captureId,formatRepair,model,resultArtifactId,schema,updatedAt" ||
 			typeof value.model !== "string" ||
 			value.model.trim().length === 0
 		) {
 			throw new MemoryValidationError(`Memory pending capture is invalid: ${captureId}`);
+		}
+		let formatRepair: PendingCaptureFormatRepairV1 | null = null;
+		if (value.formatRepair !== null) {
+			const candidate = value.formatRepair;
+			if (
+				!isRecord(candidate) ||
+				Object.keys(candidate).sort().join(",") !== "validationMessage" ||
+				typeof candidate.validationMessage !== "string" ||
+				candidate.validationMessage.trim().length === 0 ||
+				[...candidate.validationMessage].length > 500
+			) {
+				throw new MemoryValidationError(`Memory pending capture is invalid: ${captureId}`);
+			}
+			formatRepair = { validationMessage: candidate.validationMessage.trim() };
 		}
 		return {
 			schema: MEMORY_CAPTURE_PENDING_SCHEMA,
@@ -347,6 +398,7 @@ export class MemoryController {
 			resultArtifactId,
 			model: value.model,
 			updatedAt,
+			formatRepair,
 		};
 	}
 
@@ -621,10 +673,23 @@ export class MemoryController {
 			await rm(this.pendingPath(captureId), { force: true });
 		}
 		let pending = await this.readPending(captureId, selectedModel);
-		if (capture.status === "generating" && !pending) {
+		if (
+			pending !== null &&
+			pending.formatRepair !== null &&
+			!(
+				(capture.status === "failed" &&
+					capture.attempt === 1 &&
+					capture.errorCode === "memory_capture_format_repair_requested" &&
+					capture.retryable === true) ||
+				(capture.status === "generating" && capture.attempt === 2)
+			)
+		) {
+			throw new MemoryValidationError("Memory format repair marker does not match capture state");
+		}
+		if (capture.status === "generating" && (!pending || pending.formatRepair !== null)) {
 			return { captureId, status: "indeterminate", proposalId: null, confirmationRequired: false };
 		}
-		if (!pending) {
+		if (!pending || pending.formatRepair !== null) {
 			if (!host.model) throw new MemoryValidationError("Memory capture requires a selected model");
 			const started = await this.service.markGenerationStarted(captureId, (capture.attempt ?? 0) + 1, {
 				eventId: `evt_memory_generation_${suffix(captureDigest)}_${(capture.attempt ?? 0) + 1}`,
@@ -659,11 +724,32 @@ export class MemoryController {
 					state: memory.state,
 				})),
 			});
+			let generationSource = modelSource;
+			let instructions = MEMORY_CAPTURE_PROMPT;
+			const repair = pending?.formatRepair;
+			if (repair && pending) {
+				try {
+					const rejected = await this.artifacts.read(pending.resultArtifactId);
+					generationSource = stableJsonStringify({
+						schema: "pi-xk.memory-capture-format-repair-input.v1",
+						captureInput: JSON.parse(modelSource) as unknown,
+						rejectedResult: {
+							artifactId: pending.resultArtifactId,
+							content: rejected.content,
+							validationMessage: repair.validationMessage,
+						},
+					});
+					instructions = MEMORY_CAPTURE_FORMAT_REPAIR_PROMPT;
+				} catch (error) {
+					await this.recordFailure(captureId, "artifact", error);
+					return { captureId, status: "failed", proposalId: null, confirmationRequired: false };
+				}
+			}
 			let generated: Awaited<ReturnType<MemoryGenerationHost["generate"]>>;
 			try {
 				generated = await host.generate({
-					source: modelSource,
-					instructions: MEMORY_CAPTURE_PROMPT,
+					source: generationSource,
+					instructions,
 					maxOutputTokens: Math.min(4_000, Math.max(2_048, Math.floor(host.model.contextWindow * 0.05))),
 				});
 			} catch (error) {
@@ -676,7 +762,10 @@ export class MemoryController {
 					text: generated.text,
 					producer: MEMORY_CAPTURE_PROMPT_VERSION,
 					sensitivity: "internal",
-					sourceIds: [captureId, request.artifactId],
+					sourceIds:
+						repair && pending
+							? [captureId, request.artifactId, pending.resultArtifactId]
+							: [captureId, request.artifactId],
 					createdAt: this.now(),
 				});
 				await this.artifacts.read(result.artifactId);
@@ -686,6 +775,7 @@ export class MemoryController {
 					resultArtifactId: result.artifactId,
 					model: `${generated.model.provider}/${generated.model.modelId}`,
 					updatedAt: this.now(),
+					formatRepair: null,
 				};
 				await this.replacePending(pending);
 			} catch (error) {
@@ -702,7 +792,12 @@ export class MemoryController {
 		let review: ReturnType<typeof buildMemoryCaptureReview>;
 		try {
 			const result = await this.artifacts.read(pending.resultArtifactId);
-			const envelope = parseMemoryCaptureEnvelope(result.content);
+			let envelope: ReturnType<typeof parseMemoryCaptureEnvelope>;
+			try {
+				envelope = parseMemoryCaptureEnvelope(result.content);
+			} catch (error) {
+				throw new MemoryCaptureFormatError(error);
+			}
 			const currentMemories = await this.existingContext(request.query);
 			const existingCues = await this.service.getStore().readCues();
 			const currentCapture = (await this.service.getStore().replay()).captures.get(captureId);
@@ -721,6 +816,22 @@ export class MemoryController {
 				gitContexts: await this.gitContexts(envelope, existingCues, captureDigest, pending.updatedAt),
 			});
 		} catch (error) {
+			const currentCapture = (await this.service.getStore().replay()).captures.get(captureId);
+			if (
+				error instanceof MemoryCaptureFormatError &&
+				currentCapture?.attempt === 1 &&
+				pending.formatRepair === null
+			) {
+				await this.recordFailure(captureId, "validation", error);
+				const failedCapture = (await this.service.getStore().replay()).captures.get(captureId);
+				if (failedCapture?.status === "failed" && failedCapture.retryable === true) {
+					await this.replacePending({
+						...pending,
+						formatRepair: { validationMessage: limitedMessage(error) },
+					});
+					return await this.process(request, host, captureId, captureDigest);
+				}
+			}
 			await this.recordFailure(captureId, "validation", error);
 			if (error instanceof MemoryRevisionConflictError) {
 				await rm(this.pendingPath(captureId), { force: true });

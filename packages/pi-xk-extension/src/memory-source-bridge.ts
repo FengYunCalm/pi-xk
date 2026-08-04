@@ -26,12 +26,14 @@ import type {
 	MemoryController,
 	MemoryGenerationHost,
 } from "./memory-controller.ts";
+import { MEMORY_CAPTURE_PROMPT_VERSION } from "./memory-prompt.ts";
 
 const MEMORY_SOURCE_CURSOR_V1_SCHEMA = "pi-xk.memory-source-cursors.v1";
 const MEMORY_SOURCE_CURSOR_SCHEMA = "pi-xk.memory-source-cursors.v2";
 const MEMORY_HISTORY_CUE_CURSOR_V1_SCHEMA = "pi-xk.memory-history-cue-cursor.v1";
 const MEMORY_HISTORY_CUE_CURSOR_SCHEMA = "pi-xk.memory-history-cue-cursor.v2";
 const MEMORY_GOAL_SOURCE_SCHEMA = "pi-xk.memory-goal-source.v1";
+const LEGACY_MEMORY_CAPTURE_PROMPT_VERSION = "pi-xk.memory-capture-v2";
 
 interface MemoryCaptureControllerPort {
 	getService(): ReturnType<MemoryController["getService"]>;
@@ -851,14 +853,39 @@ export class MemorySourceBridge {
 
 	private async retryableSourceIds(): Promise<Set<string>> {
 		const readModel = (await this.controller.getService().getStore().loadReadModelSnapshot()).readModel;
-		const sourceIds = new Set<string>();
-		for (const capture of readModel.captures) {
-			if (capture.status !== "failed" || capture.retryable !== true) continue;
+		const captures = [...readModel.captures];
+		const legacyInvalidCaptures = captures.filter(
+			(capture) =>
+				capture.status === "failed" &&
+				capture.retryable !== true &&
+				capture.errorCode === "memory_capture_invalid" &&
+				capture.promptVersion === LEGACY_MEMORY_CAPTURE_PROMPT_VERSION,
+		);
+		const sourceFor = async (capture: (typeof captures)[number]) => {
 			const stored = await this.artifacts.read(capture.sourceArtifactId);
 			const source = validateMemoryCaptureSourceV1(JSON.parse(stored.content) as unknown);
-			if (source.captureId !== capture.captureId || source.sourceDigest !== capture.sourceDigest) {
-				throw new Error(`Retryable Memory capture source does not match its event state: ${capture.captureId}`);
+			if (
+				source.captureId !== capture.captureId ||
+				source.sourceDigest !== capture.sourceDigest ||
+				source.promptVersion !== capture.promptVersion
+			) {
+				throw new Error(`Memory capture source does not match its event state: ${capture.captureId}`);
 			}
+			return source;
+		};
+		const upgradedSourceIds = new Set<string>();
+		if (legacyInvalidCaptures.length > 0) {
+			for (const capture of captures) {
+				if (capture.promptVersion !== MEMORY_CAPTURE_PROMPT_VERSION) continue;
+				for (const sourceId of (await sourceFor(capture)).sourceIds) upgradedSourceIds.add(sourceId);
+			}
+		}
+		const sourceIds = new Set<string>();
+		for (const capture of captures) {
+			const legacyInvalid = legacyInvalidCaptures.includes(capture);
+			if (capture.status !== "failed" || (capture.retryable !== true && !legacyInvalid)) continue;
+			const source = await sourceFor(capture);
+			if (legacyInvalid && source.sourceIds.some((sourceId) => upgradedSourceIds.has(sourceId))) continue;
 			const sourceId = source.sourceIds[0];
 			if (sourceId) sourceIds.add(sourceId);
 		}
