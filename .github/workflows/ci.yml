@@ -38,8 +38,18 @@ jobs:
       - name: Check
         run: npm run check
 
-      - name: Session Chain benchmark smoke
-        run: npm run benchmark:session-chain -- --sizes 1 --runs 1
+      - name: Pi-XK semantic evaluations
+        run: |
+          npm run evaluate:session-chain-summaries
+          npm run evaluate:pi-xk-memory
+          npm run evaluate:pi-xk-ambient-recall
+          npm run evaluate:pi-xk-skill-evolution
+
+      - name: Pi-XK benchmark smoke
+        run: |
+          npm run benchmark:session-chain -- --sizes 1 --runs 1
+          npm run benchmark:pi-xk-memory -- --counts 100,1000 --runs 3 --json
+          npm run benchmark:pi-xk-skills -- --counts 100,1000 --runs 3 --json
 
       - name: Test
         run: npm test
