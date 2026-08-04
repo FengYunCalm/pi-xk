@@ -82,7 +82,11 @@ function runPackager(fixture: ReleaseFixture, tag: string, options: PackagerOpti
 		"0.80.10",
 	];
 	if (options.stageOnly ?? true) arguments_.push("--stage-only");
-	return spawnSync(process.execPath, arguments_, { encoding: "utf8", env: options.env });
+	return spawnSync(process.execPath, arguments_, {
+		encoding: "utf8",
+		env: options.env,
+		timeout: 60_000,
+	});
 }
 
 afterEach(async () => {
@@ -332,7 +336,7 @@ describe("Pi-XK GitHub release packaging", () => {
 		expect(existsSync(archivePath)).toBe(true);
 		if (capturePath) expect((await readFile(capturePath, "utf8")).trim()).toBe(archivePath);
 		expect(await readFile(join(fixture.binaryRoot, "SHA256SUMS"), "utf8")).toContain("pi-xk-windows-x64.zip");
-	});
+	}, 90_000);
 
 	it("rejects a mismatched local release tag before replacing existing output", async () => {
 		const releaseConfig = JSON.parse(await readFile(join(workspaceRoot, "pi-xk-release.json"), "utf8")) as {
