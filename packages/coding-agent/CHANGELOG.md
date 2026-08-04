@@ -29,6 +29,7 @@
 
 ### Fixed
 
+- Fixed production dependency audit findings by updating Undici and brace-expansion resolutions.
 - Fixed strict extension-driven summaries to replace the generic output contract only when requested with non-blank instructions, so structured generators receive one authoritative format while ordinary focus stays untrusted input and blank replacements fall back to the default contract.
 - Fixed aborted compaction and summary generations to retain cancellation semantics instead of being reported as invalid JSON or schema output.
 - Fixed custom `SYSTEM.md` and `--system-prompt` replacements to retain the active tool inventory and tool-specific guidance without restoring the default Pi identity or documentation block.
