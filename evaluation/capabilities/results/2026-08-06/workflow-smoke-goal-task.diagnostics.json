@@ -1,0 +1,20 @@
+{
+  "schema": "pi-xk.workflow-smoke-diagnostics.v1",
+  "generatedAt": "2026-08-06T22:58:27.092Z",
+  "scenarios": [
+    {
+      "scenarioId": "goal-task",
+      "checks": {
+        "goalEventsPresent": true,
+        "goalEnded": true,
+        "goalDraftToolObserved": true,
+        "goalProofMatched": true,
+        "taskEventsPresent": true,
+        "taskSucceeded": true,
+        "taskResultMatched": true,
+        "taskFinishToolObserved": true,
+        "taskResultDelivered": true
+      }
+    }
+  ]
+}

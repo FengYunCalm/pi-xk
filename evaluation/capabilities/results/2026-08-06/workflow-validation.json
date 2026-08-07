@@ -1,0 +1,247 @@
+{
+  "schema": "pi-xk.capability-report.v1",
+  "reportKind": "workflow-validation",
+  "generatedAt": "2026-08-06T18:35:19.946Z",
+  "runs": [
+    {
+      "id": "faux-goal-contract-continuity",
+      "scenarioId": "goal-contract-continuity",
+      "agent": "pi-xk",
+      "execution": "faux-provider",
+      "status": "passed",
+      "control": {
+        "model": "faux-provider",
+        "thinking": "not-applicable",
+        "piVersion": "0.80.10",
+        "runtimeId": "pi-xk-faux-0.80.10-e08bad29b158372125a4a9652d2b48a1e5da4317-dirty",
+        "taskDigest": "sha256:9c4a034a376250798837ecc4a32cfccdb4599020836a7d3e7e954598d0b74a6d",
+        "budget": {
+          "wallSeconds": 14,
+          "toolPolicy": "faux-provider-harness"
+        }
+      },
+      "metrics": {
+        "reward": 1,
+        "inputTokensIncludingCache": 0,
+        "outputTokens": 0,
+        "cacheReadTokens": 0,
+        "costUsd": 0,
+        "elapsedSeconds": 13.54
+      },
+      "verification": {
+        "structural": true,
+        "independent": false
+      }
+    },
+    {
+      "id": "faux-task-child-delivery",
+      "scenarioId": "task-child-delivery",
+      "agent": "pi-xk",
+      "execution": "faux-provider",
+      "status": "passed",
+      "control": {
+        "model": "faux-provider",
+        "thinking": "not-applicable",
+        "piVersion": "0.80.10",
+        "runtimeId": "pi-xk-faux-0.80.10-e08bad29b158372125a4a9652d2b48a1e5da4317-dirty",
+        "taskDigest": "sha256:94fe69a391dbea37b863827d6ba8ba845f3d6d9c86eb675b812e39e28b413f32",
+        "budget": {
+          "wallSeconds": 8,
+          "toolPolicy": "faux-provider-harness"
+        }
+      },
+      "metrics": {
+        "reward": 1,
+        "inputTokensIncludingCache": 0,
+        "outputTokens": 0,
+        "cacheReadTokens": 0,
+        "costUsd": 0,
+        "elapsedSeconds": 7.616
+      },
+      "verification": {
+        "structural": true,
+        "independent": false
+      }
+    },
+    {
+      "id": "faux-chain-rollover-rollup-recovery",
+      "scenarioId": "chain-rollover-rollup-recovery",
+      "agent": "pi-xk",
+      "execution": "faux-provider",
+      "status": "passed",
+      "control": {
+        "model": "faux-provider",
+        "thinking": "not-applicable",
+        "piVersion": "0.80.10",
+        "runtimeId": "pi-xk-faux-0.80.10-e08bad29b158372125a4a9652d2b48a1e5da4317-dirty",
+        "taskDigest": "sha256:c9f3e5e4f46d77d010302b912cca55b0291a9edc3dd84f979825e434cf969511",
+        "budget": {
+          "wallSeconds": 18,
+          "toolPolicy": "faux-provider-harness"
+        }
+      },
+      "metrics": {
+        "reward": 1,
+        "inputTokensIncludingCache": 0,
+        "outputTokens": 0,
+        "cacheReadTokens": 0,
+        "costUsd": 0,
+        "elapsedSeconds": 17.843
+      },
+      "verification": {
+        "structural": true,
+        "independent": false
+      }
+    },
+    {
+      "id": "faux-compaction-continuation",
+      "scenarioId": "compaction-continuation",
+      "agent": "pi-xk",
+      "execution": "faux-provider",
+      "status": "passed",
+      "control": {
+        "model": "faux-provider",
+        "thinking": "not-applicable",
+        "piVersion": "0.80.10",
+        "runtimeId": "pi-xk-faux-0.80.10-e08bad29b158372125a4a9652d2b48a1e5da4317-dirty",
+        "taskDigest": "sha256:6b3e0af62f3f33553921d6454fd1c2162b573162c72eba68dc9fbb03cc3051bc",
+        "budget": {
+          "wallSeconds": 3,
+          "toolPolicy": "faux-provider-harness"
+        }
+      },
+      "metrics": {
+        "reward": 1,
+        "inputTokensIncludingCache": 0,
+        "outputTokens": 0,
+        "cacheReadTokens": 0,
+        "costUsd": 0,
+        "elapsedSeconds": 2.857
+      },
+      "verification": {
+        "structural": true,
+        "independent": false
+      }
+    },
+    {
+      "id": "faux-ambient-memory-recall-and-review",
+      "scenarioId": "ambient-memory-recall-and-review",
+      "agent": "pi-xk",
+      "execution": "faux-provider",
+      "status": "passed",
+      "control": {
+        "model": "faux-provider",
+        "thinking": "not-applicable",
+        "piVersion": "0.80.10",
+        "runtimeId": "pi-xk-faux-0.80.10-e08bad29b158372125a4a9652d2b48a1e5da4317-dirty",
+        "taskDigest": "sha256:23a172e3dc6b3eb17b00dd17b0c358ff4270e69c3f56a5bc40cb29e0ead4b612",
+        "budget": {
+          "wallSeconds": 23,
+          "toolPolicy": "faux-provider-harness"
+        }
+      },
+      "metrics": {
+        "reward": 1,
+        "inputTokensIncludingCache": 0,
+        "outputTokens": 0,
+        "cacheReadTokens": 0,
+        "costUsd": 0,
+        "elapsedSeconds": 22.877
+      },
+      "verification": {
+        "structural": true,
+        "independent": false
+      }
+    },
+    {
+      "id": "faux-skill-evolution-and-reload",
+      "scenarioId": "skill-evolution-and-reload",
+      "agent": "pi-xk",
+      "execution": "faux-provider",
+      "status": "passed",
+      "control": {
+        "model": "faux-provider",
+        "thinking": "not-applicable",
+        "piVersion": "0.80.10",
+        "runtimeId": "pi-xk-faux-0.80.10-e08bad29b158372125a4a9652d2b48a1e5da4317-dirty",
+        "taskDigest": "sha256:8bda53d01a48b07bfc9b48fddc1f1b87e79d603e367d282a0fd82672942c808e",
+        "budget": {
+          "wallSeconds": 12,
+          "toolPolicy": "faux-provider-harness"
+        }
+      },
+      "metrics": {
+        "reward": 1,
+        "inputTokensIncludingCache": 0,
+        "outputTokens": 0,
+        "cacheReadTokens": 0,
+        "costUsd": 0,
+        "elapsedSeconds": 11.553
+      },
+      "verification": {
+        "structural": true,
+        "independent": false
+      }
+    },
+    {
+      "id": "faux-doctor-projection-repair",
+      "scenarioId": "doctor-projection-repair",
+      "agent": "pi-xk",
+      "execution": "faux-provider",
+      "status": "passed",
+      "control": {
+        "model": "faux-provider",
+        "thinking": "not-applicable",
+        "piVersion": "0.80.10",
+        "runtimeId": "pi-xk-faux-0.80.10-e08bad29b158372125a4a9652d2b48a1e5da4317-dirty",
+        "taskDigest": "sha256:038b099176f41a09f4d01bb030e7c4172d021456ed0f91fc5bceb76ec2b3800d",
+        "budget": {
+          "wallSeconds": 17,
+          "toolPolicy": "faux-provider-harness"
+        }
+      },
+      "metrics": {
+        "reward": 1,
+        "inputTokensIncludingCache": 0,
+        "outputTokens": 0,
+        "cacheReadTokens": 0,
+        "costUsd": 0,
+        "elapsedSeconds": 16.191
+      },
+      "verification": {
+        "structural": true,
+        "independent": false
+      }
+    },
+    {
+      "id": "faux-local-installation-lifecycle",
+      "scenarioId": "local-installation-lifecycle",
+      "agent": "pi-xk",
+      "execution": "faux-provider",
+      "status": "passed",
+      "control": {
+        "model": "faux-provider",
+        "thinking": "not-applicable",
+        "piVersion": "0.80.10",
+        "runtimeId": "pi-xk-faux-0.80.10-e08bad29b158372125a4a9652d2b48a1e5da4317-dirty",
+        "taskDigest": "sha256:2f265064c6d8a4d98a7851187bbf2ea82a5ec71fb76203541c1f6efb8ba2c7fc",
+        "budget": {
+          "wallSeconds": 4,
+          "toolPolicy": "faux-provider-harness"
+        }
+      },
+      "metrics": {
+        "reward": 1,
+        "inputTokensIncludingCache": 0,
+        "outputTokens": 0,
+        "cacheReadTokens": 0,
+        "costUsd": 0,
+        "elapsedSeconds": 3.82
+      },
+      "verification": {
+        "structural": true,
+        "independent": false
+      }
+    }
+  ]
+}

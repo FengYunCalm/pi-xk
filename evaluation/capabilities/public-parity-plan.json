@@ -1,0 +1,52 @@
+{
+	"schema": "pi-xk.public-parity-plan.v1",
+	"harness": {
+		"name": "Harbor",
+		"repository": "https://github.com/harbor-framework/harbor.git",
+		"commit": "459ff6ec99417589b7f679d14ddf3b3f0ae4f1dc",
+		"version": "0.20.0"
+	},
+	"benchmark": {
+		"name": "Aider Polyglot",
+		"repository": "https://github.com/Aider-AI/polyglot-benchmark.git",
+		"commit": "7e0611e77b54e2dea774cdc0aa00cf9f7ed6144f",
+		"probeManifest": "evaluation/harbor/aider-polyglot-probe.json"
+	},
+	"controls": {
+		"provider": "deepseek",
+		"model": "deepseek-chat",
+		"thinking": "low",
+		"wallSeconds": 900,
+		"agentSetupSeconds": 900,
+		"toolPolicy": "pi-default",
+		"networkPolicyProfile": "portable-loopback-v1"
+	},
+	"retryPolicy": "abort-pair-no-single-side-retry",
+	"pairs": [
+		{
+			"attemptId": "pair-01",
+			"taskId": "aider-polyglot-python-phone-number",
+			"agentOrder": ["pi-native", "pi-xk"]
+		},
+		{
+			"attemptId": "pair-02",
+			"taskId": "aider-polyglot-go-robot-simulator",
+			"agentOrder": ["pi-xk", "pi-native"]
+		},
+		{
+			"attemptId": "pair-03",
+			"taskId": "aider-polyglot-rust-acronym",
+			"agentOrder": ["pi-native", "pi-xk"]
+		},
+		{
+			"attemptId": "pair-04",
+			"taskId": "aider-polyglot-cpp-clock",
+			"agentOrder": ["pi-xk", "pi-native"]
+		},
+		{
+			"attemptId": "pair-05",
+			"taskId": "aider-polyglot-java-all-your-base",
+			"agentOrder": ["pi-native", "pi-xk"]
+		}
+	]
+}

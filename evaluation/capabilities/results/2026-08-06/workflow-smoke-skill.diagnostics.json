@@ -1,0 +1,21 @@
+{
+  "schema": "pi-xk.workflow-smoke-diagnostics.v1",
+  "generatedAt": "2026-08-06T22:58:27.092Z",
+  "scenarios": [
+    {
+      "scenarioId": "skill",
+      "checks": {
+        "skillEventsPresent": true,
+        "activeSkillPresent": true,
+        "skillReviewToolObserved": true,
+        "skillChangeApplied": true,
+        "initialValidationMatched": true,
+        "hotReloadReadObserved": true,
+        "skillUseRecorded": true,
+        "followUpValidationMatched": true,
+        "skillDoctorOk": true,
+        "skillDoctorDiagnosticCodes": []
+      }
+    }
+  ]
+}

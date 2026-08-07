@@ -1,0 +1,74 @@
+{
+	"schema": "pi-xk.capability-matrix.v1",
+	"title": "Pi-XK capability evaluation matrix",
+	"control": {
+		"baseline": "pi-native",
+		"treatment": "pi-xk",
+		"publicParityRequirements": [
+			"same task digest",
+			"same provider and model",
+			"same thinking level",
+			"same Pi runtime identity",
+			"same tool and wall-time budgets",
+			"independent deterministic verifier"
+		]
+	},
+	"scenarios": [
+		{
+			"id": "public-code-task-parity",
+			"class": "public-parity",
+			"minimumComparisons": 5,
+			"components": ["pi-coding-agent"],
+			"benchmark": "Aider Polyglot via Harbor",
+			"requiredEvidence": ["verifier reward", "usage", "control identity"]
+		},
+		{
+			"id": "goal-contract-continuity",
+			"class": "pi-xk-workflow",
+			"components": ["goal", "checkpoint", "restart-recovery"],
+			"verifier": "contract, state revision, acceptance evidence, and recovered lifecycle agree"
+		},
+		{
+			"id": "task-child-delivery",
+			"class": "pi-xk-workflow",
+			"components": ["task", "child-session", "queued-input"],
+			"verifier": "one bounded child result is durable and queued parent input is delivered in order"
+		},
+		{
+			"id": "chain-rollover-rollup-recovery",
+			"class": "pi-xk-workflow",
+			"components": ["session-chain", "l1-summary", "l2-rollup", "restart-recovery"],
+			"verifier": "sealed segment provenance, successor, rollup, read model, and projection agree after restart"
+		},
+		{
+			"id": "compaction-continuation",
+			"class": "pi-xk-workflow",
+			"components": ["native-compaction", "compaction-recovery", "goal-coordination"],
+			"verifier": "one continuation trigger is used and no prior user request is duplicated"
+		},
+		{
+			"id": "ambient-memory-recall-and-review",
+			"class": "pi-xk-workflow",
+			"components": ["memory", "ambient-recall", "provenance", "settled-review"],
+			"verifier": "D1-D3 access, evidence scope, revision transition, and trust state are valid"
+		},
+		{
+			"id": "skill-evolution-and-reload",
+			"class": "pi-xk-workflow",
+			"components": ["skill", "managed-projection", "skill-reload"],
+			"verifier": "candidate evidence, active projection, reload generation, and rollback history agree"
+		},
+		{
+			"id": "doctor-projection-repair",
+			"class": "pi-xk-workflow",
+			"components": ["doctor", "read-model", "sqlite", "markdown-projection", "write-lock"],
+			"verifier": "derived data can be rebuilt without rewriting facts and live locks remain protected"
+		},
+		{
+			"id": "local-installation-lifecycle",
+			"class": "pi-xk-workflow",
+			"components": ["local-package", "profile-reference", "managed-fd", "cold-restart"],
+			"verifier": "isolated install, upgrade, uninstall, and cold-start extension discovery preserve the daily Pi profile boundary"
+		}
+	]
+}

@@ -1,0 +1,37 @@
+{
+  "schema": "pi-xk.capability-report.v1",
+  "reportKind": "workflow-smoke",
+  "generatedAt": "2026-08-06T22:58:27.090Z",
+  "runs": [
+    {
+      "id": "real-skill-evolution-and-reload",
+      "scenarioId": "skill-evolution-and-reload",
+      "agent": "pi-xk",
+      "execution": "real-provider",
+      "status": "passed",
+      "control": {
+        "model": "deepseek/deepseek-chat",
+        "thinking": "low",
+        "piVersion": "0.80.10",
+        "runtimeId": "pi-0.80.10-runtime-sha256:d7c924ee6b2ec1148e5cd713306ffe1821b663ec27db055556e7090f85195449",
+        "taskDigest": "sha256:b8b3af6aa05401cac8d8ca060bef12cd99cdf75561771eebff1daa7cfd217cef",
+        "budget": {
+          "wallSeconds": 900,
+          "toolPolicy": "pi-default"
+        }
+      },
+      "metrics": {
+        "reward": 1,
+        "inputTokensIncludingCache": 226855,
+        "outputTokens": 12542,
+        "cacheReadTokens": 207104,
+        "costUsd": 0.020253977,
+        "elapsedSeconds": 171.631
+      },
+      "verification": {
+        "structural": true,
+        "independent": true
+      }
+    }
+  ]
+}

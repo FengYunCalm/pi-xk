@@ -10,6 +10,7 @@ import {
 	captureGitFreshnessBasis,
 	type GoalContractV2,
 	GoalStore,
+	type MemoryIndexHistoryCueV1,
 	MemoryRevisionConflictError,
 	MemoryService,
 	MemoryStore,
@@ -30,6 +31,7 @@ import {
 	MEMORY_CAPTURE_RESPONSE_SCHEMA,
 	parseMemoryCaptureEnvelope,
 } from "../../../pi-xk-extension/src/memory-prompt.ts";
+import { MemorySourceBridge } from "../../../pi-xk-extension/src/memory-source-bridge.ts";
 import { PI_XK_SESSION_CHAIN_LINK_CUSTOM_TYPE } from "../../../pi-xk-extension/src/session-chain-controller.ts";
 import { createPiXkGoalBinding } from "../../../pi-xk-extension/src/session-link.ts";
 import { createHarness, getMessageText, type Harness } from "./harness.ts";
@@ -1417,6 +1419,99 @@ describe("Pi-XK Memory extension", () => {
 		expect(status.index?.head).toEqual(status.head);
 		expect(fullReplays).toBe(0);
 	});
+
+	it("waits for background projection work before running the Memory doctor command", async () => {
+		const memoryErrors: Error[] = [];
+		let extensionController: MemoryController | undefined;
+		let observeDoctorLockAttempt = false;
+		let signalDoctorLockAttempt: (() => void) | undefined;
+		const doctorLockAttempted = new Promise<void>((resolve) => {
+			signalDoctorLockAttempt = resolve;
+		});
+		class ObservedMemoryStore extends MemoryStore {
+			override async withProjectionLock<TResult>(action: () => Promise<TResult>): Promise<TResult> {
+				if (observeDoctorLockAttempt) {
+					observeDoctorLockAttempt = false;
+					signalDoctorLockAttempt?.();
+				}
+				return await super.withProjectionLock(action);
+			}
+		}
+		let signalBackgroundEntered: (() => void) | undefined;
+		let releaseBackground: (() => void) | undefined;
+		const backgroundEntered = new Promise<void>((resolve) => {
+			signalBackgroundEntered = resolve;
+		});
+		const backgroundGate = new Promise<void>((resolve) => {
+			releaseBackground = resolve;
+		});
+		class BlockingMemorySourceBridge extends MemorySourceBridge {
+			private readonly store: MemoryStore;
+			private refreshCount = 0;
+
+			constructor(projectRoot: string, controller: MemoryController) {
+				super({ projectRoot, controller });
+				this.store = controller.getService().getStore();
+			}
+
+			override async refreshHistoryCues(
+				options: { forceRebuild?: boolean } = {},
+			): Promise<MemoryIndexHistoryCueV1[]> {
+				this.refreshCount += 1;
+				if (this.refreshCount !== 2) return await super.refreshHistoryCues(options);
+				return await this.store.withProjectionLock(async () => {
+					signalBackgroundEntered?.();
+					await backgroundGate;
+					return [];
+				});
+			}
+		}
+		const harness = await createHarness({
+			extensionFactories: [
+				createPiXkMemoryExtension({
+					onMemoryError: (error) => memoryErrors.push(error),
+					createController: (projectRoot) => {
+						extensionController = new MemoryController({
+							projectRoot,
+							service: new MemoryService(projectRoot, new ObservedMemoryStore(projectRoot)),
+						});
+						controllers.push(extensionController);
+						return extensionController;
+					},
+					createSourceBridge: (projectRoot, controller) => new BlockingMemorySourceBridge(projectRoot, controller),
+				}),
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		await harness.session.prompt("/memory remember Doctor waits for settled background projection work.");
+		const service = extensionController?.getService();
+		if (!service) throw new Error("Memory extension controller was not created");
+		const memoryId = (await service.search({ query: "Doctor waits" })).items[0]?.memoryId;
+		if (!memoryId) throw new Error("doctor concurrency fixture was not published");
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("pi_xk_read_memory", { memoryIds: [memoryId] })),
+			fauxAssistantMessage("The historical Memory was read before settlement."),
+		]);
+		await harness.session.prompt("Read the Memory, then verify projections immediately after settlement.");
+		await backgroundEntered;
+
+		observeDoctorLockAttempt = true;
+		const doctorCommand = harness.session.prompt("/memory doctor");
+		try {
+			await expect(
+				Promise.race([
+					doctorLockAttempted.then(() => "lock-attempted"),
+					doctorCommand.then(() => "doctor-completed"),
+				]),
+			).resolves.toBe("lock-attempted");
+		} finally {
+			releaseBackground?.();
+		}
+		await doctorCommand;
+		expect(memoryErrors).toEqual([]);
+		await expect(service.doctor()).resolves.toMatchObject({ ok: true, diagnostics: [] });
+	}, 20_000);
 
 	it("publishes a staged Memory revision only after a successful settled run", async () => {
 		const memoryErrors: Error[] = [];
