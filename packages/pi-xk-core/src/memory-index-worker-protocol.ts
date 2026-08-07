@@ -8,6 +8,8 @@ import type {
 	MemoryIndexSearchResultV1,
 	MemoryIndexSnapshotV1,
 	MemoryIndexStatusV1,
+	MemoryRecallCoverageInputV1,
+	MemoryRecallCoverageV1,
 } from "./memory-index.ts";
 
 export type MemoryIndexWorkerOperationV1 =
@@ -18,6 +20,7 @@ export type MemoryIndexWorkerOperationV1 =
 	| { kind: "apply_delta"; delta: MemoryIndexDeltaV1 }
 	| { kind: "search"; input: MemoryIndexSearchInputV1 }
 	| { kind: "graph"; input: MemoryIndexGraphInputV1 }
+	| { kind: "recall_coverage"; input: MemoryRecallCoverageInputV1 }
 	| { kind: "record_access"; memoryIds: string[]; accessedAt: string; head: MemoryIndexSnapshotV1["head"] }
 	| { kind: "status" }
 	| { kind: "integrity_check" }
@@ -33,6 +36,7 @@ export type MemoryIndexWorkerResultV1 =
 	| { kind: "void" }
 	| { kind: "search"; value: MemoryIndexSearchResultV1 }
 	| { kind: "graph"; value: MemoryIndexGraphResultV1 }
+	| { kind: "recall_coverage"; value: MemoryRecallCoverageV1 }
 	| { kind: "status"; value: MemoryIndexStatusV1 }
 	| { kind: "integrity_check"; value: "ok" | string };
 

@@ -1,7 +1,7 @@
 import { Type } from "typebox";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { convertMessages } from "../src/api/openai-completions.ts";
-import { getModel, stream, streamSimple } from "../src/compat.ts";
+import { getModel, getModels, stream, streamSimple } from "../src/compat.ts";
 import type { AssistantMessage, Model, SimpleStreamOptions, Tool, ToolResultMessage } from "../src/types.ts";
 
 const mockState = vi.hoisted(() => ({
@@ -196,7 +196,13 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("maps groq qwen3 reasoning levels to default reasoning_effort", async () => {
-		const model = getModel("groq", "qwen/qwen3-32b")!;
+		const model = {
+			...localOpenAICompletionsModel,
+			id: "qwen/qwen3-32b",
+			name: "Groq Qwen3 reasoning fixture",
+			provider: "groq",
+			thinkingLevelMap: { minimal: null, low: null, medium: null, high: "default" },
+		} satisfies Model<"openai-completions">;
 		let payload: unknown;
 
 		await streamSimple(
@@ -1355,7 +1361,14 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("sends max_tokens for OpenCode completions models", async () => {
-		const cases = [getModel("opencode-go", "kimi-k2.6")!, getModel("opencode", "grok-build-0.1")!] as const;
+		const cases = (["opencode-go", "opencode"] as const).map((provider) => {
+			const model = getModels(provider).find((candidate) => candidate.api === "openai-completions") as
+				| Model<"openai-completions">
+				| undefined;
+			expect(model).toBeDefined();
+			expect(model?.compat?.maxTokensField).toBe("max_tokens");
+			return model!;
+		});
 
 		for (const model of cases) {
 			let payload: unknown;

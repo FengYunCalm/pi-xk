@@ -1,4 +1,4 @@
-import { mkdtemp, rm, stat, utimes } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -84,6 +84,39 @@ describe("Memory incremental publication", () => {
 			indexState: "current",
 			index: { memoryCount: 2 },
 		});
+		expect(await service.doctor()).toMatchObject({ ok: true, diagnostics: [] });
+		await service.close();
+	});
+
+	it("keeps Recall Routing valid across an access-only event", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-xk-memory-routing-access-"));
+		roots.push(root);
+		const service = new MemoryService(root);
+		const memory = await service.remember("Recall Routing is derived from Memory fact references.", {
+			commandId: "command_routing_access",
+			recordedAt: "2026-08-03T00:00:00.000Z",
+		});
+		const routingPath = join(root, ".pi-xk", "memory", "memory-recall-routing-read-model.json");
+		const beforeAccess = await readFile(routingPath, "utf8");
+		const expectedHead = (await service.getStore().replay()).head;
+
+		await service.recordAccess(
+			{
+				runId: "run_routing_access",
+				memoryIds: [memory.revision.memoryId],
+				evidenceIds: [],
+			},
+			{
+				eventId: "evt_memory_routing_access",
+				idempotencyKey: "memory:access:routing",
+				expectedHead,
+				actor: "model",
+				timestamp: "2026-08-03T00:01:00.000Z",
+			},
+		);
+
+		expect(await readFile(routingPath, "utf8")).toBe(beforeAccess);
+		await service.status();
 		expect(await service.doctor()).toMatchObject({ ok: true, diagnostics: [] });
 		await service.close();
 	});

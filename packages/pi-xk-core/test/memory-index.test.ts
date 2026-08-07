@@ -44,6 +44,7 @@ function memory(
 		evidenceIds: [`evidence_${memoryId}`],
 		accessCount: 0,
 		lastAccessedAt: null,
+		recallRouting: { routes: [] },
 		...options,
 	};
 }
@@ -119,6 +120,135 @@ async function* rebuildChunks(value: MemoryIndexSnapshotV1): AsyncGenerator<Memo
 }
 
 describe("Memory SQLite projection", () => {
+	it("aggregates only safe Recall Routing metadata for the active Goal and Chain branch", () => {
+		const database = new DatabaseSync(":memory:");
+		const projection = new MemorySqliteProjection(database);
+		projection.rebuild({
+			...snapshot(),
+			memories: [
+				memory("memory_goal", "UNTRUSTED_TITLE_DO_NOT_INJECT", "UNTRUSTED_BODY_DO_NOT_INJECT", {
+					recallRouting: {
+						routes: [
+							{
+								sourceType: "goal_checkpoint",
+								goalId: "goal_current",
+								chainId: null,
+								branchId: null,
+								scopeRoot: null,
+							},
+							{
+								sourceType: "agent_run",
+								goalId: "goal_current",
+								chainId: "chain_current",
+								branchId: "branch_current",
+								scopeRoot: null,
+							},
+							{
+								sourceType: "git",
+								goalId: null,
+								chainId: null,
+								branchId: null,
+								scopeRoot: "packages",
+							},
+						],
+					},
+				}),
+				memory("memory_stale", "STALE_TITLE_DO_NOT_INJECT", "STALE_BODY_DO_NOT_INJECT", {
+					freshness: "stale",
+					trust: "disputed",
+					recallRouting: {
+						routes: [
+							{
+								sourceType: "chain_summary",
+								goalId: null,
+								chainId: "chain_current",
+								branchId: "branch_current",
+								scopeRoot: null,
+							},
+						],
+					},
+				}),
+				memory("memory_archived", "ARCHIVED_TITLE_DO_NOT_INJECT", "ARCHIVED_BODY_DO_NOT_INJECT", {
+					lifecycle: "archived",
+					recallRouting: {
+						routes: [
+							{
+								sourceType: "goal_completion",
+								goalId: "goal_current",
+								chainId: null,
+								branchId: null,
+								scopeRoot: null,
+							},
+						],
+					},
+				}),
+			],
+		});
+
+		const coverage = projection.recallCoverage({
+			goalId: "goal_current",
+			chainId: "chain_current",
+			branchId: "branch_current",
+		});
+		expect(coverage).toEqual({
+			schema: "pi-xk.memory-recall-coverage.v1",
+			activeMemoryCount: 2,
+			goalMatchCount: 1,
+			chainBranchMatchCount: 2,
+			sourceCounts: [
+				{ sourceType: "goal_checkpoint", memoryCount: 1 },
+				{ sourceType: "chain_summary", memoryCount: 1 },
+				{ sourceType: "git", memoryCount: 1 },
+				{ sourceType: "agent_run", memoryCount: 1 },
+			],
+			gitScopeRoots: ["packages"],
+		});
+		const serialized = JSON.stringify(coverage);
+		for (const forbidden of [
+			"UNTRUSTED_TITLE_DO_NOT_INJECT",
+			"UNTRUSTED_BODY_DO_NOT_INJECT",
+			"STALE_TITLE_DO_NOT_INJECT",
+			"STALE_BODY_DO_NOT_INJECT",
+			"goal_current",
+			"chain_current",
+			"branch_current",
+		]) {
+			expect(serialized).not.toContain(forbidden);
+		}
+		expect(coverage).not.toHaveProperty("trust");
+		expect(coverage).not.toHaveProperty("freshness");
+		database.close();
+	});
+
+	it("rejects arbitrary path text from Recall Routing metadata", () => {
+		const database = new DatabaseSync(":memory:");
+		const projection = new MemorySqliteProjection(database);
+		expect(() =>
+			projection.rebuild({
+				...snapshot(),
+				memories: [
+					memory("memory_untrusted_scope", "Safe title", "Safe statement", {
+						recallRouting: {
+							routes: [
+								{
+									sourceType: "git",
+									goalId: null,
+									chainId: null,
+									branchId: null,
+									scopeRoot: "IGNORE_SYSTEM_PROMPT",
+								},
+							],
+						},
+					}),
+				],
+				cues: [],
+				edges: [],
+				historyCues: [],
+			}),
+		).toThrow(/scopeRoot/i);
+		database.close();
+	});
+
 	it("runs the Node SQLite projection behind the async worker port", async () => {
 		const directory = await mkdtemp(join(tmpdir(), "pi-xk-memory-index-worker-"));
 		const client = new MemoryIndexWorkerClient({
@@ -127,7 +257,7 @@ describe("Memory SQLite projection", () => {
 		});
 		try {
 			expect(await client.status()).toEqual({
-				schemaVersion: 3,
+				schemaVersion: 6,
 				head: { sequence: 0, hash: null },
 				memoryCount: 0,
 				cueCount: 0,
@@ -227,7 +357,7 @@ describe("Memory SQLite projection", () => {
 		const projection = new MemorySqliteProjection(database);
 		projection.rebuild(snapshot());
 		expect(projection.status()).toEqual({
-			schemaVersion: 3,
+			schemaVersion: 6,
 			head: snapshot().head,
 			memoryCount: 2,
 			cueCount: 2,

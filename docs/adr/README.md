@@ -12,6 +12,7 @@ ADR 记录已经接受的 Pi-XK 设计决策、约束和取舍。它们解释“
 | [0006：Goal V3 与 compaction recovery](0006-goal-v3-and-compaction-recovery.md) | Accepted and implemented | Intent Anchor、受控 Objective 修订、Objective/State 分工、单一续接触发器和摘要标题 |
 | [0007：项目级证据图 Memory v1](0007-memory-v1.md) | Accepted and implemented | 项目级有向多重图、证据/时间/三维状态、D0–D3 检索、捕获发布、SQLite 投影和恢复 |
 | [0008：Ambient Memory v2 与自演进 Skill v1](0008-ambient-memory-v2-and-skill-v1.md) | Accepted and implemented | 模型主导 recall/review、Memory revision 演进、项目/全局 Skill 事实域、跨项目晋升和 settled-boundary 热刷新 |
+| [0009：Ambient Recall 安全路由与效果评测](0009-ambient-recall-routing-and-effect-evaluation.md) | Accepted and implemented; real-provider evidence recorded | 无正文 D0 路由 metadata、三臂隔离效果评测和失败时不扩大注入面 |
 
 ## 阅读顺序
 
@@ -21,5 +22,6 @@ ADR 记录已经接受的 Pi-XK 设计决策、约束和取舍。它们解释“
 4. 涉及长期 session、rollover 或分支时读 ADR-0005；涉及 compaction 后续接时再读 ADR-0006。
 5. 涉及跨 Goal、Task、branch 或重启的项目经验时读 ADR-0007；它不替代 ADR-0005 的会话摘要或 ADR-0006 的 Goal 合同。
 6. 涉及模型自主回忆、Memory review、Skill candidate/晋升或资源热刷新时读 ADR-0008；它不改变 Memory/Skill 的事实源分离和 Pi 原生 session 边界。
+7. 涉及 Recall 可发现性或“Memory 是否真的改善开发结果”时读 ADR-0009；确定性 fixture 只验证评测协议，已记录的真实 provider 证据及其限制见 [效果证据摘要](../pi-xk/ambient-recall-effect-evidence-2026-08-05.md)。
 
 新增或改变事实源、权限、schema、生命周期、恢复协议或外部依赖边界时，应新增 ADR 或明确修订现有 ADR，不能只修改操作文档。

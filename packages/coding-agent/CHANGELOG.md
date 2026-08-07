@@ -27,6 +27,7 @@
 - Added Pi-XK Memory commands and model tools for search, validated read, evidence expansion, CAS-guarded proposals, explicit verified remember, lifecycle/timeline/graph control, backfill, doctor recovery, and settled model-requested compaction.
 - Added Ambient Recall budgets and reconstruction traces, Memory `keep/revise/supersede/dispute/create` review, Skill candidate/revision/use/promotion facts, project/global projections, Skill doctor commands, and resource-only Skill reload at settled boundaries.
 - Added controlled Pi-XK capability, workflow, and Memory retention/transfer evaluation with matched native, disabled, placebo, and learned arms, independent verifiers, sanitized per-turn progress reports, and explicit provider-failure classification.
+- Added safe Ambient Recall routing coverage and a sealed tri-arm effect-report evaluator. D0 remains body-free; deterministic fixtures validate the evaluation protocol but do not claim real-provider benefit.
 
 ### Fixed
 

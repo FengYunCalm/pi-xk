@@ -11,6 +11,8 @@ import type {
 	MemoryIndexSearchResultV1,
 	MemoryIndexSnapshotV1,
 	MemoryIndexStatusV1,
+	MemoryRecallCoverageInputV1,
+	MemoryRecallCoverageV1,
 } from "./memory-index.ts";
 import type {
 	MemoryIndexWorkerDataV1,
@@ -164,6 +166,14 @@ export class MemoryIndexWorkerClient implements MemoryIndexPort {
 	async graph(input: MemoryIndexGraphInputV1): Promise<MemoryIndexGraphResultV1> {
 		const result = await this.request({ kind: "graph", input });
 		if (result.kind !== "graph") throw new MemoryIndexWorkerError("Memory index graph returned an invalid result");
+		return result.value;
+	}
+
+	async recallCoverage(input: MemoryRecallCoverageInputV1): Promise<MemoryRecallCoverageV1> {
+		const result = await this.request({ kind: "recall_coverage", input });
+		if (result.kind !== "recall_coverage") {
+			throw new MemoryIndexWorkerError("Memory index recall coverage returned an invalid result");
+		}
 		return result.value;
 	}
 

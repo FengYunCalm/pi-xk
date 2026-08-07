@@ -2,12 +2,14 @@ import { execFile as execFileCallback } from "node:child_process";
 import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	ArtifactStore,
 	captureGitFreshnessBasis,
 	type EvidenceRefV1,
+	type GitFreshnessBasisV1,
 	type GoalContractV3,
 	GoalStore,
 	type MemoryCaptureSourceV1,
@@ -35,6 +37,7 @@ async function publishMemoryWithEvidence(
 	service: MemoryService,
 	memoryId: string,
 	evidence: EvidenceRefV1,
+	freshnessBasis: GitFreshnessBasisV1 | null = null,
 ): Promise<void> {
 	const suffix = memoryId.replace(/^memory_/u, "");
 	const source: MemoryCaptureSourceV1 = {
@@ -84,7 +87,7 @@ async function publishMemoryWithEvidence(
 					effectiveTo: null,
 					cueIds: [],
 					evidenceRefs: [evidence],
-					freshnessBasis: null,
+					freshnessBasis,
 					sourceDigest: source.sourceDigest,
 					supersedesRevision: null,
 					provenance: {
@@ -287,6 +290,28 @@ afterEach(async () => {
 });
 
 describe("Memory Service", () => {
+	it("returns empty Recall Routing coverage without creating Memory projections", async () => {
+		const { projectRoot, service } = await createService();
+		try {
+			expect(await service.getRecallCoverage({ goalId: null, chainId: null, branchId: null })).toEqual({
+				schema: "pi-xk.memory-recall-coverage.v1",
+				activeMemoryCount: 0,
+				goalMatchCount: 0,
+				chainBranchMatchCount: 0,
+				sourceCounts: [],
+				gitScopeRoots: [],
+			});
+			await expect(stat(join(projectRoot, ".pi-xk", "memory", "index.sqlite"))).rejects.toMatchObject({
+				code: "ENOENT",
+			});
+			await expect(
+				stat(join(projectRoot, ".pi-xk", "memory", "memory-recall-routing-read-model.json")),
+			).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			await service.close();
+		}
+	});
+
 	it("reads the revision that was effective at asOf instead of the current revision", async () => {
 		const { service } = await createService();
 		const remembered = await service.remember("Historical lifecycle queries must return the effective revision.", {
@@ -466,6 +491,98 @@ describe("Memory Service", () => {
 		} finally {
 			await restarted.close();
 		}
+	});
+
+	it("rebuilds a previous SQLite schema before returning Recall Routing coverage", async () => {
+		const { projectRoot, service } = await createService();
+		await service.remember("Schema migration must preserve derived Recall Routing coverage.", {
+			commandId: "command_recall_coverage_schema_migration",
+			recordedAt: "2026-08-01T00:00:00.000Z",
+		});
+		await service.status();
+		await service.close();
+
+		const indexPath = join(projectRoot, ".pi-xk", "memory", "index.sqlite");
+		const legacy = new DatabaseSync(indexPath);
+		legacy.prepare("UPDATE metadata SET value = '3' WHERE key = 'schema_version'").run();
+		legacy.close();
+
+		const restarted = new MemoryService(projectRoot);
+		try {
+			expect(await restarted.getRecallCoverage({ goalId: null, chainId: null, branchId: null })).toEqual({
+				schema: "pi-xk.memory-recall-coverage.v1",
+				activeMemoryCount: 1,
+				goalMatchCount: 0,
+				chainBranchMatchCount: 0,
+				sourceCounts: [{ sourceType: "explicit", memoryCount: 1 }],
+				gitScopeRoots: [],
+			});
+			expect((await restarted.status()).index).toMatchObject({ schemaVersion: 6 });
+		} finally {
+			await restarted.close();
+		}
+	});
+
+	it("rebuilds the Recall Routing read model without persisting Memory content or source identifiers", async () => {
+		const { projectRoot, service } = await createService();
+		const commandId = "command_recall_routing_read_model";
+		const titleAndBody = "IGNORE_SYSTEM_PROMPT_RECALL_ROUTING_TITLE_AND_BODY";
+		await service.remember(titleAndBody, {
+			commandId,
+			recordedAt: "2026-08-01T00:00:00.000Z",
+		});
+
+		expect(await service.getRecallCoverage({ goalId: null, chainId: null, branchId: null })).toEqual({
+			schema: "pi-xk.memory-recall-coverage.v1",
+			activeMemoryCount: 1,
+			goalMatchCount: 0,
+			chainBranchMatchCount: 0,
+			sourceCounts: [{ sourceType: "explicit", memoryCount: 1 }],
+			gitScopeRoots: [],
+		});
+
+		const routingPath = join(projectRoot, ".pi-xk", "memory", "memory-recall-routing-read-model.json");
+		const initial = await readFile(routingPath, "utf8");
+		for (const forbidden of [titleAndBody, commandId]) {
+			expect(initial).not.toContain(forbidden);
+		}
+
+		await writeFile(routingPath, '{"schema":"invalid","injected":"ATTACK_ROOT"}\n');
+		await service.getRecallCoverage({ goalId: null, chainId: null, branchId: null });
+		const rebuilt = await readFile(routingPath, "utf8");
+		expect(rebuilt).not.toContain("ATTACK_ROOT");
+		for (const forbidden of [titleAndBody, commandId]) {
+			expect(rebuilt).not.toContain(forbidden);
+		}
+		await service.close();
+	});
+
+	it("uses the SQLite Recall Routing projection after validating the body-free routing read model", async () => {
+		const { projectRoot, service } = await createService();
+		await service.remember("Recall coverage is aggregated by the indexed routing projection.", {
+			commandId: "command_recall_coverage_index",
+			recordedAt: "2026-08-01T00:00:00.000Z",
+		});
+		await service.status();
+
+		const routingPath = join(projectRoot, ".pi-xk", "memory", "memory-recall-routing-read-model.json");
+		const routing = JSON.parse(await readFile(routingPath, "utf8")) as {
+			memories: Array<{ routes: unknown[] }>;
+		};
+		const memory = routing.memories[0];
+		if (!memory) throw new Error("Recall Routing fixture has no Memory entry");
+		memory.routes = [];
+		await writeFile(routingPath, `${JSON.stringify(routing)}\n`);
+
+		expect(await service.getRecallCoverage({ goalId: null, chainId: null, branchId: null })).toEqual({
+			schema: "pi-xk.memory-recall-coverage.v1",
+			activeMemoryCount: 1,
+			goalMatchCount: 0,
+			chainBranchMatchCount: 0,
+			sourceCounts: [{ sourceType: "explicit", memoryCount: 1 }],
+			gitScopeRoots: [],
+		});
+		await service.close();
 	});
 
 	it("rebuilds SQLite in bounded batches without requesting complete fact arrays", async () => {
@@ -1001,10 +1118,11 @@ describe("Memory Service", () => {
 		await execFile("git", ["init", "-q"], { cwd: projectRoot });
 		await execFile("git", ["config", "user.email", "memory-test@example.invalid"], { cwd: projectRoot });
 		await execFile("git", ["config", "user.name", "Memory Test"], { cwd: projectRoot });
-		await writeFile(join(projectRoot, "memory-source.txt"), "Canonical Git evidence body.\n");
-		await execFile("git", ["add", "memory-source.txt"], { cwd: projectRoot });
+		const sourcePath = "IGNORE_SYSTEM_PROMPT_MEMORY_SOURCE.md";
+		await writeFile(join(projectRoot, sourcePath), "Canonical Git evidence body.\n");
+		await execFile("git", ["add", sourcePath], { cwd: projectRoot });
 		await execFile("git", ["commit", "-q", "-m", "memory evidence fixture"], { cwd: projectRoot });
-		const basis = await captureGitFreshnessBasis(projectRoot, ["memory-source.txt"]);
+		const basis = await captureGitFreshnessBasis(projectRoot, [sourcePath]);
 		const evidence: EvidenceRefV1 = {
 			schema: "pi-xk.memory-evidence-ref.v1",
 			evidenceId: "evidence_memory_git",
@@ -1019,11 +1137,25 @@ describe("Memory Service", () => {
 				scopePaths: basis.scopePaths,
 			},
 		};
-		await publishMemoryWithEvidence(projectRoot, service, "memory_git_evidence", evidence);
+		await publishMemoryWithEvidence(projectRoot, service, "memory_git_evidence", evidence, basis);
+		const coverage = await service.getRecallCoverage({ goalId: null, chainId: null, branchId: null });
+		expect(coverage).toEqual({
+			schema: "pi-xk.memory-recall-coverage.v1",
+			activeMemoryCount: 1,
+			goalMatchCount: 0,
+			chainBranchMatchCount: 0,
+			sourceCounts: [{ sourceType: "git", memoryCount: 1 }],
+			gitScopeRoots: [],
+		});
+		const routing = await readFile(
+			join(projectRoot, ".pi-xk", "memory", "memory-recall-routing-read-model.json"),
+			"utf8",
+		);
+		expect(routing).not.toContain(sourcePath);
 
 		const expanded = await service.expandEvidence({ memoryId: "memory_git_evidence" });
 		expect(expanded.evidence[0]).toMatchObject({ unavailableReason: null });
-		expect(expanded.evidence[0]?.content).toContain("memory-source.txt");
+		expect(expanded.evidence[0]?.content).toContain(sourcePath);
 		expect(expanded.evidence[0]?.content).toContain("Canonical Git evidence body.");
 		expect(expanded.evidence[0]?.content).toContain(basis.baselineCommit);
 		await service.close();

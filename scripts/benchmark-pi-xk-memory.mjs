@@ -118,6 +118,7 @@ function createMemory(index, memoryCount) {
 		evidenceIds: [`evidence_${index}`],
 		accessCount: index % 17,
 		lastAccessedAt: index % 17 === 0 ? null : "2026-08-01T00:00:00.000Z",
+		recallRouting: { routes: [] },
 	};
 }
 
