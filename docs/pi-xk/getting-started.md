@@ -327,6 +327,7 @@ npm run check
 npm run test:pi-xk
 npm run evaluate:session-chain-summaries
 npm run evaluate:pi-xk-memory
+npm run evaluate:pi-xk-ambient-effect
 npm run benchmark:session-chain -- --sizes 1,8,32,128 --runs 3 --json
 npm run benchmark:session-chain-events -- --counts 100,1000 --runs 3 --json
 npm run benchmark:pi-xk-memory

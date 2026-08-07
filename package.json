@@ -32,6 +32,7 @@
 		"evaluate:session-chain-summaries": "node --import tsx scripts/evaluate-session-chain-summaries.mjs packages/coding-agent/test/fixtures/pi-xk/session-chain-summary-golden.json",
 		"evaluate:pi-xk-memory": "node --no-warnings=ExperimentalWarning --import tsx scripts/evaluate-pi-xk-memory.mjs packages/coding-agent/test/fixtures/pi-xk/memory-golden.json",
 		"evaluate:pi-xk-ambient-recall": "node --import tsx scripts/evaluate-pi-xk-ambient-recall.mjs packages/coding-agent/test/fixtures/pi-xk/ambient-recall-golden.json",
+		"evaluate:pi-xk-ambient-effect": "node --import tsx scripts/evaluate-pi-xk-ambient-effect.mjs packages/coding-agent/test/fixtures/pi-xk/ambient-effect-golden.json",
 		"evaluate:pi-xk-skill-evolution": "node scripts/evaluate-pi-xk-skill-evolution.mjs packages/coding-agent/test/fixtures/pi-xk/skill-evolution-golden.json",
 		"generate:models": "npm --prefix packages/ai run generate-models:strict && npm --prefix packages/ai run generate-image-models",
 		"generate:model-catalog": "npm --prefix packages/ai run generate-model-catalog",

@@ -26,6 +26,7 @@
 - Added per-run `before_agent_start.activeTools` projections, fail-closed `onCritical` prompt/context hooks, and declarative filesystem capability metadata for workflow preflight.
 - Added Pi-XK Memory commands and model tools for search, validated read, evidence expansion, CAS-guarded proposals, explicit verified remember, lifecycle/timeline/graph control, backfill, doctor recovery, and settled model-requested compaction.
 - Added Ambient Recall budgets and reconstruction traces, Memory `keep/revise/supersede/dispute/create` review, Skill candidate/revision/use/promotion facts, project/global projections, Skill doctor commands, and resource-only Skill reload at settled boundaries.
+- Added safe Ambient Recall routing coverage and a sealed tri-arm effect-report evaluator. D0 remains body-free; deterministic fixtures validate the evaluation protocol but do not claim real-provider benefit.
 
 ### Fixed
 
@@ -64,6 +65,7 @@
 - Fixed Pi-XK Memory review to reject unread revisions, preserve verified trust derivation, avoid semantic publication after error/abort/length runs, and retain implicit keep traces without duplicating transcript content.
 - Fixed Skill reload to reuse only the last trusted path/metadata snapshot, cache unchanged frontmatter, preserve disabled paths, avoid noisy missing-root diagnostics, and retain the previous Skill generation after reload failure.
 - Fixed Agent-run Memory evidence validation across canonical path aliases on macOS and Windows, and made Pi-XK test shutdown close managed Skill index workers before removing temporary projects.
+- Fixed freshly published Memory becoming temporarily unsearchable after Host clock rollback, serialized Memory doctor with projection updates to avoid mixed-snapshot diagnostics, and treated a missing Skill index as healthy when no Skill facts exist.
 
 ## [0.80.10] - 2026-07-16
 

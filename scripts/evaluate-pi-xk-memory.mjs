@@ -48,6 +48,7 @@ function snapshotFor(fixture) {
 			evidenceIds: [`evidence_${memory.memoryId}`],
 			accessCount: 0,
 			lastAccessedAt: null,
+			recallRouting: { routes: [] },
 		})),
 		cues: [],
 		edges: fixture.edges.map((edge) => ({

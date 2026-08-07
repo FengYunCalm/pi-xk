@@ -1,5 +1,6 @@
 import type {
 	MemoryEdgeRelation,
+	MemoryEvidenceSourceType,
 	MemoryFreshness,
 	MemoryHead,
 	MemoryKind,
@@ -8,7 +9,58 @@ import type {
 	MemoryTrust,
 } from "./memory-contract.ts";
 
-export const MEMORY_INDEX_SCHEMA_VERSION = 2;
+export const MEMORY_INDEX_SCHEMA_VERSION = 6;
+
+// D0 may expose only these fixed Host-defined source-scope categories, never a raw path component.
+export const MEMORY_RECALL_SCOPE_ROOT_CATEGORIES = [
+	"app",
+	"apps",
+	"bin",
+	"cmd",
+	"config",
+	"configs",
+	"docs",
+	"internal",
+	"lib",
+	"packages",
+	"pkg",
+	"scripts",
+	"server",
+	"services",
+	"src",
+	"test",
+	"tests",
+	"tools",
+] as const;
+
+export type MemoryRecallSourceType = MemoryEvidenceSourceType | "agent_run";
+
+export interface MemoryRecallRouteV1 {
+	sourceType: MemoryRecallSourceType;
+	goalId: string | null;
+	chainId: string | null;
+	branchId: string | null;
+	scopeRoot: string | null;
+}
+
+export interface MemoryRecallRoutingV1 {
+	routes: MemoryRecallRouteV1[];
+}
+
+export interface MemoryRecallCoverageInputV1 {
+	goalId: string | null;
+	chainId: string | null;
+	branchId: string | null;
+}
+
+export interface MemoryRecallCoverageV1 {
+	schema: "pi-xk.memory-recall-coverage.v1";
+	activeMemoryCount: number;
+	goalMatchCount: number;
+	chainBranchMatchCount: number;
+	sourceCounts: Array<{ sourceType: MemoryRecallSourceType; memoryCount: number }>;
+	gitScopeRoots: string[];
+}
 
 export interface MemoryIndexMemoryV1 {
 	memoryId: string;
@@ -28,6 +80,7 @@ export interface MemoryIndexMemoryV1 {
 	evidenceIds: string[];
 	accessCount: number;
 	lastAccessedAt: string | null;
+	recallRouting: MemoryRecallRoutingV1;
 }
 
 export interface MemoryIndexCueV1 {
@@ -144,7 +197,7 @@ export interface MemoryIndexGraphResultV1 {
 }
 
 export interface MemoryIndexStatusV1 {
-	schemaVersion: 2;
+	schemaVersion: 6;
 	head: MemoryHead;
 	memoryCount: number;
 	cueCount: number;
@@ -163,6 +216,7 @@ export interface MemoryIndexPort {
 	applyDelta(delta: MemoryIndexDeltaV1): Promise<void>;
 	search(input: MemoryIndexSearchInputV1): Promise<MemoryIndexSearchResultV1>;
 	graph(input: MemoryIndexGraphInputV1): Promise<MemoryIndexGraphResultV1>;
+	recallCoverage(input: MemoryRecallCoverageInputV1): Promise<MemoryRecallCoverageV1>;
 	recordAccess(memoryIds: readonly string[], accessedAt: string, head: MemoryHead): Promise<void>;
 	status(): Promise<MemoryIndexStatusV1>;
 	integrityCheck(): Promise<"ok" | string>;

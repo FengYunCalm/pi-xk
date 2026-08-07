@@ -15,7 +15,7 @@ if (args.some((arg) => arg !== "--platform-smoke")) {
 	throw new Error(`Unknown argument: ${args.find((arg) => arg !== "--platform-smoke")}`);
 }
 const platformSmoke = args.includes("--platform-smoke");
-const corePlatformSmokeOptions = process.platform === "win32" ? ["--maxWorkers=2", "--testTimeout=20000"] : [];
+const windowsPlatformSmokeOptions = process.platform === "win32" ? ["--maxWorkers=2", "--testTimeout=20000"] : [];
 const aiSourceRoot = resolve(workspaceRoot, "packages/ai/src");
 const aiProviderDataDir = resolve(aiSourceRoot, "providers/data");
 const requiredAiProviderData = readdirSync(resolve(aiSourceRoot, "providers"), { withFileTypes: true })
@@ -56,7 +56,7 @@ const commands = platformSmoke
 				"run",
 				"test",
 				"--",
-				...corePlatformSmokeOptions,
+				...windowsPlatformSmokeOptions,
 				"test/sync-directory.test.ts",
 				"test/artifact-store.test.ts",
 				"test/goal-store.test.ts",
@@ -82,10 +82,12 @@ const commands = platformSmoke
 				"run",
 				"test",
 				"--",
+				...windowsPlatformSmokeOptions,
 				"test/session-manager/file-operations.test.ts",
 				"test/suite/pi-xk-package-install.test.ts",
 				"test/suite/pi-xk-github-release.test.ts",
 				"test/suite/pi-xk-memory-extension.test.ts",
+				"test/suite/pi-xk-ambient-effect.test.ts",
 				"test/suite/pi-xk-memory-source-bridge.test.ts",
 				"test/suite/pi-xk-skill-evolution.test.ts",
 				"test/suite/pi-xk-skill-reload.test.ts",
@@ -149,6 +151,7 @@ const commands = platformSmoke
 		"test/suite/pi-xk-github-release.test.ts",
 		"test/suite/pi-xk-session-chain-summary-quality.test.ts",
 		"test/suite/pi-xk-memory-extension.test.ts",
+		"test/suite/pi-xk-ambient-effect.test.ts",
 		"test/suite/pi-xk-memory-source-bridge.test.ts",
 		"test/suite/pi-xk-skill-evolution.test.ts",
 		"test/suite/pi-xk-skill-reload.test.ts",

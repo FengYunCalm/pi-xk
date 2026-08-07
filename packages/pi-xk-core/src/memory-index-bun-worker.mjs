@@ -35,6 +35,9 @@ function execute(request) {
 	}
 	if (operation.kind === "search") return { kind: "search", value: projection.search(operation.input) };
 	if (operation.kind === "graph") return { kind: "graph", value: projection.graph(operation.input) };
+	if (operation.kind === "recall_coverage") {
+		return { kind: "recall_coverage", value: projection.recallCoverage(operation.input) };
+	}
 	if (operation.kind === "record_access") {
 		projection.recordAccess(operation.memoryIds, operation.accessedAt, operation.head);
 		return { kind: "void" };

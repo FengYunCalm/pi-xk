@@ -136,7 +136,7 @@ sealed Segment 不重写。从历史 Segment 或 tree 位置继续会创建 succ
 
 ### Memory 数据
 
-Memory facts 由 `.pi-xk/memory/events.jsonl` 与 `.pi-xk/artifacts/objects/` 中的 revision/Cue/Edge/proposal/source artifact 共同构成。`index.sqlite`、read model、History Cue、source cursor 和 Markdown 是可重建或可重新发现的投影/恢复数据。自动捕获和显式 backfill 会增加 artifact/event/SQLite 空间；archive/invalidate 不删除历史，purge 也保留 tombstone。当前没有自动 retention 或 Artifact GC。
+Memory facts 由 `.pi-xk/memory/events.jsonl` 与 `.pi-xk/artifacts/objects/` 中的 revision/Cue/Edge/proposal/source artifact 共同构成。`index.sqlite`、read model、无正文的 recall routing read model、History Cue、source cursor 和 Markdown 是可重建或可重新发现的投影/恢复数据。自动捕获和显式 backfill 会增加 artifact/event/SQLite 空间；archive/invalidate 不删除历史，purge 也保留 tombstone。当前没有自动 retention 或 Artifact GC。
 
 Ambient Memory v2 还会在成功 `agent_settled` 边界写入 reconstruction trace、Memory review 和 agent-run evidence。新 evidence V3 会记录并验证 durable Goal binding；V2 历史 evidence 保持可读。模型自主搜索不代表每轮都会产生事件：无 Memory 使用的普通 run 不写 access/reconstruction；只有 D2/D3 实际读取才计入访问。Pi 原生 queued follow-up 在同一个 logical run 内排空，因此不会创建第二个 ledger、trace 或 settled publication。`error`、`abort`、`length` 或截断 run 不发布语义 revision。
 
@@ -186,7 +186,7 @@ Compaction 后不会把最后一条用户提示词再次发送。overflow 在同
 
 ## 11. 模型可见性和提示词影响
 
-每次普通请求会追加两类有界 metadata：Session Chain manifest 包含当前 branch、sealed/L1/L2 范围和 publication 状态；Memory D0 manifest 最多 2 KiB，包含 enabled、trust/freshness 计数、capture 诊断和工具可用性。两者都不包含标题、摘要正文、Memory statement、evidence 或历史用户文本。
+每次普通请求会追加两类有界 metadata：Session Chain manifest 包含当前 branch、sealed/L1/L2 范围和 publication 状态；Memory D0 manifest 最多 2 KiB，包含 enabled、trust/freshness 计数、capture 诊断、工具可用性，以及有限的 current Goal/Chain 命中、来源类别和 Host 验证 Git scope root。两者都不包含标题、摘要正文、Memory statement、evidence、ID 或历史用户文本。Memory 路由只帮助模型决定是否发起 D1，不自动检索或提升历史内容信任。
 
 当模型判断当前问题依赖“之前、继续、原始要求、待办、历史约束或 Goal/Task 恢复”时，可先调用只读列表工具查看 L1 标题和 L1/L2 范围，再读取相关摘要。工具调用会增加本地读取和一个 tool round，但不会触发 provider 摘要生成、backfill 或修复。摘要内的命令和伪系统提示仅作为不可信历史证据返回，不能扩大工具权限。
 

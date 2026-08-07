@@ -661,6 +661,14 @@ describe("Pi-XK Memory extension", () => {
 			(await controller.getService().expandEvidence({ memoryId, evidenceIds: [gitEvidence.evidenceId] })).evidence[0]
 				?.content,
 		).toContain("export const value = 1");
+		expect(await controller.getService().getRecallCoverage({ goalId: null, chainId: null, branchId: null })).toEqual({
+			schema: "pi-xk.memory-recall-coverage.v1",
+			activeMemoryCount: 1,
+			goalMatchCount: 0,
+			chainBranchMatchCount: 0,
+			sourceCounts: [{ sourceType: "git", memoryCount: 1 }],
+			gitScopeRoots: ["src"],
+		});
 
 		await writeFile(join(harness.tempDir, "README.md"), "unrelated dirty change\n");
 		expect((await controller.getService().read({ memoryIds: [memoryId] })).memories[0]?.state.freshness).toBe(
@@ -1393,7 +1401,11 @@ describe("Pi-XK Memory extension", () => {
 
 		expect(systemPrompts[0]).toContain("Pi-XK Memory manifest");
 		expect(systemPrompts[0]).toContain("pi_xk_search_memory=enabled");
+		expect(systemPrompts[0]).toContain("Before modifying, diagnosing, or choosing an approach");
+		expect(systemPrompts[0]).toContain("This manifest does not invoke tools");
 		expect(systemPrompts[0]).not.toContain("SECRET_MEMORY_BODY");
+		const manifest = systemPrompts[0].slice(systemPrompts[0].lastIndexOf("Pi-XK Memory manifest"));
+		expect(Buffer.byteLength(manifest, "utf8")).toBeLessThanOrEqual(2 * 1024);
 		const toolResults = harness.session.messages.filter((message) => message.role === "toolResult");
 		expect(getMessageText(toolResults[0])).not.toContain('"statement"');
 		expect(getMessageText(toolResults[1])).toContain("SECRET_MEMORY_BODY");
@@ -1588,6 +1600,23 @@ describe("Pi-XK Memory extension", () => {
 				locator: expect.objectContaining({ goalId }),
 			}),
 		]);
+		const beforeIdleRun = await service.getStore().replay();
+		let manifest = "";
+		harness.setResponses([
+			(context) => {
+				manifest = context.systemPrompt ?? "";
+				return fauxAssistantMessage("The current task does not require another Memory read.");
+			},
+		]);
+		await harness.session.prompt("Continue the active Goal with a local status check.");
+		const memoryManifest = manifest.slice(manifest.lastIndexOf("Pi-XK Memory manifest"));
+		const routingLine = memoryManifest.split("\n").find((line) => line.startsWith("- Safe routing coverage:"));
+		expect(routingLine).toContain("current Goal matches=1");
+		expect(routingLine).toContain("agent_run=1");
+		expect(memoryManifest).not.toContain(goalId);
+		expect(memoryManifest).not.toContain("Agent-run evidence preserves Goal identity");
+		expect(Buffer.byteLength(memoryManifest, "utf8")).toBeLessThanOrEqual(2 * 1024);
+		expect((await service.getStore().replay()).events).toHaveLength(beforeIdleRun.events.length);
 	}, 20_000);
 
 	it("omits an uncommitted Session Chain locator from Agent-run evidence", async () => {
