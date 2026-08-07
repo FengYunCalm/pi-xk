@@ -31,22 +31,26 @@ To learn more about Pi:
 | **[@earendil-works/pi-agent-core](packages/agent)** | Agent runtime with tool calling and state management |
 | **[@earendil-works/pi-coding-agent](packages/coding-agent)** | Interactive coding agent CLI |
 | **[@earendil-works/pi-tui](packages/tui)** | Terminal UI library with differential rendering |
-| **[pi-xk-core](packages/pi-xk-core)** | Private Pi-XK Goal, Task, Session Chain, and artifact domain contracts and stores |
-| **[pi-xk-extension](packages/pi-xk-extension)** | Private local Pi extension composing Goal, Task, and Session Chain workflows |
+| **[pi-xk-core](packages/pi-xk-core)** | Private Pi-XK Goal, Task, Session Chain, Memory, Skill, and artifact domain contracts and stores |
+| **[pi-xk-extension](packages/pi-xk-extension)** | Private local Pi extension composing durable execution, context, Memory, and Skill workflows |
 
 ## Pi-XK
 
-This fork also contains Pi-XK, an extension-first workflow layer for durable Goals, bounded child Tasks, project artifacts, and long-running Session Chains composed of native Pi JSONL segments. It preserves Pi's provider, agent loop, session tree, message schema, and compaction model.
+This fork also contains Pi-XK, an extension-first workflow layer for durable Goals, bounded child Tasks, long-running Session Chains composed of native Pi JSONL segments, project-scoped evidence Memory, and evidence-backed Skill evolution. It preserves Pi's provider, agent loop, session tree, message schema, and compaction model.
 
-Pi-XK keeps its Core and Extension packages private and does not publish them to npm. It supports repository-local installation for development and independently versioned GitHub-only binary archives that bundle the private runtime payload. It is intended for trusted personal full-access use and does not provide a capability policy, sandbox, concurrent task scheduler, general context controller, or long-term memory.
+Pi-XK keeps its Core and Extension packages private and does not publish them to npm. It supports repository-local installation for development and independently versioned GitHub-only binary archives that bundle the private runtime payload. It is intended for trusted personal full-access use. It does not provide a capability policy, sandbox, concurrent task scheduler, general context controller, automatic retention/GC, or a cross-project knowledge base.
 
+- [Documentation map](docs/README.md)
 - [Pi-XK documentation](docs/pi-xk/README.md)
 - [Getting started](docs/pi-xk/getting-started.md)
+- [Evaluation and evidence](docs/pi-xk/evaluation-and-evidence.md)
 - [GitHub-only releases](docs/pi-xk/github-release.md)
 - [Design and boundaries](docs/pi-xk/design-and-boundaries.md)
 - [Operations and recovery](docs/pi-xk/operations-and-recovery.md)
 - [Compatibility and user impact](docs/pi-xk/compatibility-and-impact.md)
 - [Session Chain Rollups and model retrieval](docs/pi-xk/session-chain-rollups-and-model-retrieval.md)
+- [Memory v1/v2](docs/pi-xk/memory-v1.md)
+- [Ambient Recall and Skill evolution](docs/pi-xk/ambient-recall-and-skill-evolution.md)
 - [Pi-XK host patch boundary](docs/pi-xk/host-patch-boundary.md)
 - [Extension package reference](packages/pi-xk-extension/README.md)
 

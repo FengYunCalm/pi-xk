@@ -22,7 +22,7 @@
 | 不可信项目 | 不支持；extension 与 child 继承完整用户权限 |
 | 多进程/多 UI 同写一个 session | 不支持，可能破坏 Pi JSONL 与 chain hash |
 | 网络文件系统或最终一致存储 | 未验证；durability、rename、fsync 和 lock 语义可能不同 |
-| Windows 原生 | 未形成正式兼容矩阵；路径、锁和未来沙箱仍是开放问题 |
+| Windows 原生 | CI 在 `windows-latest` 运行 Pi-XK platform smoke，并覆盖锁、SQLite、目录替换和打包回归；这仍不是完整产品兼容矩阵，网络文件系统、长期真实交互和未来沙箱未形成承诺 |
 | 无人值守运行 | 不支持安全承诺；Policy、预算与 fail-closed sandbox 未完成 |
 | 跨版本 schema 迁移 | Goal/Task/Chain 有明确历史读兼容，Memory v1 从空域开始；没有通用迁移 CLI |
 
@@ -40,7 +40,7 @@
 | --- | --- | --- |
 | Provider/model registry | 否 | 使用当前 model；Goal/Task/L1 summary/L2 Rollup/Memory capture 可能产生额外 provider 调用 |
 | Agent loop | 否 | active Goal settled 后由 extension 发起下一 run |
-| Tool protocol | 否 | 新增 Goal/Task/Chain/Memory model tools；Goal draft 时限制可调用工具；proposal 与修订仍受 Host schema 和 CAS 控制 |
+| Tool protocol | 否 | 新增 Goal/Task/Chain/Memory/Skill model tools；Goal draft 时限制可调用工具；review、proposal 与修订仍受 Host schema 和 CAS 控制 |
 | Session JSONL schema | 否 | 使用原生 custom entry/custom message 承载小型引用和 marker |
 | Session tree | 否 | tree navigation 会暂停 active Goal；从历史位置继续时 chain 创建 successor branch |
 | `/resume` | 否 | 仍选择物理 session；逻辑 chain head 应用 `/chain` 选择 |
@@ -54,7 +54,7 @@
 
 扩展加载后增加：
 
-- `/goal`、`/task`、`/chain`、`/memory`、`/xk status` 命令；
+- `/goal`、`/task`、`/chain`、`/memory`、`/skill`、`/xk status` 命令；
 - 模型可见的 Goal lifecycle、Goal draft、Task start/finish、Chain summary 和 Memory D1–D3/proposal/compaction-request 工具；
 - `Goal active · 12m 34s` 一类 footer status；
 - `Chain <id> · S<n> · <size>` 一类 footer status；
@@ -62,6 +62,7 @@
 - 受保护 Goal revision 的 TUI/命令审阅，以及 compaction 的短标题展示；
 - lifecycle、Task 和 rollover 的通知与错误提示。
 - `Memory <count> · stale <count> · disputed <count>` 状态及 proposal/capture/doctor 输出。
+- `Skills: active/candidate/stale/cooldown` 状态及 candidate、rollback、projection/reload doctor 输出。
 
 Goal timer 每秒刷新 UI，但不每秒写事件。多个扩展都使用 footer status 时应依赖 Pi 的组合机制；Pi-XK 不替换整个 footer。
 

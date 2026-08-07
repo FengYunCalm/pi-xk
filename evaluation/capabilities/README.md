@@ -2,6 +2,8 @@
 
 This directory separates three questions that cannot be answered by one score.
 
+For the current user-facing conclusions, exact numbers, and claim boundaries, see the [Pi-XK evaluation and evidence overview](../../docs/pi-xk/evaluation-and-evidence.md). This directory remains the protocol and machine-report source of truth.
+
 1. Does Pi-XK improve a public, independently verified code task when the base Pi runtime, model, thinking level, task digest, tool policy, and wall-time budget are the same?
 2. Do Pi-XK-only workflows preserve their stated facts and recover correctly under their own deterministic verifiers?
 3. When durable context is material, does the model actually select and use the relevant Pi-XK workflow rather than merely starting it?
@@ -103,6 +105,8 @@ npm run smoke:pi-xk-memory-transfer -- --out /tmp/pi-xk-memory-transfer --attemp
 ```
 
 A valid claim requires all registered attempts, verified seeds, complete D1/D2 observability, and every configured threshold. A partial diagnostic or provider-blocked run remains evidence about the harness only; it is not a Memory benefit result.
+
+No complete real-provider Memory transfer matrix is checked in at the current documentation baseline. The fixture and runner establish the protocol; they do not by themselves prove exact-reuse or similar-transfer benefit.
 
 ## Report Protocol
 

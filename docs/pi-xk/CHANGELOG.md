@@ -12,6 +12,7 @@
 
 ### Changed
 
+- Reorganized Pi-XK documentation around current product behavior, architecture decisions, evaluation evidence, historical plans, and research; added a complete Memory/Skill onboarding path and corrected stale capability and Windows support descriptions.
 - Native compaction now records a safe historical title and adds one-time recovery guidance to the next actual Agent run instead of resending the last user request or creating a second Goal kickoff.
 - Goal runtime guidance now provides Objective/State paths and contract revision diagnostics instead of repeating the original request or complete contract.
 - Goal Draft generation now keeps fixed drafting rules in system context, carries requested/revision data in an untrusted structured input, fails closed outside its sole submission tool, and enforces a closed Intent Anchor, Current Objective, required acceptance, verification evidence, Done Condition, and Final Report traceability chain; automatic Objective refinements must preserve every existing outcome dimension and acceptance coverage.

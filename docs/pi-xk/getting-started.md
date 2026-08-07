@@ -85,7 +85,7 @@ pi list
 
 ## 4. 首次启动会发生什么
 
-从目标项目根启动 Pi。扩展加载后会注册 `/goal`、`/task`、`/chain`、`/memory`、`/xk` 命令和对应模型工具。
+从目标项目根启动 Pi。扩展加载后会注册 `/goal`、`/task`、`/chain`、`/memory`、`/skill`、`/xk` 命令和对应模型工具。
 
 - 空的持久 session 会在第一条有效普通请求到达时创建 Session Chain managed root Segment；纯命令和空输入不会提前落盘。
 - 已有正文的 Pi session 会被采用为 external root，不复制原文件。
@@ -100,6 +100,7 @@ pi list
 ```text
 /chain status
 /memory status
+/skill status
 /xk status
 ```
 
@@ -297,7 +298,39 @@ D1 对短中文关键词提供字面量 fallback，“最近/上次”会加入�
 
 `/memory config off` 停止新 capture、proposal apply 和 access 写入，既有 Memory 仍可只读检索。完整的状态、图、删除、compaction request 和恢复边界见 [Memory v1](memory-v1.md)。
 
-## 9. 停止使用
+## 9. 使用 Skill 演进
+
+Skill 用于沉淀已经在真实工作中验证、可重复使用且适用边界明确的流程。它不是每轮总结，也不要求用户手工触发。模型可以在成功 run 中自主提交 `pi_xk_review_skills`；Host 验证 evidence、名称、路径、大小、scope 和 revision CAS 后，才会创建 candidate 或 active revision。
+
+最小观察流程：
+
+```text
+/skill status
+/skill list
+/skill candidates
+/xk status
+```
+
+项目 Skill 证据充分后可发布到项目 `.pi/skills/<name>/` 的 Pi-XK managed projection，并在 settled boundary 只刷新 Skill 资源；当前 run 不变，下一逻辑 run 无须重启即可看到新 generation。证据不足、bundle 不合格、同名目录不受 Pi-XK 管理、stale 或连续失败 cooldown 时不会激活。
+
+查看、回滚和用户控制：
+
+```text
+/skill show <id|name>
+/skill timeline <id>
+/skill candidate show <candidateId>
+/skill candidate promote <candidateId>
+/skill candidate reject <candidateId>
+/skill rollback <skillId> <revision>
+/skill archive <skillId>
+/skill purge <skillId>
+/skill config off
+/skill doctor
+```
+
+模型可以 create/revise/supersede 和记录 use outcome，但不能 archive 或 purge。rollback 不重写历史，而是从旧 bundle 发布新 revision。全局 Skill 需要跨 repository 的 candidate 和成功使用证据，单一项目不能直接覆盖全局 active revision。完整流程见 [Ambient Recall 与 Skill 演进](ambient-recall-and-skill-evolution.md)。
+
+## 10. 停止使用
 
 用户级本地安装可移除：
 
@@ -310,6 +343,8 @@ npm run pi-xk:uninstall -- --agent-dir /tmp/pi-xk-profile
 
 - 项目 `.pi-xk/` 中的 Goal、Task、Chain 和 artifact；
 - 项目 `.pi-xk/memory/` 中的 Memory 事件、索引和投影；
+- 项目 `.pi-xk/skills/` 中的 Skill 事实与索引，以及 `.pi/skills/` 中的 managed projection；
+- Pi profile `pi-xk/skills/` 中的全局 Skill 事实与 profile `skills/` 中的 managed projection；
 - Pi profile 中既有原生 session；
 - local checkout 和构建产物。
 
@@ -317,7 +352,7 @@ npm run pi-xk:uninstall -- --agent-dir /tmp/pi-xk-profile
 
 GitHub 归档没有 profile package 引用；停止使用时退出 `pi-xk` 并删除解压目录即可。删除程序不会删除项目 `.pi-xk/` 或 Pi profile 中的原生 session。
 
-## 10. 开发者验证
+## 11. 开发者验证
 
 修改 Pi-XK 代码后，仓库级验证顺序为：
 
@@ -327,10 +362,13 @@ npm run check
 npm run test:pi-xk
 npm run evaluate:session-chain-summaries
 npm run evaluate:pi-xk-memory
+npm run evaluate:pi-xk-ambient-recall
 npm run evaluate:pi-xk-ambient-effect
+npm run evaluate:pi-xk-skill-evolution
 npm run benchmark:session-chain -- --sizes 1,8,32,128 --runs 3 --json
 npm run benchmark:session-chain-events -- --counts 100,1000 --runs 3 --json
 npm run benchmark:pi-xk-memory
+npm run benchmark:pi-xk-skills
 git diff --check
 ```
 
