@@ -107,7 +107,7 @@ export class SkillService {
 	private index: SkillIndexWorkerClient | undefined;
 	private indexState: SkillServiceStatusV1["indexState"] = "absent";
 	private projectionQueue: Promise<void> = Promise.resolve();
-	private readonly evidenceProjectId: Promise<string>;
+	private evidenceProjectId: Promise<string> | undefined;
 
 	constructor(projectRoot: string, options: SkillStoreOptions = {}, store = new SkillStore(projectRoot, options)) {
 		this.projectRoot = projectRoot;
@@ -115,9 +115,6 @@ export class SkillService {
 		this.factsDirectory = store.getFactsDirectory();
 		this.configPath = join(this.factsDirectory, "skill-config.json");
 		this.indexPath = join(this.factsDirectory, "index.sqlite");
-		this.evidenceProjectId = resolveGitRepositoryId(projectRoot).then(
-			(repositoryId) => repositoryId ?? store.getProjectId(),
-		);
 	}
 
 	getStore(): SkillStore {
@@ -125,6 +122,9 @@ export class SkillService {
 	}
 
 	async getEvidenceProjectId(): Promise<string> {
+		this.evidenceProjectId ??= resolveGitRepositoryId(this.projectRoot).then(
+			(repositoryId) => repositoryId ?? this.store.getProjectId(),
+		);
 		return await this.evidenceProjectId;
 	}
 
@@ -853,5 +853,6 @@ export class SkillService {
 			await this.index?.close().catch(() => {});
 			this.index = undefined;
 		});
+		await this.evidenceProjectId;
 	}
 }
