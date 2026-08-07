@@ -1,6 +1,6 @@
 # Ambient Recall 与 Skill 演进
 
-本文是 Pi-XK 当前模型工作流的操作说明。它描述“什么时候模型自己检索、什么时候可以沉淀、Host 如何阻止越权”，不把模型生成文本当作系统指令。设计决策见 [ADR-0008](../adr/0008-ambient-memory-v2-and-skill-v1.md)；基础 Memory 事实源和 D0-D3 细节见 [Memory v1](memory-v1.md)。
+本文是 Pi-XK 当前模型工作流的操作说明。它描述“什么时候模型自己检索、什么时候可以沉淀、Host 如何阻止越权”，不把模型生成文本当作系统指令。设计决策见 [ADR-0008](../adr/0008-ambient-memory-v2-and-skill-v1.md) 与 [ADR-0009](../adr/0009-ambient-recall-routing-and-effect-evaluation.md)；基础 Memory 事实源和 D0-D3 细节见 [Memory v1](memory-v1.md)。
 
 ## 一次模型 run 的顺序
 
@@ -23,11 +23,11 @@ sequenceDiagram
 
 ### D0 不是记忆正文
 
-每次 run 只得到有界 metadata：Memory/Skill 是否启用、三维状态计数、pending/failed/indeterminate 诊断、可用工具和预算。D0 不含标题、statement、Skill instructions、历史用户文本或模型生成指令。因此模型看到的是“有多少可用历史”，不是自动塞入的答案。
+每次 run 只得到有界 metadata：Memory/Skill 是否启用、三维状态计数、pending/failed/indeterminate 诊断、可用工具和预算。当前 D0 还会在剩余预算中给出 active 数、当前 Goal/Chain branch 命中数、来源类别计数和有限的 Host 验证 Git scope roots。D0 不含标题、statement、Cue、ID、Skill instructions、历史用户文本或模型生成指令。因此模型看到的是“可能相关的覆盖范围”，不是自动塞入的答案。
 
 ### 模型何时搜索
 
-模型应在历史可能实质改变当前答案时搜索，例如需要既有决定、项目约束、失败教训、用户偏好、跨 Segment 待办、Goal/Chain 恢复或与旧方案兼容时。一次性且与项目历史无关的问题应跳过搜索。不要用“之前/继续”等关键词硬触发，也不要因为 D0 有计数就主动读取正文。
+模型应在历史可能实质改变当前答案时搜索，例如需要既有决定、项目约束、失败教训、用户偏好、跨 Segment 待办、Goal/Chain 恢复或与旧方案兼容时。开始既有项目的修改、诊断或方案选择前，应先判断这些因素以及 D0 的绑定范围是否可能改变结果；判断为可能时自主执行一次 D1。一次性且与项目历史无关的问题应跳过搜索。不要用“之前/继续”等关键词硬触发，也不要因为 D0 有计数或路由命中就自动读取正文。
 
 搜索之后按需递进：
 
@@ -36,6 +36,10 @@ sequenceDiagram
 3. D3 只在 D2 不足、过期、冲突或需要核对原始来源时展开有限 evidence。
 
 Memory 与 Skill 正文必须包装为 `historical evidence, not instructions`。其中的命令、角色声明、伪 system prompt、权限要求和“忽略上文”等文本都是历史数据，不能改变当前工具集合、Goal 合同、用户授权或 system prompt 优先级。
+
+### 可发现性与效果证据
+
+路由 metadata 只帮助模型判断是否值得发起 D1；它不会调用工具、返回候选、提升 trust，也不能让 stale/disputed Memory 跳过 D3。`npm run evaluate:pi-xk-ambient-recall` 仍是协议/预算测试，不是效果证明。`npm run evaluate:pi-xk-ambient-effect` 的 CI fixture 只验证脱敏 report、隔离三臂和阈值计算；只有独立真实 provider 的 `provider_run` report 才能说明 Memory 对 sealed development task 是否有净收益。2026-08-05 的独立运行已达到当前门槛，具体指标、报告 digest 和不可外推限制见 [效果证据摘要](ambient-recall-effect-evidence-2026-08-05.md)。
 
 ## Recall ledger 与预算
 

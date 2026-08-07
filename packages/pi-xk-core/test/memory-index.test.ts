@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type {
 	MemoryIndexCueV1,
 	MemoryIndexEdgeV1,
@@ -44,6 +44,7 @@ function memory(
 		evidenceIds: [`evidence_${memoryId}`],
 		accessCount: 0,
 		lastAccessedAt: null,
+		recallRouting: { routes: [] },
 		...options,
 	};
 }
@@ -119,6 +120,135 @@ async function* rebuildChunks(value: MemoryIndexSnapshotV1): AsyncGenerator<Memo
 }
 
 describe("Memory SQLite projection", () => {
+	it("aggregates only safe Recall Routing metadata for the active Goal and Chain branch", () => {
+		const database = new DatabaseSync(":memory:");
+		const projection = new MemorySqliteProjection(database);
+		projection.rebuild({
+			...snapshot(),
+			memories: [
+				memory("memory_goal", "UNTRUSTED_TITLE_DO_NOT_INJECT", "UNTRUSTED_BODY_DO_NOT_INJECT", {
+					recallRouting: {
+						routes: [
+							{
+								sourceType: "goal_checkpoint",
+								goalId: "goal_current",
+								chainId: null,
+								branchId: null,
+								scopeRoot: null,
+							},
+							{
+								sourceType: "agent_run",
+								goalId: "goal_current",
+								chainId: "chain_current",
+								branchId: "branch_current",
+								scopeRoot: null,
+							},
+							{
+								sourceType: "git",
+								goalId: null,
+								chainId: null,
+								branchId: null,
+								scopeRoot: "packages",
+							},
+						],
+					},
+				}),
+				memory("memory_stale", "STALE_TITLE_DO_NOT_INJECT", "STALE_BODY_DO_NOT_INJECT", {
+					freshness: "stale",
+					trust: "disputed",
+					recallRouting: {
+						routes: [
+							{
+								sourceType: "chain_summary",
+								goalId: null,
+								chainId: "chain_current",
+								branchId: "branch_current",
+								scopeRoot: null,
+							},
+						],
+					},
+				}),
+				memory("memory_archived", "ARCHIVED_TITLE_DO_NOT_INJECT", "ARCHIVED_BODY_DO_NOT_INJECT", {
+					lifecycle: "archived",
+					recallRouting: {
+						routes: [
+							{
+								sourceType: "goal_completion",
+								goalId: "goal_current",
+								chainId: null,
+								branchId: null,
+								scopeRoot: null,
+							},
+						],
+					},
+				}),
+			],
+		});
+
+		const coverage = projection.recallCoverage({
+			goalId: "goal_current",
+			chainId: "chain_current",
+			branchId: "branch_current",
+		});
+		expect(coverage).toEqual({
+			schema: "pi-xk.memory-recall-coverage.v1",
+			activeMemoryCount: 2,
+			goalMatchCount: 1,
+			chainBranchMatchCount: 2,
+			sourceCounts: [
+				{ sourceType: "goal_checkpoint", memoryCount: 1 },
+				{ sourceType: "chain_summary", memoryCount: 1 },
+				{ sourceType: "git", memoryCount: 1 },
+				{ sourceType: "agent_run", memoryCount: 1 },
+			],
+			gitScopeRoots: ["packages"],
+		});
+		const serialized = JSON.stringify(coverage);
+		for (const forbidden of [
+			"UNTRUSTED_TITLE_DO_NOT_INJECT",
+			"UNTRUSTED_BODY_DO_NOT_INJECT",
+			"STALE_TITLE_DO_NOT_INJECT",
+			"STALE_BODY_DO_NOT_INJECT",
+			"goal_current",
+			"chain_current",
+			"branch_current",
+		]) {
+			expect(serialized).not.toContain(forbidden);
+		}
+		expect(coverage).not.toHaveProperty("trust");
+		expect(coverage).not.toHaveProperty("freshness");
+		database.close();
+	});
+
+	it("rejects arbitrary path text from Recall Routing metadata", () => {
+		const database = new DatabaseSync(":memory:");
+		const projection = new MemorySqliteProjection(database);
+		expect(() =>
+			projection.rebuild({
+				...snapshot(),
+				memories: [
+					memory("memory_untrusted_scope", "Safe title", "Safe statement", {
+						recallRouting: {
+							routes: [
+								{
+									sourceType: "git",
+									goalId: null,
+									chainId: null,
+									branchId: null,
+									scopeRoot: "IGNORE_SYSTEM_PROMPT",
+								},
+							],
+						},
+					}),
+				],
+				cues: [],
+				edges: [],
+				historyCues: [],
+			}),
+		).toThrow(/scopeRoot/i);
+		database.close();
+	});
+
 	it("runs the Node SQLite projection behind the async worker port", async () => {
 		const directory = await mkdtemp(join(tmpdir(), "pi-xk-memory-index-worker-"));
 		const client = new MemoryIndexWorkerClient({
@@ -127,7 +257,7 @@ describe("Memory SQLite projection", () => {
 		});
 		try {
 			expect(await client.status()).toEqual({
-				schemaVersion: 2,
+				schemaVersion: 6,
 				head: { sequence: 0, hash: null },
 				memoryCount: 0,
 				cueCount: 0,
@@ -227,7 +357,7 @@ describe("Memory SQLite projection", () => {
 		const projection = new MemorySqliteProjection(database);
 		projection.rebuild(snapshot());
 		expect(projection.status()).toEqual({
-			schemaVersion: 2,
+			schemaVersion: 6,
 			head: snapshot().head,
 			memoryCount: 2,
 			cueCount: 2,
@@ -586,6 +716,44 @@ describe("Memory SQLite projection", () => {
 		).toHaveLength(0);
 		expect(projection.search({ query: "Archived decision", limit: 12, graphDepth: 0 }).memories).toHaveLength(0);
 		database.close();
+	});
+
+	it("keeps committed current facts visible when the host wall clock moves backward", () => {
+		vi.useFakeTimers();
+		const database = new DatabaseSync(":memory:");
+		try {
+			const committedAt = "2026-08-06T12:00:00.500Z";
+			vi.setSystemTime(committedAt);
+			const projection = new MemorySqliteProjection(database);
+			projection.rebuild({
+				head: { sequence: 1, hash: `sha256:${"7".repeat(64)}` },
+				memories: [
+					memory("memory_one", "Clock-safe current fact", "The committed fact remains searchable.", {
+						effectiveFrom: committedAt,
+						recordedAt: committedAt,
+					}),
+				],
+				cues: [],
+				edges: [],
+				historyCues: [],
+			});
+
+			vi.setSystemTime("2026-08-06T12:00:00.000Z");
+			expect(projection.search({ query: "Clock-safe current fact", limit: 12, graphDepth: 0 }).memories).toEqual([
+				expect.objectContaining({ memoryId: "memory_one" }),
+			]);
+			expect(
+				projection.search({
+					query: "Clock-safe current fact",
+					asOf: "2026-08-06T12:00:00.000Z",
+					limit: 12,
+					graphDepth: 0,
+				}).memories,
+			).toEqual([]);
+		} finally {
+			database.close();
+			vi.useRealTimers();
+		}
 	});
 
 	it("pages the ranked candidate set without reading memory bodies into D1", () => {

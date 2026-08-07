@@ -265,6 +265,11 @@ export {
 	type MemoryIndexSearchResultV1,
 	type MemoryIndexSnapshotV1,
 	type MemoryIndexStatusV1,
+	type MemoryRecallCoverageInputV1,
+	type MemoryRecallCoverageV1,
+	type MemoryRecallRouteV1,
+	type MemoryRecallRoutingV1,
+	type MemoryRecallSourceType,
 } from "./memory-index.ts";
 export {
 	MemoryIndexWorkerClient,

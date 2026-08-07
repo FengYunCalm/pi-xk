@@ -69,6 +69,7 @@ Memory kind：
     events.jsonl                     # Memory 事件事实源
     memory-read-model.json           # 可重建快速视图
     memory-read-model.checkpoint.json
+    memory-recall-routing-read-model.json # 无正文的 D0 安全路由投影
     memory-config.json               # enabled/off
     source-cursors.json              # 自动 source discovery 恢复游标，不是 Memory fact
     history-cue-cursor.json          # sealed Segment/Cue 增量扫描缓存，可重建
@@ -85,7 +86,7 @@ Memory kind：
 
 1. Artifact Store 中的 canonical 对象；
 2. `memory/events.jsonl` 的发布、生命周期、删除和访问事件；
-3. read model/SQLite/Markdown 只用于加速和阅读。
+3. read model、routing read model、SQLite/Markdown 只用于加速和阅读。
 
 不要手工编辑 `events.jsonl`、Artifact Store object 或 lock。SQLite 和 Markdown 损坏时使用 doctor repair；事实损坏只报告，不自动改写。
 
@@ -198,8 +199,9 @@ proposed -> rejected
 - current/stale/unknown 数量；
 - pending/failed capture；
 - 五个 Memory 工具是否在本次 run 可用。
+- 在剩余预算中，active 数、当前 Goal/Chain branch 命中数、来源类别计数和有限的 Host 验证 Git scope 类别。
 
-D0 不包含 Cue 标题、Memory statement、历史用户原文或 evidence 正文。
+D0 不包含 Cue 标题、Memory statement、artifact/source/Goal/Chain ID、历史用户原文或 evidence 正文。路由 metadata 是独立 routing read model 与 SQLite 的可重建投影，只能来自完整验证的 evidence locator 与严格匹配的 Git freshness basis；完整路径只在 Host 内部验证，D0 只显示固定 scope 类别（例如 `src`、`packages`），因此任意文件或目录名不能进入 system prompt。它不自动搜索、读取或提升 stale/disputed 的信任。
 
 ### D1：搜索候选
 
@@ -332,6 +334,7 @@ purge 的 tombstone 会列出目标 Memory 的 revision/edge/evidence，以及�
 快速 doctor 检查：
 
 - event/read-model checkpoint；
+- routing read model 的 schema、构建时 head 与 Memory reference 对齐；其中有效性以 `memoryId + revision + lifecycle` 的事实引用为准，access 等中性事件推进 head 不会单独使其失效；
 - SQLite schema、integrity 和 head；
 - write lock；
 - capture 状态；
@@ -348,7 +351,7 @@ deep doctor 额外检查：
 - purged artifact 是否仍在磁盘；
 - 每条 Memory Markdown digest。
 
-repair-projections 先显式重建损坏的 History Cue cursor/cache，再以同一个 read-model head 校验 Memory references；SQLite 已与该 head 一致时直接复用，否则从临时数据库重建。Markdown 和 manifest 使用同一快照，完成后复核事实 head，避免发布跨 revision 的混合投影。该命令不改 event、artifact 或来源。abandoned lock 仅在 PID 明确不存在且 nonce 精确匹配时修复。
+repair-projections 先显式重建损坏的 History Cue cursor/cache，再以同一个 read-model head 校验 Memory references，并重建无正文 routing read model；SQLite 已与该 head 一致时直接复用，否则从临时数据库重建。Markdown 和 manifest 使用同一快照，完成后复核事实 head，避免发布跨 revision 的混合投影。该命令不改 event、artifact 或来源。abandoned lock 仅在 PID 明确不存在且 nonce 精确匹配时修复。
 
 旧 `source-cursors.v1` 会在验证其 sequence 仍落在对应 event log 后升级为保存 sequence+hash 的 v2；旧 `history-cue-cursor.v1` 会从 sealed facts 重建为带 content digest 的 v2。损坏的 source cursor 可能影响“哪些稳定来源已经观察过”，doctor 只报告且不自动猜测；History Cue 不承载 Memory facts，因此可由 repair-projections 重建。
 
@@ -358,6 +361,7 @@ repair-projections 先显式重建损坏的 History Cue cursor/cache，再以同
 | --- | --- | --- |
 | `index_missing/index_corrupt/index_stale` | SQLite 缺失、损坏或与 facts 不一致 | `/memory doctor repair-projections` |
 | `read_model_*` | checkpoint/read model 缺失或落后 | repair projections；event 缩短则先保留现场 |
+| `recall_routing_read_model_*` | D0 routing read model 缺失、损坏或其 Memory 事实引用不一致 | `/memory doctor repair-projections` |
 | `fact_provenance_invalid` | artifact/evidence/source 不匹配 | 不自动修，检查事实源和备份 |
 | `orphan_memory_artifact` | artifact 未被 facts/pending 引用 | deep 审计；不要直接批量删除 |
 | `capture_failed_retryable` | 已知失败且可安全重试 | 等待下一次匹配 stable-source scan，或检查 provider/I/O 状态 |
@@ -386,7 +390,7 @@ Memory 与 active Goal 发生冲突时，模型应报告差异并走 `pi_xk_prop
 - History Cue 正常刷新按 chain head 和 sealed Segment cursor 只处理新增来源；稳定 chain 不重复打开全部 Segment；
 - D2 最多 5 条，D3 最多 3 个 evidence；
 - Node/Bun SQLite 在 worker 中运行，Node 主进程不加载额外 native npm addon；
-- SQLite schema v2 保存 Edge 有效时间；事实 mutation 通过 event-head CAS 增量更新，History Cue 使用同-head projection delta；完整 rebuild 不构造或跨 Worker 克隆完整 Memory/Edge snapshot；
+- SQLite schema v6 保存 Edge 有效时间、安全 recall route 和防 Host 时钟回拨的单调逻辑时间；事实 mutation 通过 event-head CAS 增量更新，History Cue 使用同-head projection delta；完整 rebuild 不构造或跨 Worker 克隆完整 Memory/Edge snapshot；
 - 自动 capture 可能产生 provider 调用；explicit remember/search/read/refresh/doctor 不调用模型；
 - backfill 的 limit 是成本控制，不是迁移进度承诺。
 
@@ -400,9 +404,10 @@ npm run benchmark:pi-xk-memory
 
 ```bash
 npm run evaluate:pi-xk-memory
+npm run evaluate:pi-xk-ambient-effect
 ```
 
-长期文档不把设计门槛冒充当前机器 SLA；最终结论应记录 commit、Node/Bun、OS、数据规模和命令输出。
+`evaluate:pi-xk-ambient-effect` 的默认 fixture 只验证脱敏 report 与三臂阈值计算，不是真实模型收益。真实 provider 效果结论必须保留独立 verifier 的 `provider_run` report。2026-08-05 的独立 report 已达到当前门槛，摘要和限制见 [Ambient Recall 效果证据](ambient-recall-effect-evidence-2026-08-05.md)。长期文档不把设计门槛冒充当前机器 SLA；最终结论应记录 commit、Node/Bun、OS、数据规模和命令输出。
 
 ## 17. 明确限制
 

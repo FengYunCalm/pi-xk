@@ -43,6 +43,7 @@ jobs:
           npm run evaluate:session-chain-summaries
           npm run evaluate:pi-xk-memory
           npm run evaluate:pi-xk-ambient-recall
+          npm run evaluate:pi-xk-ambient-effect
           npm run evaluate:pi-xk-skill-evolution
 
       - name: Pi-XK benchmark smoke

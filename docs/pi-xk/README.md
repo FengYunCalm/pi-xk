@@ -12,7 +12,7 @@ Pi-XK 是 Pi 的维护型 fork 与扩展层。它在保留 Pi provider、Agent l
 | Goal 连续执行 | 已实现 | active Goal 会自动继续，直到模型提交合格的 pause/end intent 或用户显式控制 |
 | Task Run v1 | 已实现 | 同一 parent 只运行一个 in-process child；无并发、DAG、retry、deadline 或 worktree 隔离 |
 | Session Chain v1.1 | 已实现 | 物理 Segment、L1 递进摘要、默认每 5 段 L2 Rollup、模型按需检索、恢复和 successor branch |
-| Memory v1/v2 | 已实现 | 项目级有向证据图、Goal/L2 稳定边界捕获、模型主导 D0–D3 recall、run ledger、Memory review/implicit keep、增量 SQLite/History Cue 投影和恢复 |
+| Memory v1/v2 | 已实现 | 项目级有向证据图、Goal/L2 稳定边界捕获、带安全路由覆盖的模型主导 D0–D3 recall、run ledger、Memory review/implicit keep、增量 SQLite/History Cue 投影和恢复 |
 | Skill evolution v1 | 已实现 | 项目/全局 candidate、证据化 review、项目 active projection、跨项目晋升门槛、cooldown、rollback 和 settled-boundary Skill-only reload |
 | 日常状态与管理 | 已实现 | `/xk status` 聚合 Chain/Goal/Task/Memory/恢复诊断；Chain 支持标题、归档和默认隐藏归档项 |
 | Artifact store | 已实现 | 项目级、内容寻址、单 artifact 最大 64 KiB；不是任意大文件仓库 |
@@ -32,7 +32,8 @@ Pi-XK 是 Pi 的维护型 fork 与扩展层。它在保留 Pi provider、Agent l
 - 评估安装后对现有 Pi 的影响：[兼容性与使用影响](compatibility-and-impact.md)
 - 理解 L1/L2 与模型按需读取：[Session Chain Rollup 与模型检索](session-chain-rollups-and-model-retrieval.md)
 - 使用项目级长期经验：[Memory v1/v2：证据图与渐进式检索](memory-v1.md)
-- 查看模型自主回忆和 Skill 演进：[Ambient Recall 与 Skill 演进](ambient-recall-and-skill-evolution.md)
+- 查看模型自主回忆、路由与效果证据边界：[Ambient Recall 与 Skill 演进](ambient-recall-and-skill-evolution.md)
+- 查看独立真实 provider 的受限效果结论：[Ambient Recall 效果证据（2026-08-05）](ambient-recall-effect-evidence-2026-08-05.md)
 - 维护 upstream fork 边界：[Host patch 边界](host-patch-boundary.md)
 - 查阅完整未来路线：[Pi-XK 架构策划案](../pi-xk-architecture-proposal.md)
 - 查阅已接受决策：[ADR 索引](../adr/README.md)
@@ -93,4 +94,4 @@ flowchart LR
 
 ## 版本基线
 
-当前文档对应 2026-08-04 的 Pi-XK Goal V3、compaction recovery、Session Chain v1.1、Memory v1/v2、Ambient Recall、Skill evolution v1、增量 append/checkpoint/projection 与既有 GitHub-only 发行实现。完整验收以当前 commit 实际执行 `npm run test:pi-xk` 的输出为准，不再在长期文档中固化会随回归测试增长而过期的计数；旧的 `42/97`、`55/119`、`63/157`、`93/241` 都不是当前完整证据。发布前还必须运行 `npm run check`、`./test.sh`、Session Chain 与 Memory 评估/benchmark、隔离归档 smoke、Windows/macOS 定向 CI 和 `git diff --check`。
+当前文档对应 2026-08-05 的 Pi-XK Goal V3、compaction recovery、Session Chain v1.1、Memory v1/v2、Ambient Recall 安全路由、Skill evolution v1、增量 append/checkpoint/projection 与既有 GitHub-only 发行实现。完整验收以当前 commit 实际执行 `npm run test:pi-xk` 的输出为准，不再在长期文档中固化会随回归测试增长而过期的计数；旧的 `42/97`、`55/119`、`63/157`、`93/241` 都不是当前完整证据。发布前还必须运行 `npm run check`、`./test.sh`、Session Chain 与 Memory 评估/benchmark、隔离归档 smoke、Windows/macOS 定向 CI 和 `git diff --check`。当前 CI 的 Ambient effect fixture 仅验证评测协议；[独立真实 provider 评测](ambient-recall-effect-evidence-2026-08-05.md)已记录一个受限但通过阈值的效果结论。

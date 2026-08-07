@@ -1,8 +1,8 @@
-import { mkdtemp, rm, stat, utimes } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { MemoryService } from "../src/index.ts";
+import { MemoryService, MemoryStore } from "../src/index.ts";
 
 const roots: string[] = [];
 
@@ -11,6 +11,51 @@ afterEach(async () => {
 });
 
 describe("Memory incremental publication", () => {
+	it("takes the shared projection lock before doctor reads a projection snapshot", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-xk-memory-doctor-lock-"));
+		roots.push(root);
+		const ownerStore = new MemoryStore(root);
+		let signalOwnerEntered: (() => void) | undefined;
+		let releaseOwner: (() => void) | undefined;
+		const ownerEntered = new Promise<void>((resolve) => {
+			signalOwnerEntered = resolve;
+		});
+		const ownerGate = new Promise<void>((resolve) => {
+			releaseOwner = resolve;
+		});
+		const owner = ownerStore.withProjectionLock(async () => {
+			signalOwnerEntered?.();
+			await ownerGate;
+		});
+		await ownerEntered;
+
+		let signalDoctorLockAttempt: (() => void) | undefined;
+		const doctorLockAttempted = new Promise<void>((resolve) => {
+			signalDoctorLockAttempt = resolve;
+		});
+		class ObservedMemoryStore extends MemoryStore {
+			override async withProjectionLock<TResult>(action: () => Promise<TResult>): Promise<TResult> {
+				signalDoctorLockAttempt?.();
+				return await super.withProjectionLock(action);
+			}
+		}
+		const service = new MemoryService(root, new ObservedMemoryStore(root));
+		let doctorCompleted = false;
+		const doctor = service.doctor().then((report) => {
+			doctorCompleted = true;
+			return report;
+		});
+
+		await expect(
+			Promise.race([doctorLockAttempted.then(() => "lock-attempted"), doctor.then(() => "doctor-completed")]),
+		).resolves.toBe("lock-attempted");
+		expect(doctorCompleted).toBe(false);
+		releaseOwner?.();
+		await expect(owner).resolves.toBeUndefined();
+		await expect(doctor).resolves.toMatchObject({ ok: true, diagnostics: [] });
+		await service.close();
+	});
+
 	it("updates only changed Markdown and keeps the open SQLite projection current", async () => {
 		const root = await mkdtemp(join(tmpdir(), "pi-xk-memory-incremental-"));
 		roots.push(root);
@@ -39,6 +84,39 @@ describe("Memory incremental publication", () => {
 			indexState: "current",
 			index: { memoryCount: 2 },
 		});
+		expect(await service.doctor()).toMatchObject({ ok: true, diagnostics: [] });
+		await service.close();
+	});
+
+	it("keeps Recall Routing valid across an access-only event", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-xk-memory-routing-access-"));
+		roots.push(root);
+		const service = new MemoryService(root);
+		const memory = await service.remember("Recall Routing is derived from Memory fact references.", {
+			commandId: "command_routing_access",
+			recordedAt: "2026-08-03T00:00:00.000Z",
+		});
+		const routingPath = join(root, ".pi-xk", "memory", "memory-recall-routing-read-model.json");
+		const beforeAccess = await readFile(routingPath, "utf8");
+		const expectedHead = (await service.getStore().replay()).head;
+
+		await service.recordAccess(
+			{
+				runId: "run_routing_access",
+				memoryIds: [memory.revision.memoryId],
+				evidenceIds: [],
+			},
+			{
+				eventId: "evt_memory_routing_access",
+				idempotencyKey: "memory:access:routing",
+				expectedHead,
+				actor: "model",
+				timestamp: "2026-08-03T00:01:00.000Z",
+			},
+		);
+
+		expect(await readFile(routingPath, "utf8")).toBe(beforeAccess);
+		await service.status();
 		expect(await service.doctor()).toMatchObject({ ok: true, diagnostics: [] });
 		await service.close();
 	});

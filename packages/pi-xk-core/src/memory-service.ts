@@ -12,6 +12,7 @@ import {
 	type MemoryCaptureSourceV1,
 	type MemoryChangeProposalV1,
 	type MemoryKind,
+	type MemoryLifecycle,
 	MemoryValidationError,
 } from "./memory-contract.ts";
 import { resolveMemoryCompactionEvidence, validateMemoryEvidenceOwnership } from "./memory-evidence.ts";
@@ -27,7 +28,12 @@ import type {
 	MemoryIndexRebuildChunkV1,
 	MemoryIndexRebuildPlanV1,
 	MemoryIndexStatusV1,
+	MemoryRecallCoverageInputV1,
+	MemoryRecallCoverageV1,
+	MemoryRecallRouteV1,
+	MemoryRecallRoutingV1,
 } from "./memory-index.ts";
+import { MEMORY_RECALL_SCOPE_ROOT_CATEGORIES } from "./memory-index.ts";
 import { MemoryIndexWorkerClient } from "./memory-index-worker-client.ts";
 import {
 	type MemoryApplyOptions,
@@ -49,6 +55,17 @@ const MEMORY_CONFIG_V2_SCHEMA = "pi-xk.memory-config.v2";
 const EXPLICIT_MEMORY_PROMPT_VERSION = "pi-xk.memory-explicit.v1";
 const MEMORY_INDEX_ENTITY_CHUNK_SIZE = 256;
 const MEMORY_INDEX_EDGE_CHUNK_SIZE = 2_048;
+const MEMORY_RECALL_ROUTING_READ_MODEL_SCHEMA = "pi-xk.memory-recall-routing-read-model.v1";
+const MEMORY_RECALL_SOURCE_TYPES = [
+	"goal_checkpoint",
+	"goal_completion",
+	"chain_summary",
+	"compaction",
+	"task_result",
+	"git",
+	"explicit",
+	"agent_run",
+] as const satisfies readonly MemoryRecallRouteV1["sourceType"][];
 
 export interface MemoryConfigV1 {
 	enabled: boolean;
@@ -164,6 +181,19 @@ interface MemoryProjectionManifestV1 {
 	memoryCount: number;
 	indexDigest: string;
 	memories: MemoryProjectionManifestEntryV1[];
+}
+
+interface MemoryRecallRoutingMemoryProjectionV1 {
+	memoryId: string;
+	revision: number;
+	lifecycle: MemoryLifecycle;
+	routes: MemoryRecallRouteV1[];
+}
+
+interface MemoryRecallRoutingReadModelV1 {
+	schema: typeof MEMORY_RECALL_ROUTING_READ_MODEL_SCHEMA;
+	head: MemoryReadModelV1["head"];
+	memories: MemoryRecallRoutingMemoryProjectionV1[];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -304,11 +334,266 @@ function isTemporalMemoryQuery(query: string): boolean {
 	return /(?:上次|最近|近期|刚才|previous|recent|latest|last(?:\s+time)?)/iu.test(query);
 }
 
+function samePathList(left: readonly string[], right: readonly string[]): boolean {
+	return left.length === right.length && left.every((path, index) => path === right[index]);
+}
+
+function isRecallSourceType(value: unknown): value is MemoryRecallRouteV1["sourceType"] {
+	return typeof value === "string" && (MEMORY_RECALL_SOURCE_TYPES as readonly string[]).includes(value);
+}
+
+function recallIdentifier(value: unknown, field: string): string | null {
+	if (value === null) return null;
+	if (typeof value !== "string" || value.length === 0 || value.length > 160 || /[\u0000-\u001f\u007f]/u.test(value)) {
+		throw new MemoryValidationError(`${field} is invalid`);
+	}
+	return value;
+}
+
+function recallScopeRoot(value: unknown, field: string): string | null {
+	if (value === null) return null;
+	if (typeof value !== "string" || !(MEMORY_RECALL_SCOPE_ROOT_CATEGORIES as readonly string[]).includes(value)) {
+		throw new MemoryValidationError(`${field} is invalid`);
+	}
+	return value;
+}
+
+function memoryLifecycle(value: unknown, field: string): MemoryLifecycle {
+	if (value !== "active" && value !== "superseded" && value !== "invalidated" && value !== "archived") {
+		throw new MemoryValidationError(`${field} is invalid`);
+	}
+	return value;
+}
+
+function recallRoute(value: unknown, field: string): MemoryRecallRouteV1 {
+	if (!isRecord(value) || !exactKeys(value, ["sourceType", "goalId", "chainId", "branchId", "scopeRoot"])) {
+		throw new MemoryValidationError(`${field} is invalid`);
+	}
+	if (!isRecallSourceType(value.sourceType)) throw new MemoryValidationError(`${field} sourceType is invalid`);
+	return {
+		sourceType: value.sourceType,
+		goalId: recallIdentifier(value.goalId, `${field} goalId`),
+		chainId: recallIdentifier(value.chainId, `${field} chainId`),
+		branchId: recallIdentifier(value.branchId, `${field} branchId`),
+		scopeRoot: recallScopeRoot(value.scopeRoot, `${field} scopeRoot`),
+	};
+}
+
+function sameReadModelHead(left: MemoryReadModelV1["head"], right: MemoryReadModelV1["head"]): boolean {
+	return left.sequence === right.sequence && left.hash === right.hash;
+}
+
+function parseRecallRoutingReadModel(value: unknown): MemoryRecallRoutingReadModelV1 {
+	if (!isRecord(value) || !exactKeys(value, ["schema", "head", "memories"])) {
+		throw new MemoryValidationError("Memory Recall Routing read model has unknown or missing fields");
+	}
+	if (value.schema !== MEMORY_RECALL_ROUTING_READ_MODEL_SCHEMA) {
+		throw new MemoryValidationError("Memory Recall Routing read model schema is unsupported");
+	}
+	if (!isRecord(value.head) || !exactKeys(value.head, ["sequence", "hash"])) {
+		throw new MemoryValidationError("Memory Recall Routing read model head is invalid");
+	}
+	const sequence = value.head.sequence;
+	const hash = value.head.hash;
+	if (
+		typeof sequence !== "number" ||
+		!Number.isInteger(sequence) ||
+		sequence < 0 ||
+		(hash !== null && (typeof hash !== "string" || !/^sha256:[a-f0-9]{64}$/.test(hash))) ||
+		(sequence === 0) !== (hash === null)
+	) {
+		throw new MemoryValidationError("Memory Recall Routing read model head is invalid");
+	}
+	const head: MemoryReadModelV1["head"] = {
+		sequence,
+		hash,
+	};
+	if (!Array.isArray(value.memories) || value.memories.length > 1_000_000) {
+		throw new MemoryValidationError("Memory Recall Routing read model memories are invalid");
+	}
+	const memories = value.memories.map((entry, index): MemoryRecallRoutingMemoryProjectionV1 => {
+		if (!isRecord(entry) || !exactKeys(entry, ["memoryId", "revision", "lifecycle", "routes"])) {
+			throw new MemoryValidationError(`Memory Recall Routing read model memories[${index}] is invalid`);
+		}
+		const memoryId = entry.memoryId;
+		const revision = entry.revision;
+		const lifecycle = entry.lifecycle;
+		const routesValue = entry.routes;
+		if (
+			typeof memoryId !== "string" ||
+			memoryId.length === 0 ||
+			memoryId.length > 160 ||
+			typeof revision !== "number" ||
+			!Number.isInteger(revision) ||
+			revision < 1 ||
+			!Array.isArray(routesValue) ||
+			routesValue.length > 128
+		) {
+			throw new MemoryValidationError(`Memory Recall Routing read model memories[${index}] is invalid`);
+		}
+		const routes = routesValue.map((route, routeIndex) =>
+			recallRoute(route, `Memory Recall Routing read model memories[${index}].routes[${routeIndex}]`),
+		);
+		for (let routeIndex = 1; routeIndex < routes.length; routeIndex++) {
+			if (stableJsonStringify(routes[routeIndex - 1]) >= stableJsonStringify(routes[routeIndex])) {
+				throw new MemoryValidationError("Memory Recall Routing read model routes must be sorted and unique");
+			}
+		}
+		return {
+			memoryId,
+			revision,
+			lifecycle: memoryLifecycle(lifecycle, `Memory Recall Routing read model memories[${index}] lifecycle`),
+			routes,
+		};
+	});
+	for (let index = 1; index < memories.length; index++) {
+		if (memories[index - 1]!.memoryId >= memories[index]!.memoryId) {
+			throw new MemoryValidationError("Memory Recall Routing read model memory IDs must be sorted and unique");
+		}
+	}
+	return {
+		schema: MEMORY_RECALL_ROUTING_READ_MODEL_SCHEMA,
+		head,
+		memories,
+	};
+}
+
+function routingReferencesMatch(
+	routingReadModel: MemoryRecallRoutingReadModelV1,
+	readModel: MemoryReadModelV1,
+): boolean {
+	return (
+		routingReadModel.memories.length === readModel.memories.length &&
+		routingReadModel.memories.every((memory, index) => {
+			const reference = readModel.memories[index];
+			return (
+				reference !== undefined &&
+				memory.memoryId === reference.memoryId &&
+				memory.revision === reference.revision &&
+				memory.lifecycle === reference.lifecycle
+			);
+		})
+	);
+}
+
+function validateRecallRoutingReadModel(
+	value: unknown,
+	expectedReadModel: MemoryReadModelV1,
+): MemoryRecallRoutingReadModelV1 {
+	const routingReadModel = parseRecallRoutingReadModel(value);
+	if (!routingReferencesMatch(routingReadModel, expectedReadModel)) {
+		throw new MemoryValidationError("Memory Recall Routing read model references do not match Memory facts");
+	}
+	return routingReadModel;
+}
+
+function gitScopeRoot(path: string): string | null {
+	const root = path.split("/", 1)[0];
+	return root !== undefined && (MEMORY_RECALL_SCOPE_ROOT_CATEGORIES as readonly string[]).includes(root) ? root : null;
+}
+
+async function recallRouting(projectRoot: string, memory: MemoryReadResultV1): Promise<MemoryRecallRoutingV1> {
+	const routes = new Map<string, MemoryRecallRouteV1>();
+	const add = (route: MemoryRecallRouteV1): void => {
+		routes.set(stableJsonStringify(route), route);
+	};
+	const freshnessBasis = memory.revision.freshnessBasis;
+	for (const evidence of memory.revision.evidenceRefs) {
+		try {
+			await validateMemoryEvidenceOwnership(projectRoot, evidence);
+		} catch {
+			continue;
+		}
+		if (evidence.sourceType === "goal_checkpoint" || evidence.sourceType === "goal_completion") {
+			add({
+				sourceType: evidence.sourceType,
+				goalId: evidence.locator.goalId,
+				chainId: null,
+				branchId: null,
+				scopeRoot: null,
+			});
+			continue;
+		}
+		if (evidence.sourceType === "chain_summary") {
+			add({
+				sourceType: "chain_summary",
+				goalId: null,
+				chainId: evidence.locator.chainId,
+				branchId: evidence.locator.branchId,
+				scopeRoot: null,
+			});
+			continue;
+		}
+		if (evidence.sourceType === "agent_run") {
+			add({
+				sourceType: "agent_run",
+				goalId: "goalId" in evidence.locator ? evidence.locator.goalId : null,
+				chainId: evidence.locator.chainId,
+				branchId: evidence.locator.branchId,
+				scopeRoot: null,
+			});
+			continue;
+		}
+		if (evidence.sourceType === "git") {
+			if (
+				freshnessBasis !== null &&
+				freshnessBasis.repositoryId === evidence.locator.repositoryId &&
+				freshnessBasis.baselineCommit === evidence.locator.baselineCommit &&
+				samePathList(freshnessBasis.scopePaths, evidence.locator.scopePaths)
+			) {
+				add({
+					sourceType: "git",
+					goalId: null,
+					chainId: null,
+					branchId: null,
+					scopeRoot: null,
+				});
+				for (const scopePath of freshnessBasis.scopePaths) {
+					const scopeRoot = gitScopeRoot(scopePath);
+					if (scopeRoot === null) continue;
+					add({
+						sourceType: "git",
+						goalId: null,
+						chainId: null,
+						branchId: null,
+						scopeRoot,
+					});
+				}
+			}
+			continue;
+		}
+		add({
+			sourceType: evidence.sourceType,
+			goalId: null,
+			chainId: null,
+			branchId: null,
+			scopeRoot: null,
+		});
+	}
+	return {
+		routes: [...routes.values()].sort((left, right) =>
+			stableJsonStringify(left).localeCompare(stableJsonStringify(right)),
+		),
+	};
+}
+
+function emptyRecallCoverage(): MemoryRecallCoverageV1 {
+	return {
+		schema: "pi-xk.memory-recall-coverage.v1",
+		activeMemoryCount: 0,
+		goalMatchCount: 0,
+		chainBranchMatchCount: 0,
+		sourceCounts: [],
+		gitScopeRoots: [],
+	};
+}
+
 export class MemoryService {
 	private readonly projectRoot: string;
 	private readonly memoryDirectory: string;
 	private readonly configPath: string;
 	private readonly indexPath: string;
+	private readonly recallRoutingPath: string;
 	private readonly store: MemoryStore;
 	private readonly artifacts: ArtifactStore;
 	private index: MemoryIndexWorkerClient | undefined;
@@ -323,6 +608,7 @@ export class MemoryService {
 		this.memoryDirectory = join(this.projectRoot, ".pi-xk", "memory");
 		this.configPath = join(this.memoryDirectory, "memory-config.json");
 		this.indexPath = join(this.memoryDirectory, "index.sqlite");
+		this.recallRoutingPath = join(this.memoryDirectory, "memory-recall-routing-read-model.json");
 		this.store = store;
 		this.artifacts = new ArtifactStore(this.projectRoot);
 	}
@@ -383,6 +669,153 @@ export class MemoryService {
 			await syncDirectory(this.memoryDirectory);
 		} finally {
 			await rm(temporary, { force: true });
+		}
+	}
+
+	private async readRecallRoutingReadModel(
+		readModel: MemoryReadModelV1,
+	): Promise<MemoryRecallRoutingReadModelV1 | undefined> {
+		try {
+			return validateRecallRoutingReadModel(
+				JSON.parse(await readFile(this.recallRoutingPath, "utf8")) as unknown,
+				readModel,
+			);
+		} catch {
+			return undefined;
+		}
+	}
+
+	private async readRawRecallRoutingReadModel(): Promise<MemoryRecallRoutingReadModelV1 | undefined> {
+		try {
+			return parseRecallRoutingReadModel(JSON.parse(await readFile(this.recallRoutingPath, "utf8")) as unknown);
+		} catch {
+			return undefined;
+		}
+	}
+
+	private async deriveRecallRoutingReadModel(readModel: MemoryReadModelV1): Promise<MemoryRecallRoutingReadModelV1> {
+		const cueIds = new Set(readModel.cues.map((reference) => reference.cueId));
+		const memories = await this.store.readMemoriesByReferences(readModel.memories, (cueId) => cueIds.has(cueId));
+		const memoryById = new Map(memories.map((memory) => [memory.revision.memoryId, memory] as const));
+		const projectedMemories: MemoryRecallRoutingMemoryProjectionV1[] = [];
+		for (const reference of readModel.memories) {
+			const memory = memoryById.get(reference.memoryId);
+			if (
+				!memory ||
+				memory.revision.revision !== reference.revision ||
+				memory.state.lifecycle !== reference.lifecycle
+			) {
+				throw new MemoryValidationError("Memory Recall Routing references do not match the read model");
+			}
+			projectedMemories.push({
+				memoryId: reference.memoryId,
+				revision: reference.revision,
+				lifecycle: reference.lifecycle,
+				routes: (await recallRouting(this.projectRoot, memory)).routes,
+			});
+		}
+		return validateRecallRoutingReadModel(
+			{
+				schema: MEMORY_RECALL_ROUTING_READ_MODEL_SCHEMA,
+				head: readModel.head,
+				memories: projectedMemories,
+			},
+			readModel,
+		);
+	}
+
+	private async ensureRecallRoutingReadModel(
+		initialReadModel: MemoryReadModelV1,
+	): Promise<MemoryRecallRoutingReadModelV1> {
+		let readModel = initialReadModel;
+		for (let attempt = 0; attempt < 3; attempt++) {
+			const stored = await this.readRecallRoutingReadModel(readModel);
+			if (stored) return stored;
+			const derived = await this.deriveRecallRoutingReadModel(readModel);
+			const latestReadModel = (await this.store.loadReadModelSnapshot()).readModel;
+			if (!sameReadModelHead(latestReadModel.head, readModel.head)) {
+				readModel = latestReadModel;
+				continue;
+			}
+			await this.replaceFile(this.recallRoutingPath, `${JSON.stringify(derived, null, "\t")}\n`);
+			return derived;
+		}
+		throw new MemoryValidationError("Memory facts changed repeatedly while Recall Routing was being rebuilt");
+	}
+
+	private async synchronizeRecallRoutingReadModel(initialReadModel: MemoryReadModelV1): Promise<void> {
+		let readModel = initialReadModel;
+		for (let attempt = 0; attempt < 3; attempt++) {
+			const stored = await this.readRawRecallRoutingReadModel();
+			if (!stored) {
+				await this.ensureRecallRoutingReadModel(readModel);
+				return;
+			}
+			const storedByMemoryId = new Map(stored.memories.map((memory) => [memory.memoryId, memory] as const));
+			const changedReferences = readModel.memories.filter((reference) => {
+				const previous = storedByMemoryId.get(reference.memoryId);
+				return !previous || previous.revision !== reference.revision || previous.lifecycle !== reference.lifecycle;
+			});
+			const cueIds = new Set(readModel.cues.map((reference) => reference.cueId));
+			const changedMemories = await this.store.readMemoriesByReferences(changedReferences, (cueId) =>
+				cueIds.has(cueId),
+			);
+			const changedByMemoryId = new Map(
+				changedMemories.map((memory) => [memory.revision.memoryId, memory] as const),
+			);
+			const nextMemories: MemoryRecallRoutingMemoryProjectionV1[] = [];
+			for (const reference of readModel.memories) {
+				const previous = storedByMemoryId.get(reference.memoryId);
+				if (previous && previous.revision === reference.revision && previous.lifecycle === reference.lifecycle) {
+					nextMemories.push(previous);
+					continue;
+				}
+				const memory = changedByMemoryId.get(reference.memoryId);
+				if (
+					!memory ||
+					memory.revision.revision !== reference.revision ||
+					memory.state.lifecycle !== reference.lifecycle
+				) {
+					throw new MemoryValidationError("Memory Recall Routing references do not match the read model");
+				}
+				nextMemories.push({
+					memoryId: reference.memoryId,
+					revision: reference.revision,
+					lifecycle: reference.lifecycle,
+					routes: (await recallRouting(this.projectRoot, memory)).routes,
+				});
+			}
+			const next = validateRecallRoutingReadModel(
+				{
+					schema: MEMORY_RECALL_ROUTING_READ_MODEL_SCHEMA,
+					head: readModel.head,
+					memories: nextMemories,
+				},
+				readModel,
+			);
+			const latestReadModel = (await this.store.loadReadModelSnapshot()).readModel;
+			if (!sameReadModelHead(latestReadModel.head, readModel.head)) {
+				readModel = latestReadModel;
+				continue;
+			}
+			if (!sameReadModelHead(stored.head, next.head) || !routingReferencesMatch(stored, readModel)) {
+				await this.replaceFile(this.recallRoutingPath, `${JSON.stringify(next, null, "\t")}\n`);
+			}
+			return;
+		}
+		throw new MemoryValidationError("Memory facts changed repeatedly while Recall Routing was being synchronized");
+	}
+
+	private async inspectRecallRoutingReadModel(
+		readModel: MemoryReadModelV1,
+	): Promise<"missing" | "current" | "invalid-or-stale"> {
+		try {
+			const raw = JSON.parse(await readFile(this.recallRoutingPath, "utf8")) as unknown;
+			validateRecallRoutingReadModel(raw, readModel);
+			return "current";
+		} catch (error) {
+			if (isRecord(error) && error.code === "ENOENT") return "missing";
+			return "invalid-or-stale";
 		}
 	}
 
@@ -598,8 +1031,9 @@ export class MemoryService {
 			this.store.readCuesByReferences(cueReferences),
 			this.store.readEdgesByReferences(edgeReferences),
 		]);
+		const routes = await Promise.all(memories.map(async (memory) => await recallRouting(this.projectRoot, memory)));
 		return {
-			memories: memories.map((memory) => {
+			memories: memories.map((memory, index) => {
 				const access = accessByMemoryId.get(memory.revision.memoryId);
 				return {
 					memoryId: memory.revision.memoryId,
@@ -619,6 +1053,7 @@ export class MemoryService {
 					evidenceIds: memory.revision.evidenceRefs.map((evidence) => evidence.evidenceId),
 					accessCount: access?.accessCount ?? 0,
 					lastAccessedAt: access?.lastAccessedAt ?? null,
+					recallRouting: routes[index]!,
 				};
 			}),
 			cues: cues.map(({ cue, artifactId }) => ({
@@ -795,8 +1230,11 @@ export class MemoryService {
 		for (let offset = 0; offset < readModel.memories.length; offset += MEMORY_INDEX_ENTITY_CHUNK_SIZE) {
 			const references = readModel.memories.slice(offset, offset + MEMORY_INDEX_ENTITY_CHUNK_SIZE);
 			const memories = await this.store.readMemoriesByReferences(references, cueExists);
+			const routes = await Promise.all(
+				memories.map(async (memory) => await recallRouting(this.projectRoot, memory)),
+			);
 			yield {
-				memories: memories.map((memory) => {
+				memories: memories.map((memory, index) => {
 					const access = readModel.accesses[accessIndex];
 					if (access && access.memoryId.localeCompare(memory.revision.memoryId) < 0) {
 						throw new MemoryValidationError("Memory access projection ordering is inconsistent");
@@ -821,6 +1259,7 @@ export class MemoryService {
 						evidenceIds: memory.revision.evidenceRefs.map((evidence) => evidence.evidenceId),
 						accessCount: matchingAccess?.accessCount ?? 0,
 						lastAccessedAt: matchingAccess?.lastAccessedAt ?? null,
+						recallRouting: routes[index]!,
 					};
 				}),
 				cues: [],
@@ -1538,6 +1977,10 @@ export class MemoryService {
 	}
 
 	async doctor(mode: "quick" | "deep" = "quick"): Promise<MemoryDoctorReportV1> {
+		return await this.withProjectionMutation(async () => await this.doctorLocked(mode));
+	}
+
+	private async doctorLocked(mode: "quick" | "deep"): Promise<MemoryDoctorReportV1> {
 		const startedAt = performance.now();
 		const diagnostics: MemoryDoctorReportV1["diagnostics"] = [];
 		let inspection: Awaited<ReturnType<MemoryStore["inspectReadModelProjection"]>>;
@@ -1602,6 +2045,23 @@ export class MemoryService {
 				repairable: !lock.malformed && lock.ownerState === "missing",
 			});
 		}
+		if (readModel && readModel.head.sequence > 0) {
+			const recallRoutingState = await this.inspectRecallRoutingReadModel(readModel);
+			if (recallRoutingState === "missing") {
+				diagnostics.push({
+					code: "recall_routing_read_model_missing",
+					message: "Memory Recall Routing read model is missing.",
+					repairable: true,
+				});
+			} else if (recallRoutingState === "invalid-or-stale") {
+				diagnostics.push({
+					code: "recall_routing_read_model_invalid_or_stale",
+					message:
+						"Memory Recall Routing read model is invalid or its Memory references do not match the current read model.",
+					repairable: true,
+				});
+			}
+		}
 		for (const capture of readModel?.captures ?? []) {
 			if (capture.status === "failed") {
 				diagnostics.push({
@@ -1628,45 +2088,42 @@ export class MemoryService {
 			}
 		}
 		if ((readModel?.head.sequence ?? 0) > 0 || this.historyCues.length > 0) {
-			await this.withProjectionOperation(async () => {
+			try {
+				await stat(this.indexPath);
+				const index = new MemoryIndexWorkerClient({ databasePath: this.indexPath });
 				try {
-					await stat(this.indexPath);
-					const index = new MemoryIndexWorkerClient({ databasePath: this.indexPath });
-					try {
-						const [status, integrity] = await Promise.all([index.status(), index.integrityCheck()]);
-						if (integrity !== "ok")
-							diagnostics.push({ code: "index_corrupt", message: integrity, repairable: true });
-						if (
-							readModel &&
-							(status.head.sequence !== readModel.head.sequence ||
-								status.head.hash !== readModel.head.hash ||
-								status.memoryCount !== readModel.memories.length ||
-								status.cueCount !== readModel.cues.length ||
-								status.edgeCount !== readModel.edges.length)
-						) {
-							diagnostics.push({
-								code: "index_stale",
-								message: "Memory index head does not match the read model.",
-								repairable: true,
-							});
-						}
-					} finally {
-						await index.close();
+					const [status, integrity] = await Promise.all([index.status(), index.integrityCheck()]);
+					if (integrity !== "ok")
+						diagnostics.push({ code: "index_corrupt", message: integrity, repairable: true });
+					if (
+						readModel &&
+						(status.head.sequence !== readModel.head.sequence ||
+							status.head.hash !== readModel.head.hash ||
+							status.memoryCount !== readModel.memories.length ||
+							status.cueCount !== readModel.cues.length ||
+							status.edgeCount !== readModel.edges.length)
+					) {
+						diagnostics.push({
+							code: "index_stale",
+							message: "Memory index head does not match the read model.",
+							repairable: true,
+						});
 					}
-				} catch (error) {
-					const missing =
-						typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
-					diagnostics.push({
-						code: missing ? "index_missing" : "index_unreadable",
-						message: missing
-							? "Memory SQLite projection is missing."
-							: error instanceof Error
-								? error.message
-								: String(error),
-						repairable: true,
-					});
+				} finally {
+					await index.close();
 				}
-			});
+			} catch (error) {
+				const missing = typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+				diagnostics.push({
+					code: missing ? "index_missing" : "index_unreadable",
+					message: missing
+						? "Memory SQLite projection is missing."
+						: error instanceof Error
+							? error.message
+							: String(error),
+					repairable: true,
+				});
+			}
 		}
 		let artifacts = 0;
 		let files = 2;
@@ -1853,6 +2310,7 @@ export class MemoryService {
 	}): Promise<{ markdownFiles: number }> {
 		return await this.withProjectionMutation(async () => {
 			const readModel = (await this.store.loadReadModelSnapshot()).readModel;
+			await this.synchronizeRecallRoutingReadModel(readModel);
 			const changedMemoryIds = new Set(changes.memoryIds ?? []);
 			const removedMemoryIds = new Set(changes.removeMemoryIds ?? []);
 			for (const memoryId of changedMemoryIds) {
@@ -1980,6 +2438,7 @@ export class MemoryService {
 			for (let attempt = 0; attempt < 3; attempt++) {
 				const readModel = (await this.store.loadReadModelSnapshot()).readModel;
 				const index = await this.ensureIndexForReadModel(readModel);
+				await this.ensureRecallRoutingReadModel(readModel);
 				const cueIds = new Set(readModel.cues.map((reference) => reference.cueId));
 				const memories = await this.store.readMemoriesByReferences(readModel.memories, (cueId) =>
 					cueIds.has(cueId),
@@ -2073,6 +2532,16 @@ export class MemoryService {
 				captures,
 				lock,
 			};
+		});
+	}
+
+	async getRecallCoverage(input: MemoryRecallCoverageInputV1): Promise<MemoryRecallCoverageV1> {
+		return await this.withProjectionOperation(async () => {
+			const initialReadModel = (await this.store.loadReadModelSnapshot()).readModel;
+			if (initialReadModel.head.sequence === 0 && this.historyCues.length === 0) return emptyRecallCoverage();
+			const { index, readModel } = await this.ensureIndex();
+			await this.ensureRecallRoutingReadModel(readModel);
+			return await index.recallCoverage(input);
 		});
 	}
 
