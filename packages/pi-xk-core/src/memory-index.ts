@@ -8,7 +8,7 @@ import type {
 	MemoryTrust,
 } from "./memory-contract.ts";
 
-export const MEMORY_INDEX_SCHEMA_VERSION = 2;
+export const MEMORY_INDEX_SCHEMA_VERSION = 3;
 
 export interface MemoryIndexMemoryV1 {
 	memoryId: string;
@@ -144,7 +144,7 @@ export interface MemoryIndexGraphResultV1 {
 }
 
 export interface MemoryIndexStatusV1 {
-	schemaVersion: 2;
+	schemaVersion: 3;
 	head: MemoryHead;
 	memoryCount: number;
 	cueCount: number;

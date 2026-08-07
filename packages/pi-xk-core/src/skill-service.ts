@@ -803,7 +803,9 @@ export class SkillService {
 		let index: SkillIndexStatusV1 | null = null;
 		try {
 			const model = await this.store.loadReadModel();
-			if (await this.adoptIndex(model)) index = (await this.index?.status()) ?? null;
+			if (model.head.sequence === 0) {
+				this.indexState = "absent";
+			} else if (await this.adoptIndex(model)) index = (await this.index?.status()) ?? null;
 			else
 				diagnostics.push({
 					code: "index_missing_or_stale",

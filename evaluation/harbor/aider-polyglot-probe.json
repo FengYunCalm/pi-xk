@@ -1,0 +1,96 @@
+{
+  "schema": "pi-xk.harbor-aider-polyglot-probe.v1",
+	"harness": {
+		"name": "Harbor",
+		"repository": "https://github.com/harbor-framework/harbor.git",
+		"commit": "459ff6ec99417589b7f679d14ddf3b3f0ae4f1dc",
+		"version": "0.20.0"
+	},
+	"upstream": {
+		"repository": "https://github.com/Aider-AI/polyglot-benchmark.git",
+		"commit": "7e0611e77b54e2dea774cdc0aa00cf9f7ed6144f"
+	},
+	"agentAllowedHosts": ["api.deepseek.com"],
+	"agentTimeoutSeconds": 900,
+	"networkPolicyProfile": "portable-loopback-v1",
+	"tasks": [
+    {
+      "id": "aider-polyglot-python-phone-number",
+      "language": "python",
+      "upstreamPath": "python/exercises/practice/phone-number",
+      "instructionFiles": [".docs/instructions.md", ".docs/instructions.append.md"],
+      "oracleCopies": [
+        { "from": ".meta/example.py", "to": "phone_number.py" }
+      ],
+      "verifierCopies": [
+        { "from": "phone_number_test.py", "to": "phone_number_test.py" }
+      ],
+      "testCommand": "PYTHONPATH=\"$APP_DIR\" python3 \"$TEST_DIR/phone_number_test.py\""
+    },
+    {
+      "id": "aider-polyglot-go-robot-simulator",
+      "language": "go",
+      "upstreamPath": "go/exercises/practice/robot-simulator",
+      "instructionFiles": [".docs/instructions.md", ".docs/instructions.append.md"],
+      "oracleCopies": [
+        { "from": ".meta/example.go", "to": "robot_simulator.go" }
+      ],
+      "verifierCopies": [
+        { "from": "defs.go", "to": "defs.go" },
+        { "from": "go.mod", "to": "go.mod" },
+        { "from": "robot_simulator_test.go", "to": "robot_simulator_test.go" },
+        { "from": "robot_simulator_step2_test.go", "to": "robot_simulator_step2_test.go" },
+        { "from": "robot_simulator_step3_test.go", "to": "robot_simulator_step3_test.go" }
+      ],
+      "testCommand": "go test ./..."
+    },
+    {
+      "id": "aider-polyglot-rust-acronym",
+      "language": "rust",
+      "upstreamPath": "rust/exercises/practice/acronym",
+      "instructionFiles": [".docs/instructions.md"],
+      "oracleCopies": [
+        { "from": ".meta/example.rs", "to": "src/lib.rs" }
+      ],
+      "verifierCopies": [
+        { "from": "Cargo.toml", "to": "Cargo.toml" },
+        { "from": "tests/acronym.rs", "to": "tests/acronym.rs" }
+      ],
+      "testCommand": "cargo test --offline"
+    },
+    {
+      "id": "aider-polyglot-cpp-clock",
+      "language": "cpp",
+      "upstreamPath": "cpp/exercises/practice/clock",
+      "instructionFiles": [".docs/instructions.md"],
+      "oracleCopies": [
+        { "from": ".meta/example.cpp", "to": "clock.cpp" },
+        { "from": ".meta/example.h", "to": "clock.h" }
+      ],
+      "verifierCopies": [
+        { "from": "CMakeLists.txt", "to": "CMakeLists.txt" },
+        { "from": "clock_test.cpp", "to": "clock_test.cpp" },
+        { "from": "test/catch.hpp", "to": "test/catch.hpp" },
+        { "from": "test/tests-main.cpp", "to": "test/tests-main.cpp" }
+      ],
+      "testCommand": "rm -rf /tmp/pi-xk-clock-source /tmp/pi-xk-clock-build && mkdir -p /tmp/pi-xk-clock-source/clock && cp -a \"$APP_DIR\"/. /tmp/pi-xk-clock-source/clock/ && cmake -S /tmp/pi-xk-clock-source/clock -B /tmp/pi-xk-clock-build -DEXERCISM_RUN_ALL_TESTS=ON && cmake --build /tmp/pi-xk-clock-build && /tmp/pi-xk-clock-build/clock"
+    },
+    {
+      "id": "aider-polyglot-java-all-your-base",
+      "language": "java",
+      "upstreamPath": "java/exercises/practice/all-your-base",
+      "instructionFiles": [".docs/introduction.md", ".docs/instructions.md"],
+      "oracleCopies": [
+        { "from": ".meta/src/reference/java/BaseConverter.java", "to": "src/main/java/BaseConverter.java" }
+      ],
+      "verifierCopies": [
+        { "from": "build.gradle", "to": "build.gradle" },
+        { "from": "gradlew", "to": "gradlew" },
+        { "from": "gradle/wrapper/gradle-wrapper.jar", "to": "gradle/wrapper/gradle-wrapper.jar" },
+        { "from": "gradle/wrapper/gradle-wrapper.properties", "to": "gradle/wrapper/gradle-wrapper.properties" },
+        { "from": "src/test/java/BaseConverterTest.java", "to": "src/test/java/BaseConverterTest.java" }
+      ],
+      "testCommand": "sed -i '/@Disabled(\"Remove to run test\")/d' \"$APP_DIR/src/test/java/BaseConverterTest.java\" && chmod +x \"$APP_DIR/gradlew\" && \"$APP_DIR/gradlew\" test --offline --no-daemon"
+    }
+  ]
+}

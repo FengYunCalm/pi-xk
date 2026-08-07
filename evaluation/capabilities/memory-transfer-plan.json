@@ -1,0 +1,36 @@
+{
+  "schema": "pi-xk.memory-transfer-plan.v1",
+  "title": "Pi-XK Memory retention, exact reuse, analogical transfer, and rule-change evaluation",
+  "minimumAttempts": 3,
+  "controls": {
+    "provider": "deepseek",
+    "model": "deepseek-chat",
+    "thinking": "low",
+    "wallSeconds": 300,
+    "toolPolicy": "pi-default"
+  },
+  "arms": [
+    { "id": "pi-native", "agent": "pi-native", "memorySetup": "none" },
+    { "id": "pi-xk-memory-off", "agent": "pi-xk", "memorySetup": "disabled" },
+    { "id": "pi-xk-placebo", "agent": "pi-xk", "memorySetup": "placebo" },
+    { "id": "pi-xk-learned", "agent": "pi-xk", "memorySetup": "learned" }
+  ],
+  "episodes": [
+    { "id": "learning", "kind": "learning", "relevantRecallExpected": false },
+    { "id": "exact-reuse", "kind": "exact-reuse", "relevantRecallExpected": true },
+    { "id": "similar-transfer", "kind": "similar-transfer", "relevantRecallExpected": true },
+    { "id": "changed-rule", "kind": "changed-rule", "relevantRecallExpected": true },
+    { "id": "unrelated", "kind": "unrelated", "relevantRecallExpected": false }
+  ],
+  "thresholds": {
+    "exactRecallRateMin": 0.8,
+    "similarRecallRateMin": 0.67,
+    "changedRulePassRateMin": 0.8,
+    "changedRuleRevisionRateMin": 0.67,
+    "unrelatedD1RateMax": 0.34,
+    "exactVerifierDeltaMin": 0,
+    "similarVerifierDeltaMin": 0,
+    "exactEfficiencyGainMin": 0.1,
+    "medianOverheadMax": 0.25
+  }
+}

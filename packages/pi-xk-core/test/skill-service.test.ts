@@ -169,6 +169,21 @@ async function createCandidate(root: string, store: SkillStore): Promise<SkillCa
 }
 
 describe("SkillService", () => {
+	it("treats an absent index as healthy when no Skill facts exist", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-xk-skill-service-"));
+		roots.push(root);
+		const service = new SkillService(root, { projectId: "project_test", now: () => now });
+
+		expect(await service.doctor()).toMatchObject({
+			ok: true,
+			diagnostics: [],
+			checkedEvents: 0,
+			checkedArtifacts: 0,
+			index: null,
+		});
+		await service.close();
+	});
+
 	it("rebuilds a missing index from facts and returns D1 metadata plus controlled D2 bundle reads", async () => {
 		const root = await mkdtemp(join(tmpdir(), "pi-xk-skill-service-"));
 		roots.push(root);

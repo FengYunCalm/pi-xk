@@ -61,6 +61,7 @@ interface RankedIdRow {
 
 interface MemoryIndexRebuildState {
 	plan: MemoryIndexRebuildPlanV1;
+	logicalTime: string | null;
 	counts: {
 		memoryCount: number;
 		cueCount: number;
@@ -193,6 +194,12 @@ function canonicalTimestamp(timestamp: string, field: string): string {
 	const value = milliseconds(timestamp);
 	if (value === null) throw new Error(`Memory index ${field} must be a valid timestamp`);
 	return new Date(value).toISOString();
+}
+
+function laterTimestamp(current: string | null, candidate: string | null, field: string): string | null {
+	if (candidate === null) return current;
+	const canonical = canonicalTimestamp(candidate, field);
+	return current === null || Date.parse(canonical) > Date.parse(current) ? canonical : current;
 }
 
 const schemaSql = `
@@ -354,6 +361,7 @@ export class MemorySqliteProjection {
 			this.insertMetadataDefaultStatement.run(key);
 		}
 		this.database.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('head_hash', '')").run();
+		this.database.prepare("INSERT OR IGNORE INTO metadata(key, value) VALUES ('logical_time', '')").run();
 		const version = this.database.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get();
 		if (!isRecord(version) || version.value !== String(MEMORY_INDEX_SCHEMA_VERSION)) {
 			throw new Error("Memory index schema version is unsupported");
@@ -362,6 +370,27 @@ export class MemorySqliteProjection {
 
 	private putMetadata(key: string, value: string): void {
 		this.putMetadataStatement.run(key, value);
+	}
+
+	private storedLogicalTime(): string | null {
+		const row = this.database.prepare("SELECT value FROM metadata WHERE key = 'logical_time'").get();
+		if (!isRecord(row)) throw new Error("Memory index logical time metadata is missing");
+		const value = metadataValue(row.value);
+		return value.length === 0 ? null : canonicalTimestamp(value, "logical time");
+	}
+
+	private advanceLogicalTime(candidates: readonly (string | null)[]): void {
+		let logicalTime = this.storedLogicalTime();
+		for (const candidate of candidates) {
+			logicalTime = laterTimestamp(logicalTime, candidate, "logical time candidate");
+		}
+		this.putMetadata("logical_time", logicalTime ?? "");
+	}
+
+	private currentAsOf(explicitAsOf: string | undefined, field: string): string {
+		if (explicitAsOf !== undefined) return canonicalTimestamp(explicitAsOf, field);
+		const wallTime = canonicalTimestamp(new Date().toISOString(), field);
+		return laterTimestamp(wallTime, this.storedLogicalTime(), "logical time") ?? wallTime;
 	}
 
 	private insertMemory(memory: MemoryIndexMemoryV1): void {
@@ -433,6 +462,7 @@ export class MemorySqliteProjection {
 			);
 			this.rebuildState = {
 				plan,
+				logicalTime: null,
 				counts: { memoryCount: 0, cueCount: 0, edgeCount: 0, historyCueCount: 0 },
 				stateCounts: emptyStateCounts(),
 				ids: { memories: new Set(), cues: new Set(), edges: new Set(), historyCues: new Set() },
@@ -470,6 +500,8 @@ export class MemorySqliteProjection {
 					throw new Error("Memory index rebuild lifecycle is invalid");
 				}
 				this.insertMemory(memory);
+				state.logicalTime = laterTimestamp(state.logicalTime, memory.recordedAt, "memory recordedAt");
+				state.logicalTime = laterTimestamp(state.logicalTime, memory.lastAccessedAt, "memory lastAccessedAt");
 				state.stateCounts.trust[memory.trust] += 1;
 				state.stateCounts.freshness[memory.freshness] += 1;
 				state.stateCounts.lifecycle[memory.lifecycle] += 1;
@@ -488,6 +520,7 @@ export class MemorySqliteProjection {
 				if (state.ids.historyCues.has(cue.cueId)) throw new Error("Memory index rebuild duplicates history cueId");
 				state.ids.historyCues.add(cue.cueId);
 				this.insertHistoryCue(cue);
+				state.logicalTime = laterTimestamp(state.logicalTime, cue.recordedAt, "history cue recordedAt");
 			}
 			state.counts.memoryCount += chunk.memories.length;
 			state.counts.cueCount += chunk.cues.length;
@@ -519,6 +552,7 @@ export class MemorySqliteProjection {
 					this.putMetadata(`${dimension}_${value}_count`, String(count));
 				}
 			}
+			this.advanceLogicalTime([state.logicalTime]);
 			this.database.exec("COMMIT");
 			this.rebuildState = undefined;
 		} catch (error) {
@@ -558,7 +592,10 @@ export class MemorySqliteProjection {
 		}
 	}
 
-	private refreshMetadata(head: MemoryIndexSnapshotV1["head"]): void {
+	private refreshMetadata(
+		head: MemoryIndexSnapshotV1["head"],
+		logicalTimeCandidates: readonly (string | null)[] = [],
+	): void {
 		const count = (table: "memories" | "cues" | "edges" | "history_cues"): number => {
 			const row = this.database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get();
 			if (!isRecord(row)) throw new Error(`Memory index ${table} count is invalid`);
@@ -589,6 +626,7 @@ export class MemorySqliteProjection {
 			);
 			for (const value of values) this.putMetadata(`${column}_${value}_count`, String(rows.get(value) ?? 0));
 		}
+		this.advanceLogicalTime(logicalTimeCandidates);
 	}
 
 	applyDelta(delta: MemoryIndexDeltaV1): void {
@@ -661,7 +699,10 @@ export class MemorySqliteProjection {
 				this.database.prepare("DELETE FROM history_cue_fts WHERE cue_id = ?").run(cue.cueId);
 				this.insertHistoryCue(cue);
 			}
-			this.refreshMetadata(head);
+			this.refreshMetadata(head, [
+				...delta.memories.flatMap((memory) => [memory.recordedAt, memory.lastAccessedAt]),
+				...delta.historyCues.map((cue) => cue.recordedAt),
+			]);
 		});
 	}
 
@@ -749,6 +790,7 @@ export class MemorySqliteProjection {
 			}
 			this.putMetadata("head_sequence", String(head.sequence));
 			this.putMetadata("head_hash", head.hash ?? "");
+			this.advanceLogicalTime([accessedAt]);
 		});
 	}
 
@@ -868,7 +910,7 @@ export class MemorySqliteProjection {
 		const offset = input.offset ?? 0;
 		if (!Number.isInteger(offset) || offset < 0 || offset > MEMORY_CANDIDATE_POOL_LIMIT)
 			throw new Error(`Memory index offset must be 0 to ${MEMORY_CANDIDATE_POOL_LIMIT}`);
-		const asOf = canonicalTimestamp(input.asOf ?? new Date().toISOString(), "asOf");
+		const asOf = this.currentAsOf(input.asOf, "asOf");
 		const pools: string[][] = [];
 		const lexical = this.matchingIds("memory_fts", "memories", "memory_id", query);
 		if (lexical.length > 0) pools.push(lexical);
@@ -999,7 +1041,7 @@ export class MemorySqliteProjection {
 
 	graph(input: MemoryIndexGraphInputV1): MemoryIndexGraphResultV1 {
 		if (input.depth !== 1 && input.depth !== 2) throw new Error("Memory index graph depth must be 1 or 2");
-		const asOf = canonicalTimestamp(input.asOf ?? new Date().toISOString(), "graph asOf");
+		const asOf = this.currentAsOf(input.asOf, "graph asOf");
 		if (!this.database.prepare("SELECT 1 AS present FROM memories WHERE memory_id = ?").get(input.rootMemoryId)) {
 			throw new Error(`Memory index graph root is missing: ${input.rootMemoryId}`);
 		}

@@ -1538,6 +1538,10 @@ export class MemoryService {
 	}
 
 	async doctor(mode: "quick" | "deep" = "quick"): Promise<MemoryDoctorReportV1> {
+		return await this.withProjectionMutation(async () => await this.doctorLocked(mode));
+	}
+
+	private async doctorLocked(mode: "quick" | "deep"): Promise<MemoryDoctorReportV1> {
 		const startedAt = performance.now();
 		const diagnostics: MemoryDoctorReportV1["diagnostics"] = [];
 		let inspection: Awaited<ReturnType<MemoryStore["inspectReadModelProjection"]>>;
@@ -1628,45 +1632,42 @@ export class MemoryService {
 			}
 		}
 		if ((readModel?.head.sequence ?? 0) > 0 || this.historyCues.length > 0) {
-			await this.withProjectionOperation(async () => {
+			try {
+				await stat(this.indexPath);
+				const index = new MemoryIndexWorkerClient({ databasePath: this.indexPath });
 				try {
-					await stat(this.indexPath);
-					const index = new MemoryIndexWorkerClient({ databasePath: this.indexPath });
-					try {
-						const [status, integrity] = await Promise.all([index.status(), index.integrityCheck()]);
-						if (integrity !== "ok")
-							diagnostics.push({ code: "index_corrupt", message: integrity, repairable: true });
-						if (
-							readModel &&
-							(status.head.sequence !== readModel.head.sequence ||
-								status.head.hash !== readModel.head.hash ||
-								status.memoryCount !== readModel.memories.length ||
-								status.cueCount !== readModel.cues.length ||
-								status.edgeCount !== readModel.edges.length)
-						) {
-							diagnostics.push({
-								code: "index_stale",
-								message: "Memory index head does not match the read model.",
-								repairable: true,
-							});
-						}
-					} finally {
-						await index.close();
+					const [status, integrity] = await Promise.all([index.status(), index.integrityCheck()]);
+					if (integrity !== "ok")
+						diagnostics.push({ code: "index_corrupt", message: integrity, repairable: true });
+					if (
+						readModel &&
+						(status.head.sequence !== readModel.head.sequence ||
+							status.head.hash !== readModel.head.hash ||
+							status.memoryCount !== readModel.memories.length ||
+							status.cueCount !== readModel.cues.length ||
+							status.edgeCount !== readModel.edges.length)
+					) {
+						diagnostics.push({
+							code: "index_stale",
+							message: "Memory index head does not match the read model.",
+							repairable: true,
+						});
 					}
-				} catch (error) {
-					const missing =
-						typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
-					diagnostics.push({
-						code: missing ? "index_missing" : "index_unreadable",
-						message: missing
-							? "Memory SQLite projection is missing."
-							: error instanceof Error
-								? error.message
-								: String(error),
-						repairable: true,
-					});
+				} finally {
+					await index.close();
 				}
-			});
+			} catch (error) {
+				const missing = typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+				diagnostics.push({
+					code: missing ? "index_missing" : "index_unreadable",
+					message: missing
+						? "Memory SQLite projection is missing."
+						: error instanceof Error
+							? error.message
+							: String(error),
+					repairable: true,
+				});
+			}
 		}
 		let artifacts = 0;
 		let files = 2;

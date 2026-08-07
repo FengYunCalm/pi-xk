@@ -1,0 +1,317 @@
+{
+  "schema": "pi-xk.capability-report.v1",
+  "reportKind": "public-evaluation",
+  "generatedAt": "2026-08-06T18:29:14.150Z",
+  "runs": [
+    {
+      "id": "native-a071c9757db9af38-pair-01",
+      "scenarioId": "public-code-task-parity",
+      "comparisonId": "pi-xk-evaluation-aider-polyglot-python-phone-number-deepseek-deepseek-chat-low-pair-01",
+      "agent": "pi-native",
+      "execution": "real-provider",
+      "status": "passed",
+      "control": {
+        "model": "deepseek/deepseek-chat",
+        "thinking": "low",
+        "piVersion": "0.80.10",
+        "runtimeId": "harbor-0.20.0-459ff6ec99417589b7f679d14ddf3b3f0ae4f1dc-pi-0.80.10-e08bad29b158372125a4a9652d2b48a1e5da4317-6da0657f9b9cfb2393259621cf9de9d3a6aa3ecb11a14e185b752313329b1ac2-05d2955b82af48e2a32120778c0a589cb8074459c439405b318fe04f12abe478",
+        "taskDigest": "a071c9757db9af38e9741e874b466dc53c4b0b8e913723d6589a17125b1af343",
+        "budget": {
+          "wallSeconds": 900,
+          "toolPolicy": "pi-default"
+        }
+      },
+      "metrics": {
+        "reward": 1,
+        "inputTokensIncludingCache": 40883,
+        "outputTokens": 4008,
+        "cacheReadTokens": 38016,
+        "costUsd": 0.004871912999999999,
+        "elapsedSeconds": 398.802
+      },
+      "verification": {
+        "structural": true,
+        "independent": true
+      }
+    },
+    {
+      "id": "xk-a071c9757db9af38-pair-01",
+      "scenarioId": "public-code-task-parity",
+      "comparisonId": "pi-xk-evaluation-aider-polyglot-python-phone-number-deepseek-deepseek-chat-low-pair-01",
+      "agent": "pi-xk",
+      "execution": "real-provider",
+      "status": "passed",
+      "control": {
+        "model": "deepseek/deepseek-chat",
+        "thinking": "low",
+        "piVersion": "0.80.10",
+        "runtimeId": "harbor-0.20.0-459ff6ec99417589b7f679d14ddf3b3f0ae4f1dc-pi-0.80.10-e08bad29b158372125a4a9652d2b48a1e5da4317-6da0657f9b9cfb2393259621cf9de9d3a6aa3ecb11a14e185b752313329b1ac2-05d2955b82af48e2a32120778c0a589cb8074459c439405b318fe04f12abe478",
+        "taskDigest": "a071c9757db9af38e9741e874b466dc53c4b0b8e913723d6589a17125b1af343",
+        "budget": {
+          "wallSeconds": 900,
+          "toolPolicy": "pi-default"
+        }
+      },
+      "metrics": {
+        "reward": 1,
+        "inputTokensIncludingCache": 100700,
+        "outputTokens": 4680,
+        "cacheReadTokens": 90240,
+        "costUsd": 0.008948820000000001,
+        "elapsedSeconds": 472.188
+      },
+      "verification": {
+        "structural": true,
+        "independent": true
+      }
+    },
+    {
+      "id": "native-9d1b809ccfbf38dd-pair-02",
+      "scenarioId": "public-code-task-parity",
+      "comparisonId": "pi-xk-evaluation-aider-polyglot-go-robot-simulator-deepseek-deepseek-chat-low-pair-02",
+      "agent": "pi-native",
+      "execution": "real-provider",
+      "status": "passed",
+      "control": {
+        "model": "deepseek/deepseek-chat",
+        "thinking": "low",
+        "piVersion": "0.80.10",
+        "runtimeId": "harbor-0.20.0-459ff6ec99417589b7f679d14ddf3b3f0ae4f1dc-pi-0.80.10-e08bad29b158372125a4a9652d2b48a1e5da4317-6da0657f9b9cfb2393259621cf9de9d3a6aa3ecb11a14e185b752313329b1ac2-05d2955b82af48e2a32120778c0a589cb8074459c439405b318fe04f12abe478",
+        "taskDigest": "9d1b809ccfbf38dd3eca802f06c022ac8acd7db35fd181471ec041c1cab362c6",
+        "budget": {
+          "wallSeconds": 900,
+          "toolPolicy": "pi-default"
+        }
+      },
+      "metrics": {
+        "reward": 1,
+        "inputTokensIncludingCache": 233884,
+        "outputTokens": 26970,
+        "cacheReadTokens": 226048,
+        "costUsd": 0.027691984000000006,
+        "elapsedSeconds": 588.696
+      },
+      "verification": {
+        "structural": true,
+        "independent": true
+      }
+    },
+    {
+      "id": "xk-9d1b809ccfbf38dd-pair-02",
+      "scenarioId": "public-code-task-parity",
+      "comparisonId": "pi-xk-evaluation-aider-polyglot-go-robot-simulator-deepseek-deepseek-chat-low-pair-02",
+      "agent": "pi-xk",
+      "execution": "real-provider",
+      "status": "passed",
+      "control": {
+        "model": "deepseek/deepseek-chat",
+        "thinking": "low",
+        "piVersion": "0.80.10",
+        "runtimeId": "harbor-0.20.0-459ff6ec99417589b7f679d14ddf3b3f0ae4f1dc-pi-0.80.10-e08bad29b158372125a4a9652d2b48a1e5da4317-6da0657f9b9cfb2393259621cf9de9d3a6aa3ecb11a14e185b752313329b1ac2-05d2955b82af48e2a32120778c0a589cb8074459c439405b318fe04f12abe478",
+        "taskDigest": "9d1b809ccfbf38dd3eca802f06c022ac8acd7db35fd181471ec041c1cab362c6",
+        "budget": {
+          "wallSeconds": 900,
+          "toolPolicy": "pi-default"
+        }
+      },
+      "metrics": {
+        "reward": 1,
+        "inputTokensIncludingCache": 208519,
+        "outputTokens": 27708,
+        "cacheReadTokens": 195840,
+        "costUsd": 0.030331245,
+        "elapsedSeconds": 875.214
+      },
+      "verification": {
+        "structural": true,
+        "independent": true
+      }
+    },
+    {
+      "id": "native-ee351e29227aa8d3-pair-03",
+      "scenarioId": "public-code-task-parity",
+      "comparisonId": "pi-xk-evaluation-aider-polyglot-rust-acronym-deepseek-deepseek-chat-low-pair-03",
+      "agent": "pi-native",
+      "execution": "real-provider",
+      "status": "passed",
+      "control": {
+        "model": "deepseek/deepseek-chat",
+        "thinking": "low",
+        "piVersion": "0.80.10",
+        "runtimeId": "harbor-0.20.0-459ff6ec99417589b7f679d14ddf3b3f0ae4f1dc-pi-0.80.10-e08bad29b158372125a4a9652d2b48a1e5da4317-6da0657f9b9cfb2393259621cf9de9d3a6aa3ecb11a14e185b752313329b1ac2-05d2955b82af48e2a32120778c0a589cb8074459c439405b318fe04f12abe478",
+        "taskDigest": "ee351e29227aa8d3188739500f3a04fe076dba27efb51241996806d10ca64350",
+        "budget": {
+          "wallSeconds": 900,
+          "toolPolicy": "pi-default"
+        }
+      },
+      "metrics": {
+        "reward": 1,
+        "inputTokensIncludingCache": 89688,
+        "outputTokens": 8964,
+        "cacheReadTokens": 87040,
+        "costUsd": 0.00926608,
+        "elapsedSeconds": 612.565
+      },
+      "verification": {
+        "structural": true,
+        "independent": true
+      }
+    },
+    {
+      "id": "xk-ee351e29227aa8d3-pair-03",
+      "scenarioId": "public-code-task-parity",
+      "comparisonId": "pi-xk-evaluation-aider-polyglot-rust-acronym-deepseek-deepseek-chat-low-pair-03",
+      "agent": "pi-xk",
+      "execution": "real-provider",
+      "status": "passed",
+      "control": {
+        "model": "deepseek/deepseek-chat",
+        "thinking": "low",
+        "piVersion": "0.80.10",
+        "runtimeId": "harbor-0.20.0-459ff6ec99417589b7f679d14ddf3b3f0ae4f1dc-pi-0.80.10-e08bad29b158372125a4a9652d2b48a1e5da4317-6da0657f9b9cfb2393259621cf9de9d3a6aa3ecb11a14e185b752313329b1ac2-05d2955b82af48e2a32120778c0a589cb8074459c439405b318fe04f12abe478",
+        "taskDigest": "ee351e29227aa8d3188739500f3a04fe076dba27efb51241996806d10ca64350",
+        "budget": {
+          "wallSeconds": 900,
+          "toolPolicy": "pi-default"
+        }
+      },
+      "metrics": {
+        "reward": 1,
+        "inputTokensIncludingCache": 67028,
+        "outputTokens": 5868,
+        "cacheReadTokens": 58880,
+        "costUsd": 0.008862980000000001,
+        "elapsedSeconds": 332.688
+      },
+      "verification": {
+        "structural": true,
+        "independent": true
+      }
+    },
+    {
+      "id": "native-5fcb0dcd8e64a7af-pair-04",
+      "scenarioId": "public-code-task-parity",
+      "comparisonId": "pi-xk-evaluation-aider-polyglot-cpp-clock-deepseek-deepseek-chat-low-pair-04",
+      "agent": "pi-native",
+      "execution": "real-provider",
+      "status": "passed",
+      "control": {
+        "model": "deepseek/deepseek-chat",
+        "thinking": "low",
+        "piVersion": "0.80.10",
+        "runtimeId": "harbor-0.20.0-459ff6ec99417589b7f679d14ddf3b3f0ae4f1dc-pi-0.80.10-e08bad29b158372125a4a9652d2b48a1e5da4317-6da0657f9b9cfb2393259621cf9de9d3a6aa3ecb11a14e185b752313329b1ac2-05d2955b82af48e2a32120778c0a589cb8074459c439405b318fe04f12abe478",
+        "taskDigest": "5fcb0dcd8e64a7afb0f86b4a4ac7265f09e156754b520dac09efc5da16f3989e",
+        "budget": {
+          "wallSeconds": 900,
+          "toolPolicy": "pi-default"
+        }
+      },
+      "metrics": {
+        "reward": 1,
+        "inputTokensIncludingCache": 57586,
+        "outputTokens": 5071,
+        "cacheReadTokens": 53248,
+        "costUsd": 0.006491824,
+        "elapsedSeconds": 401.623
+      },
+      "verification": {
+        "structural": true,
+        "independent": true
+      }
+    },
+    {
+      "id": "xk-5fcb0dcd8e64a7af-pair-04",
+      "scenarioId": "public-code-task-parity",
+      "comparisonId": "pi-xk-evaluation-aider-polyglot-cpp-clock-deepseek-deepseek-chat-low-pair-04",
+      "agent": "pi-xk",
+      "execution": "real-provider",
+      "status": "passed",
+      "control": {
+        "model": "deepseek/deepseek-chat",
+        "thinking": "low",
+        "piVersion": "0.80.10",
+        "runtimeId": "harbor-0.20.0-459ff6ec99417589b7f679d14ddf3b3f0ae4f1dc-pi-0.80.10-e08bad29b158372125a4a9652d2b48a1e5da4317-6da0657f9b9cfb2393259621cf9de9d3a6aa3ecb11a14e185b752313329b1ac2-05d2955b82af48e2a32120778c0a589cb8074459c439405b318fe04f12abe478",
+        "taskDigest": "5fcb0dcd8e64a7afb0f86b4a4ac7265f09e156754b520dac09efc5da16f3989e",
+        "budget": {
+          "wallSeconds": 900,
+          "toolPolicy": "pi-default"
+        }
+      },
+      "metrics": {
+        "reward": 1,
+        "inputTokensIncludingCache": 153005,
+        "outputTokens": 4767,
+        "cacheReadTokens": 142336,
+        "costUsd": 0.009304272999999998,
+        "elapsedSeconds": 473.132
+      },
+      "verification": {
+        "structural": true,
+        "independent": true
+      }
+    },
+    {
+      "id": "native-fe21ae5fab5d9c4b-pair-05",
+      "scenarioId": "public-code-task-parity",
+      "comparisonId": "pi-xk-evaluation-aider-polyglot-java-all-your-base-deepseek-deepseek-chat-low-pair-05",
+      "agent": "pi-native",
+      "execution": "real-provider",
+      "status": "passed",
+      "control": {
+        "model": "deepseek/deepseek-chat",
+        "thinking": "low",
+        "piVersion": "0.80.10",
+        "runtimeId": "harbor-0.20.0-459ff6ec99417589b7f679d14ddf3b3f0ae4f1dc-pi-0.80.10-e08bad29b158372125a4a9652d2b48a1e5da4317-6da0657f9b9cfb2393259621cf9de9d3a6aa3ecb11a14e185b752313329b1ac2-05d2955b82af48e2a32120778c0a589cb8074459c439405b318fe04f12abe478",
+        "taskDigest": "fe21ae5fab5d9c4bfa71f6dea8293905bfdb35505639b0402e9dad22774e6ccc",
+        "budget": {
+          "wallSeconds": 900,
+          "toolPolicy": "pi-default"
+        }
+      },
+      "metrics": {
+        "reward": 1,
+        "inputTokensIncludingCache": 29141,
+        "outputTokens": 2546,
+        "cacheReadTokens": 25728,
+        "costUsd": 0.0037929390000000004,
+        "elapsedSeconds": 606.554
+      },
+      "verification": {
+        "structural": true,
+        "independent": true
+      }
+    },
+    {
+      "id": "xk-fe21ae5fab5d9c4b-pair-05",
+      "scenarioId": "public-code-task-parity",
+      "comparisonId": "pi-xk-evaluation-aider-polyglot-java-all-your-base-deepseek-deepseek-chat-low-pair-05",
+      "agent": "pi-xk",
+      "execution": "real-provider",
+      "status": "passed",
+      "control": {
+        "model": "deepseek/deepseek-chat",
+        "thinking": "low",
+        "piVersion": "0.80.10",
+        "runtimeId": "harbor-0.20.0-459ff6ec99417589b7f679d14ddf3b3f0ae4f1dc-pi-0.80.10-e08bad29b158372125a4a9652d2b48a1e5da4317-6da0657f9b9cfb2393259621cf9de9d3a6aa3ecb11a14e185b752313329b1ac2-05d2955b82af48e2a32120778c0a589cb8074459c439405b318fe04f12abe478",
+        "taskDigest": "fe21ae5fab5d9c4bfa71f6dea8293905bfdb35505639b0402e9dad22774e6ccc",
+        "budget": {
+          "wallSeconds": 900,
+          "toolPolicy": "pi-default"
+        }
+      },
+      "metrics": {
+        "reward": 1,
+        "inputTokensIncludingCache": 77791,
+        "outputTokens": 2406,
+        "cacheReadTokens": 67712,
+        "costUsd": 0.006723041,
+        "elapsedSeconds": 336.865
+      },
+      "verification": {
+        "structural": true,
+        "independent": true
+      }
+    }
+  ]
+}

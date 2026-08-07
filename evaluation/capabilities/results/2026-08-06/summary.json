@@ -1,0 +1,285 @@
+{
+  "schema": "pi-xk.capability-summary.v1",
+  "publicParity": [
+    {
+      "comparisonId": "pi-xk-evaluation-aider-polyglot-cpp-clock-deepseek-deepseek-chat-low-pair-04",
+      "outcome": "tied",
+      "piNative": {
+        "reward": 1,
+        "inputTokensIncludingCache": 57586,
+        "outputTokens": 5071,
+        "costUsd": 0.006491824,
+        "elapsedSeconds": 401.623
+      },
+      "piXk": {
+        "reward": 1,
+        "inputTokensIncludingCache": 153005,
+        "outputTokens": 4767,
+        "costUsd": 0.009304272999999998,
+        "elapsedSeconds": 473.132
+      }
+    },
+    {
+      "comparisonId": "pi-xk-evaluation-aider-polyglot-go-robot-simulator-deepseek-deepseek-chat-low-pair-02",
+      "outcome": "tied",
+      "piNative": {
+        "reward": 1,
+        "inputTokensIncludingCache": 233884,
+        "outputTokens": 26970,
+        "costUsd": 0.027691984000000006,
+        "elapsedSeconds": 588.696
+      },
+      "piXk": {
+        "reward": 1,
+        "inputTokensIncludingCache": 208519,
+        "outputTokens": 27708,
+        "costUsd": 0.030331245,
+        "elapsedSeconds": 875.214
+      }
+    },
+    {
+      "comparisonId": "pi-xk-evaluation-aider-polyglot-java-all-your-base-deepseek-deepseek-chat-low-pair-05",
+      "outcome": "tied",
+      "piNative": {
+        "reward": 1,
+        "inputTokensIncludingCache": 29141,
+        "outputTokens": 2546,
+        "costUsd": 0.0037929390000000004,
+        "elapsedSeconds": 606.554
+      },
+      "piXk": {
+        "reward": 1,
+        "inputTokensIncludingCache": 77791,
+        "outputTokens": 2406,
+        "costUsd": 0.006723041,
+        "elapsedSeconds": 336.865
+      }
+    },
+    {
+      "comparisonId": "pi-xk-evaluation-aider-polyglot-python-phone-number-deepseek-deepseek-chat-low-pair-01",
+      "outcome": "tied",
+      "piNative": {
+        "reward": 1,
+        "inputTokensIncludingCache": 40883,
+        "outputTokens": 4008,
+        "costUsd": 0.004871912999999999,
+        "elapsedSeconds": 398.802
+      },
+      "piXk": {
+        "reward": 1,
+        "inputTokensIncludingCache": 100700,
+        "outputTokens": 4680,
+        "costUsd": 0.008948820000000001,
+        "elapsedSeconds": 472.188
+      }
+    },
+    {
+      "comparisonId": "pi-xk-evaluation-aider-polyglot-rust-acronym-deepseek-deepseek-chat-low-pair-03",
+      "outcome": "tied",
+      "piNative": {
+        "reward": 1,
+        "inputTokensIncludingCache": 89688,
+        "outputTokens": 8964,
+        "costUsd": 0.00926608,
+        "elapsedSeconds": 612.565
+      },
+      "piXk": {
+        "reward": 1,
+        "inputTokensIncludingCache": 67028,
+        "outputTokens": 5868,
+        "costUsd": 0.008862980000000001,
+        "elapsedSeconds": 332.688
+      }
+    }
+  ],
+  "publicCalibration": [],
+  "workflow": [
+    {
+      "id": "faux-ambient-memory-recall-and-review",
+      "scenarioId": "ambient-memory-recall-and-review",
+      "execution": "faux-provider",
+      "status": "passed",
+      "structural": true,
+      "independent": false
+    },
+    {
+      "id": "faux-chain-rollover-rollup-recovery",
+      "scenarioId": "chain-rollover-rollup-recovery",
+      "execution": "faux-provider",
+      "status": "passed",
+      "structural": true,
+      "independent": false
+    },
+    {
+      "id": "faux-compaction-continuation",
+      "scenarioId": "compaction-continuation",
+      "execution": "faux-provider",
+      "status": "passed",
+      "structural": true,
+      "independent": false
+    },
+    {
+      "id": "faux-doctor-projection-repair",
+      "scenarioId": "doctor-projection-repair",
+      "execution": "faux-provider",
+      "status": "passed",
+      "structural": true,
+      "independent": false
+    },
+    {
+      "id": "faux-goal-contract-continuity",
+      "scenarioId": "goal-contract-continuity",
+      "execution": "faux-provider",
+      "status": "passed",
+      "structural": true,
+      "independent": false
+    },
+    {
+      "id": "faux-local-installation-lifecycle",
+      "scenarioId": "local-installation-lifecycle",
+      "execution": "faux-provider",
+      "status": "passed",
+      "structural": true,
+      "independent": false
+    },
+    {
+      "id": "faux-skill-evolution-and-reload",
+      "scenarioId": "skill-evolution-and-reload",
+      "execution": "faux-provider",
+      "status": "passed",
+      "structural": true,
+      "independent": false
+    },
+    {
+      "id": "faux-task-child-delivery",
+      "scenarioId": "task-child-delivery",
+      "execution": "faux-provider",
+      "status": "passed",
+      "structural": true,
+      "independent": false
+    },
+    {
+      "id": "real-ambient-memory-recall-and-review",
+      "scenarioId": "ambient-memory-recall-and-review",
+      "execution": "real-provider",
+      "status": "passed",
+      "structural": true,
+      "independent": true
+    },
+    {
+      "id": "real-chain-rollover-rollup-recovery",
+      "scenarioId": "chain-rollover-rollup-recovery",
+      "execution": "real-provider",
+      "status": "passed",
+      "structural": true,
+      "independent": true
+    },
+    {
+      "id": "real-compaction-continuation",
+      "scenarioId": "compaction-continuation",
+      "execution": "real-provider",
+      "status": "passed",
+      "structural": true,
+      "independent": true
+    },
+    {
+      "id": "real-doctor-projection-repair",
+      "scenarioId": "doctor-projection-repair",
+      "execution": "real-provider",
+      "status": "passed",
+      "structural": true,
+      "independent": true
+    },
+    {
+      "id": "real-goal-contract-continuity",
+      "scenarioId": "goal-contract-continuity",
+      "execution": "real-provider",
+      "status": "passed",
+      "structural": true,
+      "independent": true
+    },
+    {
+      "id": "real-skill-evolution-and-reload",
+      "scenarioId": "skill-evolution-and-reload",
+      "execution": "real-provider",
+      "status": "passed",
+      "structural": true,
+      "independent": true
+    },
+    {
+      "id": "real-task-child-delivery",
+      "scenarioId": "task-child-delivery",
+      "execution": "real-provider",
+      "status": "passed",
+      "structural": true,
+      "independent": true
+    }
+  ],
+  "statistics": {
+    "publicParity": {
+      "comparisons": 5,
+      "piXkAdvantages": 0,
+      "piNativeAdvantages": 0,
+      "ties": 5
+    },
+    "publicCalibration": {
+      "comparisons": 0,
+      "piXkAdvantages": 0,
+      "piNativeAdvantages": 0,
+      "ties": 0
+    },
+    "workflow": {
+      "runs": 15,
+      "passed": 15,
+      "failed": 0,
+      "inconclusive": 0,
+      "other": 0
+    }
+  },
+  "coverage": {
+    "publicParity": [
+      {
+        "scenarioId": "public-code-task-parity",
+        "covered": true,
+        "calibrated": false,
+        "comparisonCount": 5,
+        "minimumComparisons": 5,
+        "sufficient": true
+      }
+    ],
+    "workflow": [
+      {
+        "scenarioId": "goal-contract-continuity",
+        "covered": true
+      },
+      {
+        "scenarioId": "task-child-delivery",
+        "covered": true
+      },
+      {
+        "scenarioId": "chain-rollover-rollup-recovery",
+        "covered": true
+      },
+      {
+        "scenarioId": "compaction-continuation",
+        "covered": true
+      },
+      {
+        "scenarioId": "ambient-memory-recall-and-review",
+        "covered": true
+      },
+      {
+        "scenarioId": "skill-evolution-and-reload",
+        "covered": true
+      },
+      {
+        "scenarioId": "doctor-projection-repair",
+        "covered": true
+      },
+      {
+        "scenarioId": "local-installation-lifecycle",
+        "covered": true
+      }
+    ]
+  }
+}

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type {
 	MemoryIndexCueV1,
 	MemoryIndexEdgeV1,
@@ -127,7 +127,7 @@ describe("Memory SQLite projection", () => {
 		});
 		try {
 			expect(await client.status()).toEqual({
-				schemaVersion: 2,
+				schemaVersion: 3,
 				head: { sequence: 0, hash: null },
 				memoryCount: 0,
 				cueCount: 0,
@@ -227,7 +227,7 @@ describe("Memory SQLite projection", () => {
 		const projection = new MemorySqliteProjection(database);
 		projection.rebuild(snapshot());
 		expect(projection.status()).toEqual({
-			schemaVersion: 2,
+			schemaVersion: 3,
 			head: snapshot().head,
 			memoryCount: 2,
 			cueCount: 2,
@@ -586,6 +586,44 @@ describe("Memory SQLite projection", () => {
 		).toHaveLength(0);
 		expect(projection.search({ query: "Archived decision", limit: 12, graphDepth: 0 }).memories).toHaveLength(0);
 		database.close();
+	});
+
+	it("keeps committed current facts visible when the host wall clock moves backward", () => {
+		vi.useFakeTimers();
+		const database = new DatabaseSync(":memory:");
+		try {
+			const committedAt = "2026-08-06T12:00:00.500Z";
+			vi.setSystemTime(committedAt);
+			const projection = new MemorySqliteProjection(database);
+			projection.rebuild({
+				head: { sequence: 1, hash: `sha256:${"7".repeat(64)}` },
+				memories: [
+					memory("memory_one", "Clock-safe current fact", "The committed fact remains searchable.", {
+						effectiveFrom: committedAt,
+						recordedAt: committedAt,
+					}),
+				],
+				cues: [],
+				edges: [],
+				historyCues: [],
+			});
+
+			vi.setSystemTime("2026-08-06T12:00:00.000Z");
+			expect(projection.search({ query: "Clock-safe current fact", limit: 12, graphDepth: 0 }).memories).toEqual([
+				expect.objectContaining({ memoryId: "memory_one" }),
+			]);
+			expect(
+				projection.search({
+					query: "Clock-safe current fact",
+					asOf: "2026-08-06T12:00:00.000Z",
+					limit: 12,
+					graphDepth: 0,
+				}).memories,
+			).toEqual([]);
+		} finally {
+			database.close();
+			vi.useRealTimers();
+		}
 	});
 
 	it("pages the ranked candidate set without reading memory bodies into D1", () => {

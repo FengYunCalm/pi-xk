@@ -1,0 +1,57 @@
+{
+	"schema": "pi-xk.capability-report.v1",
+	"reportKind": "public-calibration",
+	"generatedAt": "2026-08-05T18:20:22.193149Z",
+	"runs": [
+		{
+			"id": "native-aider-polyglot-python-phone-number",
+			"scenarioId": "public-code-task-parity",
+			"comparisonId": "aider-polyglot-python-phone-number-deepseek-chat-low",
+			"agent": "pi-native",
+			"execution": "real-provider",
+			"status": "passed",
+			"control": {
+				"model": "deepseek/deepseek-chat",
+				"thinking": "low",
+				"piVersion": "0.80.10",
+				"runtimeId": "pi-0.80.10-built-from-e08bad2",
+				"taskDigest": "551a1202f994d3e952718c320da1e7b7316f8677c04eb5bc9ca9060a2dfe190a",
+				"budget": { "wallSeconds": 900, "toolPolicy": "pi-default" }
+			},
+			"metrics": {
+				"reward": 1,
+				"inputTokensIncludingCache": 34997,
+				"outputTokens": 2610,
+				"cacheReadTokens": 29696,
+				"costUsd": 0.004684283,
+				"elapsedSeconds": 247.466
+			},
+			"verification": { "structural": true, "independent": true }
+		},
+		{
+			"id": "xk-aider-polyglot-python-phone-number",
+			"scenarioId": "public-code-task-parity",
+			"comparisonId": "aider-polyglot-python-phone-number-deepseek-chat-low",
+			"agent": "pi-xk",
+			"execution": "real-provider",
+			"status": "passed",
+			"control": {
+				"model": "deepseek/deepseek-chat",
+				"thinking": "low",
+				"piVersion": "0.80.10",
+				"runtimeId": "pi-0.80.10-built-from-e08bad2",
+				"taskDigest": "551a1202f994d3e952718c320da1e7b7316f8677c04eb5bc9ca9060a2dfe190a",
+				"budget": { "wallSeconds": 900, "toolPolicy": "pi-default" }
+			},
+			"metrics": {
+				"reward": 1,
+				"inputTokensIncludingCache": 149515,
+				"outputTokens": 5200,
+				"cacheReadTokens": 138368,
+				"costUsd": 0.009874529,
+				"elapsedSeconds": 310.194
+			},
+			"verification": { "structural": true, "independent": true }
+		}
+	]
+}

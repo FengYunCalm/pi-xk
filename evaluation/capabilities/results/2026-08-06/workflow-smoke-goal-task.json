@@ -1,0 +1,67 @@
+{
+  "schema": "pi-xk.capability-report.v1",
+  "reportKind": "workflow-smoke",
+  "generatedAt": "2026-08-06T22:58:27.090Z",
+  "runs": [
+    {
+      "id": "real-goal-contract-continuity",
+      "scenarioId": "goal-contract-continuity",
+      "agent": "pi-xk",
+      "execution": "real-provider",
+      "status": "passed",
+      "control": {
+        "model": "deepseek/deepseek-chat",
+        "thinking": "low",
+        "piVersion": "0.80.10",
+        "runtimeId": "pi-0.80.10-runtime-sha256:d7c924ee6b2ec1148e5cd713306ffe1821b663ec27db055556e7090f85195449",
+        "taskDigest": "sha256:ca3ceed76f8c2fdb2e88f88b6f2c20e8b8fbbeb204c457fee00907769e4a3028",
+        "budget": {
+          "wallSeconds": 900,
+          "toolPolicy": "pi-default"
+        }
+      },
+      "metrics": {
+        "reward": 1,
+        "inputTokensIncludingCache": 443324,
+        "outputTokens": 21869,
+        "cacheReadTokens": 413824,
+        "costUsd": 0.033358641999999994,
+        "elapsedSeconds": 425.082
+      },
+      "verification": {
+        "structural": true,
+        "independent": true
+      }
+    },
+    {
+      "id": "real-task-child-delivery",
+      "scenarioId": "task-child-delivery",
+      "agent": "pi-xk",
+      "execution": "real-provider",
+      "status": "passed",
+      "control": {
+        "model": "deepseek/deepseek-chat",
+        "thinking": "low",
+        "piVersion": "0.80.10",
+        "runtimeId": "pi-0.80.10-runtime-sha256:d7c924ee6b2ec1148e5cd713306ffe1821b663ec27db055556e7090f85195449",
+        "taskDigest": "sha256:ca3ceed76f8c2fdb2e88f88b6f2c20e8b8fbbeb204c457fee00907769e4a3028",
+        "budget": {
+          "wallSeconds": 900,
+          "toolPolicy": "pi-default"
+        }
+      },
+      "metrics": {
+        "reward": 1,
+        "inputTokensIncludingCache": 443324,
+        "outputTokens": 21869,
+        "cacheReadTokens": 413824,
+        "costUsd": 0.033358641999999994,
+        "elapsedSeconds": 425.082
+      },
+      "verification": {
+        "structural": true,
+        "independent": true
+      }
+    }
+  ]
+}
